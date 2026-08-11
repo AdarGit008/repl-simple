@@ -46,7 +46,6 @@ export interface RunOptions {
   ) => ApprovalDecision | Promise<ApprovalDecision>;
   maxStdoutBytes?: number;
   scriptName?: string;
-  lineOffset?: number;
   limits?: RunLimits;
 }
 
@@ -87,6 +86,8 @@ export interface RunError {
 export interface RunSuspended {
   status: "suspended";
   suspendedCall: ApprovalRequest;
+  /** Serialized MontySnapshot — pass to resumeSuspended() to continue. */
+  snapshot: Buffer;
   stdout: string;
   stdoutTruncated: boolean;
   calls: ToolCallTrace[];

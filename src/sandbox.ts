@@ -14,8 +14,10 @@ import { HostToolError } from "./types.js";
 import type {
   HostTool,
   RunResult,
+  RunSuspended,
   ToolCallTrace,
   ApprovalRequest,
+  ApprovalDecision,
   RunOptions,
   RunLimits,
 } from "./types.js";
@@ -409,10 +411,10 @@ export async function runInSandbox(
         : false;
 
       if (decision === "suspend") {
-        // Terminal suspension for now — snapshot resume in follow-up
         return {
           status: "suspended",
           suspendedCall: req,
+          snapshot: snapshot.dump(),
           stdout,
           stdoutTruncated,
           calls,
@@ -540,5 +542,378 @@ export async function runInSandbox(
       }
     }
     // Loop back for next pause point
+  }
+}
+
+// ── Resume suspended execution ──────────────────────────────────
+
+/**
+ * Resume a sandbox execution that was suspended for tool approval.
+ *
+ * Loads the serialized `MontySnapshot` from `suspended.snapshot`,
+ * applies the approval `decision`, and continues the start/resume loop.
+ *
+ * Returns the same discriminated `RunResult` as `runInSandbox()`.
+ */
+export async function resumeSuspended(
+  suspended: RunSuspended,
+  decision: ApprovalDecision,
+  options: SandboxOptions,
+  runOpts?: RunOptions,
+): Promise<RunResult> {
+  const registry = options.registry;
+  const maxStdout = runOpts?.maxStdoutBytes ?? DEFAULT_MAX_STDOUT;
+
+  // Accumulators — carry over from suspended state
+  let stdout = suspended.stdout;
+  let stdoutTruncated = suspended.stdoutTruncated;
+  const calls = [...suspended.calls];
+
+  // Abort flag
+  let aborted = false;
+  const onAbort = () => {
+    aborted = true;
+  };
+  if (runOpts?.signal) {
+    runOpts.signal.addEventListener("abort", onAbort, { once: true });
+    if (runOpts.signal.aborted) aborted = true;
+  }
+
+  // Print callback — accumulate beyond existing stdout
+  const printCallback = (_stream: string, text: string) => {
+    if (stdoutTruncated) return;
+    runOpts?.onPrint?.(text);
+    if (Buffer.byteLength(stdout) + Buffer.byteLength(text) > maxStdout) {
+      stdout += text.slice(0, maxStdout - Buffer.byteLength(stdout));
+      stdout += TRUNCATION_MARKER;
+      stdoutTruncated = true;
+    } else {
+      stdout += text;
+    }
+  };
+
+  // Load the snapshot with printCallback attached
+  const snapshot: MontySnapshot = MontySnapshot.load(suspended.snapshot, {
+    printCallback,
+  });
+  const tool = registry.get(suspended.suspendedCall.tool);
+
+  let current: MontySnapshot | MontyNameLookup | MontyComplete;
+
+  // Replay the approval decision
+  if (decision === true && tool) {
+    // Approved — execute the tool and resume
+    const t0 = performance.now();
+    try {
+      const resolvedArgs = resolveToolArgs(
+        tool,
+        suspended.suspendedCall.args,
+        suspended.suspendedCall.kwargs,
+      );
+      const returnValue = await tool.execute(resolvedArgs);
+      calls.push({
+        tool: tool.name,
+        args: suspended.suspendedCall.args,
+        kwargs: suspended.suspendedCall.kwargs,
+        durationMs: performance.now() - t0,
+        ok: true,
+        approved: true,
+      });
+      current = snapshot.resume({ returnValue });
+    } catch (err) {
+      const durationMs = performance.now() - t0;
+      const message = err instanceof Error ? err.message : String(err);
+      const pythonType =
+        err instanceof HostToolError ? err.pythonType : "RuntimeError";
+      calls.push({
+        tool: tool.name,
+        args: suspended.suspendedCall.args,
+        kwargs: suspended.suspendedCall.kwargs,
+        durationMs,
+        ok: false,
+        error: message,
+        approved: true,
+      });
+      current = snapshot.resume({
+        exception: { type: pythonType, message },
+      });
+    }
+  } else if (decision === false || !tool) {
+    // Denied or tool not found → PermissionError or NameError
+    const excType = !tool ? "NameError" : "PermissionError";
+    const excMsg = !tool
+      ? `name '${suspended.suspendedCall.tool}' is not defined`
+      : `tool '${tool.name}' requires approval`;
+    calls.push({
+      tool: suspended.suspendedCall.tool,
+      args: suspended.suspendedCall.args,
+      kwargs: suspended.suspendedCall.kwargs,
+      durationMs: 0,
+      ok: false,
+      approved: false,
+      error: excMsg,
+    });
+    current = snapshot.resume({
+      exception: { type: excType, message: excMsg },
+    });
+  } else {
+    // decision === "suspend" again → return suspended
+    return {
+      status: "suspended",
+      suspendedCall: suspended.suspendedCall,
+      snapshot: suspended.snapshot,
+      stdout,
+      stdoutTruncated,
+      calls,
+    };
+  }
+
+  // Continue the main execution loop
+  while (true) {
+    if (aborted) {
+      return {
+        status: "error",
+        error: "execution aborted",
+        errorKind: "aborted",
+        stdout,
+        stdoutTruncated,
+        calls,
+      };
+    }
+
+    if (current instanceof MontyComplete) {
+      return {
+        status: "ok",
+        output: formatOutput(current.output),
+        stdout,
+        stdoutTruncated,
+        calls,
+      };
+    }
+
+    if (current instanceof MontyNameLookup) {
+      const name = current.variableName;
+      const registeredTool = registry.get(name);
+      try {
+        if (registeredTool) {
+          const sentinel = () => "";
+          current = current.resume({ value: sentinel });
+        } else {
+          current = current.resume();
+        }
+      } catch (err) {
+        if (err instanceof MontyRuntimeError) {
+          return {
+            status: "error",
+            error: err.message,
+            errorKind: "runtime",
+            stdout,
+            stdoutTruncated,
+            calls,
+          };
+        }
+        throw err;
+      }
+      continue;
+    }
+
+    // MontySnapshot — external function call (same logic as runInSandbox)
+    const loopSnapshot = current;
+    const funcName = loopSnapshot.functionName;
+    const loopTool = registry.get(funcName);
+
+    if (!loopTool) {
+      try {
+        current = loopSnapshot.resume({
+          exception: {
+            type: "NameError",
+            message: `name '${funcName}' is not defined`,
+          },
+        });
+      } catch (err) {
+        if (err instanceof MontyRuntimeError) {
+          return {
+            status: "error",
+            error: err.message,
+            errorKind: "runtime",
+            stdout,
+            stdoutTruncated,
+            calls,
+          };
+        }
+        throw err;
+      }
+      continue;
+    }
+
+    let resolvedArgs: Record<string, unknown>;
+    try {
+      resolvedArgs = resolveToolArgs(
+        loopTool,
+        loopSnapshot.args as unknown[],
+        loopSnapshot.kwargs as Record<string, unknown>,
+      );
+    } catch (err) {
+      calls.push({
+        tool: loopTool.name,
+        args: loopSnapshot.args as unknown[],
+        kwargs: loopSnapshot.kwargs as Record<string, unknown>,
+        durationMs: 0,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      try {
+        current = loopSnapshot.resume({
+          exception: {
+            type:
+              err instanceof HostToolError ? err.pythonType : "TypeError",
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      } catch (resumeErr) {
+        if (resumeErr instanceof MontyRuntimeError) {
+          return {
+            status: "error",
+            error: resumeErr.message,
+            errorKind: "runtime",
+            stdout,
+            stdoutTruncated,
+            calls,
+          };
+        }
+        throw resumeErr;
+      }
+      continue;
+    }
+
+    let approved: boolean | undefined;
+    if (loopTool.requiresApproval) {
+      const req = buildApprovalRequest(
+        loopTool,
+        loopSnapshot.args as unknown[],
+        loopSnapshot.kwargs as Record<string, unknown>,
+      );
+      const loopDecision = runOpts?.onApproval
+        ? await runOpts.onApproval(req)
+        : false;
+
+      if (loopDecision === "suspend") {
+        return {
+          status: "suspended",
+          suspendedCall: req,
+          snapshot: loopSnapshot.dump(),
+          stdout,
+          stdoutTruncated,
+          calls,
+        };
+      }
+
+      if (!loopDecision) {
+        calls.push({
+          tool: loopTool.name,
+          args: loopSnapshot.args as unknown[],
+          kwargs: loopSnapshot.kwargs as Record<string, unknown>,
+          durationMs: 0,
+          ok: false,
+          approved: false,
+          error: `tool '${loopTool.name}' requires approval`,
+        });
+        try {
+          current = loopSnapshot.resume({
+            exception: {
+              type: "PermissionError",
+              message: `tool '${loopTool.name}' requires approval`,
+            },
+          });
+        } catch (err) {
+          if (err instanceof MontyRuntimeError) {
+            return {
+              status: "error",
+              error: err.message,
+              errorKind: "runtime",
+              stdout,
+              stdoutTruncated,
+              calls,
+            };
+          }
+          throw err;
+        }
+        continue;
+      }
+
+      approved = true;
+    }
+
+    const t0 = performance.now();
+    try {
+      const returnValue = await loopTool.execute(resolvedArgs);
+      calls.push({
+        tool: loopTool.name,
+        args: loopSnapshot.args as unknown[],
+        kwargs: loopSnapshot.kwargs as Record<string, unknown>,
+        durationMs: performance.now() - t0,
+        ok: true,
+        approved,
+      });
+      current = loopSnapshot.resume({ returnValue });
+    } catch (err) {
+      const durationMs = performance.now() - t0;
+      if (err instanceof HostToolError) {
+        calls.push({
+          tool: loopTool.name,
+          args: loopSnapshot.args as unknown[],
+          kwargs: loopSnapshot.kwargs as Record<string, unknown>,
+          durationMs,
+          ok: false,
+          error: err.message,
+          approved,
+        });
+        try {
+          current = loopSnapshot.resume({
+            exception: { type: err.pythonType, message: err.message },
+          });
+        } catch (resumeErr) {
+          if (resumeErr instanceof MontyRuntimeError) {
+            return {
+              status: "error",
+              error: resumeErr.message,
+              errorKind: "runtime",
+              stdout,
+              stdoutTruncated,
+              calls,
+            };
+          }
+          throw resumeErr;
+        }
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        calls.push({
+          tool: loopTool.name,
+          args: loopSnapshot.args as unknown[],
+          kwargs: loopSnapshot.kwargs as Record<string, unknown>,
+          durationMs,
+          ok: false,
+          error: message,
+          approved,
+        });
+        try {
+          current = loopSnapshot.resume({
+            exception: { type: "RuntimeError", message },
+          });
+        } catch (resumeErr) {
+          if (resumeErr instanceof MontyRuntimeError) {
+            return {
+              status: "error",
+              error: resumeErr.message,
+              errorKind: "runtime",
+              stdout,
+              stdoutTruncated,
+              calls,
+            };
+          }
+          throw resumeErr;
+        }
+      }
+    }
   }
 }

@@ -124,10 +124,11 @@ describe("Interface shapes (compile-time)", () => {
       onApproval: (_req) => true,
       maxStdoutBytes: 50000,
       scriptName: "<repl>",
-      lineOffset: 0,
+      limits: { maxDurationSecs: 30 },
     };
     assert.equal(opts.maxStdoutBytes, 50000);
     assert.equal(opts.scriptName, "<repl>");
+    assert.equal(opts.limits?.maxDurationSecs, 30);
   });
 
   it("ApprovalRequest object literal", () => {
@@ -217,12 +218,14 @@ describe("RunResult discriminated union", () => {
     const result: RunSuspended = {
       status: "suspended",
       suspendedCall: req,
+      snapshot: Buffer.from("mock-snapshot"),
       stdout: "Writing...\n",
       stdoutTruncated: false,
       calls: [],
     };
     assert.equal(result.status, "suspended");
     assert.equal(result.suspendedCall.tool, "write");
+    assert.ok(result.snapshot instanceof Buffer);
   });
 
   it("discriminated narrowing — status: 'ok'", () => {
@@ -263,12 +266,14 @@ describe("RunResult discriminated union", () => {
         kwargs: {},
         description: "Edit file.txt",
       },
+      snapshot: Buffer.from("mock"),
       stdout: "",
       stdoutTruncated: false,
       calls: [],
     };
     if (result.status === "suspended") {
       assert.equal(result.suspendedCall.tool, "edit");
+      assert.ok(result.snapshot instanceof Buffer);
     }
   });
 });
