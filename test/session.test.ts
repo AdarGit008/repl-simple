@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
+import { createRLMTools } from "../src/rlm_tools.js";
 import type {
   HostTool,
   RunOk,
@@ -624,5 +625,131 @@ result
     );
     ok(result);
     assert.equal(result.output, "bad input");
+  });
+});
+
+// ── SUBMIT in Session ───────────────────────────────────────────
+
+describe("Session — SUBMIT", () => {
+  const rlmOpts = {
+    onLLMQuery: async (p: string) => `llm:${p}`,
+    onRLMQuery: async (q: string) => `rlm:${q}`,
+  };
+
+  function makeRegistry(extraTools: HostTool[] = []): ToolRegistry {
+    return new ToolRegistry([...createRLMTools(rlmOpts), ...extraTools]);
+  }
+
+  it("SUBMIT terminates the run and returns ok with answer", async () => {
+    const registry = makeRegistry();
+    const session = new Session({ registry });
+
+    const result = await session.run('SUBMIT("done")');
+    ok(result);
+    assert.equal(result.output, "done");
+  });
+
+  it("SUBMIT snippet is appended to session on success", async () => {
+    const registry = makeRegistry();
+    const session = new Session({ registry });
+
+    await session.run('x = 42');
+    const result = await session.run('SUBMIT(str(x))');
+    ok(result);
+    assert.equal(result.output, "42");
+  });
+
+  it("Session replay with SUBMIT: prior SUBMIT re-executes (not cached)", async () => {
+    let llmCalls = 0;
+    const opts = {
+      onLLMQuery: async (p: string) => { llmCalls++; return `llm:${p}`; },
+      onRLMQuery: async (q: string) => `rlm:${q}`,
+    };
+    const registry = new ToolRegistry([
+      ...createRLMTools(opts),
+    ]);
+    const session = new Session({ registry });
+
+    // Run 1: llm_query then SUBMIT
+    const r1 = await session.run('response = llm_query("q1")\nSUBMIT(response)');
+    ok(r1);
+    assert.equal(r1.output, "llm:q1");
+    assert.equal(llmCalls, 1);
+
+    // Run 2: same code — replay executes prior snippets, then re-runs
+    // During replay of snippet 1, llm_query is served from cache (no callback).
+    // But SUBMIT is NOT in cache — it re-executes and terminates.
+    // The new snippet never runs because replay terminates at SUBMIT.
+    // Actually: session concatenates all prior snippets + new code.
+    // Snippet 1 + Snippet 2 = the same code twice.
+    // During replay of snippet 1: llm_query → cache hit, SUBMIT → cache miss → throws → ok.
+    // Execution terminates at SUBMIT, new snippet (snippet 2 copy) never runs.
+    const r2 = await session.run('response = llm_query("q2")\nSUBMIT(response)');
+    ok(r2);
+    // Output comes from snippet 1's SUBMIT (replayed), which had answer "llm:q1"
+    assert.equal(r2.output, "llm:q1");
+    // llm_query in snippet 1 was served from cache, so llmCalls stays 1
+    assert.equal(llmCalls, 1);
+  });
+
+  it("SUBMIT after tool call captures both in calls", async () => {
+    const echo: HostTool = {
+      name: "echo",
+      description: "echo",
+      params: [{ name: "text", type: "str", description: "" }],
+      returns: "str",
+      execute: (args) => String(args.text),
+    };
+    const registry = makeRegistry([echo]);
+    const session = new Session({ registry });
+
+    const result = await session.run('x = echo("hi")\nSUBMIT(x)');
+    ok(result);
+    assert.equal(result.output, "hi");
+    // Both calls should appear
+    const echoCalls = result.calls.filter((c) => c.tool === "echo");
+    const submitCalls = result.calls.filter((c) => c.tool === "SUBMIT");
+    assert.equal(echoCalls.length, 1);
+    assert.equal(submitCalls.length, 1);
+    assert.equal(submitCalls[0].ok, true);
+  });
+
+  it("Session dump/load preserves SUBMIT-less state", async () => {
+    const registry = makeRegistry();
+    const session = new Session({ registry });
+
+    // Run a snippet that doesn't SUBMIT
+    await session.run('x = 99');
+    const dump = session.dump();
+
+    const restored = Session.load(dump, { registry });
+    const result = await restored.run('SUBMIT(str(x))');
+    ok(result);
+    assert.equal(result.output, "99");
+  });
+
+  it("SUBMIT with llm_query in same run", async () => {
+    const registry = makeRegistry();
+    const session = new Session({ registry });
+
+    const result = await session.run(
+      'answer = llm_query("what is 2+2?")\nSUBMIT(answer)',
+    );
+    ok(result);
+    assert.equal(result.output, "llm:what is 2+2?");
+  });
+
+  it("SUBMIT error (syntax error before SUBMIT) does not append snippet", async () => {
+    const registry = makeRegistry();
+    const session = new Session({ registry });
+
+    const result = await session.run('invalid syntax!!!\nSUBMIT("never")');
+    const err = result as RunError;
+    assert.equal(err.status, "error");
+    assert.equal(err.errorKind, "syntax");
+
+    // Session should be empty — snippet was not appended
+    const dump = JSON.parse(session.dump());
+    assert.equal(dump.snippets.length, 0);
   });
 });

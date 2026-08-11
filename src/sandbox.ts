@@ -11,6 +11,7 @@ import {
 } from "@pydantic/monty";
 import { ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import { HostToolError } from "./types.js";
+import { SubmitSignal } from "./submit_signal.js";
 import type {
   HostTool,
   RunResult,
@@ -477,6 +478,23 @@ export async function runInSandbox(
       });
     } catch (err) {
       const durationMs = performance.now() - t0;
+      if (err instanceof SubmitSignal) {
+        calls.push({
+          tool: tool.name,
+          args: snapshot.args as unknown[],
+          kwargs: snapshot.kwargs as Record<string, unknown>,
+          durationMs,
+          ok: true,
+          approved,
+        });
+        return {
+          status: "ok",
+          output: err.answer,
+          stdout,
+          stdoutTruncated,
+          calls,
+        };
+      }
       if (err instanceof HostToolError) {
         calls.push({
           tool: tool.name,
@@ -622,6 +640,23 @@ export async function resumeSuspended(
       current = snapshot.resume({ returnValue });
     } catch (err) {
       const durationMs = performance.now() - t0;
+      if (err instanceof SubmitSignal) {
+        calls.push({
+          tool: tool.name,
+          args: suspended.suspendedCall.args,
+          kwargs: suspended.suspendedCall.kwargs,
+          durationMs,
+          ok: true,
+          approved: true,
+        });
+        return {
+          status: "ok",
+          output: err.answer,
+          stdout,
+          stdoutTruncated,
+          calls,
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       const pythonType =
         err instanceof HostToolError ? err.pythonType : "RuntimeError";
@@ -858,6 +893,23 @@ export async function resumeSuspended(
       current = loopSnapshot.resume({ returnValue });
     } catch (err) {
       const durationMs = performance.now() - t0;
+      if (err instanceof SubmitSignal) {
+        calls.push({
+          tool: loopTool.name,
+          args: loopSnapshot.args as unknown[],
+          kwargs: loopSnapshot.kwargs as Record<string, unknown>,
+          durationMs,
+          ok: true,
+          approved,
+        });
+        return {
+          status: "ok",
+          output: err.answer,
+          stdout,
+          stdoutTruncated,
+          calls,
+        };
+      }
       if (err instanceof HostToolError) {
         calls.push({
           tool: loopTool.name,
