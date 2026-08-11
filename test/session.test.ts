@@ -1,0 +1,628 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Session } from "../src/session.js";
+import { ToolRegistry } from "../src/registry.js";
+import { HostToolError } from "../src/types.js";
+import type {
+  HostTool,
+  RunOk,
+  RunError,
+  RunSuspended,
+} from "../src/types.js";
+
+// ── Helpers ─────────────────────────────────────────────────────
+
+let tmpDir: string;
+
+function makeTempDir() {
+  tmpDir = mkdtempSync(join(tmpdir(), "repl-session-test-"));
+  return tmpDir;
+}
+
+function cleanup() {
+  if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+}
+
+function ok(result: unknown): asserts result is RunOk {
+  assert.equal((result as RunOk).status, "ok");
+}
+
+function err(result: unknown): asserts result is RunError {
+  assert.equal((result as RunError).status, "error");
+}
+
+function suspended(result: unknown): asserts result is RunSuspended {
+  assert.equal((result as RunSuspended).status, "suspended");
+}
+
+// A tool that tracks invocation count (never cached — always executes)
+function makeCounterTool(): HostTool {
+  let count = 0;
+  return {
+    name: "counter",
+    description: "Returns incrementing counter",
+    params: [],
+    returns: "str",
+    execute: () => String(++count),
+  };
+}
+
+// A tool that echoes its argument
+function makeEchoTool(): HostTool {
+  return {
+    name: "echo",
+    description: "Echo back",
+    params: [{ name: "text", type: "str", description: "Text" }],
+    returns: "str",
+    execute: (args) => String(args.text),
+  };
+}
+
+// A file-read tool (real file system)
+function makeFileReaderTool(root: string): HostTool {
+  return {
+    name: "readf",
+    description: "Read a file",
+    params: [{ name: "path", type: "str", description: "Relative path" }],
+    returns: "str",
+    execute: (args) => {
+      const content = require("node:fs").readFileSync(
+        join(root, String(args.path)),
+        "utf-8",
+      );
+      return content;
+    },
+  };
+}
+
+// ── Basic execution ─────────────────────────────────────────────
+
+describe("Session — basic execution", () => {
+  it("executes simple Python code", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    const result = await session.run("1 + 2");
+    ok(result);
+    assert.equal(result.output, "3");
+  });
+
+  it("variables persist across calls via transcript replay", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    await session.run("x = 42");
+    const result = await session.run("x");
+    ok(result);
+    assert.equal(result.output, "42");
+  });
+
+  it("multiple variable assignments persist", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    await session.run("x = 10");
+    await session.run("y = x + 5");
+    const result = await session.run("y * 2");
+    ok(result);
+    assert.equal(result.output, "30");
+  });
+
+  it("imports persist across calls", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    await session.run("import json");
+    const result = await session.run('json.dumps({"a": 1})');
+    ok(result);
+    // Should return the JSON string (monty should support json module)
+    assert.ok(typeof result.output === "string");
+  });
+
+  it("print output accumulates in stdout", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    const r1 = await session.run('print("hello")');
+    ok(r1);
+    assert.ok(r1.stdout.includes("hello"));
+
+    const r2 = await session.run('print("world")');
+    ok(r2);
+    // Replay: both prints fire, so stdout has both
+    assert.ok(r2.stdout.includes("hello"));
+    assert.ok(r2.stdout.includes("world"));
+  });
+});
+
+// ── Tool call caching ───────────────────────────────────────────
+
+describe("Session — tool call caching", () => {
+  it("caches successful tool calls and replays from cache", async () => {
+    // counter tool increments on each real execution.
+    // If cached, it returns the same value; otherwise it increments.
+    const counter = makeCounterTool();
+    const registry = new ToolRegistry([counter]);
+    const session = new Session({ registry });
+
+    // First snippet: counter() → 1
+    const r1 = await session.run("x = counter()");
+    ok(r1);
+    // x should be 1
+    const r2 = await session.run("x");
+    ok(r2);
+    assert.equal(r2.output, "1");
+
+    // During replay for third run, counter() from snippet 1 is CACHED → returns "1"
+    // So x stays 1, then the new code "counter()" executes fresh → "2"
+    const r3 = await session.run("counter()");
+    ok(r3);
+    assert.equal(r3.output, "2");
+  });
+
+  it("does NOT cache calls from failed runs", async () => {
+    const counter = makeCounterTool();
+    const registry = new ToolRegistry([counter]);
+    const session = new Session({ registry });
+
+    // First: successful call → cached
+    await session.run("x = counter()"); // counter → 1
+
+    // Second: fails after tool call → tool call from this run is NOT cached
+    const r2 = await session.run("y = counter()\nundefined_var");
+    err(r2);
+    assert.equal(r2.errorKind, "typing");
+
+    // Third: during replay, counter() from snippet 1 is cached → "1"
+    // counter() in new code executes fresh → should be 2 (not 3, because
+    // the failed run's counter call was not cached)
+    const r3 = await session.run("counter()");
+    ok(r3);
+    assert.equal(r3.output, "2");
+  });
+
+  it("caches calls keyed by tool name + args", async () => {
+    const echo = makeEchoTool();
+    const registry = new ToolRegistry([echo]);
+    const session = new Session({ registry });
+
+    // Make two different echo calls
+    await session.run('a = echo("hello")');
+    await session.run('b = echo("world")');
+
+    // Both should be cached; during replay of run 3, echo("hello") and echo("world")
+    // are served from cache; new echo("hello") and echo("world") execute fresh
+    const r3 = await session.run('echo("hello") + " " + echo("world")');
+    ok(r3);
+    assert.equal(r3.output, "hello world");
+  });
+
+  it("replayed calls do NOT count in ToolCallTrace of current run", async () => {
+    const echo = makeEchoTool();
+    const registry = new ToolRegistry([echo]);
+    const session = new Session({ registry });
+
+    await session.run('echo("first")'); // 1 real call
+    // ToolCallTrace has 1 call
+
+    const r2 = await session.run('echo("second")');
+    ok(r2);
+    // Replay replays echo("first") + executes echo("second").
+    // Only the NEW call (echo("second")) should appear in the trace.
+    assert.equal(r2.calls.length, 1);
+    assert.equal(r2.calls[0].tool, "echo");
+    assert.deepEqual(r2.calls[0].args, ["second"]);
+  });
+});
+
+// ── Error handling ──────────────────────────────────────────────
+
+describe("Session — error handling", () => {
+  it("failed run does NOT add snippet", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    const r1 = await session.run("x = 1");
+    ok(r1);
+
+    const r2 = await session.run("1 / 0");
+    err(r2);
+
+    // x should still be 1 — the failed snippet was dropped
+    const r3 = await session.run("x");
+    ok(r3);
+    assert.equal(r3.output, "1");
+  });
+
+  it("syntax error does NOT add snippet", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    await session.run("x = 5");
+    await session.run("1 +"); // syntax error
+
+    const r3 = await session.run("x");
+    ok(r3);
+    assert.equal(r3.output, "5");
+  });
+
+  it("typing error does NOT add snippet", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    await session.run("x = 10");
+    await session.run('x: int = "not an int"'); // typing error
+
+    const r3 = await session.run("x");
+    ok(r3);
+    assert.equal(r3.output, "10");
+  });
+
+  it("runtime error in tool call does NOT add snippet", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    // Create a snippet that uses undefined_name — will fail at type check
+    await session.run("x = 1");
+    const r2 = await session.run("undefined_name");
+    err(r2);
+
+    // x should still be 1
+    const r3 = await session.run("x");
+    ok(r3);
+    assert.equal(r3.output, "1");
+  });
+});
+
+// ── Approval / Suspension ───────────────────────────────────────
+
+describe("Session — approval & suspension", () => {
+  const gatedTool: HostTool = {
+    name: "gated",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  it("suspends and resumes successfully", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    // Run with approval callback that suspends
+    const r1 = await session.run('gated("test")', {
+      onApproval: () => "suspend",
+    });
+    suspended(r1);
+    assert.equal(r1.suspendedCall.tool, "gated");
+
+    // Resume with approve
+    const r2 = await session.resume({
+      onApproval: () => true,
+    });
+    ok(r2);
+    assert.equal(r2.output, "approved: test");
+  });
+
+  it("resume with deny → PermissionError", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    await session.run(
+      `
+try:
+    gated("x")
+    result = "no-error"
+except PermissionError:
+    result = "blocked"
+result
+`,
+      { onApproval: () => "suspend" },
+    );
+
+    const r2 = await session.resume({
+      onApproval: () => false,
+    });
+    ok(r2);
+    assert.equal(r2.output, "blocked");
+  });
+
+  it("abandon() clears suspended state", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    await session.run('gated("test")', {
+      onApproval: () => "suspend",
+    });
+
+    assert.equal(session.abandon(), true);
+
+    // After abandon, resume should throw (no suspended state)
+    await assert.rejects(
+      async () => {
+        await session.resume();
+      },
+      /no suspended execution/i,
+    );
+  });
+
+  it("abandon() returns false when nothing suspended", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+    assert.equal(session.abandon(), false);
+  });
+
+  it("suspended snippet added on resume, state persists without re-approval", async () => {
+    const echo = makeEchoTool();
+    const registry = new ToolRegistry([gatedTool, echo]);
+    const session = new Session({ registry });
+
+    // Code that sets a variable via echo (non-gated) BEFORE the gate.
+    await session.run('prefix = echo("before-gate")\ngated("go")', {
+      onApproval: () => "suspend",
+    });
+
+    // Resume and approve.
+    const r2 = await session.resume({
+      onApproval: () => true,
+    });
+    ok(r2);
+    assert.equal(r2.output, "approved: go");
+
+    // Replay WITHOUT onApproval — both echo AND gated are cached now.
+    // gated("go") no longer triggers the approval gate on replay.
+    const r3 = await session.run("prefix");
+    ok(r3);
+    assert.equal(r3.output, "before-gate");
+  });
+
+  it("onApproval decides suspended call + subsequent calls", async () => {
+    // resume() calls onApproval for the suspended call first,
+    // then for any subsequent gated calls.
+    const gatedTool2: HostTool = {
+      name: "gated2",
+      description: "Another gated tool",
+      params: [{ name: "v", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `second: ${args.v}`,
+    };
+
+    const registry = new ToolRegistry([gatedTool, gatedTool2]);
+    const session = new Session({ registry });
+
+    // Suspend on gated("first"); gated2("second") is the last expression
+    await session.run(
+      'gated("first")\ngated2("second")',
+      { onApproval: () => "suspend" },
+    );
+
+    // Resume — onApproval receives suspended call ("gated") first,
+    // then "gated2" when execution continues.
+    const seen: string[] = [];
+    const r2 = await session.resume({
+      onApproval: (req) => {
+        seen.push(req.tool);
+        return true; // approve all
+      },
+    });
+    ok(r2);
+    // Both tools were seen
+    assert.deepEqual(seen, ["gated", "gated2"]);
+    assert.equal(r2.output, "second: second");
+  });
+});
+
+// ── reset ───────────────────────────────────────────────────────
+
+describe("Session — reset", () => {
+  it("clears all snippets and cache", async () => {
+    const echo = makeEchoTool();
+    const registry = new ToolRegistry([echo]);
+    const session = new Session({ registry });
+
+    await session.run("x = 5");
+    session.reset();
+
+    // x should not exist anymore
+    const r2 = await session.run("x");
+    err(r2);
+  });
+
+  it("clears suspended state", async () => {
+    const gatedTool: HostTool = {
+      name: "gated",
+      description: "Gated",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "ok",
+    };
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    await session.run("gated()", { onApproval: () => "suspend" });
+    session.reset();
+
+    await assert.rejects(
+      async () => { await session.resume(); },
+      /no suspended/i,
+    );
+  });
+});
+
+// ── Serialization ───────────────────────────────────────────────
+
+describe("Session — dump / load", () => {
+  it("round-trips snippets", async () => {
+    const registry = new ToolRegistry();
+    const s1 = new Session({ registry });
+
+    await s1.run("x = 42");
+    await s1.run("y = x + 1");
+
+    const json = s1.dump();
+    const s2 = Session.load(json, { registry });
+
+    const result = await s2.run("y");
+    ok(result);
+    assert.equal(result.output, "43");
+  });
+
+  it("round-trips tool call cache", async () => {
+    const counter = makeCounterTool();
+    const registry = new ToolRegistry([counter]);
+    const s1 = new Session({ registry });
+
+    await s1.run("x = counter()"); // counter → 1
+
+    const json = s1.dump();
+    const s2 = Session.load(json, { registry });
+
+    // During replay, counter() from cached snippet is cached → returns "1"
+    // New counter() call returns "2"
+    const r2 = await s2.run("counter()");
+    ok(r2);
+    assert.equal(r2.output, "2");
+  });
+
+  it("round-trips suspended state", async () => {
+    const gatedTool: HostTool = {
+      name: "gated",
+      description: "Needs approval",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `got ${args.x}`,
+    };
+    const registry = new ToolRegistry([gatedTool]);
+    const s1 = new Session({ registry });
+
+    await s1.run('gated("data")', { onApproval: () => "suspend" });
+
+    const json = s1.dump();
+    const s2 = Session.load(json, { registry });
+
+    // Resume from loaded session
+    const result = await s2.resume({
+      onApproval: () => true,
+    });
+    ok(result);
+    assert.equal(result.output, "got data");
+  });
+
+  it("dump is valid JSON parseable by JSON.parse", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    await session.run("x = [1, 2, 3]");
+    const json = session.dump();
+
+    const parsed = JSON.parse(json);
+    assert.equal(parsed.version, 1);
+    assert.ok(Array.isArray(parsed.snippets));
+    assert.equal(parsed.snippets[0], "x = [1, 2, 3]");
+  });
+
+  it("load preserves empty session", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+    const json = session.dump();
+
+    const restored = Session.load(json, { registry });
+    const result = await restored.run("42");
+    ok(result);
+    assert.equal(result.output, "42");
+  });
+
+  it("load with mismatched version → throws", () => {
+    const registry = new ToolRegistry();
+    assert.throws(
+      () => Session.load(JSON.stringify({ version: 999 }), { registry }),
+      /Unsupported session version/,
+    );
+  });
+
+  it("load with missing version → throws", () => {
+    const registry = new ToolRegistry();
+    assert.throws(
+      () => Session.load(JSON.stringify({ snippets: [] }), { registry }),
+      /version/i,
+    );
+  });
+});
+
+// ── runOpts passthrough ─────────────────────────────────────────
+
+describe("Session — runOpts passthrough", () => {
+  it("passes inputs to sandbox", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    const result = await session.run("name", {
+      inputs: { name: "Alice" },
+    });
+    ok(result);
+    assert.equal(result.output, "Alice");
+  });
+
+  it("passes maxStdoutBytes to sandbox", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    const result = await session.run('print("A" * 200)', {
+      maxStdoutBytes: 10,
+    });
+    ok(result);
+    assert.equal(result.stdoutTruncated, true);
+  });
+
+  it("passes signal (abort) to sandbox", async () => {
+    const registry = new ToolRegistry();
+    const session = new Session({ registry });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await session.run("1 + 1", {
+      signal: controller.signal,
+    });
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+  });
+});
+
+// ── HostToolError passthrough ───────────────────────────────────
+
+describe("Session — HostToolError passthrough", () => {
+  it("tool throwing HostToolError surfaces as Python exception", async () => {
+    const fragile: HostTool = {
+      name: "fragile",
+      description: "Fails",
+      params: [],
+      returns: "str",
+      execute: () => {
+        throw new HostToolError("ValueError", "bad input");
+      },
+    };
+    const registry = new ToolRegistry([fragile]);
+    const session = new Session({ registry });
+
+    const result = await session.run(
+      `
+try:
+    fragile()
+    result = "no-error"
+except ValueError as e:
+    result = str(e)
+result
+`,
+    );
+    ok(result);
+    assert.equal(result.output, "bad input");
+  });
+});
