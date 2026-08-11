@@ -47,6 +47,7 @@ export interface RunOptions {
   maxStdoutBytes?: number;
   scriptName?: string;
   lineOffset?: number;
+  limits?: RunLimits;
 }
 
 /** Trace of a single host-tool call during execution */
