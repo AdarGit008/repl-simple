@@ -95,7 +95,7 @@ function buildApprovalRequest(
 }
 
 /** Resolve tool args from Monty positional+keyword into a flat Record. */
-function resolveToolArgs(
+export function resolveToolArgs(
   tool: HostTool,
   args: unknown[],
   kwargs: Record<string, unknown>,
