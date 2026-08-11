@@ -132,14 +132,16 @@ export class Session {
   /** Ordered list of all tool calls from successful snippets. */
   private callCacheEntries: CacheEntry[] = [];
   private sandboxOptions: SandboxOptions;
+  private preamble: string | undefined;
   private suspended: RunSuspended | null = null;
   private suspendedCode: string | null = null;
   private suspendedRunOpts: RunOptions | undefined;
 
   // ── Constructor ────────────────────────────────────────────
 
-  constructor(sandboxOptions: SandboxOptions) {
+  constructor(sandboxOptions: SandboxOptions, preamble?: string) {
     this.sandboxOptions = sandboxOptions;
+    this.preamble = preamble;
   }
 
   // ── run ────────────────────────────────────────────────────
@@ -157,8 +159,11 @@ export class Session {
    * On suspension the state is saved for later `resume()`.
    */
   async run(code: string, runOpts?: RunOptions): Promise<RunResult> {
-    // Build the full transcript: all prior snippets + new code
-    const allCode = [...this.snippets, code].join("\n");
+    // Build the full transcript: preamble + prior snippets + new code
+    const parts: string[] = [];
+    if (this.preamble) parts.push(this.preamble);
+    parts.push(...this.snippets, code);
+    const allCode = parts.join("\n");
 
     // Record the cache length BEFORE this run (for trace filtering)
     const priorEntryCount = this.callCacheEntries.length;
@@ -382,7 +387,7 @@ export class Session {
    * @param sandboxOptions  Sandbox configuration (ToolRegistry, etc.).
    * @throws If the JSON version is unsupported or the format is invalid.
    */
-  static load(json: string, sandboxOptions: SandboxOptions): Session {
+  static load(json: string, sandboxOptions: SandboxOptions, preamble?: string): Session {
     let obj: SessionDump;
     try {
       obj = JSON.parse(json) as SessionDump;
@@ -399,7 +404,7 @@ export class Session {
       );
     }
 
-    const session = new Session(sandboxOptions);
+    const session = new Session(sandboxOptions, preamble);
     session.snippets = obj.snippets ?? [];
     session.callCacheEntries = obj.callCache ?? [];
 

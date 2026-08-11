@@ -55,3 +55,10 @@ export {
   type RLMLoopResult,
   type RlmMessage,
 } from "./rlm_loop.js";
+
+// ── Tool Store ──────────────────────────────────────────────────
+export {
+  createToolStoreTools,
+  loadSavedTools,
+  type ToolStoreOptions,
+} from "./toolstore.js";
