@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
+import { createRLMTools } from "../src/rlm_tools.js";
+import { SubmitSignal } from "../src/submit_signal.js";
 import type {
   HostTool,
   RunOk,
@@ -669,5 +671,143 @@ result
     // Post-resume stdout IS captured because SnapshotLoadOptions.printCallback
     // re-attaches the callback during MontySnapshot.load()
     assert.ok(result.stdout.includes("after"));
+  });
+});
+
+// ── SUBMIT integration ──────────────────────────────────────────
+
+describe("SUBMIT in sandbox", () => {
+  const rlmOpts = {
+    onLLMQuery: async (p: string) => `llm:${p}`,
+    onRLMQuery: async (q: string) => `rlm:${q}`,
+  };
+
+  it("returns status ok with the submitted answer", async () => {
+    const rlmTools = createRLMTools(rlmOpts);
+    const echo: HostTool = {
+      name: "echo",
+      description: "echo",
+      params: [{ name: "text", type: "str", description: "" }],
+      returns: "str",
+      execute: (args) => String(args.text),
+    };
+    const registry = new ToolRegistry([...rlmTools, echo]);
+
+    const result = await runInSandbox(
+      'x = echo("hello")\nSUBMIT(x)',
+      { registry },
+    );
+
+    ok(result);
+    assert.equal(result.output, "hello");
+  });
+
+  it("SUBMIT call appears in calls with ok: true", async () => {
+    const rlmTools = createRLMTools(rlmOpts);
+    const registry = new ToolRegistry([...rlmTools]);
+
+    const result = await runInSandbox(
+      'SUBMIT("done")',
+      { registry },
+    );
+
+    ok(result);
+    assert.equal(result.output, "done");
+    const submitCalls = result.calls.filter((c) => c.tool === "SUBMIT");
+    assert.equal(submitCalls.length, 1);
+    assert.equal(submitCalls[0].ok, true);
+  });
+
+  it("code after SUBMIT does not execute", async () => {
+    const rlmTools = createRLMTools(rlmOpts);
+    const echo: HostTool = {
+      name: "echo",
+      description: "echo",
+      params: [{ name: "text", type: "str", description: "" }],
+      returns: "str",
+      execute: (args) => String(args.text),
+    };
+    const registry = new ToolRegistry([...rlmTools, echo]);
+
+    const result = await runInSandbox(
+      'SUBMIT("first")\necho("never runs")',
+      { registry },
+    );
+
+    ok(result);
+    assert.equal(result.output, "first");
+    // echo should not be in the calls
+    const echoCalls = result.calls.filter((c) => c.tool === "echo");
+    assert.equal(echoCalls.length, 0);
+  });
+
+  it("first SUBMIT wins when called twice", async () => {
+    const rlmTools = createRLMTools(rlmOpts);
+    const registry = new ToolRegistry([...rlmTools]);
+
+    const result = await runInSandbox(
+      'SUBMIT("first")\nSUBMIT("second")',
+      { registry },
+    );
+
+    ok(result);
+    assert.equal(result.output, "first");
+  });
+
+  it("SUBMIT in resumeSuspended path works", async () => {
+    // Use a gated tool before SUBMIT to force a suspend/resume cycle
+    const rlmTools = createRLMTools(rlmOpts);
+    const gatedTool: HostTool = {
+      name: "gated",
+      description: "Gated",
+      params: [{ name: "val", type: "str", description: "" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `gated:${args.val}`,
+    };
+    const registry = new ToolRegistry([...rlmTools, gatedTool]);
+
+    // First: suspend on gated call
+    const susp = await runInSandbox(
+      'x = gated("foo")\nSUBMIT(x)',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    assert.equal(susp.suspendedCall.tool, "gated");
+
+    // Resume with approval — execution should continue, then SUBMIT
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.equal(result.output, "gated:foo");
+    const submitCalls = result.calls.filter((c) => c.tool === "SUBMIT");
+    assert.equal(submitCalls.length, 1);
+    assert.equal(submitCalls[0].ok, true);
+  });
+
+  it("SUBMIT with llm_query interaction", async () => {
+    const rlmTools = createRLMTools(rlmOpts);
+    const registry = new ToolRegistry([...rlmTools]);
+
+    const result = await runInSandbox(
+      'response = llm_query("what is pi?")\nSUBMIT(response)',
+      { registry },
+    );
+
+    ok(result);
+    assert.equal(result.output, "llm:what is pi?");
+  });
+
+  it("SUBMIT with rlm_query interaction", async () => {
+    const rlmTools = createRLMTools(rlmOpts);
+    const registry = new ToolRegistry([...rlmTools]);
+
+    const result = await runInSandbox(
+      'result = rlm_query("analyze", "data")\nSUBMIT(result)',
+      { registry },
+    );
+
+    ok(result);
+    assert.equal(result.output, "rlm:analyze");
   });
 });
