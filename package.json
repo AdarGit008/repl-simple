@@ -1,0 +1,24 @@
+{
+  "name": "repl-simple",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension — sandboxed Python execution via Monty",
+  "keywords": ["pi-package"],
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": ["./extensions/"]
+  },
+  "dependencies": {
+    "@pydantic/monty": "0.0.18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.0"
+  }
+}

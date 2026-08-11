@@ -1,22 +1,6 @@
 import type { HostTool } from "./types.js";
 import { HostToolError } from "./types.js";
-
-// Monty may not be installed yet (package.json is issue #15).
-// Gracefully degrade when it's unavailable. Uses a lazy getter to
-// avoid top-level await (which breaks when no package.json exists yet).
-let _monty: unknown = undefined;
-let _montyProbed = false;
-function getMonty(): unknown {
-  if (!_montyProbed) {
-    _montyProbed = true;
-    try {
-      _monty = require("@pydantic/monty").Monty;
-    } catch {
-      // Monty not installed — probe functions will return empty results
-    }
-  }
-  return _monty;
-}
+import { Monty } from "@pydantic/monty";
 
 // ── ToolRegistry ─────────────────────────────────────────────────
 
@@ -63,7 +47,7 @@ export class ToolRegistry {
   renderTypeStubs(): string {
     if (this.typeStubCache !== null) return this.typeStubCache;
     this.typeStubCache = this.list()
-      .map((tool) => validatedTypeStub(tool, getMonty()))
+      .map((tool) => validatedTypeStub(tool))
       .join("\n");
     return this.typeStubCache;
   }
@@ -77,23 +61,12 @@ function renderParams(tool: HostTool): string {
     .join(", ");
 }
 
-function validatedTypeStub(
-  tool: HostTool,
-  MontyCtor: unknown,
-): string {
+function validatedTypeStub(tool: HostTool): string {
   const params = renderParams(tool);
   const stub = `def ${tool.name}(${params}) -> ${tool.returns}:\n    raise NotImplementedError`;
 
-  if (typeof MontyCtor !== "function") {
-    // Monty not installed — emit best-effort stub
-    return stub;
-  }
-
   try {
-    new (MontyCtor as new (
-      code: string,
-      opts?: { typeCheck?: boolean; typeCheckPrefixCode?: string },
-    ) => unknown)("pass", { typeCheck: true, typeCheckPrefixCode: stub });
+    new Monty("pass", { typeCheck: true, typeCheckPrefixCode: stub });
     return stub;
   } catch {
     return `${tool.name}: Any = None`;
@@ -163,18 +136,14 @@ export const CANDIDATE_MODULES = [
 
 /**
  * Empirically determines which modules the installed monty can import
- * by trying each in a throwaway interpreter. Returns an empty array
- * when monty is not installed.
+ * by trying each in a throwaway interpreter.
  */
 export function probeImportableModules(
   candidates: string[] = CANDIDATE_MODULES,
 ): string[] {
-  const m = getMonty();
-  if (typeof m !== "function") return [];
-  const MontyCtor = m as new (code: string) => { run(): unknown };
   return candidates.filter((name) => {
     try {
-      new MontyCtor(`import ${name}`).run();
+      new Monty(`import ${name}`).run();
       return true;
     } catch {
       return false;
@@ -201,20 +170,14 @@ const TY_GAP_CANDIDATES = [
 /**
  * Names the interpreter provides at runtime that its type checker
  * rejects as unresolved. These need `name: Any = None` declarations
- * in any typecheck prefix. Returns empty when monty is not installed.
+ * in any typecheck prefix.
  */
 export function probeTypeCheckerGaps(
   candidates: string[] = TY_GAP_CANDIDATES,
 ): string[] {
-  const m = getMonty();
-  if (typeof m !== "function") return [];
-  const MontyCtor = m as new (
-    code: string,
-    opts?: { typeCheck?: boolean },
-  ) => unknown;
   return candidates.filter((name) => {
     try {
-      new MontyCtor(name, { typeCheck: true });
+      new Monty(name, { typeCheck: true });
       return false; // ty resolves it
     } catch {
       return true; // ty rejects it — gap confirmed
