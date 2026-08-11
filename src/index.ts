@@ -50,6 +50,7 @@ export { SubmitSignal } from "./submit_signal.js";
 // ── RLM Loop ────────────────────────────────────────────────────
 export {
   RLMLoop,
+  getReplPreamble,
   type RLMLoopOptions,
   type RLMLoopResult,
   type RlmMessage,

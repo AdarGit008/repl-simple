@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { ToolRegistry, probeImportableModules, renderPythonToolRules } from "./registry.js";
 import { createRLMTools } from "./rlm_tools.js";
 import { runInSandbox, type SandboxOptions } from "./sandbox.js";
@@ -42,6 +46,12 @@ export interface RLMLoopOptions {
 
   /** Sandbox run options passed to runInSandbox. */
   runOpts?: RunOptions;
+
+  /** Optional Python preamble prepended to generated code before
+   *  sandbox execution. Use for helpers like repl_server.py that
+   *  provide context_preview(), context_lines(), etc.
+   *  Prepended with a newline separator. */
+  preamble?: string;
 }
 
 export interface RLMLoopResult {
@@ -59,6 +69,10 @@ const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_MAX_DEPTH = 1;
 
 const RLM_TOOL_NAMES = ["llm_query", "rlm_query", "SUBMIT"] as const;
+
+/** Path to the bundled repl_server.py preamble, resolved relative to this module. */
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPL_PREAMBLE_PATH = join(__dirname, "..", "repl", "repl_server.py");
 
 // ── RLMLoop ──────────────────────────────────────────────────────
 
@@ -220,6 +234,7 @@ export class RLMLoop {
           maxDepth: this.options.maxDepth,
           depth: depth + 1,
           runOpts: this.options.runOpts,
+          preamble: this.options.preamble,
         });
 
         const result = await nested.run(query, context);
@@ -231,17 +246,19 @@ export class RLMLoop {
     });
   }
 
-  /** Execute code in the sandbox. */
+  /** Execute code in the sandbox. Prepends preamble if configured. */
   private async executeCode(
     code: string,
     registry: ToolRegistry,
     inputs?: Record<string, string>,
   ): Promise<RunResult> {
+    const preamble = this.options.preamble;
+    const fullCode = preamble ? preamble + "\n" + code : code;
     const sandboxOpts: SandboxOptions = { registry };
     const runOpts: RunOptions | undefined = inputs
       ? { ...this.options.runOpts, inputs }
       : this.options.runOpts;
-    return await runInSandbox(code, sandboxOpts, runOpts);
+    return await runInSandbox(fullCode, sandboxOpts, runOpts);
   }
 
   /** Build the system prompt with tool stubs and rules. */
@@ -249,13 +266,28 @@ export class RLMLoop {
     const stubs = registry.renderTypeStubs();
     const importableModules = probeImportableModules();
     const rules = renderPythonToolRules(importableModules);
+    const preamble = this.options.preamble;
 
-    return [
+    const parts: string[] = [
       "You are a Python code generator for a sandboxed investigation environment.",
       "",
       "Your task: write Python code to investigate the user's question.",
       "Use the tools below to gather information, then call SUBMIT(answer)",
       "when you have the final answer.",
+    ];
+
+    // Mention preamble helpers if configured
+    if (preamble) {
+      parts.push(
+        "",
+        "## Preamble Helpers",
+        "Your code is prepended with a preamble that may define helper",
+        "functions and variables. Any functions or variables defined",
+        "in the preamble are available in your code — call them directly.",
+      );
+    }
+
+    parts.push(
       "",
       "## Available Tools",
       "Call these as plain functions (no await, no import):",
@@ -272,7 +304,9 @@ export class RLMLoop {
       rules,
       "",
       "Respond with ONLY Python code, no markdown fences, no explanation.",
-    ].join("\n");
+    );
+
+    return parts.join("\n");
   }
 }
 
@@ -295,6 +329,17 @@ function formatOkResult(result: RunOk): string {
       "Call SUBMIT(answer) when you have the final answer.]",
   );
   return parts.join("\n");
+}
+
+/**
+ * Read the bundled repl_server.py preamble.
+ *
+ * Convenience loader — equivalent to:
+ *   readFileSync("repl/repl_server.py", "utf-8")
+ * but resolved relative to the package so it works regardless of cwd.
+ */
+export function getReplPreamble(): string {
+  return readFileSync(REPL_PREAMBLE_PATH, "utf-8");
 }
 
 /** Format an error result as feedback for the LLM. */

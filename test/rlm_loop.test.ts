@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { RLMLoop, type RLMLoopOptions, type RLMLoopResult, type RlmMessage } from "../src/rlm_loop.js";
+import { RLMLoop, getReplPreamble, type RLMLoopOptions, type RLMLoopResult, type RlmMessage } from "../src/rlm_loop.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
@@ -763,6 +763,98 @@ describe("RLMLoop — runOpts passthrough", () => {
   });
 });
 
+// ── Preamble injection ─────────────────────────────────────────
+
+describe("RLMLoop — preamble", () => {
+  const baseOpts: RLMLoopOptions = {
+    registry: new ToolRegistry(),
+    llmQuery: async () => "",
+    generateCode: async () => "",
+  };
+
+  it("preamble is prepended to code before sandbox execution", async () => {
+    const preamble = "# preamble header\nHELPER = 42\n";
+    const loop = new RLMLoop({
+      ...baseOpts,
+      preamble,
+      generateCode: fixedCode("SUBMIT(str(HELPER))"),
+    });
+    const result = await loop.run("task");
+    okResult(result);
+    // HELPER defined in preamble, accessible in user code
+    assert.equal(result.answer, "42");
+  });
+
+  it("context helpers from preamble are available", async () => {
+    const preamble = [
+      "def context_length() -> int:",
+      '    """Return the total character length of the context."""',
+      "    return len(context) if context else 0",
+      "",
+    ].join("\n");
+    const loop = new RLMLoop({
+      ...baseOpts,
+      preamble,
+      generateCode: fixedCode("SUBMIT(str(context_length()))"),
+    });
+    const result = await loop.run("task", "hello world");
+    okResult(result);
+    assert.equal(result.answer, "11");
+  });
+
+  it("no preamble (undefined) — existing behavior unchanged", async () => {
+    const loop = new RLMLoop({
+      ...baseOpts,
+      // preamble: undefined (default)
+      generateCode: fixedCode('SUBMIT("works")'),
+    });
+    const result = await loop.run("task");
+    okResult(result);
+    assert.equal(result.answer, "works");
+  });
+
+  it("preamble is inherited by nested loops", async () => {
+    const preamble = "NESTED_HELPER = 99\n";
+    const loop = new RLMLoop({
+      ...baseOpts,
+      preamble,
+      generateCode: codeSequence(
+        // Root: rlm_query → SUBMIT combined
+        'nested = rlm_query("sub")\nSUBMIT("root:" + nested)',
+        // Nested: uses preamble variable → SUBMIT
+        'SUBMIT(str(NESTED_HELPER))',
+      ),
+    });
+    const result = await loop.run("task");
+    okResult(result);
+    assert.equal(result.answer, "root:99");
+  });
+
+  it("preamble with repl_server.py style functions", async () => {
+    const preamble = [
+      "def context_preview(max_chars: int = 500) -> str:",
+      '    """Return a truncated preview of the context."""',
+      "    if not context:",
+      '        return "(empty)"',
+      "    if len(context) <= max_chars:",
+      "        return context",
+      "    half = max_chars // 2",
+      "    return context[:half] + '...' + context[-half:]",
+      "",
+    ].join("\n");
+    const loop = new RLMLoop({
+      ...baseOpts,
+      preamble,
+      generateCode: fixedCode(
+        "preview = context_preview(10)\nSUBMIT(preview)",
+      ),
+    });
+    const result = await loop.run("task", "abcdefghijklmnopqrstuvwxyz");
+    okResult(result);
+    assert.ok(result.answer.includes("..."));
+  });
+});
+
 // ── System prompt ───────────────────────────────────────────────
 
 describe("RLMLoop — system prompt", () => {
@@ -794,5 +886,58 @@ describe("RLMLoop — system prompt", () => {
     const systemMsg = messages()[0].find((m) => m.role === "system");
     assert.ok(systemMsg);
     assert.ok(systemMsg.content.includes("SUBMIT"));
+  });
+
+  it("system prompt mentions preamble helpers when preamble is set", async () => {
+    const { fn: gen, messages } = recordingCode('SUBMIT("ok")');
+    const loop = new RLMLoop({
+      registry: new ToolRegistry(),
+      llmQuery: async () => "",
+      generateCode: gen,
+      preamble: "def foo(): pass",
+    });
+    await loop.run("task");
+    const systemMsg = messages()[0].find((m) => m.role === "system");
+    assert.ok(systemMsg);
+    assert.ok(systemMsg.content.includes("Preamble Helpers"));
+  });
+
+  it("system prompt does NOT mention preamble when preamble is not set", async () => {
+    const { fn: gen, messages } = recordingCode('SUBMIT("ok")');
+    const loop = new RLMLoop({
+      registry: new ToolRegistry(),
+      llmQuery: async () => "",
+      generateCode: gen,
+      // preamble: undefined
+    });
+    await loop.run("task");
+    const systemMsg = messages()[0].find((m) => m.role === "system");
+    assert.ok(systemMsg);
+    assert.ok(!systemMsg.content.includes("Preamble Helpers"));
+  });
+});
+
+// ── getReplPreamble ────────────────────────────────────────────
+
+describe("getReplPreamble", () => {
+  it("returns contents of repl_server.py", () => {
+    const preamble = getReplPreamble();
+    assert.ok(preamble.includes("context_preview"));
+    assert.ok(preamble.includes("context_lines"));
+    assert.ok(preamble.includes("context_length"));
+    assert.ok(preamble.includes("context_summary"));
+  });
+
+  it("returned string is usable as an RLMLoop preamble", async () => {
+    const preamble = getReplPreamble();
+    const loop = new RLMLoop({
+      registry: new ToolRegistry(),
+      llmQuery: async () => "",
+      generateCode: fixedCode("SUBMIT(str(context_length()))"),
+      preamble,
+    });
+    const result = await loop.run("task", "hello world");
+    okResult(result);
+    assert.equal(result.answer, "11");
   });
 });
