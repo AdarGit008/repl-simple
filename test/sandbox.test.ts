@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { runInSandbox } from "../src/sandbox.js";
+import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import type {
@@ -498,5 +498,176 @@ describe("runInSandbox — mount", () => {
     });
     ok(result);
     assert.equal(result.output, "42");
+  });
+});
+
+// ── resumeSuspended ──────────────────────────────────────────────
+
+describe("resumeSuspended", () => {
+  it("resume with approve → executes and continues", async () => {
+    const gatedTool: HostTool = {
+      name: "gated_echo",
+      description: "Needs approval",
+      params: [{ name: "x", type: "str", description: "Some value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `echo: ${args.x}`,
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    // First: suspend
+    const susp = await runInSandbox(
+      'gated_echo("hello")',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    assert.equal(susp.suspendedCall.tool, "gated_echo");
+    assert.ok(susp.snapshot instanceof Buffer);
+    assert.ok(susp.snapshot.length > 0);
+
+    // Resume with approve
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.equal(result.output, "echo: hello");
+  });
+
+  it("resume with deny → PermissionError", async () => {
+    const gatedTool: HostTool = {
+      name: "gated_op",
+      description: "Needs approval",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "secret",
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    const susp = await runInSandbox(
+      `
+try:
+    gated_op()
+    result = "no-error"
+except PermissionError:
+    result = "blocked"
+result
+`,
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    // Resume with deny
+    const result = await resumeSuspended(susp, false, { registry });
+    ok(result);
+    assert.equal(result.output, "blocked");
+  });
+
+  it("resume with suspend again → RunSuspended", async () => {
+    const gatedTool: HostTool = {
+      name: "double_gate",
+      description: "Needs approval",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "ok",
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    const susp = await runInSandbox(
+      "double_gate()",
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    // Resume with suspend again
+    const result = await resumeSuspended(susp, "suspend", { registry });
+    suspended(result);
+    assert.equal(result.suspendedCall.tool, "double_gate");
+    assert.ok(result.snapshot instanceof Buffer);
+  });
+
+  it("resume records ToolCallTrace with approved=true", async () => {
+    const gatedTool: HostTool = {
+      name: "traced",
+      description: "Traced tool",
+      params: [{ name: "v", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `got ${args.v}`,
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    const susp = await runInSandbox(
+      'traced("x")',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].tool, "traced");
+    assert.equal(result.calls[0].ok, true);
+    assert.equal(result.calls[0].approved, true);
+  });
+
+  it("resume continues execution after approval", async () => {
+    const gatedTool: HostTool = {
+      name: "first_step",
+      description: "First step",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `step1: ${args.x}`,
+    };
+    const normalTool = echoTool();
+    const registry = new ToolRegistry([gatedTool, normalTool]);
+
+    // Python: call gated tool (suspends), then echo
+    const susp = await runInSandbox(
+      'x = first_step("a")\necho(x)',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    // Resume with approve → first_step executes, then echo runs
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    // echo output = "step1: a" (the value first_step returned)
+    assert.equal(result.output, "step1: a");
+    assert.equal(result.calls.length, 2);
+    assert.equal(result.calls[0].tool, "first_step");
+    assert.equal(result.calls[1].tool, "echo");
+  });
+
+  it("resume preserves stdout from before and after suspension", async () => {
+    const gatedTool: HostTool = {
+      name: "gated",
+      description: "Gated",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "done",
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    const susp = await runInSandbox(
+      'print("before")\ngated()\nprint("after")',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    assert.ok(susp.stdout.includes("before"));
+
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.ok(result.stdout.includes("before"));
+    // Post-resume stdout IS captured because SnapshotLoadOptions.printCallback
+    // re-attaches the callback during MontySnapshot.load()
+    assert.ok(result.stdout.includes("after"));
   });
 });
