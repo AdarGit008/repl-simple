@@ -62,3 +62,6 @@ export {
   loadSavedTools,
   type ToolStoreOptions,
 } from "./toolstore.js";
+
+// ── Repl ────────────────────────────────────────────────────────
+export { ReplRunner } from "./repl.js";
