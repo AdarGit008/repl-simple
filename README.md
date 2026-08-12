@@ -68,7 +68,11 @@ import {
 }
 ```
 
-The `pi.extensions` field in `package.json` auto-loads `extensions/repl-extension.ts` to register `repl` tools.
+The `pi.extensions` field in `package.json` points at `extensions/repl-extension.ts`, which pi
+auto-loads to register the `repl` tools. It must name the **file**, not the `extensions/` directory —
+pi's discovery path (`<cwd>/.pi/extensions/`, `<agentDir>/extensions/`) passes the manifest entry
+straight to its module loader without expanding directories, so a directory entry registers zero
+tools. See [#37](https://github.com/AdarGit008/repl-simple/issues/37).
 
 Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
 `@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. See

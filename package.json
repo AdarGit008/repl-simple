@@ -17,7 +17,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/"
+      "./extensions/repl-extension.ts"
     ]
   },
   "dependencies": {
