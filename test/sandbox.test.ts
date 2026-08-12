@@ -4,6 +4,7 @@ import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
+import { SubmitSignal } from "../src/submit_signal.js";
 import type {
   HostTool,
   RunOk,
@@ -826,5 +827,209 @@ describe("SUBMIT in sandbox", () => {
 
     ok(result);
     assert.equal(result.output, "rlm:analyze");
+  });
+});
+
+// ── Accumulator ownership (#27) ──────────────────────────────────
+//
+// `printCallback` and `onAbort` write to `acc`, and every early return
+// reads `acc`. Before #27 both call sites built `DispatchAccumulators`
+// by value from locals the callbacks kept mutating, so stdout produced
+// after the first loop-dispatched tool call was discarded and a
+// mid-run abort was a complete no-op.
+//
+// The pre-existing coverage does not reach any of this:
+//   - "resume preserves stdout" (above) prints in `resumeSuspended`'s
+//     prologue, before `acc` is built. One more tool call catches it.
+//   - "aborted before start" (above) sets the flag at the pre-abort
+//     check, also before `acc` is built — the one abort case the bug
+//     leaves working.
+
+describe("accumulator ownership — stdout after a dispatched tool call", () => {
+  it("runInSandbox keeps stdout printed after loop-dispatched tool calls", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox(
+      [
+        'print("BEFORE_TOOL")',
+        'x = echo("hi")',
+        'print("AFTER_TOOL_1")',
+        'y = echo("yo")',
+        'print("AFTER_TOOL_2")',
+      ].join("\n"),
+      { registry },
+    );
+    ok(result);
+    assert.equal(result.calls.length, 2);
+    assert.ok(
+      result.stdout.includes("BEFORE_TOOL"),
+      `stdout lost pre-tool output: ${JSON.stringify(result.stdout)}`,
+    );
+    assert.ok(
+      result.stdout.includes("AFTER_TOOL_1"),
+      `stdout lost output after tool call 1: ${JSON.stringify(result.stdout)}`,
+    );
+    assert.ok(
+      result.stdout.includes("AFTER_TOOL_2"),
+      `stdout lost output after tool call 2: ${JSON.stringify(result.stdout)}`,
+    );
+  });
+
+  it("resumeSuspended keeps stdout printed after loop-dispatched tool calls", async () => {
+    const gatedTool: HostTool = {
+      name: "gated",
+      description: "Gated",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "done",
+    };
+    const registry = new ToolRegistry([gatedTool, echoTool()]);
+
+    const susp = await runInSandbox(
+      [
+        'print("BEFORE_SUSPEND")',
+        "gated()",
+        'print("PROLOGUE_AFTER")',
+        'echo("x")',
+        'print("LOOP_AFTER")',
+      ].join("\n"),
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.equal(result.calls.length, 2);
+    // Prologue output — captured even before #27.
+    assert.ok(
+      result.stdout.includes("PROLOGUE_AFTER"),
+      `stdout lost prologue output: ${JSON.stringify(result.stdout)}`,
+    );
+    // Loop output — discarded before #27.
+    assert.ok(
+      result.stdout.includes("LOOP_AFTER"),
+      `stdout lost output after the dispatched tool call: ${JSON.stringify(result.stdout)}`,
+    );
+  });
+
+  it("reports stdoutTruncated when the overflow happens after a tool call", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox(
+      ['echo("hi")', 'print("B" * 500)'].join("\n"),
+      { registry },
+      { maxStdoutBytes: 100 },
+    );
+    ok(result);
+    assert.equal(
+      result.stdoutTruncated,
+      true,
+      "stdoutTruncated must be true when post-tool output overflows the cap",
+    );
+  });
+});
+
+describe("accumulator ownership — mid-run abort", () => {
+  /** A tool that aborts the signal the first time it is invoked. */
+  function abortingTool(controller: AbortController): HostTool {
+    let invocations = 0;
+    return {
+      name: "slow",
+      description: "Aborts on first call",
+      params: [],
+      returns: "str",
+      execute: async () => {
+        invocations++;
+        if (invocations === 1) controller.abort();
+        await new Promise((resolve) => setImmediate(resolve));
+        return `slow:${invocations}`;
+      },
+    };
+  }
+
+  it("runInSandbox stops the loop and skips the remaining tool calls", async () => {
+    const controller = new AbortController();
+    const registry = new ToolRegistry([abortingTool(controller)]);
+
+    const result = await runInSandbox(
+      ["a = slow()", "b = slow()", "c = slow()", '"finished-all-three"'].join(
+        "\n",
+      ),
+      { registry },
+      { signal: controller.signal },
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.equal(
+      result.calls.length,
+      1,
+      `abort fired during call 1; later calls must not run (ran ${result.calls.length})`,
+    );
+  });
+
+  it("resumeSuspended stops the loop and skips the remaining tool calls", async () => {
+    const controller = new AbortController();
+    const gatedTool: HostTool = {
+      name: "gated",
+      description: "Gated",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "done",
+    };
+    const registry = new ToolRegistry([gatedTool, abortingTool(controller)]);
+
+    const susp = await runInSandbox(
+      ["gated()", "a = slow()", "b = slow()", '"finished-both"'].join("\n"),
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    const result = await resumeSuspended(susp, true, { registry }, {
+      signal: controller.signal,
+    });
+
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    // gated (prologue) + slow #1 — slow #2 must not run.
+    assert.equal(
+      result.calls.length,
+      2,
+      `abort fired during the first dispatched call; later calls must not run (ran ${result.calls.length})`,
+    );
+  });
+});
+
+describe("accumulator ownership — SubmitSignal in the resume prologue", () => {
+  it("returns the SUBMIT answer and keeps the trace and stdout", async () => {
+    const submitTool: HostTool = {
+      name: "finish",
+      description: "Submits an answer",
+      params: [{ name: "answer", type: "str", description: "Answer" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => {
+        throw new SubmitSignal(String(args.answer));
+      },
+    };
+    const registry = new ToolRegistry([submitTool]);
+
+    const susp = await runInSandbox(
+      ['print("BEFORE_SUBMIT")', 'finish("the-answer")'].join("\n"),
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.equal(result.output, "the-answer");
+    assert.ok(result.stdout.includes("BEFORE_SUBMIT"));
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].tool, "finish");
+    assert.equal(result.calls[0].ok, true);
+    assert.equal(result.calls[0].approved, true);
   });
 });

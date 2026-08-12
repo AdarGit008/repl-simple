@@ -170,13 +170,15 @@ function buildMounts(
  * Dispatches Monty pauses (Complete → NameLookup → Snapshot)
  * in a `while(true)` loop until execution completes, errors,
  * or suspends awaiting tool approval.
+ *
+ * `acc` is owned by the caller and mutated in place — by this loop, and
+ * concurrently by the caller's `printCallback` and abort listener, which
+ * Monty invokes while the loop is awaiting a resume.
  */
 async function runDispatchLoop(
   current: MontySnapshot | MontyNameLookup | MontyComplete,
   registry: ToolRegistry,
   runOpts: RunOptions | undefined,
-  maxStdout: number,
-  printCallback: (stream: string, text: string) => void,
   acc: DispatchAccumulators,
 ): Promise<RunResult> {
   while (true) {
@@ -471,34 +473,37 @@ export async function runInSandbox(
   const maxStdout = runOpts?.maxStdoutBytes ?? DEFAULT_MAX_STDOUT;
   const scriptName = runOpts?.scriptName ?? "<repl>";
 
-  // Accumulators
-  let stdout = "";
-  let stdoutTruncated = false;
-  const calls: ToolCallTrace[] = [];
+  // Accumulators. Built here, before `printCallback` and `onAbort`, because
+  // both mutate `acc` and both are handed to Monty before the dispatch loop
+  // is entered. Nothing below may read a local copy of this state.
+  const acc: DispatchAccumulators = {
+    stdout: "",
+    stdoutTruncated: false,
+    calls: [],
+    aborted: false,
+  };
 
-  // Abort flag
-  let aborted = false;
   const onAbort = () => {
-    aborted = true;
+    acc.aborted = true;
   };
   if (runOpts?.signal) {
     runOpts.signal.addEventListener("abort", onAbort, { once: true });
-    if (runOpts.signal.aborted) aborted = true;
+    if (runOpts.signal.aborted) acc.aborted = true;
   }
 
   // Print callback → accumulate stdout
   const printCallback = (_stream: string, text: string) => {
-    if (stdoutTruncated) return;
+    if (acc.stdoutTruncated) return;
     runOpts?.onPrint?.(text);
-    if (Buffer.byteLength(stdout) + Buffer.byteLength(text) > maxStdout) {
-      stdout += text.slice(
+    if (Buffer.byteLength(acc.stdout) + Buffer.byteLength(text) > maxStdout) {
+      acc.stdout += text.slice(
         0,
-        maxStdout - Buffer.byteLength(stdout),
+        maxStdout - Buffer.byteLength(acc.stdout),
       );
-      stdout += TRUNCATION_MARKER;
-      stdoutTruncated = true;
+      acc.stdout += TRUNCATION_MARKER;
+      acc.stdoutTruncated = true;
     } else {
-      stdout += text;
+      acc.stdout += text;
     }
   };
 
@@ -520,9 +525,9 @@ export async function runInSandbox(
         status: "error",
         error: err.message,
         errorKind: "syntax",
-        stdout,
-        stdoutTruncated,
-        calls,
+        stdout: acc.stdout,
+        stdoutTruncated: acc.stdoutTruncated,
+        calls: acc.calls,
       };
     }
     throw err;
@@ -537,9 +542,9 @@ export async function runInSandbox(
         status: "error",
         error: err.message,
         errorKind: "typing",
-        stdout,
-        stdoutTruncated,
-        calls,
+        stdout: acc.stdout,
+        stdoutTruncated: acc.stdoutTruncated,
+        calls: acc.calls,
       };
     }
     throw err;
@@ -568,20 +573,15 @@ export async function runInSandbox(
         status: "error",
         error: err.message,
         errorKind: "runtime",
-        stdout,
-        stdoutTruncated,
-        calls,
+        stdout: acc.stdout,
+        stdoutTruncated: acc.stdoutTruncated,
+        calls: acc.calls,
       };
     }
     throw err;
   }
 
-  return await runDispatchLoop(current, registry, runOpts, maxStdout, printCallback, {
-    stdout,
-    stdoutTruncated,
-    calls,
-    aborted,
-  });
+  return await runDispatchLoop(current, registry, runOpts, acc);
 }
 
 // ── Resume suspended execution ──────────────────────────────────
@@ -603,31 +603,35 @@ export async function resumeSuspended(
   const registry = options.registry;
   const maxStdout = runOpts?.maxStdoutBytes ?? DEFAULT_MAX_STDOUT;
 
-  // Accumulators — carry over from suspended state
-  let stdout = suspended.stdout;
-  let stdoutTruncated = suspended.stdoutTruncated;
-  const calls = [...suspended.calls];
+  // Accumulators — carry over from suspended state. Built here, before
+  // `printCallback` and `onAbort`, because both mutate `acc` and both are
+  // handed to Monty before the dispatch loop is entered. The prologue below
+  // pushes through `acc.calls` for the same reason.
+  const acc: DispatchAccumulators = {
+    stdout: suspended.stdout,
+    stdoutTruncated: suspended.stdoutTruncated,
+    calls: [...suspended.calls],
+    aborted: false,
+  };
 
-  // Abort flag
-  let aborted = false;
   const onAbort = () => {
-    aborted = true;
+    acc.aborted = true;
   };
   if (runOpts?.signal) {
     runOpts.signal.addEventListener("abort", onAbort, { once: true });
-    if (runOpts.signal.aborted) aborted = true;
+    if (runOpts.signal.aborted) acc.aborted = true;
   }
 
   // Print callback — accumulate beyond existing stdout
   const printCallback = (_stream: string, text: string) => {
-    if (stdoutTruncated) return;
+    if (acc.stdoutTruncated) return;
     runOpts?.onPrint?.(text);
-    if (Buffer.byteLength(stdout) + Buffer.byteLength(text) > maxStdout) {
-      stdout += text.slice(0, maxStdout - Buffer.byteLength(stdout));
-      stdout += TRUNCATION_MARKER;
-      stdoutTruncated = true;
+    if (Buffer.byteLength(acc.stdout) + Buffer.byteLength(text) > maxStdout) {
+      acc.stdout += text.slice(0, maxStdout - Buffer.byteLength(acc.stdout));
+      acc.stdout += TRUNCATION_MARKER;
+      acc.stdoutTruncated = true;
     } else {
-      stdout += text;
+      acc.stdout += text;
     }
   };
 
@@ -649,7 +653,7 @@ export async function resumeSuspended(
         suspended.suspendedCall.kwargs,
       );
       const returnValue = await tool.execute(resolvedArgs);
-      calls.push({
+      acc.calls.push({
         tool: tool.name,
         args: suspended.suspendedCall.args,
         kwargs: suspended.suspendedCall.kwargs,
@@ -661,7 +665,7 @@ export async function resumeSuspended(
     } catch (err) {
       const durationMs = performance.now() - t0;
       if (err instanceof SubmitSignal) {
-        calls.push({
+        acc.calls.push({
           tool: tool.name,
           args: suspended.suspendedCall.args,
           kwargs: suspended.suspendedCall.kwargs,
@@ -672,15 +676,15 @@ export async function resumeSuspended(
         return {
           status: "ok",
           output: err.answer,
-          stdout,
-          stdoutTruncated,
-          calls,
+          stdout: acc.stdout,
+          stdoutTruncated: acc.stdoutTruncated,
+          calls: acc.calls,
         };
       }
       const message = err instanceof Error ? err.message : String(err);
       const pythonType =
         err instanceof HostToolError ? err.pythonType : "RuntimeError";
-      calls.push({
+      acc.calls.push({
         tool: tool.name,
         args: suspended.suspendedCall.args,
         kwargs: suspended.suspendedCall.kwargs,
@@ -698,7 +702,7 @@ export async function resumeSuspended(
     const excMsg = !tool
       ? `name '${suspended.suspendedCall.tool}' is not defined`
       : `tool '${tool.name}' requires approval`;
-    calls.push({
+    acc.calls.push({
       tool: suspended.suspendedCall.tool,
       args: suspended.suspendedCall.args,
       kwargs: suspended.suspendedCall.kwargs,
@@ -715,17 +719,12 @@ export async function resumeSuspended(
       status: "suspended",
       suspendedCall: suspended.suspendedCall,
       snapshot: suspended.snapshot,
-      stdout,
-      stdoutTruncated,
-      calls,
+      stdout: acc.stdout,
+      stdoutTruncated: acc.stdoutTruncated,
+      calls: acc.calls,
     };
   }
 
   // Continue via shared dispatch loop
-  return await runDispatchLoop(current, registry, runOpts, maxStdout, printCallback, {
-    stdout,
-    stdoutTruncated,
-    calls,
-    aborted,
-  });
+  return await runDispatchLoop(current, registry, runOpts, acc);
 }
