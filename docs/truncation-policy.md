@@ -62,6 +62,18 @@ mangles a character. Neither cuts at a character boundary at or below the budget
 **M6/M7 — `output` is not a repr.** `formatOutput` (`sandbox.ts:89-92`) is `String(value)`. So
 `[1,2,3]` → `"1,2,3"` and `{'a': 1}` → `"[object Map]"`. This is load-bearing for Q4.
 
+**M10 — but the values arrive intact.** Read directly off `MontyComplete.output`:
+
+| code | constructor | `String(v)` | `JSON.stringify(v)` | contents |
+|---|---|---|---|---|
+| `{'a': 1, 'b': 2}` | `Map` | `"[object Map]"` | `"{}"` | `[["a",1],["b",2]]` |
+| `{1, 2, 3}` | `Set` | `"[object Set]"` | `"{}"` | `[1,2,3]` |
+| `[1, 2, 3]` | `Array` | `"1,2,3"` | `"[1,2,3]"` | `[1,2,3]` |
+
+Nothing is lost crossing the boundary; `formatOutput` flattens it afterwards. Note that
+`String(new Map())` and `String(new Map([["a",1]]))` are both `"[object Map]"` — that collision is
+what makes a populated dict look empty.
+
 **M9 — truncation also silences the user's live view.** `printCallback` (`sandbox.ts:491-492`, and the
 second copy at `:623-624`) checks `if (stdoutTruncated) return;` *before* calling
 `runOpts?.onPrint?.(text)`. A program emitting 200
@@ -189,17 +201,26 @@ The issue assumes `output` is "a structural repr of a Python value." **[measured
 | `[1,2,3]` | `"1,2,3"` | `"[1, 2, 3]"` |
 | `{'a': 1}` | `"[object Map]"` | `"{'a': 1}"` |
 
-"First N and last N elements" cannot be computed from `"[object Map]"`. There is no list to sample —
-the brackets, the separators and the element boundaries were all destroyed upstream of this decision.
+"First N and last N elements" cannot be computed from `"[object Map]"`. There is no list left to
+sample.
 
-So Q4 has no complexity cliff to locate yet; it has a **dependency**. `#69 (8.5 — value conversion and
-print capture lose information silently)` is the blocker. Until it lands, `output` gets the same flat
-head+tail cut as `stdout`.
+**But the structure is not lost at the boundary — only in rendering.** **[measured, M10]** Read
+straight off `MontyComplete.output` on `@pydantic/monty@0.0.18`, a Python `dict` arrives as a real JS
+`Map` with every entry intact (`[["a",1],["b",2]]`), a `set` as a real `Set`, a `list` as an `Array`.
+`formatOutput`'s `String(value)` is what flattens them one layer later. Note that this corrects #69's
+finding 1, which reads the `{}` from `JSON.stringify` as evidence that the boundary itself is lossy;
+`JSON.stringify` renders a `Map` as `{}` because its entries are not own enumerable properties.
+
+So Q4 has no complexity cliff to locate yet; it has a **dependency**, and a cheaper one than it looks.
+`#69 (8.5 — value conversion and print capture lose information silently)` is the blocker. Until it
+lands, `output` gets the same flat head+tail cut as `stdout`.
 
 **Recommendation for whoever takes #69:** emit a real repr, and make it truncation-aware at
-construction — a repr that already knows the budget can elide *between elements* and produce
-`[1, 2, 3, … 994 more … , 999, 1000]` for free. Retrofitting structure onto a flattened string
-afterwards is the expensive path, and the reason to fix it at the source.
+construction — a repr walking `.entries()` already knows the budget and can elide *between elements*,
+producing `[1, 2, 3, … 994 more … , 999, 1000]` for free. Retrofitting structure onto a flattened
+string afterwards is the expensive path, and the reason to fix it at the source. Because the values
+arrive intact, this is a local change to `formatOutput` rather than an upstream conversion fix, and it
+does not appear to depend on #40 the way #69's print-capture findings do.
 
 ### Q5 — One budget or two?
 
