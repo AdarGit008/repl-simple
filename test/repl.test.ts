@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
+import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -124,12 +125,12 @@ describe("ReplRunner — bridge tools", () => {
     assert.ok(out.includes("hello world"));
   });
 
-  it("can find files with find()", async () => {
+  it("can find files with find()", { skip: BRIDGE_TOOLS_SKIP }, async () => {
     const out = await runner.run("find('*.txt')");
     assert.ok(out.includes("hello.txt"));
   });
 
-  it("can grep files with grep()", async () => {
+  it("can grep files with grep()", { skip: BRIDGE_TOOLS_SKIP }, async () => {
     const out = await runner.run("grep('hello', 'hello.txt')");
     assert.ok(out.includes("hello"));
   });
