@@ -60,18 +60,13 @@ export interface SandboxOptions {
  * Gaps are runtime names Monty's type checker rejects (e.g. `open`,
  * `PermissionError`) — we declare them as `name: Any = None`.
  */
-function buildTypeCheckPrefix(
-  registry: ToolRegistry,
-  inputNames: string[],
-): string {
+function buildTypeCheckPrefix(registry: ToolRegistry, inputNames: string[]): string {
   const stubs = registry.renderTypeStubs();
   const gaps = probeTypeCheckerGaps();
   const parts: string[] = [];
   // "from typing import Any" must come first for gap/stub/input declarations
   const needsAny =
-    gaps.length > 0 ||
-    inputNames.length > 0 ||
-    (stubs.length > 0 && stubs.includes("Any"));
+    gaps.length > 0 || inputNames.length > 0 || (stubs.length > 0 && stubs.includes("Any"));
   if (needsAny) {
     parts.push("from typing import Any");
   }
@@ -150,9 +145,7 @@ function toResourceLimits(limits?: RunLimits): ResourceLimits | undefined {
 }
 
 /** Build MountDir[] from the mount map in RunOptions. */
-function buildMounts(
-  mount?: Record<string, string>,
-): MountDir[] | undefined {
+function buildMounts(mount?: Record<string, string>): MountDir[] | undefined {
   if (!mount) return undefined;
   const dirs: MountDir[] = [];
   for (const [virtualPath, hostPath] of Object.entries(mount)) {
@@ -304,9 +297,7 @@ async function runDispatchLoop(
         snapshot.args as unknown[],
         snapshot.kwargs as Record<string, unknown>,
       );
-      const decision = runOpts?.onApproval
-        ? await runOpts.onApproval(req)
-        : false;
+      const decision = runOpts?.onApproval ? await runOpts.onApproval(req) : false;
 
       if (decision === "suspend") {
         return {
@@ -491,10 +482,7 @@ export async function runInSandbox(
     if (stdoutTruncated) return;
     runOpts?.onPrint?.(text);
     if (Buffer.byteLength(stdout) + Buffer.byteLength(text) > maxStdout) {
-      stdout += text.slice(
-        0,
-        maxStdout - Buffer.byteLength(stdout),
-      );
+      stdout += text.slice(0, maxStdout - Buffer.byteLength(stdout));
       stdout += TRUNCATION_MARKER;
       stdoutTruncated = true;
     } else {
@@ -678,8 +666,7 @@ export async function resumeSuspended(
         };
       }
       const message = err instanceof Error ? err.message : String(err);
-      const pythonType =
-        err instanceof HostToolError ? err.pythonType : "RuntimeError";
+      const pythonType = err instanceof HostToolError ? err.pythonType : "RuntimeError";
       calls.push({
         tool: tool.name,
         args: suspended.suspendedCall.args,

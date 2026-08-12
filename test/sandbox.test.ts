@@ -4,12 +4,7 @@ import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
-import type {
-  HostTool,
-  RunOk,
-  RunError,
-  RunSuspended,
-} from "../src/types.js";
+import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -88,10 +83,7 @@ describe("runInSandbox — pure computation", () => {
   });
 
   it("handles multi-line with print and expression", async () => {
-    const result = await runInSandbox(
-      'print("a")\nprint("b")\n42',
-      { registry },
-    );
+    const result = await runInSandbox('print("a")\nprint("b")\n42', { registry });
     ok(result);
     assert.equal(result.output, "42");
     // Monty calls printCallback once per print, no trailing newline
@@ -130,10 +122,7 @@ describe("runInSandbox — error handling", () => {
   });
 
   it("error result has stdout captured before the error", async () => {
-    const result = await runInSandbox(
-      'print("before")\n1 / 0',
-      { registry },
-    );
+    const result = await runInSandbox('print("before")\n1 / 0', { registry });
     err(result);
     assert.equal(result.errorKind, "runtime");
     assert.ok(result.stdout.includes("before"));
@@ -291,9 +280,13 @@ describe("runInSandbox — approval flow", () => {
 
   it("approved → executes and records approved=true", async () => {
     const registry = new ToolRegistry([gatedTool]);
-    const result = await runInSandbox('sensitive("data")', { registry }, {
-      onApproval: () => true,
-    });
+    const result = await runInSandbox(
+      'sensitive("data")',
+      { registry },
+      {
+        onApproval: () => true,
+      },
+    );
     ok(result);
     assert.equal(result.output, "got data");
     assert.equal(result.calls[0].approved, true);
@@ -320,9 +313,13 @@ result
 
   it("suspended → RunSuspended result", async () => {
     const registry = new ToolRegistry([gatedTool]);
-    const result = await runInSandbox('sensitive("data")', { registry }, {
-      onApproval: () => "suspend",
-    });
+    const result = await runInSandbox(
+      'sensitive("data")',
+      { registry },
+      {
+        onApproval: () => "suspend",
+      },
+    );
     suspended(result);
     assert.equal(result.suspendedCall.tool, "sensitive");
     assert.deepEqual(result.suspendedCall.args, ["data"]);
@@ -348,12 +345,16 @@ result
   it("non-gated tool skips approval", async () => {
     const normalTool = echoTool();
     const registry = new ToolRegistry([normalTool]);
-    const result = await runInSandbox('echo("hi")', { registry }, {
-      onApproval: () => {
-        // Should never be called
-        throw new Error("approval should not be requested");
+    const result = await runInSandbox(
+      'echo("hi")',
+      { registry },
+      {
+        onApproval: () => {
+          // Should never be called
+          throw new Error("approval should not be requested");
+        },
       },
-    });
+    );
     ok(result);
     assert.equal(result.output, "hi");
     assert.equal(result.calls[0].approved, undefined);
@@ -366,21 +367,13 @@ describe("runInSandbox — stdout truncation", () => {
   const registry = new ToolRegistry();
 
   it("stdoutTruncated true when output exceeds limit", async () => {
-    const result = await runInSandbox(
-      'print("A" * 200)',
-      { registry },
-      { maxStdoutBytes: 10 },
-    );
+    const result = await runInSandbox('print("A" * 200)', { registry }, { maxStdoutBytes: 10 });
     ok(result);
     assert.equal(result.stdoutTruncated, true);
   });
 
   it("stdoutTruncated false when within limit", async () => {
-    const result = await runInSandbox(
-      'print("hi")',
-      { registry },
-      { maxStdoutBytes: 1000 },
-    );
+    const result = await runInSandbox('print("hi")', { registry }, { maxStdoutBytes: 1000 });
     ok(result);
     assert.equal(result.stdoutTruncated, false);
   });
@@ -408,9 +401,13 @@ describe("runInSandbox — abort", () => {
   it("aborted before start → errorKind 'aborted'", async () => {
     const controller = new AbortController();
     controller.abort();
-    const result = await runInSandbox("1 + 1", { registry }, {
-      signal: controller.signal,
-    });
+    const result = await runInSandbox(
+      "1 + 1",
+      { registry },
+      {
+        signal: controller.signal,
+      },
+    );
     err(result);
     assert.equal(result.errorKind, "aborted");
   });
@@ -421,10 +418,7 @@ describe("runInSandbox — abort", () => {
 describe("runInSandbox — multiple tool calls", () => {
   it("records two ToolCallTrace entries", async () => {
     const registry = new ToolRegistry([echoTool()]);
-    const result = await runInSandbox(
-      'echo("a")\necho("b")',
-      { registry },
-    );
+    const result = await runInSandbox('echo("a")\necho("b")', { registry });
     ok(result);
     assert.equal(result.calls.length, 2);
     assert.equal(result.calls[0].tool, "echo");
@@ -470,9 +464,13 @@ describe("runInSandbox — inputs", () => {
   it("passes input variables to Python", async () => {
     const registry = new ToolRegistry();
     // Inputs are strings; Python concatenates them
-    const result = await runInSandbox("x + y", { registry }, {
-      inputs: { x: "Hello", y: "World" },
-    });
+    const result = await runInSandbox(
+      "x + y",
+      { registry },
+      {
+        inputs: { x: "Hello", y: "World" },
+      },
+    );
     ok(result);
     assert.equal(result.output, "HelloWorld");
   });
@@ -492,16 +490,24 @@ describe("runInSandbox — inputs", () => {
 
     // With a colliding input, the name binds to the input value — which is a
     // string, so calling it fails. The tool is not reachable under that name.
-    const shadowed = await runInSandbox('echo("wins")', { registry }, {
-      inputs: { echo: "SHADOW" },
-    });
+    const shadowed = await runInSandbox(
+      'echo("wins")',
+      { registry },
+      {
+        inputs: { echo: "SHADOW" },
+      },
+    );
     err(shadowed);
     assert.match(shadowed.error, /not callable/);
 
     // And the bare name resolves to the input, confirming which binding won.
-    const bare = await runInSandbox("echo", { registry }, {
-      inputs: { echo: "SHADOW" },
-    });
+    const bare = await runInSandbox(
+      "echo",
+      { registry },
+      {
+        inputs: { echo: "SHADOW" },
+      },
+    );
     ok(bare);
     assert.equal(bare.output, "SHADOW");
   });
@@ -512,9 +518,13 @@ describe("runInSandbox — inputs", () => {
 describe("runInSandbox — mount", () => {
   it("passes mount to Monty (does not crash)", async () => {
     const registry = new ToolRegistry();
-    const result = await runInSandbox("42", { registry }, {
-      mount: { "/data": "/tmp" },
-    });
+    const result = await runInSandbox(
+      "42",
+      { registry },
+      {
+        mount: { "/data": "/tmp" },
+      },
+    );
     ok(result);
     assert.equal(result.output, "42");
   });
@@ -593,11 +603,7 @@ result
     };
     const registry = new ToolRegistry([gatedTool]);
 
-    const susp = await runInSandbox(
-      "double_gate()",
-      { registry },
-      { onApproval: () => "suspend" },
-    );
+    const susp = await runInSandbox("double_gate()", { registry }, { onApproval: () => "suspend" });
     suspended(susp);
 
     // Resume with suspend again
@@ -618,11 +624,7 @@ result
     };
     const registry = new ToolRegistry([gatedTool]);
 
-    const susp = await runInSandbox(
-      'traced("x")',
-      { registry },
-      { onApproval: () => "suspend" },
-    );
+    const susp = await runInSandbox('traced("x")', { registry }, { onApproval: () => "suspend" });
     suspended(susp);
 
     const result = await resumeSuspended(susp, true, { registry });
@@ -710,10 +712,7 @@ describe("SUBMIT in sandbox", () => {
     };
     const registry = new ToolRegistry([...rlmTools, echo]);
 
-    const result = await runInSandbox(
-      'x = echo("hello")\nSUBMIT(x)',
-      { registry },
-    );
+    const result = await runInSandbox('x = echo("hello")\nSUBMIT(x)', { registry });
 
     ok(result);
     assert.equal(result.output, "hello");
@@ -723,10 +722,7 @@ describe("SUBMIT in sandbox", () => {
     const rlmTools = createRLMTools(rlmOpts);
     const registry = new ToolRegistry([...rlmTools]);
 
-    const result = await runInSandbox(
-      'SUBMIT("done")',
-      { registry },
-    );
+    const result = await runInSandbox('SUBMIT("done")', { registry });
 
     ok(result);
     assert.equal(result.output, "done");
@@ -746,10 +742,7 @@ describe("SUBMIT in sandbox", () => {
     };
     const registry = new ToolRegistry([...rlmTools, echo]);
 
-    const result = await runInSandbox(
-      'SUBMIT("first")\necho("never runs")',
-      { registry },
-    );
+    const result = await runInSandbox('SUBMIT("first")\necho("never runs")', { registry });
 
     ok(result);
     assert.equal(result.output, "first");
@@ -762,10 +755,7 @@ describe("SUBMIT in sandbox", () => {
     const rlmTools = createRLMTools(rlmOpts);
     const registry = new ToolRegistry([...rlmTools]);
 
-    const result = await runInSandbox(
-      'SUBMIT("first")\nSUBMIT("second")',
-      { registry },
-    );
+    const result = await runInSandbox('SUBMIT("first")\nSUBMIT("second")', { registry });
 
     ok(result);
     assert.equal(result.output, "first");
@@ -806,10 +796,9 @@ describe("SUBMIT in sandbox", () => {
     const rlmTools = createRLMTools(rlmOpts);
     const registry = new ToolRegistry([...rlmTools]);
 
-    const result = await runInSandbox(
-      'response = llm_query("what is pi?")\nSUBMIT(response)',
-      { registry },
-    );
+    const result = await runInSandbox('response = llm_query("what is pi?")\nSUBMIT(response)', {
+      registry,
+    });
 
     ok(result);
     assert.equal(result.output, "llm:what is pi?");
@@ -819,10 +808,9 @@ describe("SUBMIT in sandbox", () => {
     const rlmTools = createRLMTools(rlmOpts);
     const registry = new ToolRegistry([...rlmTools]);
 
-    const result = await runInSandbox(
-      'result = rlm_query("analyze", "data")\nSUBMIT(result)',
-      { registry },
-    );
+    const result = await runInSandbox('result = rlm_query("analyze", "data")\nSUBMIT(result)', {
+      registry,
+    });
 
     ok(result);
     assert.equal(result.output, "rlm:analyze");

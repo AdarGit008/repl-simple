@@ -66,10 +66,7 @@ describe("ToolRegistry", () => {
     it("rejects duplicate names", () => {
       const reg = new ToolRegistry();
       reg.add(makeTool({ name: "dup" }));
-      assert.throws(
-        () => reg.add(makeTool({ name: "dup" })),
-        /Tool 'dup' is already registered/,
-      );
+      assert.throws(() => reg.add(makeTool({ name: "dup" })), /Tool 'dup' is already registered/);
     });
 
     it("rejects names that are not valid Python identifiers", () => {
@@ -180,10 +177,7 @@ describe("arg", () => {
   it("throws when positional and keyword both provide same arg", () => {
     // arg([1], {y:2}, 0, "y"): positional at index 0 and keyword "y" both
     // target the same parameter → Python-style duplicate error
-    assert.throws(
-      () => arg([1], { y: 2 }, 0, "y"),
-      HostToolError,
-    );
+    assert.throws(() => arg([1], { y: 2 }, 0, "y"), HostToolError);
   });
 
   it("returns undefined when missing from both", () => {
@@ -191,10 +185,7 @@ describe("arg", () => {
   });
 
   it("throws HostToolError on duplicate (both positional and keyword for same name)", () => {
-    assert.throws(
-      () => arg([1], { x: 2 }, 0, "x"),
-      HostToolError,
-    );
+    assert.throws(() => arg([1], { x: 2 }, 0, "x"), HostToolError);
   });
 
   it("throws with pythonType 'TypeError' on duplicate", () => {
@@ -224,24 +215,15 @@ describe("requireString", () => {
   });
 
   it("throws HostToolError for a non-string value", () => {
-    assert.throws(
-      () => requireString(42, "count"),
-      HostToolError,
-    );
+    assert.throws(() => requireString(42, "count"), HostToolError);
   });
 
   it("throws HostToolError for null", () => {
-    assert.throws(
-      () => requireString(null, "name"),
-      HostToolError,
-    );
+    assert.throws(() => requireString(null, "name"), HostToolError);
   });
 
   it("throws HostToolError for undefined", () => {
-    assert.throws(
-      () => requireString(undefined, "name"),
-      HostToolError,
-    );
+    assert.throws(() => requireString(undefined, "name"), HostToolError);
   });
 });
 
@@ -276,7 +258,6 @@ describe("renderPythonToolRules", () => {
 // monty is not installed (no crash).
 
 describe("probeImportableModules / probeTypeCheckerGaps", () => {
-
   it("probeImportableModules is a function", () => {
     assert.equal(typeof probeImportableModules, "function");
   });

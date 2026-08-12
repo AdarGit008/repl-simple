@@ -1,10 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { ToolRegistry } from "../src/registry.js";
-import type {
-  LlmClient,
-  RlmIteration,
-} from "../src/types.js";
+import type { LlmClient, RlmIteration } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
 import { runRlm, extractPythonCode } from "../src/rlm.js";
@@ -13,24 +10,15 @@ import { runRlm, extractPythonCode } from "../src/rlm.js";
 
 describe("extractPythonCode()", () => {
   it("5.2.1 Python fence", () => {
-    assert.equal(
-      extractPythonCode("```python\nprint('hi')\n```"),
-      "print('hi')",
-    );
+    assert.equal(extractPythonCode("```python\nprint('hi')\n```"), "print('hi')");
   });
 
   it("5.2.2 Generic fence", () => {
-    assert.equal(
-      extractPythonCode("```\nx=1\n```"),
-      "x=1",
-    );
+    assert.equal(extractPythonCode("```\nx=1\n```"), "x=1");
   });
 
   it("5.2.3 Naked code (no fence)", () => {
-    assert.equal(
-      extractPythonCode("print('hi')"),
-      "print('hi')",
-    );
+    assert.equal(extractPythonCode("print('hi')"), "print('hi')");
   });
 
   it("5.2.4 Python fence wins over generic", () => {
@@ -43,10 +31,7 @@ describe("extractPythonCode()", () => {
       "print('not this')",
       "```",
     ].join("\n");
-    assert.equal(
-      extractPythonCode(response),
-      "print('only this')",
-    );
+    assert.equal(extractPythonCode(response), "print('only this')");
   });
 
   it("5.2.5 Empty code", () => {
@@ -55,28 +40,16 @@ describe("extractPythonCode()", () => {
   });
 
   it("5.2.6 Windows line endings", () => {
-    assert.equal(
-      extractPythonCode("```python\r\nprint('hi')\r\n```"),
-      "print('hi')",
-    );
+    assert.equal(extractPythonCode("```python\r\nprint('hi')\r\n```"), "print('hi')");
   });
 
   it("5.2.x Multiline Python code", () => {
-    const code = [
-      "```python",
-      "x = 1",
-      "y = 2",
-      "print(x + y)",
-      "```",
-    ].join("\n");
+    const code = ["```python", "x = 1", "y = 2", "print(x + y)", "```"].join("\n");
     assert.equal(extractPythonCode(code), "x = 1\ny = 2\nprint(x + y)");
   });
 
   it("5.2.x Trailing whitespace stripped", () => {
-    assert.equal(
-      extractPythonCode("```python\nprint('hi')   \n\n```"),
-      "print('hi')",
-    );
+    assert.equal(extractPythonCode("```python\nprint('hi')   \n\n```"), "print('hi')");
   });
 
   it("5.2.x Only whitespace between fences", () => {
@@ -118,9 +91,7 @@ function mockLlmCodeGen(codes: string[]): {
 
 describe("runRlm()", () => {
   it("5.3.1 single iteration with SUBMIT", async () => {
-    const { llm } = mockLlmCodeGen([
-      '```python\nSUBMIT("the answer is 42")\n```',
-    ]);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("the answer is 42")\n```']);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -209,10 +180,7 @@ describe("runRlm()", () => {
   });
 
   it("5.3.4 error recovery: runtime error → LLM fixes → SUBMIT", async () => {
-    const { llm } = mockLlmCodeGen([
-      "```python\n1/0\n```",
-      "```python\nSUBMIT('fixed')\n```",
-    ]);
+    const { llm } = mockLlmCodeGen(["```python\n1/0\n```", "```python\nSUBMIT('fixed')\n```"]);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -236,11 +204,7 @@ describe("runRlm()", () => {
 
   it("5.3.5 max iterations reached (no SUBMIT)", async () => {
     const exploitCode = "```python\nprint('still working...')\n```";
-    const { llm } = mockLlmCodeGen([
-      exploitCode,
-      exploitCode,
-      exploitCode,
-    ]);
+    const { llm } = mockLlmCodeGen([exploitCode, exploitCode, exploitCode]);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -265,12 +229,7 @@ describe("runRlm()", () => {
     // This is a design difference from the lane-2 approach (which used
     // HostToolError → Python SystemExit that Python could catch).
     const { llm } = mockLlmCodeGen([
-      [
-        "```python",
-        "SUBMIT('immediate')",
-        "print('never runs')",
-        "```",
-      ].join("\n"),
+      ["```python", "SUBMIT('immediate')", "print('never runs')", "```"].join("\n"),
     ]);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
@@ -339,9 +298,7 @@ describe("runRlm()", () => {
   });
 
   it("5.3.9 onIteration callback", async () => {
-    const { llm } = mockLlmCodeGen([
-      '```python\nSUBMIT("done")\n```',
-    ]);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -387,20 +344,19 @@ describe("runRlm()", () => {
       },
     });
 
-    await assert.rejects(
-      resultPromise,
-      (e: unknown) => {
-        const err = e as Error & { name?: string };
-        return err.name === "AbortError" || err.message.includes("abort") || err.message.includes("AbortError");
-      },
-    );
+    await assert.rejects(resultPromise, (e: unknown) => {
+      const err = e as Error & { name?: string };
+      return (
+        err.name === "AbortError" ||
+        err.message.includes("abort") ||
+        err.message.includes("AbortError")
+      );
+    });
   });
 
   it("5.3.11 preamble injection", async () => {
     const preamble = 'context = "hello world"\n';
-    const { llm } = mockLlmCodeGen([
-      '```python\nSUBMIT(str(len(context)))\n```',
-    ]);
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -433,9 +389,7 @@ describe("runRlm() edge cases", () => {
 
   it("5.4.2 deep conversation (many iterations)", async () => {
     const codes = Array.from({ length: 5 }, (_, i) =>
-      i < 4
-        ? `\`\`\`python\nprint('iteration ${i}')\n\`\`\``
-        : '```python\nSUBMIT("final")\n```',
+      i < 4 ? `\`\`\`python\nprint('iteration ${i}')\n\`\`\`` : '```python\nSUBMIT("final")\n```',
     );
     const { llm } = mockLlmCodeGen(codes);
     const tools = createRLMTools({
@@ -457,10 +411,7 @@ describe("runRlm() edge cases", () => {
     const calls = llm.calls();
     assert.equal(calls.length, 5);
     for (let i = 1; i < calls.length; i++) {
-      assert.ok(
-        calls[i].messages.length >= 2,
-        `call ${i} should have at least 2 messages`,
-      );
+      assert.ok(calls[i].messages.length >= 2, `call ${i} should have at least 2 messages`);
     }
   });
 
@@ -486,9 +437,7 @@ describe("runRlm() edge cases", () => {
   });
 
   it("5.4.5 SUBMIT followed by more code — code after SUBMIT never runs", async () => {
-    const { llm } = mockLlmCodeGen([
-      '```python\nSUBMIT("answer")\nprint("after submit")\n```',
-    ]);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("answer")\nprint("after submit")\n```']);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",

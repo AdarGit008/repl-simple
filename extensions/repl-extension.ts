@@ -12,9 +12,7 @@ import type { ApprovalRequest, ApprovalDecision } from "../src/types.js";
  * - `repl_reset` — clear session state
  * - `repl_abandon` — discard a pending suspension
  */
-export default function (pi: {
-  registerTool: (tool: ReturnType<typeof defineTool>) => void;
-}) {
+export default function (pi: { registerTool: (tool: ReturnType<typeof defineTool>) => void }) {
   // Defer ReplRunner construction until first execute() —
   // ctx.cwd is only available inside execute(), not at module load.
   let runner: ReplRunner | null = null;
@@ -25,15 +23,13 @@ export default function (pi: {
   }
 
   /** Build an onApproval callback that uses Pi's native confirm dialog. */
-  function makeOnApproval(
-    ctx: { hasUI: boolean; ui: { confirm: (title: string, message: string) => Promise<boolean> } },
-  ): (req: ApprovalRequest) => Promise<ApprovalDecision> {
+  function makeOnApproval(ctx: {
+    hasUI: boolean;
+    ui: { confirm: (title: string, message: string) => Promise<boolean> };
+  }): (req: ApprovalRequest) => Promise<ApprovalDecision> {
     return async (req: ApprovalRequest): Promise<ApprovalDecision> => {
       if (!ctx.hasUI) return false;
-      const approved = await ctx.ui.confirm(
-        "Approve tool call?",
-        `Allow ${req.description}?`,
-      );
+      const approved = await ctx.ui.confirm("Approve tool call?", `Allow ${req.description}?`);
       return approved;
     };
   }
@@ -60,11 +56,7 @@ export default function (pi: {
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const r = getRunner(ctx.cwd);
-        const text = await r.run(
-          params.code,
-          params.sessionId ?? "default",
-          makeOnApproval(ctx),
-        );
+        const text = await r.run(params.code, params.sessionId ?? "default", makeOnApproval(ctx));
         return { content: [{ type: "text" as const, text }], details: {} };
       },
     }),
@@ -86,10 +78,7 @@ export default function (pi: {
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const r = getRunner(ctx.cwd);
-        const text = await r.resume(
-          params.sessionId ?? "default",
-          makeOnApproval(ctx),
-        );
+        const text = await r.resume(params.sessionId ?? "default", makeOnApproval(ctx));
         return { content: [{ type: "text" as const, text }], details: {} };
       },
     }),
@@ -101,8 +90,7 @@ export default function (pi: {
     defineTool({
       name: "repl_reset",
       label: "Reset REPL session",
-      description:
-        "Clear all state (variables, imports, tool call cache) in a REPL session.",
+      description: "Clear all state (variables, imports, tool call cache) in a REPL session.",
       parameters: Type.Object({
         sessionId: Type.Optional(
           Type.String({ description: "Session to reset. Default: 'default'." }),

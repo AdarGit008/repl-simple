@@ -30,15 +30,10 @@ const TRUNCATION_MARKER = "\n[...truncated]";
 
 function truncate(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text) <= maxBytes) return text;
-  return (
-    Buffer.from(text).subarray(0, maxBytes).toString() + TRUNCATION_MARKER
-  );
+  return Buffer.from(text).subarray(0, maxBytes).toString() + TRUNCATION_MARKER;
 }
 
-async function readUtf8FileLimited(
-  path: string,
-  maxBytes: number,
-): Promise<string> {
+async function readUtf8FileLimited(path: string, maxBytes: number): Promise<string> {
   const handle = await open(path, "r");
   try {
     const buffer = Buffer.alloc(maxBytes + 1);
@@ -53,10 +48,7 @@ async function readUtf8FileLimited(
   }
 }
 
-async function readResponseTextLimited(
-  response: Response,
-  maxBytes: number,
-): Promise<string> {
+async function readResponseTextLimited(response: Response, maxBytes: number): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return truncate(await response.text(), maxBytes);
 
@@ -87,9 +79,7 @@ async function readResponseTextLimited(
     reader.releaseLock();
   }
 
-  return (
-    Buffer.concat(chunks).toString() + (truncated ? TRUNCATION_MARKER : "")
-  );
+  return Buffer.concat(chunks).toString() + (truncated ? TRUNCATION_MARKER : "");
 }
 
 // ── createBuiltinTools ───────────────────────────────────────────
@@ -98,9 +88,7 @@ async function readResponseTextLimited(
  * Starter host tools: read_file / list_files (rooted, escape-proof) and
  * http_get (host-side fetch — the sandbox itself has no network access).
  */
-export function createBuiltinTools(
-  options: BuiltinToolsOptions,
-): HostTool[] {
+export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
   const root = resolve(options.root);
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_BYTES;
   const maxHttpBytes = options.maxHttpBytes ?? DEFAULT_MAX_BYTES;
@@ -110,36 +98,24 @@ export function createBuiltinTools(
   // including symlink escapes.
   async function resolveInRoot(relPath: string): Promise<string> {
     if (isAbsolute(relPath)) {
-      throw new HostToolError(
-        "PermissionError",
-        `absolute paths are not allowed: '${relPath}'`,
-      );
+      throw new HostToolError("PermissionError", `absolute paths are not allowed: '${relPath}'`);
     }
     const resolved = resolve(root, relPath);
     if (resolved !== root && !resolved.startsWith(root + sep)) {
-      throw new HostToolError(
-        "PermissionError",
-        `path escapes the workspace root: '${relPath}'`,
-      );
+      throw new HostToolError("PermissionError", `path escapes the workspace root: '${relPath}'`);
     }
     let real: string;
     try {
       real = await realpath(resolved);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "ENOENT") {
-        throw new HostToolError(
-          "FileNotFoundError",
-          `no such file or directory: '${relPath}'`,
-        );
+        throw new HostToolError("FileNotFoundError", `no such file or directory: '${relPath}'`);
       }
       throw new HostToolError("OSError", String((e as Error).message));
     }
     const realRoot = await realpath(root);
     if (real !== realRoot && !real.startsWith(realRoot + sep)) {
-      throw new HostToolError(
-        "PermissionError",
-        `path escapes the workspace root: '${relPath}'`,
-      );
+      throw new HostToolError("PermissionError", `path escapes the workspace root: '${relPath}'`);
     }
     return real;
   }
@@ -163,10 +139,7 @@ export function createBuiltinTools(
       } catch (e) {
         const err = e as NodeJS.ErrnoException;
         if (err.code === "EISDIR") {
-          throw new HostToolError(
-            "IsADirectoryError",
-            `is a directory: '${path}'`,
-          );
+          throw new HostToolError("IsADirectoryError", `is a directory: '${path}'`);
         }
         throw new HostToolError("OSError", err.message);
       }
@@ -175,8 +148,7 @@ export function createBuiltinTools(
 
   const listFilesTool: HostTool = {
     name: "list_files",
-    description:
-      'List directory entries in the workspace. Directories end with "/".',
+    description: 'List directory entries in the workspace. Directories end with "/".',
     params: [
       {
         name: "path",
@@ -199,10 +171,7 @@ export function createBuiltinTools(
       } catch (e) {
         const err = e as NodeJS.ErrnoException;
         if (err.code === "ENOTDIR") {
-          throw new HostToolError(
-            "NotADirectoryError",
-            `not a directory: '${path}'`,
-          );
+          throw new HostToolError("NotADirectoryError", `not a directory: '${path}'`);
         }
         throw new HostToolError("OSError", err.message);
       }
@@ -223,25 +192,16 @@ export function createBuiltinTools(
     async execute(args) {
       const url = requireString(args.url, "url");
       if (!/^https?:\/\//i.test(url)) {
-        throw new HostToolError(
-          "ValueError",
-          `only http(s) URLs are allowed: '${url}'`,
-        );
+        throw new HostToolError("ValueError", `only http(s) URLs are allowed: '${url}'`);
       }
       let response: Response;
       try {
         response = await fetchImpl(url);
       } catch (e) {
-        throw new HostToolError(
-          "OSError",
-          `request failed: ${(e as Error).message}`,
-        );
+        throw new HostToolError("OSError", `request failed: ${(e as Error).message}`);
       }
       if (!response.ok) {
-        throw new HostToolError(
-          "OSError",
-          `HTTP ${response.status} for ${url}`,
-        );
+        throw new HostToolError("OSError", `HTTP ${response.status} for ${url}`);
       }
       return await readResponseTextLimited(response, maxHttpBytes);
     },

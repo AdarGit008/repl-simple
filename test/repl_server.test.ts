@@ -11,13 +11,7 @@ import { runInSandbox, type SandboxOptions } from "../src/sandbox.js";
 
 // ── Load repl_server.py ─────────────────────────────────────────
 
-const replServerPath = join(
-  fileURLToPath(import.meta.url),
-  "..",
-  "..",
-  "repl",
-  "repl_server.py",
-);
+const replServerPath = join(fileURLToPath(import.meta.url), "..", "..", "repl", "repl_server.py");
 const REPL_SERVER = readFileSync(replServerPath, "utf-8");
 
 // ── RLM HostTool stubs (stand-ins for #12 / #13 tools) ──────────
@@ -70,9 +64,7 @@ function makeStubRlmQuery(): HostTool {
     returns: "str",
     execute: (args) => {
       const ctx = args.context ? ` [ctx: ${String(args.context)}]` : "";
-      return Promise.resolve(
-        `nested RLM answer for: ${String(args.query)}${ctx}`,
-      );
+      return Promise.resolve(`nested RLM answer for: ${String(args.query)}${ctx}`);
     },
   };
 }
@@ -98,15 +90,12 @@ function makeStubSubmit(): HostTool {
 }
 
 /** Build a ToolRegistry with all RLM HostTools. */
-function makeRlmRegistry(
-  llmResponses?: string[],
-): { registry: ToolRegistry; llmCalls(): LlmQueryRecord[] } {
+function makeRlmRegistry(llmResponses?: string[]): {
+  registry: ToolRegistry;
+  llmCalls(): LlmQueryRecord[];
+} {
   const { tool: llmQuery, calls } = makeStubLlmQuery(llmResponses);
-  const registry = new ToolRegistry([
-    llmQuery,
-    makeStubRlmQuery(),
-    makeStubSubmit(),
-  ]);
+  const registry = new ToolRegistry([llmQuery, makeStubRlmQuery(), makeStubSubmit()]);
   return { registry, llmCalls: calls };
 }
 
@@ -156,11 +145,9 @@ describe("repl_server.py — parse & preamble", () => {
     const { registry } = makeRlmRegistry();
     const stubs = registry.renderTypeStubs();
     const gaps = probeTypeCheckerGaps();
-    const prefix = [
-      "from typing import Any",
-      stubs,
-      ...gaps.map((n) => `${n}: Any = None`),
-    ].filter(Boolean).join("\n");
+    const prefix = ["from typing import Any", stubs, ...gaps.map((n) => `${n}: Any = None`)]
+      .filter(Boolean)
+      .join("\n");
 
     // Should not throw MontyTypingError
     const m = new Monty("pass", {
@@ -206,19 +193,13 @@ describe("repl_server.py — utility functions", () => {
   });
 
   it("context_lines splits into list", async () => {
-    const { result } = await runRlmCode(
-      "len(context_lines())",
-      { context: "a\nb\nc" },
-    );
+    const { result } = await runRlmCode("len(context_lines())", { context: "a\nb\nc" });
     ok(result);
     assert.equal(result.output, "3");
   });
 
   it("context_length returns char count", async () => {
-    const { result } = await runRlmCode(
-      "context_length()",
-      { context: "12345" },
-    );
+    const { result } = await runRlmCode("context_length()", { context: "12345" });
     ok(result);
     assert.equal(result.output, "5");
   });
@@ -244,10 +225,9 @@ describe("repl_server.py — utility functions", () => {
 
 describe("repl_server.py — HostTool dispatch", () => {
   it("llm_query returns canned response", async () => {
-    const { result, llmCalls } = await runRlmCode(
-      'llm_query("what is 2+2?")',
-      { llmResponses: ["four"] },
-    );
+    const { result, llmCalls } = await runRlmCode('llm_query("what is 2+2?")', {
+      llmResponses: ["four"],
+    });
     ok(result);
     assert.equal(result.output, "four");
     assert.equal(llmCalls().length, 1);
@@ -265,21 +245,15 @@ describe("repl_server.py — HostTool dispatch", () => {
   });
 
   it("rlm_query returns nested answer", async () => {
-    const { result } = await runRlmCode(
-      'rlm_query("investigate X")',
-    );
+    const { result } = await runRlmCode('rlm_query("investigate X")');
     ok(result);
     assert.equal(result.output, "nested RLM answer for: investigate X");
   });
 
   it("rlm_query with custom context", async () => {
-    const { result } = await runRlmCode(
-      'rlm_query("analyze", "custom data")',
-    );
+    const { result } = await runRlmCode('rlm_query("analyze", "custom data")');
     ok(result);
-    assert.ok(
-      (result.output as string).includes("custom data"),
-    );
+    assert.ok((result.output as string).includes("custom data"));
   });
 
   it("SUBMIT throws SystemExit that surfaces as runtime error", async () => {
@@ -294,9 +268,7 @@ describe("repl_server.py — HostTool dispatch", () => {
   it("SUBMIT answer is captured in ToolCallTrace", async () => {
     // The answer is recorded in the trace even though execution stops.
     // The RLM loop reads it from the SUBMIT trace entry.
-    const { result } = await runRlmCode(
-      'print("before")\nSUBMIT("the-answer-42")\nprint("after")',
-    );
+    const { result } = await runRlmCode('print("before")\nSUBMIT("the-answer-42")\nprint("after")');
     err(result);
     // Check the trace has the SUBMIT call with the answer
     const submitCall = result.calls.find((c: { tool: string }) => c.tool === "SUBMIT");
@@ -378,7 +350,7 @@ upper
 describe("repl_server.py — edge cases", () => {
   it("context with special characters", async () => {
     const { result } = await runRlmCode("context", {
-      context: "line1\nline2\t\"quoted\"\nline3\\backslash",
+      context: 'line1\nline2\t"quoted"\nline3\\backslash',
     });
     ok(result);
     assert.ok((result.output as string).includes("quoted"));

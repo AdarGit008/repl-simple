@@ -82,7 +82,9 @@ describe("pi extension loading (real loader)", () => {
 
   // The realistic install shape, and the one the directory entry actually
   // breaks: pi discovers the package directory and reads its manifest.
-  it("loads when installed as a project-local extension package", { skip: process.platform === "win32" ? "symlinks need privileges on Windows" : false }, async () => {
+  it("loads when installed as a project-local extension package", {
+    skip: process.platform === "win32" ? "symlinks need privileges on Windows" : false,
+  }, async () => {
     const result = await discoverAndLoadExtensions([], projectDir, agentDir);
 
     assert.deepEqual(
