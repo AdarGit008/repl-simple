@@ -181,6 +181,7 @@ describe("RunResult discriminated union", () => {
     const result: RunOk = {
       status: "ok",
       output: "42",
+      outputTruncated: false,
       stdout: "hello\n",
       stdoutTruncated: false,
       calls: [],
@@ -226,6 +227,7 @@ describe("RunResult discriminated union", () => {
     const result: RunResult = {
       status: "ok",
       output: "hello",
+      outputTruncated: false,
       stdout: "",
       stdoutTruncated: false,
       calls: [],

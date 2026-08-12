@@ -12,10 +12,14 @@ import {
 import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import {
   Truncator,
+  truncateText,
   STDOUT_MAX_BYTES,
   STDOUT_MAX_LINES,
   STDOUT_HEAD_RATIO,
   STDOUT_RECOVERY,
+  OUTPUT_MAX_BYTES,
+  VALUE_HEAD_RATIO,
+  VALUE_RECOVERY,
 } from "./truncate.js";
 import { HostToolError } from "./types.js";
 import { SubmitSignal } from "./submit_signal.js";
@@ -33,6 +37,7 @@ import type {
 // ── Constants ────────────────────────────────────────────────────
 
 const DEFAULT_MAX_STDOUT = STDOUT_MAX_BYTES;
+const DEFAULT_MAX_OUTPUT = OUTPUT_MAX_BYTES;
 
 /**
  * Sentinel function used at NameLookup to satisfy Monty's type checker.
@@ -147,6 +152,30 @@ function formatOutput(value: unknown): string {
 }
 
 /**
+ * Cap `output` at its byte budget.
+ *
+ * Applied wherever a `RunOk` is built, not at the point the tool result is
+ * rendered, so that every consumer is covered by one cap: the `repl` tool
+ * result, and the RLM loop, whose prompts otherwise grow by a full copy of any
+ * snippet ending in a bare expression (A23).
+ *
+ * Uniform across the SUBMIT paths too. A field with two truncation policies
+ * depending on which return site produced it is exactly the drift
+ * docs/truncation-policy.md exists to prevent.
+ */
+function capOutput(
+  text: string,
+  runOpts: RunOptions | undefined,
+): { output: string; outputTruncated: boolean } {
+  const { text: output, truncated } = truncateText(text, {
+    maxBytes: runOpts?.maxOutputBytes ?? DEFAULT_MAX_OUTPUT,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: VALUE_RECOVERY,
+  });
+  return { output, outputTruncated: truncated };
+}
+
+/**
  * Build an ApprovalRequest from a tool and the raw Monty args/kwargs.
  * Constructs a human-readable description from the tool's metadata.
  */
@@ -250,7 +279,7 @@ async function runDispatchLoop(
     if (current instanceof MontyComplete) {
       return {
         status: "ok",
-        output: formatOutput(current.output),
+        ...capOutput(formatOutput(current.output), runOpts),
         stdout: acc.stdout,
         stdoutTruncated: acc.stdoutTruncated,
         calls: acc.calls,
@@ -437,7 +466,7 @@ async function runDispatchLoop(
         });
         return {
           status: "ok",
-          output: err.answer,
+          ...capOutput(err.answer, runOpts),
           stdout: acc.stdout,
           stdoutTruncated: acc.stdoutTruncated,
           calls: acc.calls,
@@ -691,7 +720,7 @@ export async function resumeSuspended(
         });
         return {
           status: "ok",
-          output: err.answer,
+          ...capOutput(err.answer, runOpts),
           stdout: acc.stdout,
           stdoutTruncated: acc.stdoutTruncated,
           calls: acc.calls,

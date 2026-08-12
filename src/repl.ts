@@ -103,6 +103,15 @@ export class ReplRunner {
 
 // ── Output formatting ────────────────────────────────────────────
 
+/**
+ * Render a `RunResult` as the tool result the model sees.
+ *
+ * Both interpolated fields arrive already bounded — `stdout` at 32 KiB and
+ * `output` at 16 KiB, capped in `sandbox.ts` where the `RunResult` is built so
+ * that every consumer shares one cap rather than each rendering site inventing
+ * its own. One tool result is therefore bounded at 48 KiB plus this framing.
+ * See docs/truncation-policy.md.
+ */
 function formatResult(result: RunResult): string {
   if (result.status === "ok") {
     const parts: string[] = [];

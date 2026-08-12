@@ -1142,3 +1142,163 @@ describe("stdout truncation — onPrint is not the model's budget (M9)", () => {
     assert.ok(streamed.includes("line 1999"), "the last line never reached onPrint");
   });
 });
+
+// ── Output truncation policy (#34) ───────────────────────────────
+
+describe("output truncation — the [result] field is bounded", () => {
+  const registry = new ToolRegistry();
+  const size = (s: string) => Buffer.byteLength(s, "utf8");
+
+  it("caps a 2 MB final expression at 16 KiB (M2)", async () => {
+    // Before: `output` had no cap of any kind, so a bare expression put
+    // 2,000,000 bytes straight into the model's context.
+    const result = await runInSandbox("'A' * 2000000", { registry });
+    ok(result);
+    assert.ok(
+      size(result.output) <= 16 * 1024,
+      `got ${size(result.output)} bytes for a 16 KiB budget`,
+    );
+    assert.equal(result.outputTruncated, true);
+  });
+
+  it("holds the ceiling for every character width", async () => {
+    for (const char of ["A", "é", "日", "😀"]) {
+      for (const cap of [200, 1024, 4096, 16 * 1024]) {
+        const result = await runInSandbox(
+          `${JSON.stringify(char)} * 50000`,
+          { registry },
+          { maxOutputBytes: cap },
+        );
+        ok(result);
+        assert.ok(size(result.output) <= cap, `${char} @ ${cap}: ${size(result.output)} bytes`);
+        assert.ok(
+          !result.output.includes("\uFFFD"),
+          `${char} @ ${cap}: truncation introduced U+FFFD`,
+        );
+      }
+    }
+  });
+
+  it("keeps both ends of the value, 50/50", async () => {
+    // A head-only cut of a long list looks exactly like a short list.
+    const result = await runInSandbox(
+      "x = [i for i in range(5000)]\nx",
+      { registry },
+      { maxOutputBytes: 1024 },
+    );
+    ok(result);
+    assert.ok(result.output.startsWith("0,1,2,3"), "head lost");
+    assert.ok(result.output.endsWith("4999"), "tail lost");
+    const marker = result.output.indexOf("[…");
+    assert.ok(marker > 0, "marker missing");
+    assert.ok(result.output.indexOf("4999") > marker, "the marker must sit between head and tail");
+  });
+
+  it("the marker states magnitude and a recovery route that exists", async () => {
+    const result = await runInSandbox("'A' * 2000000", { registry }, { maxOutputBytes: 1024 });
+    ok(result);
+    assert.match(result.output, /\[… [\d.]+MB of [\d.]+MB elided\./);
+    assert.match(result.output, /Assign the value to a name and slice it/);
+    // No line range: a single value has no lines.
+    assert.ok(!result.output.includes("lines "));
+  });
+
+  it("leaves a small value untouched", async () => {
+    const result = await runInSandbox("1 + 1", { registry });
+    ok(result);
+    assert.equal(result.output, "2");
+    assert.equal(result.outputTruncated, false);
+  });
+
+  it("caps the SUBMIT path on the same terms", async () => {
+    // One field, one policy: a second truncation rule reachable through a
+    // different return site is the drift the policy document exists to stop.
+    const submitTool: HostTool = {
+      name: "finish",
+      description: "Submits an answer",
+      params: [{ name: "answer", type: "str", description: "Answer" }],
+      returns: "str",
+      execute: (args) => {
+        throw new SubmitSignal(String(args.answer));
+      },
+    };
+    const result = await runInSandbox(
+      'finish("Z" * 100000)',
+      { registry: new ToolRegistry([submitTool]) },
+      { maxOutputBytes: 1024 },
+    );
+    ok(result);
+    assert.ok(size(result.output) <= 1024, `got ${size(result.output)} bytes`);
+    assert.equal(result.outputTruncated, true);
+  });
+
+  it("caps the SUBMIT path through resumeSuspended too", async () => {
+    const submitTool: HostTool = {
+      name: "finish",
+      description: "Submits an answer",
+      params: [{ name: "answer", type: "str", description: "Answer" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => {
+        throw new SubmitSignal(String(args.answer));
+      },
+    };
+    const registryWithSubmit = new ToolRegistry([submitTool]);
+    const susp = await runInSandbox(
+      'finish("Z" * 100000)',
+      { registry: registryWithSubmit },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    const result = await resumeSuspended(
+      susp,
+      true,
+      { registry: registryWithSubmit },
+      { maxOutputBytes: 1024 },
+    );
+    ok(result);
+    assert.ok(size(result.output) <= 1024, `got ${size(result.output)} bytes`);
+  });
+});
+
+describe("output truncation — the total tool-result budget", () => {
+  const registry = new ToolRegistry();
+  const size = (s: string) => Buffer.byteLength(s, "utf8");
+
+  it("bounds one result at 48 KiB, split 32/16 with no borrowing", async () => {
+    // Fixed sub-budgets, deliberately: with borrowing, the same code truncates
+    // differently depending on how much the other field happened to use, and a
+    // truncation bug stops being reproducible.
+    const result = await runInSandbox(
+      'for i in range(50000):\n    print("a line of output", i)\n"B" * 2000000',
+      { registry },
+    );
+    ok(result);
+    assert.ok(size(result.stdout) <= 32 * 1024, `stdout: ${size(result.stdout)} bytes`);
+    assert.ok(size(result.output) <= 16 * 1024, `output: ${size(result.output)} bytes`);
+    assert.ok(
+      size(result.stdout) + size(result.output) <= 48 * 1024,
+      `total: ${size(result.stdout) + size(result.output)} bytes`,
+    );
+    assert.equal(result.stdoutTruncated, true);
+    assert.equal(result.outputTruncated, true);
+  });
+
+  it("a large output does not shrink the stdout budget", async () => {
+    const withBigOutput = await runInSandbox(
+      'for i in range(50000):\n    print("a line of output", i)\n"B" * 2000000',
+      { registry },
+    );
+    const withSmallOutput = await runInSandbox(
+      'for i in range(50000):\n    print("a line of output", i)\n1',
+      { registry },
+    );
+    ok(withBigOutput);
+    ok(withSmallOutput);
+    assert.equal(
+      size(withBigOutput.stdout),
+      size(withSmallOutput.stdout),
+      "stdout must not depend on how much output used",
+    );
+  });
+});

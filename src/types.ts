@@ -42,7 +42,10 @@ export interface RunOptions {
   signal?: AbortSignal;
   onPrint?: (text: string) => void;
   onApproval?: (request: ApprovalRequest) => ApprovalDecision | Promise<ApprovalDecision>;
+  /** Byte ceiling on `stdout`. Default 32 KiB. */
   maxStdoutBytes?: number;
+  /** Byte ceiling on `output`. Default 16 KiB. */
+  maxOutputBytes?: number;
   scriptName?: string;
   limits?: RunLimits;
 }
@@ -65,6 +68,8 @@ export type RunErrorKind = "syntax" | "typing" | "runtime" | "aborted";
 export interface RunOk {
   status: "ok";
   output: string;
+  /** True when `output` was elided to fit `maxOutputBytes`. */
+  outputTruncated: boolean;
   stdout: string;
   stdoutTruncated: boolean;
   calls: ToolCallTrace[];
