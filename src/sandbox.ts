@@ -9,7 +9,7 @@ import {
   MountDir,
   type ResourceLimits,
 } from "@pydantic/monty";
-import { ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
+import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import { HostToolError } from "./types.js";
 import { SubmitSignal } from "./submit_signal.js";
 import type {
@@ -168,8 +168,16 @@ async function runDispatchLoop(
   current: MontySnapshot | MontyNameLookup | MontyComplete,
   registry: ToolRegistry,
   runOpts: RunOptions | undefined,
+  // biome-ignore-start lint/correctness/noUnusedFunctionParameters: these two
+  // being unused is the *symptom* of the accumulator desync in #27, not tidy-up
+  // work. The refactor that extracted this loop turned two live closure
+  // variables into a by-value snapshot and left the real `printCallback`
+  // writing to the originals, so `acc.stdout` is read 21 times and assigned
+  // zero. #27 fixes the plumbing and deletes both parameters. Silencing them by
+  // renaming would erase the only static evidence pointing at that bug.
   maxStdout: number,
   printCallback: (stream: string, text: string) => void,
+  // biome-ignore-end lint/correctness/noUnusedFunctionParameters: see above
   acc: DispatchAccumulators,
 ): Promise<RunResult> {
   while (true) {

@@ -1,0 +1,18 @@
+# Commits to skip in `git blame` — bulk mechanical reformats only.
+#
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Nothing goes in here that a reviewer would want blame to stop on. A commit
+# qualifies only if it changed no behaviour and applied no rule by hand — the
+# output of `biome format` and nothing else. That is why #20 landed as three
+# commits (config, format, lint fixes) rather than one: only the middle one is
+# listed here, so blaming the suppression comments and the config still lands
+# on the commit that reasoned about them.
+#
+# SHAs are added *after* merge. GitHub rewrites commit SHAs on rebase-merge, so
+# a branch-local SHA recorded before merge would point at an object that never
+# reaches main.
+
+# 1.2b — apply the initial Biome format pass (#20)
+# (SHA added in the follow-up to PR for #20)

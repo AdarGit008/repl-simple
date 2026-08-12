@@ -76,7 +76,7 @@ function buildInitialPrompt(question: string, context?: string): string {
   const parts = [`# Question\n${question}`];
   if (context) {
     const preview =
-      context.length > 5000 ? context.slice(0, 2500) + "\n...\n" + context.slice(-2500) : context;
+      context.length > 5000 ? `${context.slice(0, 2500)}\n...\n${context.slice(-2500)}` : context;
     parts.push(`\n# Context (available as \`context\` variable)\n\`\`\`\n${preview}\n\`\`\``);
   }
   parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
@@ -199,7 +199,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     const code = extractPythonCode(llmResponse);
 
     // 3. Build full script: preamble (if any) + code
-    const fullCode = options.preamble ? options.preamble + "\n" + code : code;
+    const fullCode = options.preamble ? `${options.preamble}\n${code}` : code;
 
     // 4. Run in sandbox
     const result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);

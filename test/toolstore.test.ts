@@ -455,7 +455,7 @@ describe("toolstore — sandbox integration", () => {
       assert.ok(preamble.includes("def square(x):"));
 
       // The preamble can be injected into sandbox code
-      const fullCode = preamble + "\nSUBMIT(str(square(5)))";
+      const fullCode = `${preamble}\nSUBMIT(str(square(5)))`;
       assert.ok(fullCode.includes("str(square(5))"));
     } finally {
       cleanup();
@@ -476,7 +476,7 @@ describe("toolstore — sandbox integration", () => {
       });
 
       const preamble = await loadSavedTools(opts);
-      const code = preamble + "\nresult = add(3, 4)\nSUBMIT(str(result))";
+      const code = `${preamble}\nresult = add(3, 4)\nSUBMIT(str(result))`;
 
       // Run in real sandbox
       const { runInSandbox } = await import("../src/sandbox.js");

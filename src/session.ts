@@ -437,6 +437,12 @@ export class Session {
     if (priorEntryCount === 0) return result;
 
     const registry = this.sandboxOptions.registry;
+    // Write-only counter: incremented below, never read. This is the linter's
+    // first catch that tsc structurally could not make — `noUnusedLocals`
+    // (enabled in #23) treats the increment as a use. Kept rather than deleted
+    // because it is evidence of an unfinished implementation, filed alongside
+    // `numToSkip` in the bucket 11 dead-code sweep (#83).
+    // biome-ignore lint/correctness/noUnusedVariables: evidence for #83
     let skipped = 0;
     const filtered: ToolCallTrace[] = [];
 
