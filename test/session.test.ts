@@ -1,8 +1,5 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
@@ -15,17 +12,6 @@ import type {
 } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
-
-let tmpDir: string;
-
-function makeTempDir() {
-  tmpDir = mkdtempSync(join(tmpdir(), "repl-session-test-"));
-  return tmpDir;
-}
-
-function cleanup() {
-  if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
-}
 
 function ok(result: unknown): asserts result is RunOk {
   assert.equal((result as RunOk).status, "ok");
@@ -59,23 +45,6 @@ function makeEchoTool(): HostTool {
     params: [{ name: "text", type: "str", description: "Text" }],
     returns: "str",
     execute: (args) => String(args.text),
-  };
-}
-
-// A file-read tool (real file system)
-function makeFileReaderTool(root: string): HostTool {
-  return {
-    name: "readf",
-    description: "Read a file",
-    params: [{ name: "path", type: "str", description: "Relative path" }],
-    returns: "str",
-    execute: (args) => {
-      const content = require("node:fs").readFileSync(
-        join(root, String(args.path)),
-        "utf-8",
-      );
-      return content;
-    },
   };
 }
 

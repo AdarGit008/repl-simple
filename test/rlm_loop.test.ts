@@ -2,7 +2,6 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { RLMLoop, getReplPreamble, type RLMLoopOptions, type RLMLoopResult, type RlmMessage } from "../src/rlm_loop.js";
 import { ToolRegistry } from "../src/registry.js";
-import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -618,16 +617,10 @@ describe("RLMLoop — unexpected suspension", () => {
   };
 
   it("returns error when sandbox suspends (no approval callback)", async () => {
-    const loop = new RLMLoop({
-      registry: new ToolRegistry([gatedTool]),
-      llmQuery: async () => "",
-      generateCode: fixedCode("gated()"),
-    });
-    const result = await loop.run("task");
-    // Without onApproval, gated tool is denied → PermissionError → runtime error
-    // The loop will try to recover. After max iterations, returns max_iterations.
-    // If we set maxIterations=1, it'll return error (since error also triggers loop).
-    // Let's use maxIterations=1 to test the error path directly.
+    // Without onApproval the gated tool is denied → PermissionError → runtime
+    // error, and the loop keeps retrying, so maxIterations=1 is what exercises
+    // the exhaustion path directly. #23 deleted an unasserted first run that
+    // built the same loop without the cap and discarded its result.
     const loop2 = new RLMLoop({
       registry: new ToolRegistry([gatedTool]),
       llmQuery: async () => "",
@@ -756,10 +749,12 @@ describe("RLMLoop — runOpts passthrough", () => {
     const result = await loop.run("task");
     okResult(result);
     assert.equal(result.answer, "done");
-    // stdout was truncated in the trace
-    const trace = result.traces[0];
-    // Actually, stdoutTruncated is on RunResult, not trace. But we can check
-    // that execution completed successfully despite truncation.
+
+    // The run completes despite its stdout being capped well below what the
+    // code printed. #23 replaced a dead `const trace = result.traces[0]` here
+    // whose own comment admitted it could not assert what it wanted:
+    // stdoutTruncated lives on RunResult, not on a trace entry.
+    assert.equal(result.traces.length, 1);
   });
 });
 

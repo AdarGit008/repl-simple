@@ -246,6 +246,22 @@ describe("SUBMIT execution", () => {
     }
   });
 
+  // Relocated from test/rlm.test.ts ("5.1.6") when that file's duplicate
+  // createRLMTools block was deleted in #23. The empty answer is the one case
+  // the block covered that this file did not, and it stays relevant: #76
+  // removes the "(no answer)" magic string and #65 revisits SUBMIT's contract,
+  // so an empty answer needs to remain distinguishable from a failed run.
+  it("throws SubmitSignal with an empty answer", () => {
+    const tool = findTool(createRLMTools(opts), "SUBMIT");
+    try {
+      tool.execute({ answer: "" });
+      assert.fail("expected SubmitSignal to be thrown");
+    } catch (err) {
+      assert.ok(err instanceof SubmitSignal);
+      assert.equal((err as SubmitSignal).answer, "");
+    }
+  });
+
   it("SubmitSignal is an instance of Error", () => {
     const tool = findTool(createRLMTools(opts), "SUBMIT");
     try {

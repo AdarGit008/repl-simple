@@ -4,13 +4,11 @@ import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
-import { SubmitSignal } from "../src/submit_signal.js";
 import type {
   HostTool,
   RunOk,
   RunError,
   RunSuspended,
-  ApprovalDecision,
 } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -479,14 +477,33 @@ describe("runInSandbox — inputs", () => {
     assert.equal(result.output, "HelloWorld");
   });
 
-  it("input variable name in registry takes precedence as tool", async () => {
-    // If a name exists as both input and tool, the tool wins
-    // (NameLookup checks registry first)
+  // Retitled and given real inputs in #23. The old title and comment claimed
+  // the tool "wins" over a same-named input; executed, the opposite is true —
+  // the input shadows the tool. The old test passed no inputs at all, so it
+  // asserted nothing in either direction, and a v1 review filed the finding
+  // backwards on the strength of its title.
+  it("an input shadows a tool of the same name", async () => {
     const registry = new ToolRegistry([echoTool()]);
-    // "echo" as input won't override the tool
-    const result = await runInSandbox('echo("wins")', { registry });
-    ok(result);
-    assert.equal(result.output, "wins");
+
+    // Baseline: with no colliding input, the tool is callable.
+    const toolOnly = await runInSandbox('echo("wins")', { registry });
+    ok(toolOnly);
+    assert.equal(toolOnly.output, "wins");
+
+    // With a colliding input, the name binds to the input value — which is a
+    // string, so calling it fails. The tool is not reachable under that name.
+    const shadowed = await runInSandbox('echo("wins")', { registry }, {
+      inputs: { echo: "SHADOW" },
+    });
+    err(shadowed);
+    assert.match(shadowed.error, /not callable/);
+
+    // And the bare name resolves to the input, confirming which binding won.
+    const bare = await runInSandbox("echo", { registry }, {
+      inputs: { echo: "SHADOW" },
+    });
+    ok(bare);
+    assert.equal(bare.output, "SHADOW");
   });
 });
 

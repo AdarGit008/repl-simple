@@ -442,7 +442,6 @@ export class Session {
     if (priorEntryCount === 0) return result;
 
     const registry = this.sandboxOptions.registry;
-    const numToSkip = priorEntryCount;
     let skipped = 0;
     const filtered: ToolCallTrace[] = [];
 
