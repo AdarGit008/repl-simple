@@ -30,11 +30,10 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      # The bridged find/grep tools shell out to fd and rg, and pi-coding-agent
-      # downloads them from GitHub releases on first use if they are not on
-      # PATH. That download is a network dependency in the middle of the test
-      # suite, and on macOS runners it fails outright — so install them up
-      # front and let the tests exercise the code instead of a release API.
+      # The bridged find/grep tools shell out to fd and rg. The suite no longer
+      # downloads them — test/support/bridge-tools.ts sets PI_OFFLINE=1, so
+      # pi's ensureTool() never reaches api.github.com mid-run (#91). Install
+      # them here so CI exercises the real integration rather than skipping it.
       - name: Install fd and ripgrep (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y fd-find ripgrep
@@ -47,4 +46,10 @@ jobs:
 
       - run: npm run check
 
+      # REQUIRE_BRIDGE_TOOLS=1 turns the local "skip if absent" behaviour into a
+      # hard failure. Without it, a broken install step above would silently
+      # drop the find/grep tests and CI would still be green — the exact
+      # "green means nothing" failure bucket 1 exists to eliminate.
       - run: npm test
+        env:
+          REQUIRE_BRIDGE_TOOLS: "1"

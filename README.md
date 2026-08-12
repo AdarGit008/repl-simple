@@ -98,5 +98,21 @@ Two TypeScript configs, deliberately:
 need only — pi supplies it at runtime via a loader alias — and a range rather than a pin could drift
 the types the compiler checks away from the ones that actually run.
 
+### Optional: `fd` and `ripgrep`
+
+The bridged `find` and `grep` tools shell out to `fd` and `rg`. Install them to run the tests that
+exercise those two tools:
+
+```bash
+apt install fd-find ripgrep     # Debian/Ubuntu
+brew install fd ripgrep         # macOS
+```
+
+Without them, those tests **skip** with a message naming what is missing; the rest of the suite runs
+normally. The suite never downloads them: `test/support/bridge-tools.ts` sets `PI_OFFLINE=1`, which
+stops `pi-coding-agent` fetching an unpinned "latest" binary from GitHub releases mid-run. Set
+`REQUIRE_BRIDGE_TOOLS=1` to turn the skip into a failure instead — CI does, so a broken install step
+goes red rather than quietly dropping coverage.
+
 CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
 ubuntu-latest and macos-latest, for every push and pull request.

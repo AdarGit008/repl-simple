@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createPiBridgeTools } from "../src/bridge.js";
+import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 import type { BridgeOptions } from "../src/bridge.js";
 import type { HostTool } from "../src/types.js";
 
@@ -150,7 +151,7 @@ describe("createPiBridgeTools — ls execution", () => {
 
 // ── Tool execution — grep ───────────────────────────────────────
 
-describe("createPiBridgeTools — grep execution", () => {
+describe("createPiBridgeTools — grep execution", { skip: BRIDGE_TOOLS_SKIP }, () => {
   it("finds matching lines", async () => {
     const tools = createPiBridgeTools(tmpDir);
     const grep = findTool(tools, "grep");
@@ -173,7 +174,7 @@ describe("createPiBridgeTools — grep execution", () => {
 
 // ── Tool execution — find ───────────────────────────────────────
 
-describe("createPiBridgeTools — find execution", () => {
+describe("createPiBridgeTools — find execution", { skip: BRIDGE_TOOLS_SKIP }, () => {
   it("finds files by pattern", async () => {
     const tools = createPiBridgeTools(tmpDir);
     const find = findTool(tools, "find");
