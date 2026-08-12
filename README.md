@@ -86,6 +86,7 @@ npm run check   # tsc --noEmit            (tsconfig.json)
 npm run build   # tsc -p tsconfig.build.json
 npm run lint    # biome check --error-on-warnings
 npm run format  # biome format --write
+npm run coverage # per-file line-coverage floors
 ```
 
 Two TypeScript configs, deliberately:
@@ -136,6 +137,40 @@ The bulk-format commit is listed in `.git-blame-ignore-revs`. To skip it in blam
 ```bash
 git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
+
+### Coverage floors
+
+`npm run coverage` runs the suite under Node's `--experimental-test-coverage` and enforces a
+**per-file** line-coverage floor from `coverage-baseline.json`. `npm run coverage:update` rewrites the
+baseline; lowering a floor is a decision to explain in the commit message, not a formality.
+
+Floors are per file because a global number does not bite. Deleting `test/sandbox.test.ts` — 813
+lines, and the only file that kills any `sandbox.ts` mutation — moves the global figure from 93.33% to
+**92.78%**, a 0.55 pp drop that any round global floor survives. The same deletion drops
+`src/sandbox.ts` from 83.19% to 80.71%, which the per-file floor catches.
+
+**This is not a quality gate.** Coverage says lines executed, not that anything was asserted, and this
+suite has a documented history of tests that execute plenty and assert nothing (see
+[#23](https://github.com/AdarGit008/repl-simple/issues/23)). The mutation score from
+[#24](https://github.com/AdarGit008/repl-simple/issues/24) is the quality gate. This is a cheap
+regression detector that runs in seconds — do not let a coverage number justify skipping a test.
+
+Two things worth knowing before relying on it:
+
+- **`test/extension-loader.test.ts` is excluded from the coverage run** (not from `npm test`). It
+  drives pi's real `discoverAndLoadExtensions`, which loads `src/` a second time through pi's jiti
+  loader; Node merges V8 coverage by file path, so those barely-executed duplicates land on top of the
+  real entries. With it in the run, `src/sandbox.ts` reports **20.80%** against a true **83.20%**, and
+  the global figure reads 54.13% instead of 93.33%. Coverage cannot fall as tests are added — the low
+  number is the instrument misreporting, not a gap.
+- **Node's report cannot see a module that stopped being loaded.** It lists only files that were
+  loaded, so a module dropping out of the suite leaves the denominator and every percentage *rises*.
+  `coverage-baseline.json` doubles as a manifest for exactly this: a file with a floor that is absent
+  from the report is a hard error.
+
+CI runs coverage as its own job on Node 24 / ubuntu only. The floors are exact measured numbers, and
+V8 line attribution differs enough between Node majors that a baseline shared across the matrix would
+have to be slackened until it stopped biting.
 
 ### Optional: `fd` and `ripgrep`
 

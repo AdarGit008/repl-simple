@@ -37,6 +37,38 @@ jobs:
       # eliminate.
       - run: npm run lint
 
+  # Per-file line-coverage floors (#25). One job, one Node version, one OS:
+  # the floors are exact measured numbers, and V8 line attribution differs
+  # enough between Node majors that a shared baseline across the matrix would
+  # have to be slackened until it stopped biting. Pinned to Node 24, the
+  # version the baseline was measured on.
+  #
+  # This is not a quality gate — see the header of scripts/coverage.mjs. #24's
+  # mutation score is.
+  coverage:
+    name: coverage floors (node 24, ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # src/bridge.ts sits at a 100% floor, which is only reachable with fd and
+      # rg present — without them those tests skip and the floor breaks. Same
+      # install as the matrix job below, same REQUIRE_BRIDGE_TOOLS=1 reasoning.
+      - name: Install fd and ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y fd-find ripgrep
+
+      - run: npm ci
+
+      - run: npm run coverage
+        env:
+          REQUIRE_BRIDGE_TOOLS: "1"
+
   check:
     name: check + test (node ${{ matrix.node }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}

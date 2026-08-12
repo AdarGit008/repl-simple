@@ -1,0 +1,18 @@
+{
+  "global": 93.33,
+  "files": {
+    "extensions/repl-extension.ts": 83.44,
+    "src/bridge.ts": 100,
+    "src/builtins.ts": 96.31,
+    "src/registry.ts": 99.5,
+    "src/repl.ts": 91.66,
+    "src/rlm_loop.ts": 98.25,
+    "src/rlm_tools.ts": 99.07,
+    "src/rlm.ts": 93.67,
+    "src/sandbox.ts": 83.19,
+    "src/session.ts": 94.87,
+    "src/submit_signal.ts": 100,
+    "src/toolstore.ts": 98.26,
+    "src/types.ts": 100
+  }
+}
