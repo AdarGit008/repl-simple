@@ -241,7 +241,7 @@ export class RLMLoop {
     inputs?: Record<string, string>,
   ): Promise<RunResult> {
     const preamble = this.options.preamble;
-    const fullCode = preamble ? preamble + "\n" + code : code;
+    const fullCode = preamble ? `${preamble}\n${code}` : code;
     const sandboxOpts: SandboxOptions = { registry };
     const runOpts: RunOptions | undefined = inputs
       ? { ...this.options.runOpts, inputs }

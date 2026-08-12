@@ -123,7 +123,7 @@ async function runRlmCode(
   const { registry, llmCalls } = makeRlmRegistry(options.llmResponses);
   const sandboxOpts: SandboxOptions = { registry };
 
-  const code = REPL_SERVER + "\n" + userCode;
+  const code = `${REPL_SERVER}\n${userCode}`;
   const result = await runInSandbox(code, sandboxOpts, {
     inputs: { context: options.context ?? "" },
     scriptName: "rlm.py",

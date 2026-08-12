@@ -42,7 +42,11 @@ export interface BridgeOptions {
 
 interface ToolSpec {
   name: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // pi's tool factories each return a differently-shaped AgentTool and the
+  // package exports no common supertype. Narrowing this would mean
+  // re-declaring pi's types here, free to drift from the ones that actually
+  // run — the failure mode the pinned `typebox` exists to avoid.
+  // biome-ignore lint/suspicious/noExplicitAny: no supertype to narrow to
   factory: (cwd: string, opts: BridgeOptions) => any;
   params: HostToolParam[];
   mutating: boolean;
@@ -217,6 +221,11 @@ export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): H
         const processed = spec.prepareArgs ? spec.prepareArgs(args) : args;
         const result = await agentTool.execute(
           randomUUID(),
+          // `processed` is a plain Record built from Monty's dynamically-typed
+          // args; pi types this parameter per-tool via its own schema. There is
+          // nothing to narrow to at this seam — the validation that matters is
+          // pi's, inside execute().
+          // biome-ignore lint/suspicious/noExplicitAny: per-tool schema, typed inside pi
           processed as any,
           undefined, // signal
           undefined, // onUpdate
