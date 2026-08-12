@@ -347,115 +347,153 @@ describe("http_get — unit", () => {
 // ── Truncation ──────────────────────────────────────────────────
 
 describe("Truncation", () => {
-  const TRUNCATION_MARKER = "\n[...truncated]";
+  const bytes = (s: string) => Buffer.byteLength(s, "utf8");
 
-  it("read_file truncates beyond maxFileBytes with truncation marker", async () => {
-    // Create a temp dir with a file larger than 10 bytes
+  async function withRoot(fn: (root: string) => Promise<void>): Promise<void> {
     const root = await mkdtemp(join(tmpdir(), "repl-simple-builtins-"));
     try {
-      await writeFile(join(root, "big.txt"), "0123456789ABCDEF"); // 16 bytes
-      const tools = createBuiltinTools({ root, maxFileBytes: 10 });
-      const readFile = findTool(tools, "read_file");
-      const result = await readFile.execute({ path: "big.txt" });
-      assert.ok(result.includes(TRUNCATION_MARKER));
-      // Should be exactly 10 chars + truncation marker
-      // marker includes leading newline from source port
-      assert.ok(result.startsWith("0123456789"));
-      assert.ok(result.endsWith("[...truncated]"));
+      await fn(root);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  }
+
+  it("read_file honours the byte ceiling, marker included", async () => {
+    await withRoot(async (root) => {
+      await writeFile(join(root, "big.txt"), "0123456789".repeat(5000));
+      const tools = createBuiltinTools({ root, maxFileBytes: 2048 });
+      const result = await findTool(tools, "read_file").execute({
+        path: "big.txt",
+      });
+      assert.ok(bytes(result) <= 2048, `got ${bytes(result)} bytes for a 2048 cap`);
+      assert.ok(result.includes("elided"), "the marker must state what went");
+    });
   });
 
-  it("read_file does not truncate when file is smaller than maxFileBytes", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repl-simple-builtins-"));
-    try {
+  it("read_file keeps both ends of the file", async () => {
+    await withRoot(async (root) => {
+      await writeFile(
+        join(root, "big.txt"),
+        `HEAD_MARKER\n${"filler\n".repeat(20000)}TAIL_MARKER\n`,
+      );
+      const tools = createBuiltinTools({ root, maxFileBytes: 4096 });
+      const result = await findTool(tools, "read_file").execute({
+        path: "big.txt",
+      });
+      assert.ok(result.startsWith("HEAD_MARKER"), "head lost");
+      assert.ok(result.trimEnd().endsWith("TAIL_MARKER"), "tail lost");
+    });
+  });
+
+  it("read_file never cuts a character in half (M5)", async () => {
+    // Before: `read_file` on 50 x "é" with maxFileBytes 11 returned 13 bytes
+    // ending in U+FFFD — the byte cut landed mid-character.
+    await withRoot(async (root) => {
+      await writeFile(join(root, "accents.txt"), "é".repeat(50));
+      for (const cap of [10, 11, 12, 64, 200, 1024]) {
+        const tools = createBuiltinTools({ root, maxFileBytes: cap });
+        const result = await findTool(tools, "read_file").execute({
+          path: "accents.txt",
+        });
+        assert.ok(
+          !result.includes("\uFFFD"),
+          `cap ${cap}: truncation introduced U+FFFD`,
+        );
+        assert.ok(bytes(result) <= cap, `cap ${cap}: got ${bytes(result)} bytes`);
+      }
+    });
+  });
+
+  it("read_file does not truncate when the file fits", async () => {
+    await withRoot(async (root) => {
       await writeFile(join(root, "small.txt"), "hi");
       const tools = createBuiltinTools({ root, maxFileBytes: 100 });
-      const readFile = findTool(tools, "read_file");
-      const result = await readFile.execute({ path: "small.txt" });
+      const result = await findTool(tools, "read_file").execute({
+        path: "small.txt",
+      });
       assert.equal(result, "hi");
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("http_get truncates beyond maxHttpBytes with truncation marker", async () => {
-    const longBody = "A".repeat(50);
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response(longBody, { status: 200 });
-    const tools = createBuiltinTools({
-      root: "/tmp",
-      maxHttpBytes: 20,
-      fetchImpl: mockFetch,
     });
-    const httpGet = findTool(tools, "http_get");
-    const result = await httpGet.execute({ url: "https://example.com" });
-    assert.ok(result.includes(TRUNCATION_MARKER));
-  });
-
-  it("http_get does not truncate when response is smaller than maxHttpBytes", async () => {
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response("short", { status: 200 });
-    const tools = createBuiltinTools({
-      root: "/tmp",
-      maxHttpBytes: 100,
-      fetchImpl: mockFetch,
-    });
-    const httpGet = findTool(tools, "http_get");
-    const result = await httpGet.execute({ url: "https://example.com" });
-    assert.equal(result, "short");
   });
 
   it("read_file default maxFileBytes is 256 KiB", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repl-simple-builtins-"));
-    try {
-      // Write a file just under 256 KiB — should not be truncated
-      const content = "A".repeat(256 * 1024 - 1);
-      await writeFile(join(root, "big.txt"), content);
+    await withRoot(async (root) => {
+      const content = "A".repeat(256 * 1024);
+      await writeFile(join(root, "exact.txt"), content);
       const tools = createBuiltinTools({ root });
-      const readFile = findTool(tools, "read_file");
-      const result = await readFile.execute({ path: "big.txt" });
+      const result = await findTool(tools, "read_file").execute({
+        path: "exact.txt",
+      });
       assert.equal(result, content);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+    });
   });
 
-  it("read_file truncates beyond default maxFileBytes (256 KiB)", async () => {
-    const root = await mkdtemp(join(tmpdir(), "repl-simple-builtins-"));
-    try {
-      // Write a file just over 256 KiB — should be truncated
+  it("read_file truncates beyond the default 256 KiB", async () => {
+    await withRoot(async (root) => {
       const content = "A".repeat(256 * 1024 + 1);
       await writeFile(join(root, "huge.txt"), content);
       const tools = createBuiltinTools({ root });
-      const readFile = findTool(tools, "read_file");
-      const result = await readFile.execute({ path: "huge.txt" });
-      assert.ok(result.includes(TRUNCATION_MARKER));
+      const result = await findTool(tools, "read_file").execute({
+        path: "huge.txt",
+      });
+      assert.ok(result.includes("elided"));
+      assert.ok(bytes(result) <= 256 * 1024);
       assert.ok(!result.includes(content));
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+    });
+  });
+
+  it("http_get honours the byte ceiling and marks where it cut", async () => {
+    const mockFetch: typeof fetch = async () =>
+      new Response("B".repeat(100_000), { status: 200 });
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      maxHttpBytes: 2048,
+      fetchImpl: mockFetch,
+    });
+    const result = await findTool(tools, "http_get").execute({
+      url: "https://example.com",
+    });
+    assert.ok(bytes(result) <= 2048, `got ${bytes(result)} bytes for a 2048 cap`);
+    // Head-only: the read stops at the budget, so there is no true total to
+    // report and the marker says where it cut instead.
+    assert.match(result, /truncated at 2\.0KB/);
+    assert.ok(result.startsWith("B"));
+  });
+
+  it("http_get does not truncate when the response fits", async () => {
+    const mockFetch: typeof fetch = async () =>
+      new Response("small body", { status: 200 });
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      maxHttpBytes: 2048,
+      fetchImpl: mockFetch,
+    });
+    const result = await findTool(tools, "http_get").execute({
+      url: "https://example.com",
+    });
+    assert.equal(result, "small body");
   });
 
   it("http_get default maxHttpBytes is 256 KiB", async () => {
-    const content = "B".repeat(256 * 1024 - 1);
-    const mockFetch: typeof fetch = async (_url) =>
+    const content = "B".repeat(256 * 1024);
+    const mockFetch: typeof fetch = async () =>
       new Response(content, { status: 200 });
     const tools = createBuiltinTools({ root: "/tmp", fetchImpl: mockFetch });
-    const httpGet = findTool(tools, "http_get");
-    const result = await httpGet.execute({ url: "https://example.com" });
+    const result = await findTool(tools, "http_get").execute({
+      url: "https://example.com",
+    });
     assert.equal(result, content);
   });
 
-  it("http_get truncates beyond default maxHttpBytes (256 KiB)", async () => {
+  it("http_get truncates beyond the default 256 KiB", async () => {
     const content = "B".repeat(256 * 1024 + 1);
-    const mockFetch: typeof fetch = async (_url) =>
+    const mockFetch: typeof fetch = async () =>
       new Response(content, { status: 200 });
     const tools = createBuiltinTools({ root: "/tmp", fetchImpl: mockFetch });
-    const httpGet = findTool(tools, "http_get");
-    const result = await httpGet.execute({ url: "https://example.com" });
-    assert.ok(result.includes(TRUNCATION_MARKER));
+    const result = await findTool(tools, "http_get").execute({
+      url: "https://example.com",
+    });
+    assert.ok(result.includes("truncated at"));
+    assert.ok(bytes(result) <= 256 * 1024);
     assert.ok(!result.includes(content));
   });
 });

@@ -1,6 +1,14 @@
-import { open, readdir, realpath } from "node:fs/promises";
+import { open, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { requireString } from "./registry.js";
+import {
+  Truncator,
+  decodeWhole,
+  VALUE_HEAD_RATIO,
+  HEAD_ONLY_RATIO,
+  FILE_RECOVERY,
+  HTTP_RECOVERY,
+} from "./truncate.js";
 import { HostToolError } from "./types.js";
 import type { HostTool } from "./types.js";
 
@@ -23,31 +31,56 @@ export interface BuiltinToolsOptions {
 
 // ── Constants ────────────────────────────────────────────────────
 
+/**
+ * These tools return a value *into the sandbox*, not into the model's context:
+ * the model may read a file and process it in Python without ever displaying
+ * it. So this is a data-safety ceiling, deliberately far above the 48 KiB
+ * `stdout` + `output` budget that governs what actually reaches the model —
+ * truncating here corrupts data, truncating there only shortens a view.
+ */
 const DEFAULT_MAX_BYTES = 256 * 1024;
-const TRUNCATION_MARKER = "\n[...truncated]";
 
 // ── Private helpers ──────────────────────────────────────────────
 
-function truncate(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text) <= maxBytes) return text;
-  return (
-    Buffer.from(text).subarray(0, maxBytes).toString() + TRUNCATION_MARKER
-  );
-}
-
+/**
+ * Read a file into the shared truncator, head + tail.
+ *
+ * `stat` gives the true size, so the marker can state what was dropped without
+ * reading the middle: two seeks are enough. Both reads are decoded with
+ * `decodeWhole`, because a byte offset chosen by arithmetic lands wherever it
+ * lands — cutting a character there is what produced U+FFFD before (M5).
+ */
 async function readUtf8FileLimited(
   path: string,
   maxBytes: number,
 ): Promise<string> {
+  const size = (await stat(path)).size;
   const handle = await open(path, "r");
   try {
-    const buffer = Buffer.alloc(maxBytes + 1);
-    const { bytesRead } = await handle.read(buffer, 0, maxBytes + 1, 0);
-    const truncated = bytesRead > maxBytes;
-    return (
-      buffer.subarray(0, truncated ? maxBytes : bytesRead).toString() +
-      (truncated ? TRUNCATION_MARKER : "")
-    );
+    if (size <= maxBytes) {
+      const buffer = Buffer.alloc(size);
+      const { bytesRead } = await handle.read(buffer, 0, size, 0);
+      return buffer.subarray(0, bytesRead).toString("utf8");
+    }
+
+    const out = new Truncator({
+      maxBytes,
+      headRatio: VALUE_HEAD_RATIO,
+      recovery: FILE_RECOVERY,
+      totalBytes: size,
+    });
+    const segment = Math.max(1, Math.ceil(maxBytes * VALUE_HEAD_RATIO)) + 8;
+
+    const headBuf = Buffer.alloc(segment);
+    const head = await handle.read(headBuf, 0, segment, 0);
+    out.push(decodeWhole(headBuf.subarray(0, head.bytesRead)));
+
+    const tailFrom = Math.max(head.bytesRead, size - segment);
+    const tailBuf = Buffer.alloc(size - tailFrom);
+    const tail = await handle.read(tailBuf, 0, tailBuf.length, tailFrom);
+    out.push(decodeWhole(tailBuf.subarray(0, tail.bytesRead)));
+
+    return out.render();
   } finally {
     await handle.close();
   }
@@ -57,39 +90,50 @@ async function readResponseTextLimited(
   response: Response,
   maxBytes: number,
 ): Promise<string> {
+  // Head-only, and the total is left unknown: the read stops just past the
+  // budget rather than draining an arbitrarily large body to measure it.
+  // Keeping a tail would mean downloading all of it, and inventing a total
+  // would break the "counters are true" invariant.
+  const out = new Truncator({
+    maxBytes,
+    headRatio: HEAD_ONLY_RATIO,
+    recovery: HTTP_RECOVERY,
+    unknownTotal: true,
+  });
+  // One byte past the ceiling, so an over-long body actually overflows the
+  // truncator rather than landing exactly on its budget and looking whole.
+  const scanLimit = maxBytes + 1;
+
   const reader = response.body?.getReader();
-  if (!reader) return truncate(await response.text(), maxBytes);
+  if (!reader) {
+    out.push(await response.text());
+    return out.render();
+  }
 
   const chunks: Uint8Array[] = [];
   let collected = 0;
-  let truncated = false;
+  let stopped = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       const chunk = value ?? new Uint8Array();
-      const remaining = maxBytes - collected;
-      if (chunk.byteLength > remaining) {
-        if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
-        truncated = true;
+      const remaining = scanLimit - collected;
+      if (chunk.byteLength >= remaining) {
+        chunks.push(chunk.subarray(0, remaining));
+        stopped = true;
         break;
       }
       chunks.push(chunk);
       collected += chunk.byteLength;
-      if (collected === maxBytes) {
-        const next = await reader.read();
-        truncated = !next.done;
-        break;
-      }
     }
   } finally {
-    if (truncated) await reader.cancel().catch(() => {});
+    if (stopped) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 
-  return (
-    Buffer.concat(chunks).toString() + (truncated ? TRUNCATION_MARKER : "")
-  );
+  out.push(decodeWhole(Buffer.concat(chunks)));
+  return out.render();
 }
 
 // ── createBuiltinTools ───────────────────────────────────────────

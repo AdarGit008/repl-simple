@@ -1033,3 +1033,131 @@ describe("accumulator ownership — SubmitSignal in the resume prologue", () => 
     assert.equal(result.calls[0].approved, true);
   });
 });
+
+// ── Stdout truncation policy (#29) ───────────────────────────────
+//
+// Asserts docs/truncation-policy.md through the sandbox. The unit-level
+// coverage of the truncator itself lives in test/truncate.test.ts; these are
+// the properties that must survive the trip through Monty's print callback and
+// both entry points.
+
+describe("stdout truncation — the budget is a ceiling", () => {
+  const registry = new ToolRegistry();
+  const size = (s: string) => Buffer.byteLength(s, "utf8");
+
+  it("stays within a 10-byte cap on 50 multibyte characters (M1)", async () => {
+    // Before: 42 bytes / 32 chars returned. A byte budget was handed to
+    // String.slice, which counts characters — 10 chars of "é" is 20 bytes —
+    // and the 22-byte marker was appended after the budget was spent.
+    const result = await runInSandbox(
+      'print("é" * 50)',
+      { registry },
+      { maxStdoutBytes: 10 },
+    );
+    ok(result);
+    assert.ok(
+      size(result.stdout) <= 10,
+      `got ${size(result.stdout)} bytes / ${result.stdout.length} chars for a 10-byte cap`,
+    );
+    assert.ok(!result.stdout.includes("\uFFFD"), "truncation introduced U+FFFD");
+    assert.equal(result.stdoutTruncated, true);
+  });
+
+  it("holds for every character width, on both entry points (M11/M12)", async () => {
+    const gated: HostTool = {
+      name: "gated",
+      description: "Gated",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "done",
+    };
+
+    for (const char of ["A", "é", "日", "😀"]) {
+      for (const cap of [64, 200, 1024, 4096]) {
+        const direct = await runInSandbox(
+          `print(${JSON.stringify(char)} * 5000)`,
+          { registry },
+          { maxStdoutBytes: cap },
+        );
+        ok(direct);
+        assert.ok(
+          size(direct.stdout) <= cap,
+          `runInSandbox ${char} @ ${cap}: ${size(direct.stdout)} bytes`,
+        );
+        assert.ok(
+          !direct.stdout.includes("\uFFFD"),
+          `runInSandbox ${char} @ ${cap}: U+FFFD`,
+        );
+
+        const susp = await runInSandbox(
+          `gated()\nprint(${JSON.stringify(char)} * 5000)`,
+          { registry: new ToolRegistry([gated]) },
+          { onApproval: () => "suspend", maxStdoutBytes: cap },
+        );
+        suspended(susp);
+        const resumed = await resumeSuspended(
+          susp,
+          true,
+          { registry: new ToolRegistry([gated]) },
+          { maxStdoutBytes: cap },
+        );
+        ok(resumed);
+        assert.ok(
+          size(resumed.stdout) <= cap,
+          `resumeSuspended ${char} @ ${cap}: ${size(resumed.stdout)} bytes`,
+        );
+        assert.ok(
+          !resumed.stdout.includes("\uFFFD"),
+          `resumeSuspended ${char} @ ${cap}: U+FFFD`,
+        );
+      }
+    }
+  });
+
+  it("keeps both ends of a long stream", async () => {
+    const result = await runInSandbox(
+      'print("FIRST_LINE")\nfor i in range(20000):\n    print("filler", i)\nprint("LAST_LINE")',
+      { registry },
+      { maxStdoutBytes: 4096 },
+    );
+    ok(result);
+    assert.ok(result.stdout.includes("FIRST_LINE"), "head lost");
+    assert.ok(result.stdout.includes("LAST_LINE"), "tail lost");
+    assert.ok(size(result.stdout) <= 4096);
+  });
+
+  it("the marker states the true magnitude and a recovery route", async () => {
+    const result = await runInSandbox(
+      'for i in range(20000):\n    print("a line of output", i)',
+      { registry },
+      { maxStdoutBytes: 4096 },
+    );
+    ok(result);
+    assert.match(result.stdout, /\[… [\d.]+KB of [\d.]+KB elided \(lines \d+-\d+ of \d+\)\./);
+    assert.match(result.stdout, /Re-run with a narrower print to see more/);
+  });
+});
+
+describe("stdout truncation — onPrint is not the model's budget (M9)", () => {
+  const registry = new ToolRegistry();
+
+  it("keeps streaming to onPrint after the model's copy is truncated", async () => {
+    // Before: `if (stdoutTruncated) return;` sat above the onPrint call, so
+    // the human's terminal went silent the moment the model's cap was hit.
+    const prints: string[] = [];
+    const result = await runInSandbox(
+      'for i in range(2000):\n    print("line", i)',
+      { registry },
+      { maxStdoutBytes: 200, onPrint: (text) => prints.push(text) },
+    );
+    ok(result);
+    assert.equal(result.stdoutTruncated, true);
+    const streamed = prints.join("");
+    assert.ok(
+      Buffer.byteLength(streamed) > 200,
+      `onPrint stopped at the model's cap: ${Buffer.byteLength(streamed)} bytes`,
+    );
+    assert.ok(streamed.includes("line 1999"), "the last line never reached onPrint");
+  });
+});

@@ -10,6 +10,13 @@ import {
   type ResourceLimits,
 } from "@pydantic/monty";
 import { ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
+import {
+  Truncator,
+  STDOUT_MAX_BYTES,
+  STDOUT_MAX_LINES,
+  STDOUT_HEAD_RATIO,
+  STDOUT_RECOVERY,
+} from "./truncate.js";
 import { HostToolError } from "./types.js";
 import { SubmitSignal } from "./submit_signal.js";
 import type {
@@ -25,8 +32,7 @@ import type {
 
 // ── Constants ────────────────────────────────────────────────────
 
-const DEFAULT_MAX_STDOUT = 256 * 1024;
-const TRUNCATION_MARKER = "\n[...stdout truncated]";
+const DEFAULT_MAX_STDOUT = STDOUT_MAX_BYTES;
 
 /**
  * Sentinel function used at NameLookup to satisfy Monty's type checker.
@@ -37,12 +43,66 @@ const SENTINEL = () => "";
 
 // ── Dispatch loop accumulators ───────────────────────────────────
 
-/** Mutable state carried across iterations of the dispatch loop. */
-interface DispatchAccumulators {
-  stdout: string;
-  stdoutTruncated: boolean;
-  calls: ToolCallTrace[];
-  aborted: boolean;
+/**
+ * Mutable state carried across iterations of the dispatch loop.
+ *
+ * Owned by the entry point that builds it and mutated in place — by the loop,
+ * and concurrently by the print callback and abort listener Monty invokes while
+ * the loop awaits a resume. Nothing may hold a copy of any field (#27).
+ *
+ * `stdout` is a projection of the `Truncator`, not a field: the accumulator
+ * keeps a bounded head and tail plus true counters, and renders the elided form
+ * only when a result is built.
+ */
+class DispatchAccumulators {
+  readonly calls: ToolCallTrace[];
+  aborted = false;
+  private readonly out: Truncator;
+
+  constructor(maxStdout: number, prior?: RunSuspended) {
+    this.out = new Truncator({
+      maxBytes: maxStdout,
+      headRatio: STDOUT_HEAD_RATIO,
+      maxLines: STDOUT_MAX_LINES,
+      recovery: STDOUT_RECOVERY,
+      truncatedBefore: prior?.stdoutTruncated,
+    });
+    this.calls = prior ? [...prior.calls] : [];
+    // Stdout carried across a suspend/resume boundary is re-accumulated from
+    // its rendered form: `RunSuspended` transports the string, not the head,
+    // tail and counters behind it. Cross-call stdout semantics are #61's.
+    if (prior?.stdout) this.out.push(prior.stdout);
+  }
+
+  print(text: string): void {
+    this.out.push(text);
+  }
+
+  get stdout(): string {
+    return this.out.render();
+  }
+
+  get stdoutTruncated(): boolean {
+    return this.out.truncated;
+  }
+}
+
+/**
+ * The one print callback. Both entry points hand this to Monty — as
+ * `startOpts.printCallback` and as `MontySnapshot.load()`'s — and it is the
+ * only thing that writes stdout.
+ */
+function makePrintCallback(
+  acc: DispatchAccumulators,
+  runOpts: RunOptions | undefined,
+): (stream: string, text: string) => void {
+  return (_stream: string, text: string) => {
+    // Unconditional, and before the accumulator: the human's live stream is not
+    // the model's context window and must not share its budget. Gating this on
+    // truncation silenced the terminal mid-run (M9).
+    runOpts?.onPrint?.(text);
+    acc.print(text);
+  };
 }
 
 // ── Options ──────────────────────────────────────────────────────
@@ -476,12 +536,7 @@ export async function runInSandbox(
   // Accumulators. Built here, before `printCallback` and `onAbort`, because
   // both mutate `acc` and both are handed to Monty before the dispatch loop
   // is entered. Nothing below may read a local copy of this state.
-  const acc: DispatchAccumulators = {
-    stdout: "",
-    stdoutTruncated: false,
-    calls: [],
-    aborted: false,
-  };
+  const acc = new DispatchAccumulators(maxStdout);
 
   const onAbort = () => {
     acc.aborted = true;
@@ -491,21 +546,7 @@ export async function runInSandbox(
     if (runOpts.signal.aborted) acc.aborted = true;
   }
 
-  // Print callback → accumulate stdout
-  const printCallback = (_stream: string, text: string) => {
-    if (acc.stdoutTruncated) return;
-    runOpts?.onPrint?.(text);
-    if (Buffer.byteLength(acc.stdout) + Buffer.byteLength(text) > maxStdout) {
-      acc.stdout += text.slice(
-        0,
-        maxStdout - Buffer.byteLength(acc.stdout),
-      );
-      acc.stdout += TRUNCATION_MARKER;
-      acc.stdoutTruncated = true;
-    } else {
-      acc.stdout += text;
-    }
-  };
+  const printCallback = makePrintCallback(acc, runOpts);
 
   // ── 1. Build type-check prefix ──────────────────────────────
   const inputNames = Object.keys(runOpts?.inputs ?? {});
@@ -607,12 +648,7 @@ export async function resumeSuspended(
   // `printCallback` and `onAbort`, because both mutate `acc` and both are
   // handed to Monty before the dispatch loop is entered. The prologue below
   // pushes through `acc.calls` for the same reason.
-  const acc: DispatchAccumulators = {
-    stdout: suspended.stdout,
-    stdoutTruncated: suspended.stdoutTruncated,
-    calls: [...suspended.calls],
-    aborted: false,
-  };
+  const acc = new DispatchAccumulators(maxStdout, suspended);
 
   const onAbort = () => {
     acc.aborted = true;
@@ -622,18 +658,7 @@ export async function resumeSuspended(
     if (runOpts.signal.aborted) acc.aborted = true;
   }
 
-  // Print callback — accumulate beyond existing stdout
-  const printCallback = (_stream: string, text: string) => {
-    if (acc.stdoutTruncated) return;
-    runOpts?.onPrint?.(text);
-    if (Buffer.byteLength(acc.stdout) + Buffer.byteLength(text) > maxStdout) {
-      acc.stdout += text.slice(0, maxStdout - Buffer.byteLength(acc.stdout));
-      acc.stdout += TRUNCATION_MARKER;
-      acc.stdoutTruncated = true;
-    } else {
-      acc.stdout += text;
-    }
-  };
+  const printCallback = makePrintCallback(acc, runOpts);
 
   // Load the snapshot with printCallback attached
   const snapshot: MontySnapshot = MontySnapshot.load(suspended.snapshot, {
