@@ -82,9 +82,21 @@ Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl do
 
 ```bash
 npm test        # tsx --test test/*.test.ts
-npm run check   # tsc --noEmit
-npm run build   # tsc
+npm run check   # tsc --noEmit            (tsconfig.json)
+npm run build   # tsc -p tsconfig.build.json
 ```
+
+Two TypeScript configs, deliberately:
+
+- **`tsconfig.json`** — what the compiler *checks*: `src/`, `test/` **and** `extensions/`. It is the
+  default config, so editors and a bare `tsc` see the same program CI does.
+- **`tsconfig.build.json`** — what the compiler *emits*: `src/` and `test/`. `extensions/` is checked
+  but not built, because pi loads the `.ts` source directly through jiti and resolves `typebox` and
+  `@earendil-works/pi-coding-agent` from its own install.
+
+`typebox` is a devDependency pinned to the exact version pi pins (`1.3.7`). It is a compile-time
+need only — pi supplies it at runtime via a loader alias — and a range rather than a pin could drift
+the types the compiler checks away from the ones that actually run.
 
 CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
 ubuntu-latest and macos-latest, for every push and pull request.

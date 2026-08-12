@@ -1,0 +1,21 @@
+// Emit config. `tsconfig.json` is the *check* config and covers everything the
+// compiler should see, including `extensions/` — the only file a consumer of
+// this package actually loads (#21). This one narrows that to what we build.
+//
+// `extensions/` is deliberately checked but not emitted: pi loads the .ts
+// source directly through jiti, resolving `typebox` and
+// `@earendil-works/pi-coding-agent` from its own install via a runtime alias.
+// Compiling it here would put a second, unreferenced copy in dist/ whose
+// imports resolve differently from the one that actually runs.
+//
+// The `test/` include and the missing `rootDir` are inherited defects, not
+// choices — dist/ currently mirrors the repo as dist/src/ + dist/test/, which
+// is #80's job to fix. Kept identical here so this issue changes nothing about
+// what gets built.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
