@@ -55,6 +55,14 @@ export const HEAD_ONLY_RATIO = 1;
 // the rest. See Q3 of the policy.
 
 export const STDOUT_RECOVERY = "Re-run with a narrower print to see more.";
+/**
+ * Deliberately *not* "the value is still bound as `_`". Measured: `_` is
+ * usable only when declared as an input or assigned, and wiring it through
+ * `Session` would break replay — a stored snippet referencing `_` re-executes
+ * against whatever `_` holds later, not what it held then. Assigning the
+ * expression to a name is a route that is true today.
+ */
+export const VALUE_RECOVERY = "Assign the value to a name and slice it to see more.";
 export const FILE_RECOVERY = "Read a narrower slice of the file to see more.";
 export const HTTP_RECOVERY = "Request a narrower range to see more.";
 

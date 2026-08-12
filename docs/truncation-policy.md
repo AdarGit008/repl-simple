@@ -184,6 +184,27 @@ as CPython's REPL does. Then the marker can name a real recovery route. **[judge
 itself is unverified against Monty and must be spiked before #34 depends on it — if it proves
 infeasible, fall back to the `stdout` wording, which needs no binding.]**
 
+**Spiked during #34. The binding did not land. [measured, M10]** `_` is usable in Monty two ways —
+declared as an input (`inputs: { _: "…" }` → `output "carried"`) or assigned in the snippet
+(`_ = 5; _ * 2` → `10`). So the mechanism exists. What blocks it is `Session`, which persists state by
+**replaying prior snippets as source**, not by carrying a snapshot. Passing the previous value in as
+an input named `_` therefore rebinds `_` for every replayed snippet, not just the next one:
+
+```
+call 1   bigvalue                 →  truncated; _ = the big string
+call 2   _[10000:11000]           →  correct slice
+call 3   anything                 →  replays call 2 against call 2's OWN output — IndexError
+```
+
+The advertised route would corrupt the session that used it, and it is exactly the flow the marker
+would be advertising. Fixing it means changing how `Session` persists state, which is #62's scope, not
+a truncation issue's.
+
+**What shipped instead is a route that is true today**: assign the expression to a name and slice
+that. It needs no new binding, it survives replay because the name is bound by the snippet itself, and
+it delivers Q3's substance — the model can reach the rest without a new tool. Revisit `_` if #62
+replaces replay with a snapshot.
+
 Note the second-order effect the issue anticipated: once recovery is cheap, a **tighter** budget beats
 a looser one, because the model spends context on the slice it asked for instead of on incidental
 bulk. That is what licenses the 5× reduction in Q5.
@@ -296,10 +317,10 @@ Shaped to match pi's vocabulary, since both appear in the same context window.
 [… 1.9 MB of 2.0 MB elided. Re-run with a narrower print to see more. …]
 ```
 
-`output`:
+`output` (as shipped — see the Q3 spike; the `_` binding did not land):
 
 ```
-[… 1.9 MB of 2.0 MB elided. The value is still bound in this session — slice it to see more. …]
+[… 1.9MB of 2.0MB elided. Assign the value to a name and slice it to see more. …]
 ```
 
 Rules:
@@ -308,7 +329,11 @@ Rules:
 - The marker goes **where the cut is** — between head and tail, not appended at the end. An appended
   marker on a head+tail result implies the tail was dropped when it was not.
 - If the `_` binding from Q3 does not land, the `output` marker uses the `stdout` wording. Do not ship
-  a marker naming a recovery route that does not exist.
+  a marker naming a recovery route that does not exist. **Resolved: it did not land, and the shipped
+  wording names assignment instead — a route that needs no binding.**
+- A caller that stops reading before the end cannot know the total, and inventing one would break
+  invariant 5. That case states where it cut instead: `[… truncated at 16.0KB. RECOVERY …]`. Used by
+  `http_get`, which will not drain an arbitrarily large body just to measure it.
 
 ### Non-goals
 
@@ -341,6 +366,40 @@ marker inside the budget. Two additions:
 
 **#69 (8.5 — value conversion loses information).** Newly implicated by M6/M7. It is the blocker for
 Q4, and Q4's recommendation — build the repr truncation-aware at construction — belongs in its scope.
+
+---
+
+## Implementation record
+
+What landed, and the two places the implementation deliberately differs from a literal reading of the
+spec above. Recorded here rather than left as drift, per #34's DoD.
+
+| Site | Budget | Shape | Landed in |
+|---|---|---|---|
+| `stdout` | 32 KiB / 1000 lines | 25/75 head+tail | #29 |
+| `output` | 16 KiB | 50/50 head+tail | #34 |
+| `read_file` | 256 KiB | 50/50 head+tail | #29 |
+| `http_get` | 256 KiB | head-only, total unknown | #29 |
+
+All four go through one implementation, `src/truncate.ts`, per invariant 4.
+
+**Exception 1 — `builtins.ts` keeps its 256 KiB ceiling; it is not part of the 48 KiB budget.**
+`read_file` and `http_get` return a value *into the sandbox*, not into the model's context: the model
+may read a file and process it in Python without ever displaying it. Whatever it chooses to surface is
+then capped again, correctly, by `stdout` or `output`. Truncating at the read would corrupt data;
+truncating at the display only shortens a view. The 48 KiB total in Q5 therefore still holds for a
+tool result, which is what it was about.
+
+**Exception 2 — `output` is capped where the `RunResult` is built, not in `repl.ts`'s
+`formatResult`.** #34 names `repl.ts:112`, but capping there would leave the RLM loop uncapped, which
+is the same defect under a different consumer — `docs/REVIEW.md` A23 records a snippet ending in a
+bare `context` appending a full copy of the context to every subsequent prompt. Capping in
+`sandbox.ts` covers both, and is the stronger reading of "one policy, not two". `formatResult` then
+interpolates an already-bounded value, and says so.
+
+**The budget-smaller-than-the-marker edge**, which #29 asked to decide explicitly: the result is
+**empty**, with the truncated flag set. A partial marker is misinformation and the budget is a hard
+ceiling, so an empty field plus an accurate flag is the only unambiguous answer.
 
 ---
 
