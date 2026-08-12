@@ -11,6 +11,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Formatting and lint are platform- and Node-independent, so this runs once
+  # rather than on all four legs of the matrix below. It also fails in well
+  # under a minute, which the matrix cannot: @pydantic/monty and the fd/rg
+  # install dominate that job's runtime.
+  lint:
+    name: lint + format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # `biome check` covers the formatter, the linter and the import-sorting
+      # assist in one pass. --error-on-warnings is what makes it a gate: Biome
+      # exits 0 on warning-severity diagnostics by default, so without it a
+      # rule like noExplicitAny would print and pass — a warning tier nobody
+      # reads is the same "green means nothing" failure bucket 1 exists to
+      # eliminate.
+      - run: npm run lint
+
   check:
     name: check + test (node ${{ matrix.node }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
