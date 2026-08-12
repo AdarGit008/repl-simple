@@ -284,7 +284,7 @@ describe("RunErrorKind", () => {
   it("all values are assignable", () => {
     const kinds: RunErrorKind[] = ["syntax", "typing", "runtime", "aborted"];
     assert.equal(kinds.length, 4);
-    assert.equal(kinds[0], "syntax");
+    assert.equal(kinds[0], "DELIBERATELY-BROKEN-FOR-CI-PROOF");
     assert.equal(kinds[3], "aborted");
   });
 });
