@@ -4,7 +4,6 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
-import type { ApprovalRequest, ApprovalDecision } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -19,15 +18,9 @@ function cleanup(): void {
   if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
 }
 
-/** Always-deny approval callback. */
-async function deny(_req: ApprovalRequest): Promise<ApprovalDecision> {
-  return false;
-}
-
-/** Always-approve approval callback. */
-async function approve(_req: ApprovalRequest): Promise<ApprovalDecision> {
-  return true;
-}
+// The `deny` / `approve` helpers were deleted here in #23 — unused, and the
+// mark of a repl_resume round-trip test that was planned and dropped. #48
+// restores them together with that test; it kills mutations M7 and M8.
 
 // ── Basic execution ──────────────────────────────────────────────
 
@@ -231,10 +224,10 @@ describe("ReplRunner — reset", () => {
     assert.ok(out.includes("not defined"));
   });
 
-  it("reset of non-existent session does not throw", () => {
-    // Should not throw
-    runner.reset("non-existent-session");
-  });
+  // "reset of non-existent session does not throw" was deleted here in #23 —
+  // it had no assertion. The real behaviour it gestured at is a defect: reset
+  // reports `Session 'X' reset.` for sessions that never existed ([N12]).
+  // #48 owns the test that actually pins that.
 });
 
 // ── Abandon ──────────────────────────────────────────────────────
