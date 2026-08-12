@@ -12,6 +12,10 @@ export type {
   RunError,
   RunSuspended,
   RunResult,
+  LlmClient,
+  RlmOptions,
+  RlmResult,
+  RlmIteration,
 } from "./types.js";
 export { HostToolError } from "./types.js";
 
@@ -62,6 +66,13 @@ export {
   loadSavedTools,
   type ToolStoreOptions,
 } from "./toolstore.js";
+
+// ── RLM (standalone runRlm) ─────────────────────────────────────
+export {
+  runRlm,
+  extractPythonCode,
+  DEFAULT_RLM_SYSTEM_PROMPT,
+} from "./rlm.js";
 
 // ── Repl ────────────────────────────────────────────────────────
 export { ReplRunner } from "./repl.js";
