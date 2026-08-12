@@ -56,8 +56,18 @@ const TOOL_SPECS: ToolSpec[] = [
     factory: (cwd, opts) => createReadTool(cwd, opts.read),
     params: [
       { name: "path", type: "str", description: "File to read (absolute or relative to cwd)." },
-      { name: "offset", type: "int", description: "Line number to start reading from (1-indexed).", optional: true },
-      { name: "limit", type: "int", description: "Maximum number of lines to read.", optional: true },
+      {
+        name: "offset",
+        type: "int",
+        description: "Line number to start reading from (1-indexed).",
+        optional: true,
+      },
+      {
+        name: "limit",
+        type: "int",
+        description: "Maximum number of lines to read.",
+        optional: true,
+      },
     ],
     mutating: false,
   },
@@ -65,13 +75,47 @@ const TOOL_SPECS: ToolSpec[] = [
     name: "grep",
     factory: (cwd, opts) => createGrepTool(cwd, opts.grep),
     params: [
-      { name: "pattern", type: "str", description: "Regular expression or literal pattern to search for." },
-      { name: "path", type: "str", description: "File or directory to search in. Default: current directory.", optional: true },
-      { name: "glob", type: "str", description: "Glob pattern to filter files (e.g. '*.ts').", optional: true },
-      { name: "ignoreCase", type: "bool", description: "Case-insensitive search. Default: false.", optional: true },
-      { name: "literal", type: "bool", description: "Treat pattern as a literal string. Default: false.", optional: true },
-      { name: "context", type: "int", description: "Number of context lines around each match.", optional: true },
-      { name: "limit", type: "int", description: "Maximum number of matches to return.", optional: true },
+      {
+        name: "pattern",
+        type: "str",
+        description: "Regular expression or literal pattern to search for.",
+      },
+      {
+        name: "path",
+        type: "str",
+        description: "File or directory to search in. Default: current directory.",
+        optional: true,
+      },
+      {
+        name: "glob",
+        type: "str",
+        description: "Glob pattern to filter files (e.g. '*.ts').",
+        optional: true,
+      },
+      {
+        name: "ignoreCase",
+        type: "bool",
+        description: "Case-insensitive search. Default: false.",
+        optional: true,
+      },
+      {
+        name: "literal",
+        type: "bool",
+        description: "Treat pattern as a literal string. Default: false.",
+        optional: true,
+      },
+      {
+        name: "context",
+        type: "int",
+        description: "Number of context lines around each match.",
+        optional: true,
+      },
+      {
+        name: "limit",
+        type: "int",
+        description: "Maximum number of matches to return.",
+        optional: true,
+      },
     ],
     mutating: false,
   },
@@ -80,7 +124,12 @@ const TOOL_SPECS: ToolSpec[] = [
     factory: (cwd, opts) => createFindTool(cwd, opts.find),
     params: [
       { name: "pattern", type: "str", description: "Glob pattern to match files (e.g. '*.ts')." },
-      { name: "path", type: "str", description: "Directory to search in. Default: current directory.", optional: true },
+      {
+        name: "path",
+        type: "str",
+        description: "Directory to search in. Default: current directory.",
+        optional: true,
+      },
       { name: "limit", type: "int", description: "Maximum number of results.", optional: true },
     ],
     mutating: false,
@@ -89,7 +138,12 @@ const TOOL_SPECS: ToolSpec[] = [
     name: "ls",
     factory: (cwd, opts) => createLsTool(cwd, opts.ls),
     params: [
-      { name: "path", type: "str", description: "Directory to list. Default: current directory.", optional: true },
+      {
+        name: "path",
+        type: "str",
+        description: "Directory to list. Default: current directory.",
+        optional: true,
+      },
       { name: "limit", type: "int", description: "Maximum number of entries.", optional: true },
     ],
     mutating: false,
@@ -108,7 +162,12 @@ const TOOL_SPECS: ToolSpec[] = [
     factory: (cwd, opts) => createEditTool(cwd, opts.edit),
     params: [
       { name: "path", type: "str", description: "File to edit (absolute or relative to cwd)." },
-      { name: "edits", type: "str", description: "JSON array of {oldText, newText} objects. Each oldText must match exactly one location." },
+      {
+        name: "edits",
+        type: "str",
+        description:
+          "JSON array of {oldText, newText} objects. Each oldText must match exactly one location.",
+      },
     ],
     mutating: true,
     prepareArgs: (args) => {
@@ -142,10 +201,7 @@ const TOOL_SPECS: ToolSpec[] = [
  * Each tool executes against `cwd` — the working directory for
  * relative paths and command execution.
  */
-export function createPiBridgeTools(
-  cwd: string,
-  options: BridgeOptions = {},
-): HostTool[] {
+export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): HostTool[] {
   const gateMutating = options.gateMutating ?? true;
 
   return TOOL_SPECS.map((spec) => {
@@ -166,12 +222,9 @@ export function createPiBridgeTools(
           undefined, // onUpdate
         );
         // Extract text blocks from AgentToolResult.content
-        const content: Array<{ type: string; text?: string }> =
-          result.content;
+        const content: Array<{ type: string; text?: string }> = result.content;
         return content
-          .filter(
-            (c): c is { type: "text"; text: string } => c.type === "text",
-          )
+          .filter((c): c is { type: "text"; text: string } => c.type === "text")
           .map((c) => c.text ?? "")
           .join("");
       },

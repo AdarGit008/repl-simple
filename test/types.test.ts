@@ -31,14 +31,8 @@ describe("HostToolError", () => {
   });
 
   it("preserves pythonType from constructor arg", () => {
-    assert.equal(
-      new HostToolError("PermissionError", "msg").pythonType,
-      "PermissionError",
-    );
-    assert.equal(
-      new HostToolError("RuntimeError", "msg").pythonType,
-      "RuntimeError",
-    );
+    assert.equal(new HostToolError("PermissionError", "msg").pythonType, "PermissionError");
+    assert.equal(new HostToolError("RuntimeError", "msg").pythonType, "RuntimeError");
   });
 
   it("preserves message from constructor arg", () => {

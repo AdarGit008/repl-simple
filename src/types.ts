@@ -41,9 +41,7 @@ export interface RunOptions {
   mount?: Record<string, string>;
   signal?: AbortSignal;
   onPrint?: (text: string) => void;
-  onApproval?: (
-    request: ApprovalRequest,
-  ) => ApprovalDecision | Promise<ApprovalDecision>;
+  onApproval?: (request: ApprovalRequest) => ApprovalDecision | Promise<ApprovalDecision>;
   maxStdoutBytes?: number;
   scriptName?: string;
   limits?: RunLimits;

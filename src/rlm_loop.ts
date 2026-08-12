@@ -5,14 +5,7 @@ import { fileURLToPath } from "node:url";
 import { ToolRegistry, probeImportableModules, renderPythonToolRules } from "./registry.js";
 import { createRLMTools } from "./rlm_tools.js";
 import { runInSandbox, type SandboxOptions } from "./sandbox.js";
-import type {
-  HostTool,
-  RunOk,
-  RunError,
-  RunResult,
-  RunOptions,
-  ToolCallTrace,
-} from "./types.js";
+import type { HostTool, RunOk, RunError, RunResult, RunOptions, ToolCallTrace } from "./types.js";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -90,10 +83,7 @@ export class RLMLoop {
       }
     }
     // Validate limits
-    if (
-      options.maxIterations !== undefined &&
-      options.maxIterations < 1
-    ) {
+    if (options.maxIterations !== undefined && options.maxIterations < 1) {
       throw new Error("RLMLoop: maxIterations must be >= 1");
     }
     if (options.maxDepth !== undefined && options.maxDepth < 0) {
@@ -119,9 +109,7 @@ export class RLMLoop {
     };
 
     // 3. Build initial conversation
-    const messages: RlmMessage[] = [
-      { role: "system", content: systemPrompt },
-    ];
+    const messages: RlmMessage[] = [{ role: "system", content: systemPrompt }];
 
     // Build the initial user message
     let userContent = task;
@@ -350,8 +338,6 @@ function formatErrorResult(result: RunError): string {
   if (result.stdout) {
     parts.push(`[stdout]\n${result.stdout}`);
   }
-  parts.push(
-    "\n[NOTE: Fix the error above and call SUBMIT(answer) when done.]",
-  );
+  parts.push("\n[NOTE: Fix the error above and call SUBMIT(answer) when done.]");
   return parts.join("\n");
 }

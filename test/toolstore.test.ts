@@ -1,13 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  statSync,
+  readFileSync,
+  existsSync,
+  writeFileSync,
+  mkdirSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import {
-  createToolStoreTools,
-  loadSavedTools,
-  type ToolStoreOptions,
-} from "../src/toolstore.js";
+import { createToolStoreTools, loadSavedTools, type ToolStoreOptions } from "../src/toolstore.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
 
@@ -120,10 +124,7 @@ describe("save_tool", () => {
       assert.ok(result.includes("saved"), result);
 
       // Verify the file exists and has content
-      const content = readFileSync(
-        join(root, ".pi", "code-tools", "my_func.py"),
-        "utf-8",
-      );
+      const content = readFileSync(join(root, ".pi", "code-tools", "my_func.py"), "utf-8");
       assert.ok(content.includes("def my_func(): return 42"));
       assert.ok(content.includes("Returns the answer"));
     } finally {
@@ -148,10 +149,7 @@ describe("save_tool", () => {
         description: "Second version",
       });
 
-      const content = readFileSync(
-        join(root, ".pi", "code-tools", "dup.py"),
-        "utf-8",
-      );
+      const content = readFileSync(join(root, ".pi", "code-tools", "dup.py"), "utf-8");
       assert.ok(content.includes("return 2"));
       assert.ok(!content.includes("return 1"));
     } finally {
@@ -165,27 +163,21 @@ describe("save_tool", () => {
       const { tools } = makeTools(root);
       const save = findTool(tools, "save_tool");
 
-      await assert.rejects(
-        async () => {
-          await save.execute({
-            name: "123bad",
-            code: "pass",
-            description: "desc",
-          });
-        },
-        HostToolError,
-      );
+      await assert.rejects(async () => {
+        await save.execute({
+          name: "123bad",
+          code: "pass",
+          description: "desc",
+        });
+      }, HostToolError);
 
-      await assert.rejects(
-        async () => {
-          await save.execute({
-            name: "has-dash",
-            code: "pass",
-            description: "desc",
-          });
-        },
-        HostToolError,
-      );
+      await assert.rejects(async () => {
+        await save.execute({
+          name: "has-dash",
+          code: "pass",
+          description: "desc",
+        });
+      }, HostToolError);
     } finally {
       cleanup();
     }
@@ -197,16 +189,13 @@ describe("save_tool", () => {
       const { tools } = makeTools(root);
       const save = findTool(tools, "save_tool");
 
-      await assert.rejects(
-        async () => {
-          await save.execute({
-            name: "",
-            code: "pass",
-            description: "desc",
-          });
-        },
-        HostToolError,
-      );
+      await assert.rejects(async () => {
+        await save.execute({
+          name: "",
+          code: "pass",
+          description: "desc",
+        });
+      }, HostToolError);
     } finally {
       cleanup();
     }
@@ -218,16 +207,13 @@ describe("save_tool", () => {
       const { tools } = makeTools(root);
       const save = findTool(tools, "save_tool");
 
-      await assert.rejects(
-        async () => {
-          await save.execute({
-            name: "../escape",
-            code: "pass",
-            description: "desc",
-          });
-        },
-        HostToolError,
-      );
+      await assert.rejects(async () => {
+        await save.execute({
+          name: "../escape",
+          code: "pass",
+          description: "desc",
+        });
+      }, HostToolError);
     } finally {
       cleanup();
     }
@@ -254,9 +240,7 @@ describe("delete_tool", () => {
       assert.ok(result.includes("deleted"), result);
 
       // Verify file is gone
-      assert.ok(
-        !existsSync(join(root, ".pi", "code-tools", "to_delete.py")),
-      );
+      assert.ok(!existsSync(join(root, ".pi", "code-tools", "to_delete.py")));
     } finally {
       cleanup();
     }
@@ -268,10 +252,9 @@ describe("delete_tool", () => {
       const { tools } = makeTools(root);
       const del = findTool(tools, "delete_tool");
 
-      await assert.rejects(
-        async () => { await del.execute({ name: "nonexistent" }); },
-        /does not exist/,
-      );
+      await assert.rejects(async () => {
+        await del.execute({ name: "nonexistent" });
+      }, /does not exist/);
     } finally {
       cleanup();
     }
@@ -283,10 +266,9 @@ describe("delete_tool", () => {
       const { tools } = makeTools(root);
       const del = findTool(tools, "delete_tool");
 
-      await assert.rejects(
-        async () => { await del.execute({ name: "../escape" }); },
-        HostToolError,
-      );
+      await assert.rejects(async () => {
+        await del.execute({ name: "../escape" });
+      }, HostToolError);
     } finally {
       cleanup();
     }
@@ -351,10 +333,7 @@ describe("list_saved_tools", () => {
 
       // Create a non-.py file manually
       mkdirSync(join(root, ".pi", "code-tools"), { recursive: true });
-      writeFileSync(
-        join(root, ".pi", "code-tools", "readme.md"),
-        "not a tool",
-      );
+      writeFileSync(join(root, ".pi", "code-tools", "readme.md"), "not a tool");
 
       const result = await list.execute({});
       assert.equal(result, "real_tool"); // Only the .py file
@@ -394,10 +373,9 @@ describe("read_tool", () => {
       const { tools } = makeTools(root);
       const read = findTool(tools, "read_tool");
 
-      await assert.rejects(
-        async () => { await read.execute({ name: "no_such_tool" }); },
-        /does not exist/,
-      );
+      await assert.rejects(async () => {
+        await read.execute({ name: "no_such_tool" });
+      }, /does not exist/);
     } finally {
       cleanup();
     }

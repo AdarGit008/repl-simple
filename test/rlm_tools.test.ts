@@ -157,10 +157,9 @@ describe("llm_query execution", () => {
       onRLMQuery: async () => "",
     };
     const tool = findTool(createRLMTools(opts), "llm_query");
-    await assert.rejects(
-      async () => { await tool.execute({ prompt: "test" }); },
-      /LLM unavailable/,
-    );
+    await assert.rejects(async () => {
+      await tool.execute({ prompt: "test" });
+    }, /LLM unavailable/);
   });
 });
 
@@ -220,10 +219,9 @@ describe("rlm_query execution", () => {
       },
     };
     const tool = findTool(createRLMTools(opts), "rlm_query");
-    await assert.rejects(
-      async () => { await tool.execute({ query: "test" }); },
-      /nested loop failed/,
-    );
+    await assert.rejects(async () => {
+      await tool.execute({ query: "test" });
+    }, /nested loop failed/);
   });
 });
 

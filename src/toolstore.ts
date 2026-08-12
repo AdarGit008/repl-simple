@@ -122,10 +122,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         await rm(path, { force: false });
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new HostToolError(
-            "FileNotFoundError",
-            `tool '${name}' does not exist`,
-          );
+          throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
         }
         throw new HostToolError("OSError", (err as Error).message);
       }
@@ -182,10 +179,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         return await readFile(path, "utf-8");
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new HostToolError(
-            "FileNotFoundError",
-            `tool '${name}' does not exist`,
-          );
+          throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
         }
         throw new HostToolError("OSError", (err as Error).message);
       }
@@ -217,9 +211,7 @@ export async function loadSavedTools(options: ToolStoreOptions): Promise<string>
     return ""; // Directory doesn't exist — no tools to load
   }
 
-  const pyFiles = entries
-    .filter((e) => extname(e) === ".py")
-    .sort();
+  const pyFiles = entries.filter((e) => extname(e) === ".py").sort();
 
   if (pyFiles.length === 0) return "";
 

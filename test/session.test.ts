@@ -4,12 +4,7 @@ import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
-import type {
-  HostTool,
-  RunOk,
-  RunError,
-  RunSuspended,
-} from "../src/types.js";
+import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -312,12 +307,9 @@ result
     assert.equal(session.abandon(), true);
 
     // After abandon, resume should throw (no suspended state)
-    await assert.rejects(
-      async () => {
-        await session.resume();
-      },
-      /no suspended execution/i,
-    );
+    await assert.rejects(async () => {
+      await session.resume();
+    }, /no suspended execution/i);
   });
 
   it("abandon() returns false when nothing suspended", async () => {
@@ -366,10 +358,7 @@ result
     const session = new Session({ registry });
 
     // Suspend on gated("first"); gated2("second") is the last expression
-    await session.run(
-      'gated("first")\ngated2("second")',
-      { onApproval: () => "suspend" },
-    );
+    await session.run('gated("first")\ngated2("second")', { onApproval: () => "suspend" });
 
     // Resume — onApproval receives suspended call ("gated") first,
     // then "gated2" when execution continues.
@@ -418,10 +407,9 @@ describe("Session — reset", () => {
     await session.run("gated()", { onApproval: () => "suspend" });
     session.reset();
 
-    await assert.rejects(
-      async () => { await session.resume(); },
-      /no suspended/i,
-    );
+    await assert.rejects(async () => {
+      await session.resume();
+    }, /no suspended/i);
   });
 });
 
@@ -519,10 +507,7 @@ describe("Session — dump / load", () => {
 
   it("load with missing version → throws", () => {
     const registry = new ToolRegistry();
-    assert.throws(
-      () => Session.load(JSON.stringify({ snippets: [] }), { registry }),
-      /version/i,
-    );
+    assert.throws(() => Session.load(JSON.stringify({ snippets: [] }), { registry }), /version/i);
   });
 });
 
@@ -622,8 +607,8 @@ describe("Session — SUBMIT", () => {
     const registry = makeRegistry();
     const session = new Session({ registry });
 
-    await session.run('x = 42');
-    const result = await session.run('SUBMIT(str(x))');
+    await session.run("x = 42");
+    const result = await session.run("SUBMIT(str(x))");
     ok(result);
     assert.equal(result.output, "42");
   });
@@ -631,12 +616,13 @@ describe("Session — SUBMIT", () => {
   it("Session replay with SUBMIT: prior SUBMIT re-executes (not cached)", async () => {
     let llmCalls = 0;
     const opts = {
-      onLLMQuery: async (p: string) => { llmCalls++; return `llm:${p}`; },
+      onLLMQuery: async (p: string) => {
+        llmCalls++;
+        return `llm:${p}`;
+      },
       onRLMQuery: async (q: string) => `rlm:${q}`,
     };
-    const registry = new ToolRegistry([
-      ...createRLMTools(opts),
-    ]);
+    const registry = new ToolRegistry([...createRLMTools(opts)]);
     const session = new Session({ registry });
 
     // Run 1: llm_query then SUBMIT
@@ -688,11 +674,11 @@ describe("Session — SUBMIT", () => {
     const session = new Session({ registry });
 
     // Run a snippet that doesn't SUBMIT
-    await session.run('x = 99');
+    await session.run("x = 99");
     const dump = session.dump();
 
     const restored = Session.load(dump, { registry });
-    const result = await restored.run('SUBMIT(str(x))');
+    const result = await restored.run("SUBMIT(str(x))");
     ok(result);
     assert.equal(result.output, "99");
   });
@@ -701,9 +687,7 @@ describe("Session — SUBMIT", () => {
     const registry = makeRegistry();
     const session = new Session({ registry });
 
-    const result = await session.run(
-      'answer = llm_query("what is 2+2?")\nSUBMIT(answer)',
-    );
+    const result = await session.run('answer = llm_query("what is 2+2?")\nSUBMIT(answer)');
     ok(result);
     assert.equal(result.output, "llm:what is 2+2?");
   });

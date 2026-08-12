@@ -15,9 +15,7 @@ export class ToolRegistry {
 
   add(tool: HostTool): void {
     if (!/^[a-z_][a-z0-9_]*$/i.test(tool.name)) {
-      throw new Error(
-        `Tool name '${tool.name}' is not a valid Python identifier`,
-      );
+      throw new Error(`Tool name '${tool.name}' is not a valid Python identifier`);
     }
     if (this.tools.has(tool.name)) {
       throw new Error(`Tool '${tool.name}' is already registered`);
@@ -83,10 +81,7 @@ export function arg(
   name: string,
 ): unknown {
   if (index < args.length && name in kwargs) {
-    throw new HostToolError(
-      "TypeError",
-      `got multiple values for argument '${name}'`,
-    );
+    throw new HostToolError("TypeError", `got multiple values for argument '${name}'`);
   }
   return index < args.length ? args[index] : kwargs[name];
 }
@@ -94,10 +89,7 @@ export function arg(
 /** Validate a value is a string, throwing HostToolError otherwise. */
 export function requireString(value: unknown, name: string): string {
   if (typeof value !== "string") {
-    throw new HostToolError(
-      "TypeError",
-      `argument '${name}' must be a str`,
-    );
+    throw new HostToolError("TypeError", `argument '${name}' must be a str`);
   }
   return value;
 }
@@ -138,9 +130,7 @@ export const CANDIDATE_MODULES = [
  * Empirically determines which modules the installed monty can import
  * by trying each in a throwaway interpreter.
  */
-export function probeImportableModules(
-  candidates: string[] = CANDIDATE_MODULES,
-): string[] {
+export function probeImportableModules(candidates: string[] = CANDIDATE_MODULES): string[] {
   return candidates.filter((name) => {
     try {
       new Monty(`import ${name}`).run();
@@ -172,9 +162,7 @@ const TY_GAP_CANDIDATES = [
  * rejects as unresolved. These need `name: Any = None` declarations
  * in any typecheck prefix.
  */
-export function probeTypeCheckerGaps(
-  candidates: string[] = TY_GAP_CANDIDATES,
-): string[] {
+export function probeTypeCheckerGaps(candidates: string[] = TY_GAP_CANDIDATES): string[] {
   return candidates.filter((name) => {
     try {
       new Monty(name, { typeCheck: true });
@@ -197,9 +185,7 @@ const BLOCKED_EXAMPLES = ["time", "random", "collections", "requests", "numpy"];
  * interpreter.
  */
 export function renderPythonToolRules(importableModules: string[]): string {
-  const blocked = BLOCKED_EXAMPLES.filter(
-    (m) => !importableModules.includes(m),
-  );
+  const blocked = BLOCKED_EXAMPLES.filter((m) => !importableModules.includes(m));
   return `\
 - Call tools as plain functions, WITHOUT \`await\`.
 - Use print() to surface anything you need to see; printed output is returned to you.

@@ -1,9 +1,4 @@
-import type {
-  RlmIteration,
-  RlmOptions,
-  RlmResult,
-  RunResult,
-} from "./types.js";
+import type { RlmIteration, RlmOptions, RlmResult, RunResult } from "./types.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
 
@@ -53,10 +48,7 @@ export function extractPythonCode(text: string): string {
  * If the signal fires first, throws DOMException("AbortError").
  * Does NOT abort the underlying operation — just rejects this call.
  */
-async function raceAgainstSignal<T>(
-  promise: Promise<T>,
-  signal?: AbortSignal,
-): Promise<T> {
+async function raceAgainstSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) {
     throw new DOMException("The operation was aborted", "AbortError");
@@ -84,16 +76,10 @@ function buildInitialPrompt(question: string, context?: string): string {
   const parts = [`# Question\n${question}`];
   if (context) {
     const preview =
-      context.length > 5000
-        ? context.slice(0, 2500) + "\n...\n" + context.slice(-2500)
-        : context;
-    parts.push(
-      `\n# Context (available as \`context\` variable)\n\`\`\`\n${preview}\n\`\`\``,
-    );
+      context.length > 5000 ? context.slice(0, 2500) + "\n...\n" + context.slice(-2500) : context;
+    parts.push(`\n# Context (available as \`context\` variable)\n\`\`\`\n${preview}\n\`\`\``);
   }
-  parts.push(
-    `\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`,
-  );
+  parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
   return parts.join("\n");
 }
 
@@ -131,9 +117,11 @@ function buildFeedback(result: RunResult): string {
   }
 
   if (result.status === "suspended") {
-    return "Error: execution suspended (tool requires approval). " +
+    return (
+      "Error: execution suspended (tool requires approval). " +
       "Do not use tools that require approval. " +
-      "Use print() and basic Python operations instead.";
+      "Use print() and basic Python operations instead."
+    );
   }
 
   // result.status === "ok"
@@ -159,15 +147,10 @@ function buildFeedback(result: RunResult): string {
  * as `{ status: "ok", output: answer }` with a SUBMIT call in the
  * trace. The loop detects this and terminates.
  */
-export async function runRlm(
-  question: string,
-  options: RlmOptions,
-): Promise<RlmResult> {
+export async function runRlm(question: string, options: RlmOptions): Promise<RlmResult> {
   // Validate required options
   if (!options.llmClient || typeof options.llmClient.query !== "function") {
-    throw new Error(
-      "options.llmClient is required and must implement LlmClient.query()",
-    );
+    throw new Error("options.llmClient is required and must implement LlmClient.query()");
   }
 
   const llmClient = options.llmClient;
@@ -180,9 +163,7 @@ export async function runRlm(
   const sandboxOpts: SandboxOptions = { registry };
 
   // Build sandbox RunOptions (combine RLM-level runOptions with inputs/scriptName)
-  const sandboxRunOpts = options.runOptions
-    ? { ...options.runOptions }
-    : {};
+  const sandboxRunOpts = options.runOptions ? { ...options.runOptions } : {};
   if (options.inputs) {
     sandboxRunOpts.inputs = {
       ...(sandboxRunOpts.inputs ?? {}),
@@ -218,9 +199,7 @@ export async function runRlm(
     const code = extractPythonCode(llmResponse);
 
     // 3. Build full script: preamble (if any) + code
-    const fullCode = options.preamble
-      ? options.preamble + "\n" + code
-      : code;
+    const fullCode = options.preamble ? options.preamble + "\n" + code : code;
 
     // 4. Run in sandbox
     const result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);

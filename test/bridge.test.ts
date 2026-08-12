@@ -43,26 +43,14 @@ describe("createPiBridgeTools — tool creation", () => {
   it("all tools have correct names", () => {
     const tools = createPiBridgeTools(tmpDir);
     const names = tools.map((t) => t.name).sort();
-    assert.deepEqual(names, [
-      "bash",
-      "edit",
-      "find",
-      "grep",
-      "ls",
-      "read",
-      "write",
-    ]);
+    assert.deepEqual(names, ["bash", "edit", "find", "grep", "ls", "read", "write"]);
   });
 
   it("read-only tools have requiresApproval: false", () => {
     const tools = createPiBridgeTools(tmpDir);
     for (const name of ["read", "grep", "find", "ls"]) {
       const tool = findTool(tools, name);
-      assert.equal(
-        tool.requiresApproval,
-        false,
-        `${name} should not require approval`,
-      );
+      assert.equal(tool.requiresApproval, false, `${name} should not require approval`);
     }
   });
 
@@ -70,11 +58,7 @@ describe("createPiBridgeTools — tool creation", () => {
     const tools = createPiBridgeTools(tmpDir);
     for (const name of ["bash", "edit", "write"]) {
       const tool = findTool(tools, name);
-      assert.equal(
-        tool.requiresApproval,
-        true,
-        `${name} should require approval by default`,
-      );
+      assert.equal(tool.requiresApproval, true, `${name} should require approval by default`);
     }
   });
 
@@ -82,11 +66,7 @@ describe("createPiBridgeTools — tool creation", () => {
     const opts: BridgeOptions = { gateMutating: false };
     const tools = createPiBridgeTools(tmpDir, opts);
     for (const tool of tools) {
-      assert.equal(
-        tool.requiresApproval,
-        false,
-        `${tool.name} should not require approval`,
-      );
+      assert.equal(tool.requiresApproval, false, `${tool.name} should not require approval`);
     }
   });
 
@@ -213,10 +193,9 @@ describe("createPiBridgeTools — bash execution", () => {
     const tools = createPiBridgeTools(tmpDir);
     const bash = findTool(tools, "bash");
     // Pi bash tool throws Error with shell output as message
-    await assert.rejects(
-      async () => { await bash.execute({ command: "nonexistent-command-xyz" }); },
-      /command not found/,
-    );
+    await assert.rejects(async () => {
+      await bash.execute({ command: "nonexistent-command-xyz" });
+    }, /command not found/);
   });
 });
 
@@ -255,9 +234,7 @@ describe("createPiBridgeTools — edit execution", () => {
     const edit = findTool(tools, "edit");
     const result = await edit.execute({
       path: "toedit.txt",
-      edits: JSON.stringify([
-        { oldText: "line two", newText: "line TWO modified" },
-      ]),
+      edits: JSON.stringify([{ oldText: "line two", newText: "line TWO modified" }]),
     });
     assert.ok(typeof result === "string");
     assert.ok(result.length > 0);
@@ -272,15 +249,11 @@ describe("createPiBridgeTools — edit execution", () => {
   it("edit with non-matching oldText → throws", async () => {
     const tools = createPiBridgeTools(tmpDir);
     const edit = findTool(tools, "edit");
-    await assert.rejects(
-      async () => {
-        await edit.execute({
-          path: "test.txt",
-          edits: JSON.stringify([
-            { oldText: "nonexistent text xyz", newText: "replace" },
-          ]),
-        });
-      },
-    );
+    await assert.rejects(async () => {
+      await edit.execute({
+        path: "test.txt",
+        edits: JSON.stringify([{ oldText: "nonexistent text xyz", newText: "replace" }]),
+      });
+    });
   });
 });

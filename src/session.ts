@@ -80,9 +80,7 @@ function createCachingRegistry(
   const tools = parent.list().map((tool): HostTool => {
     const originalExecute = tool.execute;
 
-    const wrappedExecute = async (
-      args: Record<string, unknown>,
-    ): Promise<string> => {
+    const wrappedExecute = async (args: Record<string, unknown>): Promise<string> => {
       const key = cacheKey(tool.name, args);
 
       // 1. Serve from replay cache if there are remaining entries
@@ -285,7 +283,9 @@ export class Session {
             if (this.callCacheEntries.some((e) => e.key === key)) {
               return true;
             }
-          } catch { /* fall through */ }
+          } catch {
+            /* fall through */
+          }
         }
         return userOnApproval ? userOnApproval(req) : false;
       },
@@ -399,9 +399,7 @@ export class Session {
       throw new Error("Missing or invalid session version");
     }
     if (obj.version !== CURRENT_VERSION) {
-      throw new Error(
-        `Unsupported session version: ${obj.version} (expected ${CURRENT_VERSION})`,
-      );
+      throw new Error(`Unsupported session version: ${obj.version} (expected ${CURRENT_VERSION})`);
     }
 
     const session = new Session(sandboxOptions, preamble);
@@ -435,10 +433,7 @@ export class Session {
    * `resolveToolArgs`, building the cache key, and checking whether
    * it matches one of the prior cache entries.
    */
-  private filterCachedCalls(
-    result: RunOk,
-    priorEntryCount: number,
-  ): RunOk {
+  private filterCachedCalls(result: RunOk, priorEntryCount: number): RunOk {
     if (priorEntryCount === 0) return result;
 
     const registry = this.sandboxOptions.registry;
@@ -446,9 +441,7 @@ export class Session {
     const filtered: ToolCallTrace[] = [];
 
     // Build a lookup of the prior cache keys (in order) for matching
-    const priorKeys = this.callCacheEntries
-      .slice(0, priorEntryCount)
-      .map((e) => e.key);
+    const priorKeys = this.callCacheEntries.slice(0, priorEntryCount).map((e) => e.key);
     let keyIdx = 0;
 
     for (const call of result.calls) {

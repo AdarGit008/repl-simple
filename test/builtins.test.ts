@@ -4,10 +4,7 @@ import { mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostToolError, type HostTool } from "../src/types.js";
-import {
-  createBuiltinTools,
-  type BuiltinToolsOptions,
-} from "../src/builtins.js";
+import { createBuiltinTools, type BuiltinToolsOptions } from "../src/builtins.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -294,8 +291,7 @@ describe("http_get — unit", () => {
   });
 
   it("accepts http:// URLs", async () => {
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response("ok", { status: 200 });
+    const mockFetch: typeof fetch = async (_url) => new Response("ok", { status: 200 });
     const tools = makeTools({ fetchImpl: mockFetch });
     const httpGet = findTool(tools, "http_get");
     const result = await httpGet.execute({ url: "http://example.com" });
@@ -303,8 +299,7 @@ describe("http_get — unit", () => {
   });
 
   it("throws OSError for non-2xx response", async () => {
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response("Not Found", { status: 404 });
+    const mockFetch: typeof fetch = async (_url) => new Response("Not Found", { status: 404 });
     const tools = makeTools({ fetchImpl: mockFetch });
     const httpGet = findTool(tools, "http_get");
     try {
@@ -382,8 +377,7 @@ describe("Truncation", () => {
 
   it("http_get truncates beyond maxHttpBytes with truncation marker", async () => {
     const longBody = "A".repeat(50);
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response(longBody, { status: 200 });
+    const mockFetch: typeof fetch = async (_url) => new Response(longBody, { status: 200 });
     const tools = createBuiltinTools({
       root: "/tmp",
       maxHttpBytes: 20,
@@ -395,8 +389,7 @@ describe("Truncation", () => {
   });
 
   it("http_get does not truncate when response is smaller than maxHttpBytes", async () => {
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response("short", { status: 200 });
+    const mockFetch: typeof fetch = async (_url) => new Response("short", { status: 200 });
     const tools = createBuiltinTools({
       root: "/tmp",
       maxHttpBytes: 100,
@@ -440,8 +433,7 @@ describe("Truncation", () => {
 
   it("http_get default maxHttpBytes is 256 KiB", async () => {
     const content = "B".repeat(256 * 1024 - 1);
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response(content, { status: 200 });
+    const mockFetch: typeof fetch = async (_url) => new Response(content, { status: 200 });
     const tools = createBuiltinTools({ root: "/tmp", fetchImpl: mockFetch });
     const httpGet = findTool(tools, "http_get");
     const result = await httpGet.execute({ url: "https://example.com" });
@@ -450,8 +442,7 @@ describe("Truncation", () => {
 
   it("http_get truncates beyond default maxHttpBytes (256 KiB)", async () => {
     const content = "B".repeat(256 * 1024 + 1);
-    const mockFetch: typeof fetch = async (_url) =>
-      new Response(content, { status: 200 });
+    const mockFetch: typeof fetch = async (_url) => new Response(content, { status: 200 });
     const tools = createBuiltinTools({ root: "/tmp", fetchImpl: mockFetch });
     const httpGet = findTool(tools, "http_get");
     const result = await httpGet.execute({ url: "https://example.com" });

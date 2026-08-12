@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { RLMLoop, getReplPreamble, type RLMLoopOptions, type RLMLoopResult, type RlmMessage } from "../src/rlm_loop.js";
+import {
+  RLMLoop,
+  getReplPreamble,
+  type RLMLoopOptions,
+  type RLMLoopResult,
+  type RlmMessage,
+} from "../src/rlm_loop.js";
 import { ToolRegistry } from "../src/registry.js";
 import type { HostTool } from "../src/types.js";
 
@@ -73,7 +79,9 @@ function okResult(r: RLMLoopResult): asserts r is RLMLoopResult & { status: "ok"
   assert.ok(typeof r.answer === "string");
 }
 
-function errResult(r: RLMLoopResult): asserts r is RLMLoopResult & { status: "error" | "max_iterations" } {
+function errResult(
+  r: RLMLoopResult,
+): asserts r is RLMLoopResult & { status: "error" | "max_iterations" } {
   assert.ok(r.status !== "ok");
 }
 
@@ -243,9 +251,7 @@ describe("RLMLoop — llm_query", () => {
     const loop = new RLMLoop({
       registry: new ToolRegistry(),
       llmQuery: llm.fn,
-      generateCode: fixedCode(
-        'answer = llm_query("what is 2+2?")\nSUBMIT(answer)',
-      ),
+      generateCode: fixedCode('answer = llm_query("what is 2+2?")\nSUBMIT(answer)'),
     });
     const result = await loop.run("task");
     okResult(result);
@@ -259,9 +265,7 @@ describe("RLMLoop — llm_query", () => {
     const loop = new RLMLoop({
       registry: new ToolRegistry(),
       llmQuery: llm.fn,
-      generateCode: fixedCode(
-        'response = llm_query("greet")\nSUBMIT(response.upper())',
-      ),
+      generateCode: fixedCode('response = llm_query("greet")\nSUBMIT(response.upper())'),
     });
     const result = await loop.run("task");
     okResult(result);
@@ -308,9 +312,7 @@ describe("RLMLoop — rlm_query", () => {
       llmQuery: llm.fn,
       depth: 1,
       maxDepth: 1, // Already at limit
-      generateCode: fixedCode(
-        'result = rlm_query("q", "c")\nSUBMIT(result)',
-      ),
+      generateCode: fixedCode('result = rlm_query("q", "c")\nSUBMIT(result)'),
     });
     const result = await loop.run("task");
     okResult(result);
@@ -364,11 +366,7 @@ describe("RLMLoop — multi-iteration", () => {
     const loop = new RLMLoop({
       registry: new ToolRegistry(),
       llmQuery: async () => "",
-      generateCode: codeSequence(
-        'print("iter1")\n42',
-        'print("iter2")\n43',
-        'SUBMIT("done")',
-      ),
+      generateCode: codeSequence('print("iter1")\n42', 'print("iter2")\n43', 'SUBMIT("done")'),
     });
     const result = await loop.run("task");
     okResult(result);
@@ -377,9 +375,7 @@ describe("RLMLoop — multi-iteration", () => {
   });
 
   it("messages array contains conversation history", async () => {
-    const { fn: gen, messages } = recordingCode(
-      'SUBMIT("direct")',
-    );
+    const { fn: gen, messages } = recordingCode('SUBMIT("direct")');
     const loop = new RLMLoop({
       registry: new ToolRegistry(),
       llmQuery: async () => "",
@@ -443,9 +439,7 @@ describe("RLMLoop — error recovery", () => {
 
     // The second call to gen should include error details in conversation
     const secondCall = messages()[1];
-    const userFeedback = secondCall.find(
-      (m) => m.role === "user" && m.content.includes("error"),
-    );
+    const userFeedback = secondCall.find((m) => m.role === "user" && m.content.includes("error"));
     assert.ok(userFeedback, "error feedback should be in conversation");
   });
 });
@@ -594,7 +588,7 @@ describe("RLMLoop — tool availability", () => {
       generateCode: codeSequence(
         "counter()", // → 1 (but no SUBMIT → continues)
         "counter()", // → 2 (but no SUBMIT → continues)
-        'SUBMIT(str(counter()))', // → 3
+        "SUBMIT(str(counter()))", // → 3
       ),
     });
     const result = await loop.run("task");
@@ -651,7 +645,7 @@ describe("RLMLoop — unexpected suspension", () => {
     const loop = new RLMLoop({
       registry: new ToolRegistry([gatedTool]),
       llmQuery: async () => "",
-      generateCode: fixedCode('result = gated()\nSUBMIT(result)'),
+      generateCode: fixedCode("result = gated()\nSUBMIT(result)"),
       runOpts: {
         onApproval: () => true,
       },
@@ -817,7 +811,7 @@ describe("RLMLoop — preamble", () => {
         // Root: rlm_query → SUBMIT combined
         'nested = rlm_query("sub")\nSUBMIT("root:" + nested)',
         // Nested: uses preamble variable → SUBMIT
-        'SUBMIT(str(NESTED_HELPER))',
+        "SUBMIT(str(NESTED_HELPER))",
       ),
     });
     const result = await loop.run("task");
@@ -840,9 +834,7 @@ describe("RLMLoop — preamble", () => {
     const loop = new RLMLoop({
       ...baseOpts,
       preamble,
-      generateCode: fixedCode(
-        "preview = context_preview(10)\nSUBMIT(preview)",
-      ),
+      generateCode: fixedCode("preview = context_preview(10)\nSUBMIT(preview)"),
     });
     const result = await loop.run("task", "abcdefghijklmnopqrstuvwxyz");
     okResult(result);
