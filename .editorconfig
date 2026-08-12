@@ -1,0 +1,18 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# repl/repl_server.py is Python source injected into the sandbox as a preamble.
+[*.py]
+indent_size = 4
+
+[*.md]
+# Two trailing spaces are a hard line break in Markdown; stripping them
+# silently reflows the rendered text.
+trim_trailing_whitespace = false

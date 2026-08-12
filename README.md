@@ -84,6 +84,8 @@ Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl do
 npm test        # tsx --test test/*.test.ts
 npm run check   # tsc --noEmit            (tsconfig.json)
 npm run build   # tsc -p tsconfig.build.json
+npm run lint    # biome check --error-on-warnings
+npm run format  # biome format --write
 ```
 
 Two TypeScript configs, deliberately:
@@ -97,6 +99,43 @@ Two TypeScript configs, deliberately:
 `typebox` is a devDependency pinned to the exact version pi pins (`1.3.7`). It is a compile-time
 need only — pi supplies it at runtime via a loader alias — and a range rather than a pin could drift
 the types the compiler checks away from the ones that actually run.
+
+### Formatting and lint
+
+[Biome](https://biomejs.dev) is the single formatter and linter — `npm run lint` runs `biome check`,
+covering the formatter, the linter and import sorting in one pass. `.editorconfig` carries the
+settings an editor can apply without Biome installed; `biome.json` reads it (`useEditorconfig`) and
+adds a 100-column line width.
+
+`--error-on-warnings` is what makes it a gate. Biome exits 0 on warning-severity diagnostics by
+default, so a rule like `noExplicitAny` would print and still pass. CI runs lint as its own job,
+once — formatting does not vary by platform or Node version, so it does not belong on the matrix.
+
+`@biomejs/biome` is pinned exactly, for the same reason `typebox` is: a linter on a caret range can
+turn a green `main` red on a new minor that adds a rule, with no change to this repo.
+
+**Import sorting is off.** Biome 2's `organizeImports` assist sorts every import and re-export in a
+file as one alphabetical block, ignoring the blank lines between them. `src/index.ts` is a barrel
+organised into commented sections (`// ── Registry ──`, `// ── Sandbox ──`, …); sorting it globally
+detached every section comment from the exports it labels. Deterministic import order is not worth
+losing authored structure in a change whose whole premise is that it alters no behaviour.
+
+Two lint rules are configured away from their defaults, both deliberately:
+
+- **`useTemplate: "error"`** — promoted from Biome's default `info`, which never fails a build. A rule
+  that cannot go red is decoration.
+- **`noNonNullAssertion: "off"`** — `strictNullChecks` already covers the safety case; the rule is a
+  style preference about how an already-established invariant is spelled. Its three `src/` sites sit
+  in code that [#84](https://github.com/AdarGit008/repl-simple/issues/84),
+  [#50](https://github.com/AdarGit008/repl-simple/issues/50) and
+  [#78](https://github.com/AdarGit008/repl-simple/issues/78) are actively rewriting; worth revisiting
+  once they land.
+
+The bulk-format commit is listed in `.git-blame-ignore-revs`. To skip it in blame locally:
+
+```bash
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
 
 ### Optional: `fd` and `ripgrep`
 
