@@ -12,6 +12,9 @@
     "build": "tsc",
     "check": "tsc --noEmit"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "pi": {
     "extensions": [
       "./extensions/"
