@@ -70,6 +70,10 @@ import {
 
 The `pi.extensions` field in `package.json` auto-loads `extensions/repl-extension.ts` to register `repl` tools.
 
+Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
+`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. See
+[docs/platform-support.md](docs/platform-support.md).
+
 ## Dev
 
 ```bash
@@ -77,3 +81,6 @@ npm test        # tsx --test test/*.test.ts
 npm run check   # tsc --noEmit
 npm run build   # tsc
 ```
+
+CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
+ubuntu-latest and macos-latest, for every push and pull request.

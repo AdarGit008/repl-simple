@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# One in-flight run per branch; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check + test (node ${{ matrix.node }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # Report every leg: @pydantic/monty ships per-platform native binaries,
+      # so one failing leg says nothing about the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # The bridged find/grep tools shell out to fd and rg, and pi-coding-agent
+      # downloads them from GitHub releases on first use if they are not on
+      # PATH. That download is a network dependency in the middle of the test
+      # suite, and on macOS runners it fails outright — so install them up
+      # front and let the tests exercise the code instead of a release API.
+      - name: Install fd and ripgrep (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y fd-find ripgrep
+
+      - name: Install fd and ripgrep (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fd ripgrep
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - run: npm test
