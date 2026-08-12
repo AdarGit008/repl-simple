@@ -76,3 +76,20 @@ export {
 
 // ── Repl ────────────────────────────────────────────────────────
 export { ReplRunner } from "./repl.js";
+
+// ── Truncation ──────────────────────────────────────────────────
+// The single implementation behind every model-facing byte cap.
+// Policy: docs/truncation-policy.md.
+export {
+  Truncator,
+  truncateText,
+  formatSize,
+  decodeWhole,
+  STDOUT_MAX_BYTES,
+  OUTPUT_MAX_BYTES,
+  STDOUT_MAX_LINES,
+  STDOUT_HEAD_RATIO,
+  VALUE_HEAD_RATIO,
+  HEAD_ONLY_RATIO,
+  type TruncatorOptions,
+} from "./truncate.js";
