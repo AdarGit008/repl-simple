@@ -928,3 +928,46 @@ describe("getReplPreamble", () => {
     assert.equal(result.answer, "11");
   });
 });
+
+// ── Sandbox failure preserves accumulated work ──────────────────
+
+describe("RLMLoop — a throwing sandbox", () => {
+  /** Restores whatever the env held, including "was not set at all". */
+  async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    const saved = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, vars);
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  // `runInSandbox` returns a RunError for anything the user's code did wrong,
+  // so a throw is the host failing. The messages and traces accumulated so far
+  // are the expensive part of an RLM run and must survive it — stranding them
+  // is the defect #36 fixed one layer down.
+  it("returns the accumulated messages and traces instead of stranding them", async () => {
+    const loop = new RLMLoop({
+      registry: new ToolRegistry(),
+      llmQuery: async () => "",
+      generateCode: fixedCode('print("hello")'),
+    });
+    // A 1 MB ceiling is below any live node process, so the guard fires on the
+    // first sandbox call of the first iteration.
+    const result = await withEnv({ REPL_MEMORY_CEILING_MB: "1" }, () => loop.run("task"));
+
+    errResult(result);
+    assert.equal(result.status, "error");
+    assert.match(result.error ?? "", /sandbox execution failed/);
+    assert.match(result.error ?? "", /ceiling/);
+    assert.equal(result.iterations, 1);
+    // The system and user prompts plus the assistant's code — lost before this.
+    assert.ok(result.messages.length >= 2, `expected messages, got ${result.messages.length}`);
+    assert.equal(result.messages.at(-1)?.role, "assistant");
+    assert.ok(Array.isArray(result.traces));
+  });
+});

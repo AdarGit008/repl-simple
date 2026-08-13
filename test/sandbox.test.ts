@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
+import { runInSandbox, resumeSuspended, memoryGuardConfig } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
@@ -1607,9 +1607,30 @@ describe("memory guards", () => {
 
   it("both guards are disabled by zero", async () => {
     await withEnv({ REPL_MEMORY_CEILING_MB: "0", REPL_MEMORY_FLOOR_MB: "0" }, async () => {
+      assert.deepEqual(
+        memoryGuardConfig(),
+        { ceilingMb: 0, floorMb: 0 },
+        "0 disables, not defaults",
+      );
       const result = await runInSandbox("1 + 1", { registry });
       assert.equal(result.status, "ok");
     });
+  });
+
+  // Without this, shipping both defaults as 0 — the feature entirely off —
+  // passes every other test in this block, because they all set the
+  // environment explicitly. This is the test that fails on that change.
+  it("the shipped default ceiling is live, and the floor is opt-in", () => {
+    const { ceilingMb, floorMb } = memoryGuardConfig();
+    assert.ok(ceilingMb >= 1024, `default ceiling must be a real limit, got ${ceilingMb} MB`);
+    assert.equal(floorMb, 0, "the host floor is deliberately opt-in for a shipped library");
+  });
+
+  // /proc/meminfo is not namespaced, so a container's limit is invisible to it.
+  it("a cgroup limit is accounted for where one exists", () => {
+    if (!existsSync("/sys/fs/cgroup/memory.max") && !existsSync("/proc/self/cgroup")) return;
+    const { ceilingMb } = memoryGuardConfig();
+    assert.ok(ceilingMb > 0 && Number.isFinite(ceilingMb));
   });
 
   // The guard has to sit on resume too: a suspended run resumes into the same
