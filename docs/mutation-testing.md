@@ -53,7 +53,7 @@ measured reproducibility band of the suite itself. See
 [The suite is not deterministic](#the-suite-is-not-deterministic): re-scoring the same tree from an
 independent run yields **57.86%**. A floor at the measured score fails CI on unchanged code.
 
-Raise the floor when #91 lands and the band collapses. **[judgement]**
+Raise the floor when #109 lands and the band collapses. **[judgement]**
 
 ---
 
@@ -150,8 +150,10 @@ These are `Killed ↔ Survived` flips, which move the score. `rlm.ts`'s nine are
 (Survived → Killed) and cluster at lines 40–129; `rlm_loop.ts`'s go both ways. Scoring the tree from
 one run gives 58.28%, from the other **57.86%**.
 
-This is direct evidence for **#91**. `test/support/bridge-tools.ts` already records the symptom —
-*"it made two runs of an identical tree disagree"* — and these are the coordinates:
+Filed as **#109**. This is *not* #91, which is closed: that was the suite downloading `fd`/`rg`
+mid-run, fixed by the `PI_OFFLINE=1` guard in `test/support/bridge-tools.ts`. Both runs here had
+those binaries present with offline mode on, and `bridge.ts` — the only file that shells out to
+them — reproduced perfectly. Different cause. The coordinates:
 
 | File | Line:col | Mutator | Run A | Run B |
 |---|---|---|---|---|
@@ -196,7 +198,7 @@ Set `timeoutMS` generously (60 s here) and keep the machine off its memory limit
 
 The run found M22's untracked sibling:
 
-> **`src/repl.ts:62` — dropping `onApproval` from `session.resume()` survives.**
+> **`src/repl.ts:62` — dropping `onApproval` from `session.resume()` survives.** Filed as **#110**.
 
 `test/session.test.ts` covers `Session.resume({onApproval})` directly and well, but nothing drives
 `Repl.resume()` and asserts the callback reaches the session. If that wiring regressed, the mutant
