@@ -126,12 +126,51 @@ export const CANDIDATE_MODULES = [
   "urllib",
 ];
 
+// ── Probe memoisation ───────────────────────────────────────────
+//
+// Both probes below describe the *interpreter*, which does not change while
+// the process lives, and both were re-running on every call: the module probe
+// once per `RLMLoop.run()`, the gap probe once per `runInSandbox()`. That is
+// #68, filed as ~97 ms of wasted work per call.
+//
+// It is also a memory bug, which is what made it urgent. Constructing a Monty
+// whose type check *fails* leaks ~6.9 MB that no GC reclaims — measured; a
+// constructor whose check succeeds is flat. Every `TY_GAP_CANDIDATES` entry is
+// a gap by definition, so all six throw, so `probeTypeCheckerGaps()` leaked
+// ~41 MB per sandbox run. Unmemoised, 100 trivial runs reach ~2.7 GB and the
+// kernel eventually kills the process. Memoised, they hold flat at 148 MB.
+//
+// Only the default candidate lists are cached. A caller passing its own list is
+// asking a different question and gets a fresh answer.
+
+let importableMemo: string[] | null = null;
+let tyGapMemo: string[] | null = null;
+let probeRuns = { importable: 0, tyGap: 0 };
+
+/**
+ * How many times each probe has actually executed. Exists so the memo can be
+ * asserted with a counter rather than a timer — a timing-based test would pass
+ * on a fast machine with the memo removed.
+ */
+export function probeInvocations(): { importable: number; tyGap: number } {
+  return { ...probeRuns };
+}
+
+/** Drops both memos. Without this the memoisation itself is untestable. */
+export function resetProbeMemos(): void {
+  importableMemo = null;
+  tyGapMemo = null;
+  probeRuns = { importable: 0, tyGap: 0 };
+}
+
 /**
  * Empirically determines which modules the installed monty can import
- * by trying each in a throwaway interpreter.
+ * by trying each in a throwaway interpreter. Memoised per process.
  */
 export function probeImportableModules(candidates: string[] = CANDIDATE_MODULES): string[] {
-  return candidates.filter((name) => {
+  if (candidates === CANDIDATE_MODULES && importableMemo !== null) return importableMemo;
+  probeRuns.importable++;
+  const found = candidates.filter((name) => {
     try {
       new Monty(`import ${name}`).run();
       return true;
@@ -139,6 +178,8 @@ export function probeImportableModules(candidates: string[] = CANDIDATE_MODULES)
       return false;
     }
   });
+  if (candidates === CANDIDATE_MODULES) importableMemo = found;
+  return found;
 }
 
 // ── Type checker gap probing ────────────────────────────────────
@@ -163,7 +204,9 @@ const TY_GAP_CANDIDATES = [
  * in any typecheck prefix.
  */
 export function probeTypeCheckerGaps(candidates: string[] = TY_GAP_CANDIDATES): string[] {
-  return candidates.filter((name) => {
+  if (candidates === TY_GAP_CANDIDATES && tyGapMemo !== null) return tyGapMemo;
+  probeRuns.tyGap++;
+  const gaps = candidates.filter((name) => {
     try {
       new Monty(name, { typeCheck: true });
       return false; // ty resolves it
@@ -171,6 +214,8 @@ export function probeTypeCheckerGaps(candidates: string[] = TY_GAP_CANDIDATES): 
       return true; // ty rejects it — gap confirmed
     }
   });
+  if (candidates === TY_GAP_CANDIDATES) tyGapMemo = gaps;
+  return gaps;
 }
 
 // ── Python tool rules ───────────────────────────────────────────
