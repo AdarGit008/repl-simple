@@ -7,7 +7,7 @@
   },
   "mutate": ["src/**/*.ts", "extensions/**/*.ts"],
   "coverageAnalysis": "off",
-  "concurrency": 2,
+  "concurrency": 1,
   "incremental": true,
   "incrementalFile": ".stryker-incremental.json",
   "reporters": ["html", "json", "clear-text", "progress"],

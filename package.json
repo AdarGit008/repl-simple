@@ -9,6 +9,8 @@
   ],
   "scripts": {
     "test": "tsx --test test/*.test.ts",
+    "test:contained": "node scripts/contained.mjs tsx --test test/*.test.ts",
+    "mutation": "node scripts/contained.mjs --limit 12G stryker run",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "coverage": "node scripts/coverage.mjs",

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   Monty,
   MontySnapshot,
@@ -145,6 +146,97 @@ function makePrintCallback(
 export interface SandboxOptions {
   /** Tool registry with host tools available to Python code. */
   registry: ToolRegistry;
+}
+
+// ── Memory guards ────────────────────────────────────────────────
+
+/**
+ * Refuse to start new sandbox work when memory is already gone.
+ *
+ * Every `runInSandbox` call leaks ~41 MB of native memory, because
+ * `probeTypeCheckerGaps()` constructs `new Monty(name, { typeCheck: true })`
+ * per candidate and that constructor never gives the memory back (#68). The
+ * leak is native, so it is invisible to V8: `heapUsed` stays flat, no GC
+ * pressure builds, no heap-limit abort fires. The process simply grows until
+ * the kernel kills something.
+ *
+ * On 2026-08-13 that was a worker holding 13.4 GB, and because tmux panes run
+ * under `DefaultOOMPolicy=stop`, systemd responded by tearing down the whole
+ * pane — editor session included, SIGTERM, no message printed. The failure is
+ * silent at every layer, which is what makes it worth failing loudly here.
+ *
+ * Two independent limits, because there are two independent ways to get there:
+ *   - CEILING catches one process running away on its own.
+ *   - FLOOR catches many well-behaved processes adding up — two suites in
+ *     parallel, Stryker's workers, a second agent. No process is at fault, so
+ *     a per-process limit cannot see it.
+ *
+ * These are backstops, not a fix. Remove them when #68 removes the leak.
+ */
+export class SandboxMemoryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxMemoryError";
+  }
+}
+
+/** Per-process RSS ceiling, MB. 0 disables. Above the 3.9 GB a single heavy test file reaches. */
+const DEFAULT_MEMORY_CEILING_MB = 5120;
+/** System available-memory floor, MB. 0 disables. */
+const DEFAULT_MEMORY_FLOOR_MB = 3072;
+
+/** Read at call time, not module load, so a caller can change it between runs. */
+function envMb(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Available system memory in bytes, or null where that cannot be known.
+ * `os.freemem()` is not a substitute: on Linux it reports MemFree, which
+ * excludes reclaimable page cache and so reads as alarmingly low on a healthy
+ * box. Only MemAvailable answers "could an allocation succeed". Absent on
+ * macOS, where the check is skipped rather than guessed — CI runs there.
+ */
+function availableMemoryBytes(): number | null {
+  try {
+    const match = /^MemAvailable:\s+(\d+) kB$/m.exec(readFileSync("/proc/meminfo", "utf8"));
+    return match ? Number(match[1]) * 1024 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Throws rather than returning a RunError: this is the host in trouble, not the user's code. */
+function assertMemoryHeadroom(): void {
+  const ceilingMb = envMb("REPL_MEMORY_CEILING_MB", DEFAULT_MEMORY_CEILING_MB);
+  if (ceilingMb > 0) {
+    const rssMb = Math.round(process.memoryUsage.rss() / 1_048_576);
+    if (rssMb >= ceilingMb) {
+      throw new SandboxMemoryError(
+        `sandbox refused: this process holds ${rssMb} MB, at or above the ${ceilingMb} MB ceiling. ` +
+          "Every sandbox run leaks ~41 MB (#68); a process this large is about to be OOM-killed. " +
+          "Restart the process, or raise REPL_MEMORY_CEILING_MB if you know what you are doing.",
+      );
+    }
+  }
+
+  const floorMb = envMb("REPL_MEMORY_FLOOR_MB", DEFAULT_MEMORY_FLOOR_MB);
+  if (floorMb > 0) {
+    const available = availableMemoryBytes();
+    if (available !== null) {
+      const availableMb = Math.round(available / 1_048_576);
+      if (availableMb <= floorMb) {
+        throw new SandboxMemoryError(
+          `sandbox refused: only ${availableMb} MB available on this host, at or below the ` +
+            `${floorMb} MB floor. Something is exhausting memory — often a second test suite or ` +
+            "a Stryker run. Wait for it, or raise REPL_MEMORY_FLOOR_MB.",
+        );
+      }
+    }
+  }
 }
 
 // ── Private helpers ──────────────────────────────────────────────
@@ -515,6 +607,7 @@ export async function runInSandbox(
   options: SandboxOptions,
   runOpts?: RunOptions,
 ): Promise<RunResult> {
+  assertMemoryHeadroom();
   const registry = options.registry;
   const maxStdout = runOpts?.maxStdoutBytes ?? DEFAULT_MAX_STDOUT;
   const scriptName = runOpts?.scriptName ?? "<repl>";
@@ -627,6 +720,7 @@ export async function resumeSuspended(
   options: SandboxOptions,
   runOpts?: RunOptions,
 ): Promise<RunResult> {
+  assertMemoryHeadroom();
   const registry = options.registry;
   const maxStdout = runOpts?.maxStdoutBytes ?? DEFAULT_MAX_STDOUT;
 

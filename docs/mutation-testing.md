@@ -90,28 +90,51 @@ Stryker then runs N of those concurrently, so the real process count is
 `stryker.concurrency × node's own fan-out`, which oversubscribes any machine. **[measured]**
 
 The config pins node's side with `--test-concurrency=3` so that Stryker's `concurrency` is the only
-knob. Then size it by **RAM, not cores**:
+knob.
 
-| | per Stryker worker |
+### Per-worker memory is not a constant, so no sizing formula is safe
+
+This section previously gave `concurrency = min(cores / 3, (RAM_GB - 4) / 4.8)`, from a measured
+~4.8 GB per Stryker worker. **Both the constant and the premise were wrong**, and the formula is
+what took the 8-core/24 GB box down on 2026-08-13.
+
+One worker runs one full suite, and a full suite peaks at **~9 GB**, not 4.8 — and it peaks there
+at *every* fan-out we tried, because the ceiling is set by the few sandbox-driving test files
+rather than by the worker count. **[measured]**
+
+| `--test-concurrency` | full-suite peak RSS |
 |---|---|
-| CPU | ~3.0 cores |
-| **RAM** | **~4.8 GB peak** |
+| 3 | 9075 MB |
+| 4 | 9008 MB |
+| default (8 here) | 9040 MB |
 
-A 20-core / 30 GB machine fits 6 workers by CPU but only 4 by memory — and at 6 it drove the box
-into swap (`si` ~600k, throughput down 3.5×). Memory binds first on every machine we tried.
-**[measured]**
+Worse, that 9 GB is a floor rather than a ceiling. `probeTypeCheckerGaps()` leaks ~41 MB of native
+memory on **every** `runInSandbox` call (#68), so a worker's footprint grows with the number of
+sandbox calls it has served — that is, with how long the run has been going. The kernel's OOM
+victim on 2026-08-13 was a single worker holding **13.4 GB**. **[measured]**
 
-```
-concurrency = min(cores / 3, (RAM_GB - 4) / 4.8)
-```
+A static formula cannot express that. Until #68 lands, size by containment, not by arithmetic.
 
 ### Running it
 
-Full run, on a machine you are not using:
+```sh
+npm run mutation
+```
+
+That wraps Stryker in a transient systemd scope with a hard memory ceiling
+(`scripts/contained.mjs`). The scope is a *sibling* of your terminal's, not a child, so a breach
+kills the mutation run alone — where an uncontained breach takes down the whole tmux pane, editor
+session included, via `DefaultOOMPolicy=stop`. Raise or lower the ceiling with `--limit`:
 
 ```sh
-npx stryker run
+node scripts/contained.mjs --limit 8G stryker run
 ```
+
+`concurrency` is pinned to **1** for the same reason: at 2 the peak is ~18 GB, which does not fit
+under any ceiling this box can honour. Sharding across machines is how you buy back the throughput.
+
+Containment is skipped automatically where there is no systemd user session (CI, containers), so
+the command still works everywhere — it just stops protecting you.
 
 Sharding across machines: split `mutate` into disjoint file sets — mutants are per-file, so the
 `files` maps of the JSON reports merge by plain assignment. Give each host a `concurrency` sized by
