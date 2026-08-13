@@ -153,25 +153,23 @@ export interface SandboxOptions {
 /**
  * Refuse to start new sandbox work when memory is already gone.
  *
- * Every `runInSandbox` call leaks ~41 MB of native memory, because
- * `probeTypeCheckerGaps()` constructs `new Monty(name, { typeCheck: true })`
- * per candidate and that constructor never gives the memory back (#68). The
- * leak is native, so it is invisible to V8: `heapUsed` stays flat, no GC
- * pressure builds, no heap-limit abort fires. The process simply grows until
- * the kernel kills something.
- *
- * On 2026-08-13 that was a worker holding 13.4 GB, and because tmux panes run
- * under `DefaultOOMPolicy=stop`, systemd responded by tearing down the whole
- * pane — editor session included, SIGTERM, no message printed. The failure is
- * silent at every layer, which is what makes it worth failing loudly here.
+ * These are backstops against a runaway, not a fix for one. The leak that
+ * motivated them — `probeTypeCheckerGaps()` re-running per call and leaking
+ * ~41 MB each time — is fixed at source in #68, which took the full suite from
+ * 9040 MB to 1615 MB. What remains is the general case: sandboxed code, or a
+ * caller looping over it, can still exhaust a host, and the failure is silent
+ * at every layer. A native allocation is invisible to V8, so no GC pressure
+ * builds and no heap-limit abort fires; the process simply grows until the
+ * kernel kills something.
  *
  * Two independent limits, because there are two independent ways to get there:
- *   - CEILING catches one process running away on its own.
+ *   - CEILING catches one process running away on its own. On by default.
  *   - FLOOR catches many well-behaved processes adding up — two suites in
- *     parallel, Stryker's workers, a second agent. No process is at fault, so
- *     a per-process limit cannot see it.
- *
- * These are backstops, not a fix. Remove them when #68 removes the leak.
+ *     parallel, a second agent. No single process is at fault, so a per-process
+ *     limit cannot see it. **Off by default**: whether the host as a whole is
+ *     short of memory is not this library's business to police, and a shipped
+ *     extension that refuses to run because the user has a browser open would
+ *     be diagnosing the wrong thing. Repositories running heavy suites opt in.
  */
 export class SandboxMemoryError extends Error {
   constructor(message: string) {
@@ -180,10 +178,10 @@ export class SandboxMemoryError extends Error {
   }
 }
 
-/** Per-process RSS ceiling, MB. 0 disables. Above the 3.9 GB a single heavy test file reaches. */
+/** Per-process RSS ceiling, MB. 0 disables. */
 const DEFAULT_MEMORY_CEILING_MB = 5120;
-/** System available-memory floor, MB. 0 disables. */
-const DEFAULT_MEMORY_FLOOR_MB = 3072;
+/** Host available-memory floor, MB. 0 disables — see above for why that is the default. */
+const DEFAULT_MEMORY_FLOOR_MB = 0;
 
 /** Read at call time, not module load, so a caller can change it between runs. */
 function envMb(name: string, fallback: number): number {
@@ -194,31 +192,99 @@ function envMb(name: string, fallback: number): number {
 }
 
 /**
- * Available system memory in bytes, or null where that cannot be known.
- * `os.freemem()` is not a substitute: on Linux it reports MemFree, which
- * excludes reclaimable page cache and so reads as alarmingly low on a healthy
- * box. Only MemAvailable answers "could an allocation succeed". Absent on
- * macOS, where the check is skipped rather than guessed — CI runs there.
+ * This process's cgroup v2 memory ceiling and current usage, or null when
+ * unlimited or unreadable.
+ *
+ * Necessary because `/proc/meminfo` is **not** namespaced: inside a scope
+ * capped at 512 MB it still reports the host's figure (measured: 21.7 GB).
+ * Without this, both guards are inert in exactly the environments where a
+ * memory limit is real — containers, Kubernetes, CI, and the transient scopes
+ * `scripts/contained.mjs` itself creates.
  */
-function availableMemoryBytes(): number | null {
+function cgroupMemory(): { max: number; current: number } | null {
   try {
-    const match = /^MemAvailable:\s+(\d+) kB$/m.exec(readFileSync("/proc/meminfo", "utf8"));
-    return match ? Number(match[1]) * 1024 : null;
+    const own = readFileSync("/proc/self/cgroup", "utf8").trim().split(":").pop();
+    if (!own) return null;
+    const base = `/sys/fs/cgroup${own}`;
+    const raw = readFileSync(`${base}/memory.max`, "utf8").trim();
+    if (raw === "max") return null;
+    const max = Number(raw);
+    const current = Number(readFileSync(`${base}/memory.current`, "utf8").trim());
+    return Number.isFinite(max) && Number.isFinite(current) ? { max, current } : null;
   } catch {
     return null;
   }
 }
 
-/** Throws rather than returning a RunError: this is the host in trouble, not the user's code. */
+/**
+ * Available memory in bytes, or null where that cannot be known — the smaller
+ * of what the host reports and what this process's cgroup still allows.
+ *
+ * `os.freemem()` is not a substitute for the host half: on Linux it reports
+ * MemFree, which excludes reclaimable page cache and so reads as alarmingly low
+ * on a healthy box. Only MemAvailable answers "could an allocation succeed".
+ * Absent on macOS, where the check is skipped rather than guessed.
+ */
+function availableMemoryBytes(): number | null {
+  let host: number | null = null;
+  try {
+    const match = /^MemAvailable:\s+(\d+) kB$/m.exec(readFileSync("/proc/meminfo", "utf8"));
+    host = match ? Number(match[1]) * 1024 : null;
+  } catch {
+    host = null;
+  }
+  const cg = cgroupMemory();
+  const cgAvailable = cg ? Math.max(0, cg.max - cg.current) : null;
+  if (host === null) return cgAvailable;
+  if (cgAvailable === null) return host;
+  return Math.min(host, cgAvailable);
+}
+
+/**
+ * The effective RSS ceiling in MB. A cgroup cap below the configured ceiling
+ * wins — otherwise a 5120 MB default is unreachable inside a 512 MB container
+ * and the guard never fires where it is needed most. 90% leaves room to throw
+ * rather than be OOM-killed mid-message.
+ */
+function effectiveCeilingMb(configuredMb: number): number {
+  if (configuredMb === 0) return 0; // an explicit 0 disables, cgroup or not
+  const cg = cgroupMemory();
+  if (!cg) return configuredMb;
+  return Math.min(configuredMb, Math.floor((cg.max * 0.9) / 1_048_576));
+}
+
+/**
+ * The guards as they would apply right now, in MB. Exists so a test can assert
+ * that the shipped defaults are actually live: every other test here sets the
+ * environment explicitly, so shipping both defaults as 0 — the whole feature
+ * off — passed all of them. `ceilingMb` of 0 means disabled.
+ */
+export function memoryGuardConfig(): { ceilingMb: number; floorMb: number } {
+  return {
+    ceilingMb: effectiveCeilingMb(envMb("REPL_MEMORY_CEILING_MB", DEFAULT_MEMORY_CEILING_MB)),
+    floorMb: envMb("REPL_MEMORY_FLOOR_MB", DEFAULT_MEMORY_FLOOR_MB),
+  };
+}
+
+/**
+ * Throws rather than returning a `RunError`. That is deliberate but it is a
+ * real cost: #36 established that escaping a function typed to return a
+ * discriminated union strands callers who have no reason to be in a `try`. The
+ * distinction is that a `RunError` describes the *user's code* failing, and
+ * every caller renders it back to the model as feedback to retry against. This
+ * is the *host* out of memory, where retrying is precisely wrong. Callers that
+ * hold accumulated state catch it and return what they have — see
+ * `RLMLoop.run`.
+ */
 function assertMemoryHeadroom(): void {
-  const ceilingMb = envMb("REPL_MEMORY_CEILING_MB", DEFAULT_MEMORY_CEILING_MB);
+  const ceilingMb = effectiveCeilingMb(envMb("REPL_MEMORY_CEILING_MB", DEFAULT_MEMORY_CEILING_MB));
   if (ceilingMb > 0) {
     const rssMb = Math.round(process.memoryUsage.rss() / 1_048_576);
     if (rssMb >= ceilingMb) {
       throw new SandboxMemoryError(
         `sandbox refused: this process holds ${rssMb} MB, at or above the ${ceilingMb} MB ceiling. ` +
-          "Every sandbox run leaks ~41 MB (#68); a process this large is about to be OOM-killed. " +
-          "Restart the process, or raise REPL_MEMORY_CEILING_MB if you know what you are doing.",
+          "A process this large is about to be OOM-killed, which would take the whole session with " +
+          "it. Restart the process, or raise REPL_MEMORY_CEILING_MB if you know what you are doing.",
       );
     }
   }
