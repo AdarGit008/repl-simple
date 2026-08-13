@@ -192,7 +192,7 @@ per-test filtering. Two consequences:
 
 The floor is set at 57 rather than at the measured 58.28 on purpose: the suite is not yet
 deterministic, and re-scoring the same tree from an independent run gives 57.86%. That band is
-[#91](https://github.com/AdarGit008/repl-simple/issues/91), not slack — raise the floor when it
+[#109](https://github.com/AdarGit008/repl-simple/issues/109), not slack — raise the floor when it
 closes.
 
 ### Optional: `fd` and `ripgrep`
