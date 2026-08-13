@@ -92,28 +92,34 @@ Stryker then runs N of those concurrently, so the real process count is
 The config pins node's side with `--test-concurrency=3` so that Stryker's `concurrency` is the only
 knob.
 
-### Per-worker memory is not a constant, so no sizing formula is safe
+### Sizing, after the leak was fixed
 
-This section previously gave `concurrency = min(cores / 3, (RAM_GB - 4) / 4.8)`, from a measured
-~4.8 GB per Stryker worker. **Both the constant and the premise were wrong**, and the formula is
-what took the 8-core/24 GB box down on 2026-08-13.
+This section has been wrong twice, so it is worth stating what changed.
 
-One worker runs one full suite, and a full suite peaks at **~9 GB**, not 4.8 — and it peaks there
-at *every* fan-out we tried, because the ceiling is set by the few sandbox-driving test files
-rather than by the worker count. **[measured]**
+It first gave `concurrency = min(cores / 3, (RAM_GB - 4) / 4.8)`, from a measured ~4.8 GB per
+Stryker worker. That formula is what took the 8-core/24 GB box down on 2026-08-13: a worker was
+really ~9 GB, because `probeTypeCheckerGaps()` leaked ~41 MB on **every** `runInSandbox` call, so a
+worker's footprint grew with how long the run had been going. The kernel's OOM victim that day was a
+single worker holding 13.4 GB.
 
-| `--test-concurrency` | full-suite peak RSS |
-|---|---|
-| 3 | 9075 MB |
-| 4 | 9008 MB |
-| default (8 here) | 9040 MB |
+It was then rewritten to claim per-worker memory is not a constant at all and no formula can be
+safe. That was an over-correction built on a second error — it asserted the suite peaks the same at
+every fan-out, from three data points that all happened to sit past saturation. Measured at
+`--test-concurrency=1`, the pre-fix suite peaked at 3965 MB, not ~9 GB. Fan-out mattered the whole
+time.
 
-Worse, that 9 GB is a floor rather than a ceiling. `probeTypeCheckerGaps()` leaks ~41 MB of native
-memory on **every** `runInSandbox` call (#68), so a worker's footprint grows with the number of
-sandbox calls it has served — that is, with how long the run has been going. The kernel's OOM
-victim on 2026-08-13 was a single worker holding **13.4 GB**. **[measured]**
+**#68 fixed the leak** by memoising the probes, and the numbers are now unremarkable. **[measured]**
 
-A static formula cannot express that. Until #68 lands, size by containment, not by arithmetic.
+| `--test-concurrency` | full-suite peak RSS | wall |
+|---|---|---|
+| 1 | 678 MB | 17 s |
+| 3 | 996 MB | 8 s |
+| default (8 here) | 1615 MB | — |
+
+Compare 9040 MB at default fan-out before the fix. One Stryker worker runs one suite at
+`--test-concurrency=3`, so `concurrency: 2` is roughly 2 GB — which is why it is back to 2, and why
+there is real headroom above it. Size by measuring your own host; the arithmetic is no longer
+adversarial.
 
 ### Running it
 
@@ -130,8 +136,8 @@ session included, via `DefaultOOMPolicy=stop`. Raise or lower the ceiling with `
 node scripts/contained.mjs --limit 8G stryker run
 ```
 
-`concurrency` is pinned to **1** for the same reason: at 2 the peak is ~18 GB, which does not fit
-under any ceiling this box can honour. Sharding across machines is how you buy back the throughput.
+`concurrency` is **2**. It was briefly 1, sized against the leaking footprint where two workers came
+to ~18 GB; with #68 fixed two workers are roughly 2 GB and the pin was unnecessary.
 
 Containment is skipped automatically where there is no systemd user session (CI, containers), so
 the command still works everywhere — it just stops protecting you.

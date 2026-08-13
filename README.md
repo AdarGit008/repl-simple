@@ -87,7 +87,16 @@ npm run build   # tsc -p tsconfig.build.json
 npm run lint    # biome check --error-on-warnings
 npm run format  # biome format --write
 npm run coverage # per-file line-coverage floors
+npm run mutation # stryker, contained in a memory-capped systemd scope
+npm run test:contained # the suite, likewise contained
 ```
+
+Two environment variables guard against a runaway exhausting the host, both read at call time:
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MEMORY_CEILING_MB` | `5120` | Per-process RSS ceiling; `runInSandbox` throws `SandboxMemoryError` at or above it. Clamped down automatically inside a cgroup, since `/proc/meminfo` cannot see a container limit. `0` disables. |
+| `REPL_MEMORY_FLOOR_MB` | `0` (off) | Refuse to start when the host has less than this much memory available. Opt-in: whether the machine as a whole is short of memory is not this library's business to police. |
 
 Two TypeScript configs, deliberately:
 
@@ -207,7 +216,7 @@ have to be slackened until it stopped biting.
 
 ### Mutation score
 
-`npx stryker run` mutates `src/` and `extensions/` and fails below a **57%** floor. The measured
+`npm run mutation` mutates `src/` and `extensions/` and fails below a **57%** floor. The measured
 baseline on `e556a70` is **58.28%** (1235 detected of 2119 mutants). Full write-up, per-file scores
 and the reasoning behind every config value:
 [docs/mutation-testing.md](docs/mutation-testing.md).
@@ -216,10 +225,12 @@ This is the quality gate the coverage floors above are explicitly *not*. It is a
 **~33 CPU-hours** for a full run, because the command runner re-runs all 426 tests per mutant with no
 per-test filtering. Two consequences:
 
-- **Do not run it on a machine you are using.** `npm test` is already parallel, so Stryker's
-  `concurrency` multiplies against node's own fan-out. Size it by **RAM** (~4.8 GB per worker), not
-  by cores — memory binds first, and exceeding it drives the box into swap. The committed
-  `concurrency: 2` is sized for an 8-core / 24 GB machine.
+- **Run it with `npm run mutation`**, which contains it in a systemd scope with a memory ceiling so
+  a breach cannot take your terminal session down with it. `npm test` is already parallel, so
+  Stryker's `concurrency` multiplies against node's own fan-out; size it by **RAM**, not by cores.
+  One worker is ~1 GB and the committed `concurrency: 2` is ~2 GB — see
+  [`docs/mutation-testing.md`](docs/mutation-testing.md), which records how that number was wrong
+  twice before it was right.
 - **Use `--incremental` or `--since` on pull requests**, and run the full sweep on a schedule or on
   demand.
 

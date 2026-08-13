@@ -139,7 +139,26 @@ export class RLMLoop {
       messages.push({ role: "assistant", content: code });
 
       // c. Execute code in sandbox
-      const result = await this.executeCode(code, registry, sandboxInputs);
+      //
+      // `runInSandbox` returns a RunError for anything the user's code did
+      // wrong, so a throw here is the host itself failing — a memory guard
+      // refusing to start (SandboxMemoryError), or a defect. Either way the
+      // accumulated messages and traces are the expensive part of this run and
+      // are worth strictly more than the exception: without this the loop
+      // strands them, which is the same defect #36 fixed one layer down.
+      let result: RunResult;
+      try {
+        result = await this.executeCode(code, registry, sandboxInputs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          status: "error",
+          error: `sandbox execution failed: ${msg}`,
+          iterations: i + 1,
+          messages,
+          traces: allTraces,
+        };
+      }
       allTraces.push(result.calls);
 
       // d. Check for SUBMIT

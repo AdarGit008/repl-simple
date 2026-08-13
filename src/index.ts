@@ -41,6 +41,7 @@ export {
   runInSandbox,
   resumeSuspended,
   resolveToolArgs,
+  SandboxMemoryError,
   type SandboxOptions,
 } from "./sandbox.js";
 
