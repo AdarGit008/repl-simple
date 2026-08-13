@@ -1072,6 +1072,188 @@ describe("abort before the resume prologue", () => {
   });
 });
 
+describe("resource-limit breach on the resume after a host tool call", () => {
+  // The tool *succeeds*; the limit is breached by the Python that runs after it,
+  // on the resume. Before #36 that resume sat inside the `try` guarding
+  // `tool.execute`, so the breach reached a handler written for tool faults: it
+  // pushed a second trace entry for a call already recorded `ok: true`, resumed
+  // the already-consumed snapshot, and threw the resulting `GenericFailure` out
+  // of a function typed to return a discriminated union.
+
+  /** Sleeps, so wall-clock passes without Python executing an instruction. */
+  function sleepTool(ms: number, overrides: Partial<HostTool> = {}): HostTool {
+    return {
+      name: "slow",
+      description: "Sleeps for a while",
+      params: [],
+      returns: "str",
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+        return "done";
+      },
+      ...overrides,
+    };
+  }
+
+  // Limits are only checked as Python executes instructions, so each snippet
+  // has to keep working *after* the call returns — a tool that overruns with no
+  // Python following it completes `ok`, which is what once made the duration
+  // clock look like it measured compute rather than wall time.
+  const OVERRUN_THEN_LOOP = [
+    "slow()",
+    "total = 0",
+    "for i in range(200000):",
+    "    total += i",
+    "total",
+  ].join("\n");
+  const CALL_THEN_ALLOCATE = ["slow()", "big = [0] * 20000000", "len(big)"].join("\n");
+
+  // The two limit kinds, each paired with the code that breaches it. Driving
+  // the cases from one table is what makes this a property over limit kinds
+  // rather than three examples that happen to agree.
+  const LIMIT_KINDS = [
+    {
+      name: "duration",
+      limits: { maxDurationSecs: 0.2 },
+      code: OVERRUN_THEN_LOOP,
+      toolMs: 250,
+      expected: /TimeoutError/,
+    },
+    {
+      name: "memory",
+      limits: { maxDurationSecs: 30, maxMemory: 1024 * 1024 },
+      code: CALL_THEN_ALLOCATE,
+      toolMs: 1,
+      expected: /MemoryError/,
+    },
+  ] as const;
+
+  /** Fails with the defect named, rather than letting the rejection bubble. */
+  async function noThrow<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return assert.fail(`${label} threw instead of returning a RunError: ${message}`);
+    }
+  }
+
+  for (const kind of LIMIT_KINDS) {
+    it(`runInSandbox: a ${kind.name} breach returns a runtime RunError`, async () => {
+      const registry = new ToolRegistry([sleepTool(kind.toolMs)]);
+      const result = await noThrow("runInSandbox", () =>
+        runInSandbox(kind.code, { registry }, { limits: kind.limits }),
+      );
+
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(result.error, kind.expected);
+    });
+
+    it(`resumeSuspended: a ${kind.name} breach returns a runtime RunError`, async () => {
+      // The limit rides on the *initial* run, not the resume. Monty's
+      // `SnapshotLoadOptions` carries only a `printCallback` — there is no
+      // `limits` field — so the budget in force after a resume is the one
+      // `monty.start()` was given, restored with the snapshot.
+      const registry = new ToolRegistry([sleepTool(kind.toolMs, { requiresApproval: true })]);
+      const susp = await runInSandbox(
+        kind.code,
+        { registry },
+        { limits: kind.limits, onApproval: () => "suspend" },
+      );
+      suspended(susp);
+
+      const result = await noThrow("resumeSuspended", () =>
+        resumeSuspended(susp, true, { registry }),
+      );
+
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(result.error, kind.expected);
+    });
+  }
+
+  it("traces the breached call exactly once, as the success it was", async () => {
+    // The assertion the issue exists for. The old handler recorded the same
+    // call twice — once `ok: true` from the success path, then again `ok: false`
+    // when the resume's breach landed in the tool-fault branch.
+    const registry = new ToolRegistry([sleepTool(250)]);
+    const result = await noThrow("runInSandbox", () =>
+      runInSandbox(OVERRUN_THEN_LOOP, { registry }, { limits: { maxDurationSecs: 0.2 } }),
+    );
+
+    err(result);
+    assert.equal(result.calls.length, 1, `one call, one trace entry (got ${result.calls.length})`);
+    assert.equal(result.calls[0].tool, "slow");
+    assert.equal(result.calls[0].ok, true, "the tool returned; the breach was Python's, not its");
+    assert.equal(result.calls[0].error, undefined);
+  });
+
+  it("holds for every limit kind across both entry points", async () => {
+    for (const kind of LIMIT_KINDS) {
+      const direct = await noThrow(`runInSandbox/${kind.name}`, () =>
+        runInSandbox(
+          kind.code,
+          { registry: new ToolRegistry([sleepTool(kind.toolMs)]) },
+          { limits: kind.limits },
+        ),
+      );
+
+      const registry = new ToolRegistry([sleepTool(kind.toolMs, { requiresApproval: true })]);
+      const susp = await runInSandbox(
+        kind.code,
+        { registry },
+        { limits: kind.limits, onApproval: () => "suspend" },
+      );
+      suspended(susp);
+      const resumed = await noThrow(`resumeSuspended/${kind.name}`, () =>
+        resumeSuspended(susp, true, { registry }),
+      );
+
+      for (const [entry, result] of [
+        ["runInSandbox", direct],
+        ["resumeSuspended", resumed],
+      ] as const) {
+        const where = `${entry} / ${kind.name}`;
+        err(result);
+        assert.equal(result.errorKind, "runtime", where);
+        assert.match(result.error, kind.expected, where);
+        assert.equal(result.calls.length, 1, `${where}: one trace entry`);
+      }
+    }
+  });
+
+  it("an uncaught PermissionError from a denied resume returns, rather than throwing", async () => {
+    // The prologue's deny resume was outside any `try`. Every other deny test
+    // wraps the call in Python `try/except`, so the uncaught path — the one a
+    // model writes by default — was never exercised. Guarding it here is a
+    // consequence of routing both prologue branches through one resume; the
+    // session-wedging half of that defect stays with #50.
+    const gated: HostTool = {
+      name: "gated_op",
+      description: "Needs approval",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "secret",
+    };
+    const registry = new ToolRegistry([gated]);
+
+    const susp = await runInSandbox("gated_op()", { registry }, { onApproval: () => "suspend" });
+    suspended(susp);
+
+    const result = await noThrow("resumeSuspended", () =>
+      resumeSuspended(susp, false, { registry }),
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /PermissionError/);
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].ok, false);
+  });
+});
+
 describe("accumulator ownership — SubmitSignal in the resume prologue", () => {
   it("returns the SUBMIT answer and keeps the trace and stdout", async () => {
     const submitTool: HostTool = {
