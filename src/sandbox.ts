@@ -26,6 +26,7 @@ import { SubmitSignal } from "./submit_signal.js";
 import type {
   HostTool,
   RunResult,
+  RunError,
   RunSuspended,
   ToolCallTrace,
   ApprovalRequest,
@@ -90,6 +91,34 @@ class DispatchAccumulators {
   get stdoutTruncated(): boolean {
     return this.out.truncated;
   }
+}
+
+/**
+ * Classify an error thrown by *resuming Python* into a `RunError`.
+ *
+ * Every `resume()` in this file can raise `MontyRuntimeError`: the resumed code
+ * may raise, and — once #32 lands default limits — may breach `maxDurationSecs`
+ * or `maxMemory` on any instruction it executes after the resume. That is a run
+ * outcome, not a host fault, so it becomes a `RunError`. Anything else is a bug
+ * in this file and rethrows unchanged.
+ *
+ * It exists as a function so the guard is one shape at every call site. The
+ * defect behind #36 was not a wrong classification — it was a `resume()` that
+ * sat inside a `try` written for something else and so reached a handler with
+ * no branch for this case at all.
+ */
+function classifyResumeError(err: unknown, acc: DispatchAccumulators): RunError {
+  if (err instanceof MontyRuntimeError) {
+    return {
+      status: "error",
+      error: err.message,
+      errorKind: "runtime",
+      stdout: acc.stdout,
+      stdoutTruncated: acc.stdoutTruncated,
+      calls: acc.calls,
+    };
+  }
+  throw err;
 }
 
 /**
@@ -296,17 +325,7 @@ async function runDispatchLoop(
           current = current.resume();
         }
       } catch (err) {
-        if (err instanceof MontyRuntimeError) {
-          return {
-            status: "error",
-            error: err.message,
-            errorKind: "runtime",
-            stdout: acc.stdout,
-            stdoutTruncated: acc.stdoutTruncated,
-            calls: acc.calls,
-          };
-        }
-        throw err;
+        return classifyResumeError(err, acc);
       }
       continue;
     }
@@ -325,17 +344,7 @@ async function runDispatchLoop(
           },
         });
       } catch (err) {
-        if (err instanceof MontyRuntimeError) {
-          return {
-            status: "error",
-            error: err.message,
-            errorKind: "runtime",
-            stdout: acc.stdout,
-            stdoutTruncated: acc.stdoutTruncated,
-            calls: acc.calls,
-          };
-        }
-        throw err;
+        return classifyResumeError(err, acc);
       }
       continue;
     }
@@ -365,17 +374,7 @@ async function runDispatchLoop(
           },
         });
       } catch (resumeErr) {
-        if (resumeErr instanceof MontyRuntimeError) {
-          return {
-            status: "error",
-            error: resumeErr.message,
-            errorKind: "runtime",
-            stdout: acc.stdout,
-            stdoutTruncated: acc.stdoutTruncated,
-            calls: acc.calls,
-          };
-        }
-        throw resumeErr;
+        return classifyResumeError(resumeErr, acc);
       }
       continue;
     }
@@ -420,17 +419,7 @@ async function runDispatchLoop(
             },
           });
         } catch (err) {
-          if (err instanceof MontyRuntimeError) {
-            return {
-              status: "error",
-              error: err.message,
-              errorKind: "runtime",
-              stdout: acc.stdout,
-              stdoutTruncated: acc.stdoutTruncated,
-              calls: acc.calls,
-            };
-          }
-          throw err;
+          return classifyResumeError(err, acc);
         }
         continue;
       }
@@ -438,20 +427,18 @@ async function runDispatchLoop(
       approved = true;
     }
 
-    // Execute the tool
+    // Execute the tool.
+    //
+    // This `try` covers `tool.execute` and nothing else. `snapshot.resume` used
+    // to sit inside it, which made a `MontyRuntimeError` from *Python resuming*
+    // — a duration, memory or recursion breach — arrive at a handler written
+    // for tool faults: it pushed a second trace entry for a call already
+    // recorded `ok: true`, then resumed the same snapshot a second time, and
+    // the resulting `GenericFailure` escaped `runInSandbox` uncaught (#36).
     const t0 = performance.now();
+    let returnValue: unknown;
     try {
-      const returnValue = await tool.execute(resolvedArgs);
-      const durationMs = performance.now() - t0;
-      acc.calls.push({
-        tool: tool.name,
-        args: snapshot.args as unknown[],
-        kwargs: snapshot.kwargs as Record<string, unknown>,
-        durationMs,
-        ok: true,
-        approved,
-      });
-      current = snapshot.resume({ returnValue });
+      returnValue = await tool.execute(resolvedArgs);
     } catch (err) {
       const durationMs = performance.now() - t0;
       // SubmitSignal — clean termination
@@ -472,63 +459,42 @@ async function runDispatchLoop(
           calls: acc.calls,
         };
       }
-      if (err instanceof HostToolError) {
-        acc.calls.push({
-          tool: tool.name,
-          args: snapshot.args as unknown[],
-          kwargs: snapshot.kwargs as Record<string, unknown>,
-          durationMs,
-          ok: false,
-          error: err.message,
-          approved,
-        });
-        try {
-          current = snapshot.resume({
-            exception: { type: err.pythonType, message: err.message },
-          });
-        } catch (resumeErr) {
-          if (resumeErr instanceof MontyRuntimeError) {
-            return {
-              status: "error",
-              error: resumeErr.message,
-              errorKind: "runtime",
-              stdout: acc.stdout,
-              stdoutTruncated: acc.stdoutTruncated,
-              calls: acc.calls,
-            };
-          }
-          throw resumeErr;
-        }
-      } else {
-        // Non-HostToolError → RuntimeError in Python
-        const message = err instanceof Error ? err.message : String(err);
-        acc.calls.push({
-          tool: tool.name,
-          args: snapshot.args as unknown[],
-          kwargs: snapshot.kwargs as Record<string, unknown>,
-          durationMs,
-          ok: false,
-          error: message,
-          approved,
-        });
-        try {
-          current = snapshot.resume({
-            exception: { type: "RuntimeError", message },
-          });
-        } catch (resumeErr) {
-          if (resumeErr instanceof MontyRuntimeError) {
-            return {
-              status: "error",
-              error: resumeErr.message,
-              errorKind: "runtime",
-              stdout: acc.stdout,
-              stdoutTruncated: acc.stdoutTruncated,
-              calls: acc.calls,
-            };
-          }
-          throw resumeErr;
-        }
+      // A `HostToolError` carries the Python type to re-raise; anything else
+      // reaches Python as a RuntimeError.
+      const message = err instanceof Error ? err.message : String(err);
+      const pythonType = err instanceof HostToolError ? err.pythonType : "RuntimeError";
+      acc.calls.push({
+        tool: tool.name,
+        args: snapshot.args as unknown[],
+        kwargs: snapshot.kwargs as Record<string, unknown>,
+        durationMs,
+        ok: false,
+        error: message,
+        approved,
+      });
+      try {
+        current = snapshot.resume({ exception: { type: pythonType, message } });
+      } catch (resumeErr) {
+        return classifyResumeError(resumeErr, acc);
       }
+      continue;
+    }
+
+    // The tool returned. Trace it once, here — the resume below is outside the
+    // `try` above precisely so it cannot reach a handler that would record this
+    // same call a second time.
+    acc.calls.push({
+      tool: tool.name,
+      args: snapshot.args as unknown[],
+      kwargs: snapshot.kwargs as Record<string, unknown>,
+      durationMs: performance.now() - t0,
+      ok: true,
+      approved,
+    });
+    try {
+      current = snapshot.resume({ returnValue });
+    } catch (err) {
+      return classifyResumeError(err, acc);
     }
     // Loop back for next pause point
   }
@@ -705,9 +671,16 @@ export async function resumeSuspended(
   });
   const tool = registry.get(suspended.suspendedCall.tool);
 
-  let current: MontySnapshot | MontyNameLookup | MontyComplete;
+  // Replay the approval decision.
+  //
+  // Each branch decides *what* to resume Python with and traces the call; the
+  // single guarded `snapshot.resume` below then performs it. Keeping the resume
+  // out of the branches is the point: this prologue carried the same defect as
+  // the dispatch loop — the resume sat inside the `try` guarding `tool.execute`,
+  // so a resource-limit breach on resume was handled as a tool fault and its
+  // `GenericFailure` escaped `resumeSuspended` uncaught (#36).
+  let resumeWith: { returnValue: unknown } | { exception: { type: string; message: string } };
 
-  // Replay the approval decision
   if (decision === true && tool) {
     const t0 = performance.now();
     try {
@@ -725,7 +698,7 @@ export async function resumeSuspended(
         ok: true,
         approved: true,
       });
-      current = snapshot.resume({ returnValue });
+      resumeWith = { returnValue };
     } catch (err) {
       const durationMs = performance.now() - t0;
       if (err instanceof SubmitSignal) {
@@ -756,9 +729,7 @@ export async function resumeSuspended(
         error: message,
         approved: true,
       });
-      current = snapshot.resume({
-        exception: { type: pythonType, message },
-      });
+      resumeWith = { exception: { type: pythonType, message } };
     }
   } else if (decision === false || !tool) {
     const excType = !tool ? "NameError" : "PermissionError";
@@ -774,9 +745,7 @@ export async function resumeSuspended(
       approved: false,
       error: excMsg,
     });
-    current = snapshot.resume({
-      exception: { type: excType, message: excMsg },
-    });
+    resumeWith = { exception: { type: excType, message: excMsg } };
   } else {
     return {
       status: "suspended",
@@ -786,6 +755,13 @@ export async function resumeSuspended(
       stdoutTruncated: acc.stdoutTruncated,
       calls: acc.calls,
     };
+  }
+
+  let current: MontySnapshot | MontyNameLookup | MontyComplete;
+  try {
+    current = snapshot.resume(resumeWith);
+  } catch (err) {
+    return classifyResumeError(err, acc);
   }
 
   // Continue via shared dispatch loop
