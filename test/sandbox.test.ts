@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
 import { runInSandbox, resumeSuspended } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
@@ -1561,5 +1562,73 @@ describe("output truncation — the total tool-result budget", () => {
       size(withSmallOutput.stdout),
       "stdout must not depend on how much output used",
     );
+  });
+});
+
+describe("memory guards", () => {
+  const registry = new ToolRegistry([]);
+
+  /** Restores whatever the env held, including "was not set at all". */
+  async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    const saved = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, vars);
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  // A ceiling of 1 MB is below any live node process, so this fires on the
+  // first call without having to actually leak 5 GB to prove the point.
+  it("refuses to run when the process is at its RSS ceiling", async () => {
+    await withEnv({ REPL_MEMORY_CEILING_MB: "1" }, async () => {
+      await assert.rejects(
+        () => runInSandbox("1 + 1", { registry }),
+        (e: Error) => e.name === "SandboxMemoryError" && /ceiling/.test(e.message),
+      );
+    });
+  });
+
+  // Symmetrically, a floor larger than any plausible host trips immediately.
+  // Skipped where MemAvailable cannot be read, since the guard is a no-op there.
+  it("refuses to run when the host is below its available-memory floor", async (t) => {
+    if (!existsSync("/proc/meminfo")) return t.skip("no /proc/meminfo on this platform");
+    await withEnv({ REPL_MEMORY_CEILING_MB: "0", REPL_MEMORY_FLOOR_MB: "999999999" }, async () => {
+      await assert.rejects(
+        () => runInSandbox("1 + 1", { registry }),
+        (e: Error) => e.name === "SandboxMemoryError" && /floor/.test(e.message),
+      );
+    });
+  });
+
+  it("both guards are disabled by zero", async () => {
+    await withEnv({ REPL_MEMORY_CEILING_MB: "0", REPL_MEMORY_FLOOR_MB: "0" }, async () => {
+      const result = await runInSandbox("1 + 1", { registry });
+      assert.equal(result.status, "ok");
+    });
+  });
+
+  // The guard has to sit on resume too: a suspended run resumes into the same
+  // leaking interpreter, and #36 made resume a first-class entry point.
+  it("guards resumeSuspended as well as runInSandbox", async () => {
+    const gated = new ToolRegistry([makeTool({ requiresApproval: true })]);
+    const susp = await runInSandbox(
+      'echo("hi")',
+      { registry: gated },
+      {
+        onApproval: () => "suspend",
+      },
+    );
+    suspended(susp);
+    await withEnv({ REPL_MEMORY_CEILING_MB: "1" }, async () => {
+      await assert.rejects(
+        () => resumeSuspended(susp, true, { registry: gated }),
+        (e: Error) => e.name === "SandboxMemoryError",
+      );
+    });
   });
 });
