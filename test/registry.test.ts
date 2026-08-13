@@ -8,7 +8,11 @@ import {
   renderPythonToolRules,
   probeImportableModules,
   probeTypeCheckerGaps,
+  probeInvocations,
+  resetProbeMemos,
+  CANDIDATE_MODULES,
 } from "../src/registry.js";
+import { runInSandbox } from "../src/sandbox.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -284,5 +288,52 @@ describe("probeImportableModules / probeTypeCheckerGaps", () => {
     for (const item of result) {
       assert.equal(typeof item, "string");
     }
+  });
+});
+
+// ── Probe memoisation (#68) ─────────────────────────────────────
+
+describe("probe memoisation", () => {
+  // Counters, not timers: a timing assertion passes on a fast machine with the
+  // memo removed, which is exactly the regression this has to catch.
+
+  it("probeTypeCheckerGaps executes once across multiple runInSandbox calls", async () => {
+    resetProbeMemos();
+    const registry = new ToolRegistry([]);
+    for (let i = 0; i < 3; i++) await runInSandbox("1 + 1", { registry });
+    assert.equal(probeInvocations().tyGap, 1);
+  });
+
+  it("probeImportableModules executes once across repeated calls", () => {
+    resetProbeMemos();
+    for (let i = 0; i < 3; i++) probeImportableModules();
+    assert.equal(probeInvocations().importable, 1);
+  });
+
+  it("the memo can be reset", () => {
+    resetProbeMemos();
+    probeTypeCheckerGaps();
+    probeImportableModules();
+    assert.deepEqual(probeInvocations(), { importable: 1, tyGap: 1 });
+    resetProbeMemos();
+    assert.deepEqual(probeInvocations(), { importable: 0, tyGap: 0 });
+    probeTypeCheckerGaps();
+    assert.equal(probeInvocations().tyGap, 1, "a reset memo re-probes");
+  });
+
+  it("a caller-supplied candidate list is never served from the memo", () => {
+    resetProbeMemos();
+    probeImportableModules();
+    probeImportableModules(["json"]);
+    probeImportableModules([...CANDIDATE_MODULES]); // same contents, different array
+    assert.equal(probeInvocations().importable, 3, "only the default list is cached");
+  });
+
+  it("memoised results are still correct", () => {
+    resetProbeMemos();
+    const first = probeTypeCheckerGaps();
+    const second = probeTypeCheckerGaps();
+    assert.deepEqual(second, first);
+    assert.ok(first.every((n) => typeof n === "string"));
   });
 });
