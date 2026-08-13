@@ -172,6 +172,29 @@ CI runs coverage as its own job on Node 24 / ubuntu only. The floors are exact m
 V8 line attribution differs enough between Node majors that a baseline shared across the matrix would
 have to be slackened until it stopped biting.
 
+### Mutation score
+
+`npx stryker run` mutates `src/` and `extensions/` and fails below a **57%** floor. The measured
+baseline on `e556a70` is **58.28%** (1235 detected of 2119 mutants). Full write-up, per-file scores
+and the reasoning behind every config value:
+[docs/mutation-testing.md](docs/mutation-testing.md).
+
+This is the quality gate the coverage floors above are explicitly *not*. It is also expensive —
+**~33 CPU-hours** for a full run, because the command runner re-runs all 426 tests per mutant with no
+per-test filtering. Two consequences:
+
+- **Do not run it on a machine you are using.** `npm test` is already parallel, so Stryker's
+  `concurrency` multiplies against node's own fan-out. Size it by **RAM** (~4.8 GB per worker), not
+  by cores — memory binds first, and exceeding it drives the box into swap. The committed
+  `concurrency: 2` is sized for an 8-core / 24 GB machine.
+- **Use `--incremental` or `--since` on pull requests**, and run the full sweep on a schedule or on
+  demand.
+
+The floor is set at 57 rather than at the measured 58.28 on purpose: the suite is not yet
+deterministic, and re-scoring the same tree from an independent run gives 57.86%. That band is
+[#91](https://github.com/AdarGit008/repl-simple/issues/91), not slack — raise the floor when it
+closes.
+
 ### Optional: `fd` and `ripgrep`
 
 The bridged `find` and `grep` tools shell out to `fd` and `rg`. Install them to run the tests that

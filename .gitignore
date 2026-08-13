@@ -1,2 +1,7 @@
 node_modules/
 dist/
+
+# Stryker: mutant sandboxes, HTML report, and incremental cache.
+.stryker-tmp/
+reports/
+.stryker-incremental.json
