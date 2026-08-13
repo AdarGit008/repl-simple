@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "REQUIRE_BRIDGE_TOOLS=1 npx tsx --test --test-concurrency=3 test/*.test.ts"
+  },
+  "mutate": ["src/**/*.ts", "extensions/**/*.ts"],
+  "coverageAnalysis": "off",
+  "concurrency": 2,
+  "incremental": true,
+  "incrementalFile": ".stryker-incremental.json",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/index.html" },
+  "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
+  "timeoutMS": 60000,
+  "tempDirName": ".stryker-tmp",
+  "thresholds": { "high": 100, "low": 0, "break": 57 }
+}
