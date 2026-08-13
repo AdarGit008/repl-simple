@@ -678,6 +678,25 @@ export async function resumeSuspended(
     if (runOpts.signal.aborted) acc.aborted = true;
   }
 
+  // Abort before the prologue, not after it. `runDispatchLoop` checks
+  // `acc.aborted` at the top of every iteration, but the approval replay below
+  // runs *before* that loop is entered, so its check reports an abort the side
+  // effect has already outrun. The calls that reach this path are by definition
+  // the gated ones — `bash`, `write`, `edit` — so "too late" means the shell
+  // command ran or the file was written (#28). Returning here also spares the
+  // deny branch a pointless Python resume. Nothing has been traced yet, and
+  // nothing should be: the trace must not claim a call that never ran.
+  if (acc.aborted) {
+    return {
+      status: "error",
+      error: "execution aborted",
+      errorKind: "aborted",
+      stdout: acc.stdout,
+      stdoutTruncated: acc.stdoutTruncated,
+      calls: acc.calls,
+    };
+  }
+
   const printCallback = makePrintCallback(acc, runOpts);
 
   // Load the snapshot with printCallback attached

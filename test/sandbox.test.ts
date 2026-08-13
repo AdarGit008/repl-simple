@@ -993,6 +993,85 @@ describe("accumulator ownership — mid-run abort", () => {
   });
 });
 
+describe("abort before the resume prologue", () => {
+  // The prologue runs the approved call *before* the dispatch loop, so the
+  // loop's own abort check at its top is reached only once the side effect has
+  // already happened. Every tool that reaches this path is a gated one — in the
+  // shipped registry, `bash`, `write` or `edit` (#28).
+
+  it("approve + aborted signal → aborted, and the gated tool never executes", async () => {
+    let invocations = 0;
+    const gatedTool: HostTool = {
+      name: "gated_write",
+      description: "Gated side effect",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => {
+        invocations++;
+        return "side-effect-happened";
+      },
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    const susp = await runInSandbox("gated_write()", { registry }, { onApproval: () => "suspend" });
+    suspended(susp);
+    assert.equal(invocations, 0, "suspending must not run the tool");
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await resumeSuspended(susp, true, { registry }, { signal: controller.signal });
+
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    // The assertion the issue exists for: status alone would pass even if the
+    // shell command had already run.
+    assert.equal(
+      invocations,
+      0,
+      `an aborted resume must not execute the gated tool (it ran ${invocations}x)`,
+    );
+    assert.deepEqual(result.calls, [], "no trace entry for a call that never ran");
+  });
+
+  it("deny + aborted signal → aborted, without resuming Python", async () => {
+    const gatedTool: HostTool = {
+      name: "gated_op",
+      description: "Needs approval",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "secret",
+    };
+    const registry = new ToolRegistry([gatedTool]);
+
+    const susp = await runInSandbox(
+      [
+        "try:",
+        "    gated_op()",
+        '    result = "no-error"',
+        "except PermissionError:",
+        '    result = "blocked"',
+        "result",
+      ].join("\n"),
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await resumeSuspended(susp, false, { registry }, { signal: controller.signal });
+
+    // Resuming Python with the PermissionError would return ok/"blocked".
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.deepEqual(result.calls, [], "a denial that was never delivered leaves no trace entry");
+  });
+});
+
 describe("accumulator ownership — SubmitSignal in the resume prologue", () => {
   it("returns the SUBMIT answer and keeps the trace and stdout", async () => {
     const submitTool: HostTool = {
