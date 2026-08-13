@@ -180,15 +180,26 @@ Four things worth knowing before relying on it:
   [#24](https://github.com/AdarGit008/repl-simple/issues/24).
 - **Two files' coverage varies between identical runs**, so `coverage:update` alone can write a floor
   that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts` reports
-  99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The lost line in `truncate.ts` is
-  `truncateText`'s declaration — a function called seventeen times in its own test file and once in
-  `sandbox.ts`, so it cannot really go unexecuted. It is the same merge-by-path defect as the
-  `extension-loader.test.ts` caveat above, in miniature: a test process that loads the module without
-  calling that function can land on top of one that did. **A file that varies gets its floor set by
-  hand at the low observation, not at whatever `--update` happened to measure** — `truncate.ts` is
-  pinned to 99.74 for this reason. Related to
-  [#109](https://github.com/AdarGit008/repl-simple/issues/109), which tracks the same suite's
-  nondeterminism under Stryker.
+  99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in `truncate.ts` is
+  `truncateText`'s declaration, and the lcov record shows it is the *instrument* that varies, not the
+  suite — in the low run the function's body carries a hit count of 380 while its declaration line
+  reads 0:
+
+  ```
+  DA:384,0      export function truncateText(     ← the declaration
+  DA:385,380      text: string,
+  DA:388,380      const t = new Truncator(opts);  ← the body, 380 executions
+  ```
+
+  A function cannot run its body 380 times without being called. Nothing about test execution
+  differed between the runs; V8's per-function range count is lost when coverage from several test
+  processes is merged, while the block counts inside it survive. **A file that varies gets its floor
+  set by hand at the low observation, not at whatever `--update` happened to measure** —
+  `truncate.ts` is pinned to 99.74 for this reason. Which end you land on is machine-dependent:
+  `registry.ts` reported its high in five of six local runs and its low on both CI runs of the same
+  commit. This is *not*
+  [#109](https://github.com/AdarGit008/repl-simple/issues/109) — that is real ordering-dependent
+  behaviour in the rlm tests, whereas nothing here executes differently.
 
 CI runs coverage as its own job on Node 24 / ubuntu only. The floors are exact measured numbers, and
 V8 line attribution differs enough between Node majors that a baseline shared across the matrix would
