@@ -49,6 +49,53 @@ const BASELINE = join(REPO, "coverage-baseline.json");
  */
 const EXCLUDED_TEST_FILES = ["test/extension-loader.test.ts"];
 
+/**
+ * Source files deliberately outside the instrument. Each one needs its reason
+ * here; the point of #105 is that opting out is an edit somebody makes, never
+ * the consequence of an omission.
+ *
+ * `src/index.ts` is the public barrel — nothing but `export … from "./x.js"`.
+ * No test imports it, so it never reaches the report, and there is no
+ * behaviour in it to cover if one did. `npm run check` already fails if a
+ * re-exported name stops resolving, which is the only way a barrel breaks.
+ */
+const UNMEASURED_SOURCE_FILES = ["src/index.ts"];
+
+/** Every tracked source file expected to carry a floor. */
+function sourceFiles() {
+  const ls = spawnSync("git", ["ls-files", "src/*.ts", "extensions/*.ts"], {
+    cwd: REPO,
+    encoding: "utf8",
+  });
+  if (ls.status !== 0) {
+    console.error("could not list source files via git ls-files");
+    exit(1);
+  }
+  return ls.stdout
+    .split("\n")
+    .map((f) => f.trim())
+    .filter((f) => f.endsWith(".ts"))
+    .filter((f) => !UNMEASURED_SOURCE_FILES.includes(f));
+}
+
+/**
+ * The mirror of the absent-file check at the bottom of this script. A file
+ * with a floor that never loads is an error there; a file that loads with no
+ * floor was, until #105, printed as `NEW` and left green — so a new module
+ * opted out of the instrument by existing. `src/truncate.ts`, sole owner of
+ * all model-facing truncation, sat ungated that way from #29 until #105.
+ */
+function unflooredFiles(baselineFiles, measuredFiles) {
+  return sourceFiles()
+    .filter((file) => !(file in baselineFiles))
+    .map((file) =>
+      file in measuredFiles
+        ? `${file} has no floor — run \`npm run coverage:update\``
+        : `${file} has no floor and nothing loads it — give it a test, or add it to ` +
+          "UNMEASURED_SOURCE_FILES with a reason",
+    );
+}
+
 function testFiles() {
   const ls = spawnSync("git", ["ls-files", "test/*.test.ts"], {
     cwd: REPO,
@@ -130,6 +177,17 @@ if (argv.includes("--update")) {
   for (const r of rows) baseline[r.file] = r.pct;
   writeFileSync(BASELINE, `${JSON.stringify({ global, files: baseline }, null, 2)}\n`);
   console.log(`\nBaseline written: ${rows.length} files, ${global.toFixed(2)}% global.`);
+
+  // A file no test loads cannot be given a floor by measuring — it is absent
+  // from the report, so --update cannot write one. Say so here rather than
+  // letting the next plain run be the first anyone hears of it.
+  const unfloored = unflooredFiles(baseline, measured);
+  if (unfloored.length > 0) {
+    console.error("\nStill unfloored after the update:\n");
+    for (const f of unfloored) console.error(`  ${f}`);
+    console.error("");
+    exit(1);
+  }
   exit(0);
 }
 
@@ -146,7 +204,10 @@ console.log("\nfile                            line %   floor");
 console.log("------------------------------------------------");
 for (const r of rows) {
   const floor = baseline.files[r.file];
-  const flag = floor === undefined ? "  NEW" : r.pct < floor ? "  FAIL" : "";
+  // No floor is a failure now (see unflooredFiles), reported once at the end.
+  // A row can still land here unfloored and legitimately: an UNMEASURED file
+  // that some test has started loading.
+  const flag = floor === undefined ? "  UNMEASURED" : r.pct < floor ? "  FAIL" : "";
   if (floor !== undefined && r.pct < floor) {
     failures.push(`${r.file}: ${r.pct.toFixed(2)}% is below its floor of ${floor.toFixed(2)}%`);
   }
@@ -169,6 +230,8 @@ for (const file of Object.keys(baseline.files)) {
     failures.push(`${file} has a floor but is absent from the report — nothing loaded it`);
   }
 }
+
+failures.push(...unflooredFiles(baseline.files, measured));
 
 if (failures.length > 0) {
   console.error("Coverage floor breached:\n");

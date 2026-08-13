@@ -155,7 +155,13 @@ suite has a documented history of tests that execute plenty and assert nothing (
 [#24](https://github.com/AdarGit008/repl-simple/issues/24) is the quality gate. This is a cheap
 regression detector that runs in seconds — do not let a coverage number justify skipping a test.
 
-Two things worth knowing before relying on it:
+**Adding a file under `src/` or `extensions/` means re-running `coverage:update` in the same change.**
+A source file with no floor has no gate, so the run fails until it gets one. If a file genuinely
+belongs outside the instrument, add it to `UNMEASURED_SOURCE_FILES` in `scripts/coverage.mjs` with its
+reason — `src/index.ts` is there today, a pure re-export barrel that `npm run check` already gates.
+Opting out has to be an edit somebody makes.
+
+Four things worth knowing before relying on it:
 
 - **`test/extension-loader.test.ts` is excluded from the coverage run** (not from `npm test`). It
   drives pi's real `discoverAndLoadExtensions`, which loads `src/` a second time through pi's jiti
@@ -167,6 +173,33 @@ Two things worth knowing before relying on it:
   loaded, so a module dropping out of the suite leaves the denominator and every percentage *rises*.
   `coverage-baseline.json` doubles as a manifest for exactly this: a file with a floor that is absent
   from the report is a hard error.
+- **A floor proves the lines run, not that the file's own tests do.** `src/truncate.ts` measures 100%
+  with `test/truncate.test.ts` deleted — the sandbox tests route enough output through the truncator to
+  execute every line of it. The floor still catches a *regression* in `truncate.ts`, which is its job;
+  it will not notice its test file leaving. Nothing here substitutes for
+  [#24](https://github.com/AdarGit008/repl-simple/issues/24).
+- **Two files' coverage varies between identical runs**, so `coverage:update` alone can write a floor
+  that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts` reports
+  99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in `truncate.ts` is
+  `truncateText`'s declaration, and the lcov record shows it is the *instrument* that varies, not the
+  suite — in the low run the function's body carries a hit count of 380 while its declaration line
+  reads 0:
+
+  ```
+  DA:384,0      export function truncateText(     ← the declaration
+  DA:385,380      text: string,
+  DA:388,380      const t = new Truncator(opts);  ← the body, 380 executions
+  ```
+
+  A function cannot run its body 380 times without being called. Nothing about test execution
+  differed between the runs; V8's per-function range count is lost when coverage from several test
+  processes is merged, while the block counts inside it survive. **A file that varies gets its floor
+  set by hand at the low observation, not at whatever `--update` happened to measure** —
+  `truncate.ts` is pinned to 99.74 for this reason. Which end you land on is machine-dependent:
+  `registry.ts` reported its high in five of six local runs and its low on both CI runs of the same
+  commit. This is *not*
+  [#109](https://github.com/AdarGit008/repl-simple/issues/109) — that is real ordering-dependent
+  behaviour in the rlm tests, whereas nothing here executes differently.
 
 CI runs coverage as its own job on Node 24 / ubuntu only. The floors are exact measured numbers, and
 V8 line attribution differs enough between Node majors that a baseline shared across the matrix would
