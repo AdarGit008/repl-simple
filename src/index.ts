@@ -11,6 +11,7 @@ export type {
   RunOk,
   RunError,
   RunSuspended,
+  DiscardedSuspension,
   RunResult,
   LlmClient,
   RlmOptions,

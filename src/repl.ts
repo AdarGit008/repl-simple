@@ -160,6 +160,23 @@ export class ReplRunner {
  * See docs/truncation-policy.md.
  */
 function formatResult(result: RunResult, sessionId: string): string {
+  const body = formatOutcome(result, sessionId);
+  const discarded = result.discardedSuspension;
+  if (!discarded) return body;
+
+  // First, not last. The model may stop reading at the result it asked for,
+  // and this is the line telling it that an approval it is still expecting to
+  // answer is gone — and that the side effect behind it never happened (#129).
+  return (
+    `[discarded] An approval was still pending in session '${sessionId}' and running this ` +
+    `code dropped it. The '${discarded.tool}' call never executed:\n` +
+    `${discarded.description}\n` +
+    `Run it again if you still want it.\n\n${body}`
+  );
+}
+
+/** The result itself, without the discard notice `formatResult` may prepend. */
+function formatOutcome(result: RunResult, sessionId: string): string {
   if (result.status === "ok") {
     const parts: string[] = [];
     if (result.stdout) {
