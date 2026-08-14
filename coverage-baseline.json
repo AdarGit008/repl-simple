@@ -4,6 +4,7 @@
     "extensions/repl-extension.ts": 83.44,
     "src/bridge.ts": 100,
     "src/builtins.ts": 98.86,
+    "src/pathjail.ts": 98.54,
     "src/pool.ts": 96.66,
     "src/registry.ts": 96.02,
     "src/repl.ts": 92.19,

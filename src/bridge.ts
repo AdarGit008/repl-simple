@@ -10,11 +10,21 @@ import {
   type BashToolOptions,
   type EditToolOptions,
   type FindToolOptions,
+  type GrepOperations,
   type GrepToolOptions,
+  type LsOperations,
   type LsToolOptions,
   type ReadToolOptions,
   type WriteToolOptions,
 } from "@earendil-works/pi-coding-agent";
+import {
+  access as fsAccess,
+  stat as fsStat,
+  readFile as fsReadFile,
+  readdir as fsReaddir,
+} from "node:fs/promises";
+import { createPathJail, type PathJail } from "./pathjail.js";
+import { HostToolError } from "./types.js";
 import type { HostTool, HostToolParam } from "./types.js";
 
 // ── Options ──────────────────────────────────────────────────────
@@ -22,6 +32,13 @@ import type { HostTool, HostToolParam } from "./types.js";
 export interface BridgeOptions {
   /** Gate mutating tools (bash, edit, write) behind approval. Default: true. */
   gateMutating?: boolean;
+  /**
+   * Also gate the read tools (read, grep, find, ls) behind approval.
+   * Default: false — they are jailed to `cwd` unconditionally, and a prompt
+   * on a tool the model calls dozens of times per task is the kind that gets
+   * clicked through. Set it for callers who want both (#43).
+   */
+  gateReads?: boolean;
   /** Passed through to createReadTool. */
   read?: ReadToolOptions;
   /** Passed through to createGrepTool. */
@@ -49,6 +66,91 @@ export interface BridgeOptions {
  */
 const DEFAULT_BASH_TIMEOUT_SECS = 120;
 
+// ── The cwd jail ────────────────────────────────────────────────
+
+/**
+ * Confine pi's read tools to `cwd`.
+ *
+ * The jail is applied to the `path` argument, before pi sees it, and the
+ * canonical path replaces it. That ordering is the whole design: pi's own
+ * resolution understands `~`, `file://` URLs, `@` prefixes and unicode
+ * spaces, so a check that resolves the *raw* argument its own way is
+ * checking a path that is not the one that gets opened. Handing pi an
+ * absolute, already-canonical path leaves its resolver nothing to do, which
+ * makes this check the only one that decides.
+ *
+ * `operations` back it up for the paths pi derives itself rather than taking
+ * from the model — grep's context reads, ls's per-entry stats. Neither
+ * `read` nor `find` gets one, for reasons that are not symmetry:
+ *
+ * - `read` would have to supply `detectImageMimeType`, and pi does not export
+ *   its sniffer. Omitting it means every image is decoded as UTF-8 text into
+ *   the model's context. `read` opens exactly the one path it is given, which
+ *   the argument jail has already canonicalised.
+ * - `find` only consults its operations when they supply `glob`, which
+ *   replaces the `fd` subprocess — losing .gitignore handling and the result
+ *   caps with it. `fd`, like `rg`, does not follow symlinks out of the tree
+ *   it is pointed at.
+ */
+function jailedGrepOperations(jail: PathJail, inherited?: GrepOperations): GrepOperations {
+  return {
+    isDirectory: async (p) => {
+      const real = await jail.resolve(p);
+      if (inherited) return inherited.isDirectory(real);
+      return (await fsStat(real)).isDirectory();
+    },
+    readFile: async (p) => {
+      const real = await jail.resolve(p);
+      if (inherited) return inherited.readFile(real);
+      return fsReadFile(real, "utf-8");
+    },
+  };
+}
+
+function jailedLsOperations(jail: PathJail, inherited?: LsOperations): LsOperations {
+  return {
+    exists: async (p) => {
+      // Outside the root throws rather than answering "no": pi renders a false
+      // here as "Path not found", which reads as "try another path" — the
+      // opposite of what a refusal should tell the model.
+      const real = await jail.resolve(p);
+      if (inherited) return inherited.exists(real);
+      return await fsAccess(real).then(
+        () => true,
+        () => false,
+      );
+    },
+    stat: async (p) => {
+      const real = await jail.resolve(p);
+      return inherited ? inherited.stat(real) : fsStat(real);
+    },
+    readdir: async (p) => {
+      const real = await jail.resolve(p);
+      if (inherited) return inherited.readdir(real);
+      return fsReaddir(real);
+    },
+  };
+}
+
+/**
+ * Replace `path` with the jail's canonical form, so the path pi opens is the
+ * path that was checked. An omitted `path` becomes the root itself rather
+ * than being left for pi to default — same reason.
+ */
+async function jailPathArg(
+  args: Record<string, unknown>,
+  jail: PathJail,
+): Promise<Record<string, unknown>> {
+  const raw = args.path;
+  if (raw === undefined || raw === null || raw === "") {
+    return { ...args, path: await jail.resolve(".") };
+  }
+  if (typeof raw !== "string") {
+    throw new HostToolError("TypeError", `path must be a str, got ${typeof raw}`);
+  }
+  return { ...args, path: await jail.resolve(raw) };
+}
+
 interface ToolSpec {
   name: string;
   // pi's tool factories each return a differently-shaped AgentTool and the
@@ -56,7 +158,7 @@ interface ToolSpec {
   // re-declaring pi's types here, free to drift from the ones that actually
   // run — the failure mode the pinned `typebox` exists to avoid.
   // biome-ignore lint/suspicious/noExplicitAny: no supertype to narrow to
-  factory: (cwd: string, opts: BridgeOptions) => any;
+  factory: (cwd: string, opts: BridgeOptions, jail: PathJail) => any;
   params: HostToolParam[];
   mutating: boolean;
   /** Optional arg pre-processing before passing to Pi tool */
@@ -68,7 +170,11 @@ const TOOL_SPECS: ToolSpec[] = [
     name: "read",
     factory: (cwd, opts) => createReadTool(cwd, opts.read),
     params: [
-      { name: "path", type: "str", description: "File to read (absolute or relative to cwd)." },
+      {
+        name: "path",
+        type: "str",
+        description: "File to read, inside the project root (absolute or relative to cwd).",
+      },
       {
         name: "offset",
         type: "int",
@@ -86,7 +192,11 @@ const TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "grep",
-    factory: (cwd, opts) => createGrepTool(cwd, opts.grep),
+    factory: (cwd, opts, jail) =>
+      createGrepTool(cwd, {
+        ...opts.grep,
+        operations: jailedGrepOperations(jail, opts.grep?.operations),
+      }),
     params: [
       {
         name: "pattern",
@@ -149,7 +259,8 @@ const TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "ls",
-    factory: (cwd, opts) => createLsTool(cwd, opts.ls),
+    factory: (cwd, opts, jail) =>
+      createLsTool(cwd, { ...opts.ls, operations: jailedLsOperations(jail, opts.ls?.operations) }),
     params: [
       {
         name: "path",
@@ -228,27 +339,38 @@ const TOOL_SPECS: ToolSpec[] = [
 /**
  * Create HostTool wrappers around Pi's built-in coding tools.
  *
- * Read-only tools (read, grep, find, ls) never require approval.
+ * Read-only tools (read, grep, find, ls) are jailed to `cwd` and require no
+ * approval; a path outside it is refused, `..` and symlinks included.
  * Mutating tools (bash, edit, write) require approval by default;
- * set `{ gateMutating: false }` to skip approval for all.
+ * set `{ gateMutating: false }` to skip approval for all. `bash` is
+ * therefore the only way to reach outside the root, and it is gated —
+ * see docs/path-jail.md.
  *
  * Each tool executes against `cwd` — the working directory for
  * relative paths and command execution.
  */
 export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): HostTool[] {
   const gateMutating = options.gateMutating ?? true;
+  const gateReads = options.gateReads ?? false;
+
+  // `mustExist: false` leaves a path that is not there for pi to report on,
+  // which keeps its filename-variant fallbacks (NFD, curly quotes) working.
+  // Those substitute characters; none of them can introduce a separator or a
+  // `..`, so the check still decides.
+  const jail = createPathJail(cwd, { allowAbsolute: true, mustExist: false });
 
   return TOOL_SPECS.map((spec) => {
-    const agentTool = spec.factory(cwd, options);
+    const agentTool = spec.factory(cwd, options, jail);
 
     return {
       name: spec.name,
       description: agentTool.description ?? "",
       params: spec.params,
       returns: "str" as const,
-      requiresApproval: spec.mutating ? gateMutating : false,
+      requiresApproval: spec.mutating ? gateMutating : gateReads,
       execute: async (args: Record<string, unknown>): Promise<string> => {
-        const processed = spec.prepareArgs ? spec.prepareArgs(args) : args;
+        const jailed = spec.mutating ? args : await jailPathArg(args, jail);
+        const processed = spec.prepareArgs ? spec.prepareArgs(jailed) : jailed;
         const result = await agentTool.execute(
           randomUUID(),
           // `processed` is a plain Record built from Monty's dynamically-typed

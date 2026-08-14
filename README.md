@@ -27,6 +27,12 @@ Pi extension — sandboxed Python execution via [Monty](https://github.com/pydan
 
 **Pi bridge:** `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`
 
+The four read tools are confined to the project root, as `read_file` and `list_files` always were.
+An absolute path outside it, a `..` traversal, and a symlink whose target leaves the tree are all
+refused — so `~/.ssh`, `~/.aws`, `~/.config` and sibling checkouts are out of reach, which is a real
+cost when the thing you want to read genuinely lives there. The escape hatch is a `bash` call, which
+asks for approval first. See [docs/path-jail.md](docs/path-jail.md).
+
 **Builtins:** `read_file`, `list_files`, `http_get`
 
 `http_get` is the only way out of the sandbox to the network, so it is never both silent and

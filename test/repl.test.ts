@@ -214,6 +214,60 @@ describe("ReplRunner — http_get is not a silent egress", () => {
   });
 });
 
+// ── The cwd jail (#43) ──────────────────────────────────────────
+
+/**
+ * The read half of the same chain, through the shipped path.
+ *
+ * B3 measured the bridged `read` reaching anything the Pi process could —
+ * with no prompt — while `read_file` next to it in the same registry refused.
+ * Asserted here at the seam a user actually reaches, because the bridge unit
+ * tests construct their own tools and so cannot catch `ReplRunner` handing
+ * them the wrong root, or none.
+ */
+describe("ReplRunner — the read tools cannot leave cwd", () => {
+  let runner: ReplRunner;
+  let secret: string;
+
+  before(() => {
+    const cwd = makeTempDir();
+    writeFileSync(join(cwd, "inside.txt"), "IN-ROOT-VALUE\n");
+    // Outside the runner's root, and not somewhere the suite may write to.
+    secret = "/etc/hostname";
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("refuses an absolute path outside the root, with no prompt", async () => {
+    const prompts: string[] = [];
+    const out = await runner.run(`read(path='${secret}')`, "jail", async (req) => {
+      prompts.push(req.tool);
+      return true;
+    });
+    assert.deepEqual(prompts, [], "a jail that asks is a jail that gets clicked through");
+    assert.match(out, /PermissionError/);
+    assert.match(out, /outside the project root/, "the refusal must say why");
+  });
+
+  it("refuses '..' for read, ls, grep and find alike", async () => {
+    for (const call of [
+      "read(path='../../etc/hostname')",
+      "ls(path='../..')",
+      "grep(pattern='root', path='../..')",
+      "find(pattern='*', path='../..')",
+    ]) {
+      const out = await runner.run(call, "jail");
+      assert.match(out, /PermissionError/, call);
+    }
+  });
+
+  it("still reads inside the root", async () => {
+    const out = await runner.run("read(path='inside.txt')", "jail");
+    assert.match(out, /IN-ROOT-VALUE/);
+  });
+});
+
 // ── Error handling ──────────────────────────────────────────────
 
 describe("ReplRunner — error handling", () => {
