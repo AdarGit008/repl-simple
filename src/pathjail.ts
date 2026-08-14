@@ -102,14 +102,23 @@ export function createPathJail(rootPath: string, options: PathJailOptions = {}):
         throw new HostToolError("PermissionError", `absolute paths are not allowed: '${path}'`);
       }
 
+      const realRoot = await realpath(root);
+
       // Cheap check first: it rejects `..` and absolute escapes without
       // touching the filesystem. It is not sufficient on its own — a symlink
       // inside the root passes it — which is what the realpath check below is
       // for.
+      //
+      // Either spelling of the root counts, because the root itself can be
+      // reached through a symlink: macOS hands out `/var/folders/…` for a
+      // temp dir whose real path is `/private/var/folders/…`, and a caller
+      // passing an already-canonical path would otherwise be refused entry to
+      // its own root. Nothing is loosened by accepting both — the realpath
+      // comparison below is what decides.
       const resolved = resolve(root, path);
-      if (!contains(resolved, root)) throw outsideRoot(path, root);
-
-      const realRoot = await realpath(root);
+      if (!contains(resolved, root) && !contains(resolved, realRoot)) {
+        throw outsideRoot(path, root);
+      }
 
       let real: string;
       try {

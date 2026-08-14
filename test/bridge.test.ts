@@ -351,6 +351,20 @@ describe("createPiBridgeTools — the cwd jail", () => {
     }
   });
 
+  it("works when cwd is itself reached through a symlink", async () => {
+    // What macOS does to every temp dir: cwd is `/var/folders/…`, its real
+    // path is `/private/var/folders/…`. The tools are built on the former and
+    // the jail hands back the latter, so a check against one spelling only
+    // refuses the root's own files. Run everywhere, not just on the mac leg.
+    const linked = join(outsideDir, "root-link");
+    symlinkSync(tmpDir, linked);
+    const tools = createPiBridgeTools(linked);
+
+    assert.match(await findTool(tools, "read").execute({ path: "test.txt" }), /hello world/);
+    assert.match(await findTool(tools, "ls").execute({ path: "." }), /test\.txt/);
+    await assertRefused(findTool(tools, "read"), { path: "escape-link" });
+  });
+
   it("refuses a path that is not a string", async () => {
     // Monty hands the registry dynamically-typed values, so `path` can arrive
     // as anything. Refuse it here rather than letting `resolve()` stringify

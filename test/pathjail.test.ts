@@ -118,6 +118,24 @@ describe("createPathJail — inside the root", () => {
     );
   });
 
+  it("works when the root is itself reached through a symlink", async () => {
+    // macOS hands out `/var/folders/…` for a temp dir whose real path is
+    // `/private/var/folders/…`, so the root and its canonical form differ and
+    // a prefix check against only one of them refuses the root's own files.
+    // Reproduced here on every platform rather than left to the macOS leg.
+    const linkedRoot = join(outside, "root-link");
+    await symlink(root, linkedRoot);
+    const jail = createPathJail(linkedRoot, { allowAbsolute: true });
+
+    assert.equal(await jail.resolve("file.txt"), join(await realRoot(), "file.txt"));
+    assert.equal(
+      await jail.resolve(join(await realRoot(), "file.txt")),
+      join(await realRoot(), "file.txt"),
+      "an already-canonical path must not be refused entry to its own root",
+    );
+    await assertRejects(jail.resolve("escape-link"), "PermissionError", "still jailed");
+  });
+
   it("accepts an absolute in-root path only when allowed", async () => {
     const absolute = join(root, "file.txt");
     await assertRejects(createPathJail(root).resolve(absolute), "PermissionError", "default");
