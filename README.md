@@ -43,6 +43,10 @@ import {
   // Sandbox
   runInSandbox,
   resumeSuspended,
+  // Worker pool
+  getSandboxPool,
+  closeSandboxPool,
+  poolConfig,
   // Session
   Session,
   // Tool composition
@@ -75,7 +79,9 @@ straight to its module loader without expanding directories, so a directory entr
 tools. See [#37](https://github.com/AdarGit008/repl-simple/issues/37).
 
 Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
-`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. See
+`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. 0.0.21
+also ships a wasm runtime at `@pydantic/monty/wasm` that looks like a way around this and is not:
+it runs Python in-process, so a runaway blocks the event loop and there is no crash isolation. See
 [docs/platform-support.md](docs/platform-support.md).
 
 ## Dev
@@ -91,12 +97,42 @@ npm run mutation # stryker, contained in a memory-capped systemd scope
 npm run test:contained # the suite, likewise contained
 ```
 
-Two environment variables guard against a runaway exhausting the host, both read at call time:
+Four environment variables tune the sandbox, all read at call time.
+
+Two guard against a runaway exhausting the host:
 
 | variable | default | effect |
 |---|---|---|
 | `REPL_MEMORY_CEILING_MB` | `5120` | Per-process RSS ceiling; `runInSandbox` throws `SandboxMemoryError` at or above it. Clamped down automatically inside a cgroup, since `/proc/meminfo` cannot see a container limit. `0` disables. |
 | `REPL_MEMORY_FLOOR_MB` | `0` (off) | Refuse to start when the host has less than this much memory available. Opt-in: whether the machine as a whole is short of memory is not this library's business to police. |
+
+**Both now measure the host process, which is no longer where sandboxed Python allocates.** Python
+runs in a worker subprocess, so a script allocating gigabytes grows the worker and is stopped by
+`RunLimits.maxMemory` inside it, not by these. What they still catch is growth on *our* side of the
+line — accumulated messages, buffers, a caller looping over runs — which is what a host ceiling can
+honestly speak to.
+
+Two size the worker pool. Neither is left to `@pydantic/monty`'s own default, because both of those
+fail open: `maxProcesses` follows the CPU count, and `checkoutTimeout` waits **forever**, so an
+exhausted pool hangs with no error and no log rather than failing.
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~8.5 MB each), not by core count. |
+| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing. |
+
+### The worker pool
+
+Python runs in crash-isolated `monty` worker subprocesses checked out of a pool, one pool per
+process, created on first use. `closeSandboxPool()` shuts it down; nothing requires you to call it,
+since an idle pool holds no handle that keeps the event loop alive.
+
+This is what makes a runaway survivable. Under 0.0.18 the interpreter ran in-process: an infinite
+loop fired **zero** host timers in 12 s and needed a SIGKILL of the whole process to clear. The same
+loop under a 1 s budget now raises a catchable error at 1.001 s with the host event loop ticking
+throughout. A worker that dies outright takes only its own session, and surfaces as
+`errorKind: "crashed"` — the one error kind that means the Python state is gone rather than merely
+errored, so there is nothing left to resume against.
 
 Two TypeScript configs, deliberately:
 
@@ -153,10 +189,11 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs
 **per-file** line-coverage floor from `coverage-baseline.json`. `npm run coverage:update` rewrites the
 baseline; lowering a floor is a decision to explain in the commit message, not a formality.
 
-Floors are per file because a global number does not bite. Deleting `test/sandbox.test.ts` — 813
-lines, and the only file that kills any `sandbox.ts` mutation — moves the global figure from 93.33% to
-**92.78%**, a 0.55 pp drop that any round global floor survives. The same deletion drops
-`src/sandbox.ts` from 83.19% to 80.71%, which the per-file floor catches.
+Floors are per file because a global number does not bite. Deleting `test/sandbox.test.ts` — 1811
+lines, and the only file that kills any `sandbox.ts` mutation — moves the global figure from 96.92%
+to **93.64%**, a drop a round global floor of 90% survives without noticing. The same deletion drops
+`src/sandbox.ts` from 97.06% to 83.63%, which the per-file floor catches. (Re-measured on 0.0.21;
+the same experiment on 0.0.18 moved the global figure by 0.55 pp.)
 
 **This is not a quality gate.** Coverage says lines executed, not that anything was asserted, and this
 suite has a documented history of tests that execute plenty and assert nothing (see
@@ -175,8 +212,8 @@ Four things worth knowing before relying on it:
 - **`test/extension-loader.test.ts` is excluded from the coverage run** (not from `npm test`). It
   drives pi's real `discoverAndLoadExtensions`, which loads `src/` a second time through pi's jiti
   loader; Node merges V8 coverage by file path, so those barely-executed duplicates land on top of the
-  real entries. With it in the run, `src/sandbox.ts` reports **20.80%** against a true **83.20%**, and
-  the global figure reads 54.13% instead of 93.33%. Coverage cannot fall as tests are added — the low
+  real entries. With it in the run, `src/sandbox.ts` reports **41.44%** against a true **97.06%**, and
+  the global figure reads 59.25% instead of 96.92%. Coverage cannot fall as tests are added — the low
   number is the instrument misreporting, not a gap.
 - **Node's report cannot see a module that stopped being loaded.** It lists only files that were
   loaded, so a module dropping out of the suite leaves the denominator and every percentage *rises*.
@@ -216,13 +253,18 @@ have to be slackened until it stopped biting.
 
 ### Mutation score
 
-`npm run mutation` mutates `src/` and `extensions/` and fails below a **57%** floor. The measured
-baseline on `e556a70` is **58.28%** (1235 detected of 2119 mutants). Full write-up, per-file scores
-and the reasoning behind every config value:
-[docs/mutation-testing.md](docs/mutation-testing.md).
+`npm run mutation` mutates `src/` and `extensions/` and fails below a **58%** floor
+(`thresholds.break`), just under the **58.09%** baseline. Full write-up, per-file scores and the
+reasoning behind every config value: [docs/mutation-testing.md](docs/mutation-testing.md).
+
+**The baseline predates the Monty 0.0.21 migration and has not been re-measured against it.**
+`src/sandbox.ts` was rewritten and `src/pool.ts` is new, so both the mutant population and the score
+have moved by an unknown amount, in an unknown direction. The floor is not a CI gate — mutation runs
+on demand, not in `.github/workflows/ci.yml` — so nothing is silently passing on a stale number, but
+treat the 57% as unverified until a full sweep re-baselines it.
 
 This is the quality gate the coverage floors above are explicitly *not*. It is also expensive —
-**~33 CPU-hours** for a full run, because the command runner re-runs all 426 tests per mutant with no
+**~33 CPU-hours** for a full run, because the command runner re-runs all 465 tests per mutant with no
 per-test filtering. Two consequences:
 
 - **Run it with `npm run mutation`**, which contains it in a systemd scope with a memory ceiling so
@@ -230,14 +272,17 @@ per-test filtering. Two consequences:
   Stryker's `concurrency` multiplies against node's own fan-out; size it by **RAM**, not by cores.
   One worker is ~1 GB and the committed `concurrency: 2` is ~2 GB — see
   [`docs/mutation-testing.md`](docs/mutation-testing.md), which records how that number was wrong
-  twice before it was right.
+  twice before it was right. The containment is **not** lifted by the move to worker subprocesses;
+  if anything it matters more, since a scope's cgroup accounts for a process tree while the
+  `REPL_MEMORY_CEILING_MB` guard only sees the host process. The sizing figures above predate the
+  migration and each Stryker worker now spawns monty workers of its own.
 - **Use `--incremental` or `--since` on pull requests**, and run the full sweep on a schedule or on
   demand.
 
-The floor is set at 57 rather than at the measured 58.28 on purpose: the suite is not yet
-deterministic, and re-scoring the same tree from an independent run gives 57.86%. That band is
-[#109](https://github.com/AdarGit008/repl-simple/issues/109), not slack — raise the floor when it
-closes.
+The floor sits 0.09 under the baseline, which is rounding room rather than slack: the reproducibility
+band that once justified a wider gap was an artefact of a harness scoring runs that never happened,
+and it closed with [#109](https://github.com/AdarGit008/repl-simple/issues/109). A run coming in
+under the floor is a regression to explain, not a threshold to lower.
 
 ### Optional: `fd` and `ripgrep`
 

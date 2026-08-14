@@ -61,8 +61,15 @@ export interface ToolCallTrace {
   approved?: boolean;
 }
 
-/** Kinds of run errors */
-export type RunErrorKind = "syntax" | "typing" | "runtime" | "aborted";
+/**
+ * Kinds of run errors.
+ *
+ * `crashed` is what a runaway became when the sandbox moved into a worker
+ * process: the host watchdog killed the worker and the pool replaced it. It is
+ * separate from `runtime` because the session's Python state is gone rather
+ * than merely errored — there is nothing left to resume against.
+ */
+export type RunErrorKind = "syntax" | "typing" | "runtime" | "aborted" | "crashed";
 
 /** Successful run result */
 export interface RunOk {
@@ -89,7 +96,7 @@ export interface RunError {
 export interface RunSuspended {
   status: "suspended";
   suspendedCall: ApprovalRequest;
-  /** Serialized MontySnapshot — pass to resumeSuspended() to continue. */
+  /** Serialized suspended snapshot — pass to resumeSuspended() to continue. */
   snapshot: Buffer;
   stdout: string;
   stdoutTruncated: boolean;

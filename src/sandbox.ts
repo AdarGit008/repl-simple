@@ -1,15 +1,33 @@
 import { readFileSync } from "node:fs";
+// `@pydantic/monty/node`, not the package root, here and in every other file.
+//
+// The root's `exports` map points `types` at `index.d.ts` while pointing every
+// runtime condition at `node.js` — and `index.d.ts` is the portable subset,
+// missing `MountDir` among others. So the root specifier hands the compiler a
+// narrower surface than it hands the process: `MountDir` resolves fine at
+// runtime and does not exist to `tsc`. `/node` is the same module with the
+// types that match it.
+//
+// It also states what this package requires. The native worker is where crash
+// isolation and the surviving event loop come from; the `wasm` entry runs
+// Python in-process with neither, which is 0.0.18's failure mode wearing
+// 0.0.21's API (see docs/platform-support.md).
 import {
-  Monty,
-  MontySnapshot,
-  MontyNameLookup,
+  FunctionSnapshot,
+  FutureSnapshot,
   MontyComplete,
+  MontyCrashedError,
   MontyRuntimeError,
   MontySyntaxError,
   MontyTypingError,
   MountDir,
+  type MontySession,
+  NameLookupSnapshot,
+  type PrintCallback,
   type ResourceLimits,
-} from "@pydantic/monty";
+  type Snapshot,
+} from "@pydantic/monty/node";
+import { withSandboxSession } from "./pool.js";
 import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import {
   Truncator,
@@ -28,6 +46,7 @@ import type {
   HostTool,
   RunResult,
   RunError,
+  RunErrorKind,
   RunSuspended,
   ToolCallTrace,
   ApprovalRequest,
@@ -42,11 +61,23 @@ const DEFAULT_MAX_STDOUT = STDOUT_MAX_BYTES;
 const DEFAULT_MAX_OUTPUT = OUTPUT_MAX_BYTES;
 
 /**
- * Sentinel function used at NameLookup to satisfy Monty's type checker.
- * The real tool dispatch happens at Snapshot time when we have
- * functionName + args + kwargs.
+ * Raise `pythonType` inside the sandbox with `message`.
+ *
+ * The channel is the error's **`name`**, which is the whole reason this helper
+ * exists rather than an object literal at each call site. 0.0.18 took a
+ * `{ exception: { type, message } }` record; 0.0.21's `resumeError` reads
+ * `err.name`, accepts it only if it is one of the 37 names in monty's
+ * `PYTHON_EXC_NAMES`, and quietly substitutes `RuntimeError` otherwise — the
+ * same fallback 0.0.18's native binding applied to an unknown type name, so no
+ * call site changes meaning. Passing a plain object instead is not a type
+ * error and not a runtime error: it surfaces in Python as
+ * `RuntimeError: [object Object]` (measured).
  */
-const SENTINEL = () => "";
+function pythonError(pythonType: string, message: string): Error {
+  const err = new Error(message);
+  err.name = pythonType;
+  return err;
+}
 
 // ── Dispatch loop accumulators ───────────────────────────────────
 
@@ -94,6 +125,18 @@ class DispatchAccumulators {
   }
 }
 
+/** Assemble a `RunError` around whatever the accumulators hold. */
+function runError(kind: RunErrorKind, error: string, acc: DispatchAccumulators): RunError {
+  return {
+    status: "error",
+    error,
+    errorKind: kind,
+    stdout: acc.stdout,
+    stdoutTruncated: acc.stdoutTruncated,
+    calls: acc.calls,
+  };
+}
+
 /**
  * Classify an error thrown by *resuming Python* into a `RunError`.
  *
@@ -107,19 +150,59 @@ class DispatchAccumulators {
  * defect behind #36 was not a wrong classification — it was a `resume()` that
  * sat inside a `try` written for something else and so reached a handler with
  * no branch for this case at all.
+ *
+ * `MontyCrashedError` is new with the worker pool and is emphatically not a
+ * host fault to rethrow. It is what a runaway now *becomes*: the host watchdog
+ * kills the worker, the pool replaces it, and this run is over. On 0.0.18 the
+ * same code froze the event loop until something SIGKILLed the whole process,
+ * so there was no error to classify. It gets its own kind rather than folding
+ * into `runtime` because the consequence differs — the session's Python state
+ * is gone, not merely errored, and a caller that resumes or retries against it
+ * is working with nothing.
  */
 function classifyResumeError(err: unknown, acc: DispatchAccumulators): RunError {
-  if (err instanceof MontyRuntimeError) {
-    return {
-      status: "error",
-      error: err.message,
-      errorKind: "runtime",
-      stdout: acc.stdout,
-      stdoutTruncated: acc.stdoutTruncated,
-      calls: acc.calls,
-    };
-  }
+  if (err instanceof MontyRuntimeError) return runError("runtime", err.message, acc);
+  if (err instanceof MontyCrashedError) return runError("crashed", crashMessage(err), acc);
   throw err;
+}
+
+/**
+ * Classify an error thrown by *starting* Python — everything
+ * `classifyResumeError` covers, plus the two that can only happen before the
+ * first instruction runs.
+ *
+ * The syntax/typing split needs explaining. 0.0.18 parsed and type-checked in
+ * two separate calls, so the two error classes arrived separately and this
+ * code merely labelled them. 0.0.21 type-checks as part of the feed, and the
+ * checker parses first: with `typeCheck: true`, `def (` raises
+ * **`MontyTypingError`**, not `MontySyntaxError` — its diagnostics simply lead
+ * with `error[invalid-syntax]` (measured). Reading the diagnostic code back
+ * out is the only thing left that separates "this is not Python" from "this is
+ * Python that does not type-check", and the distinction is worth keeping: it
+ * is the difference between a model that mistyped and a model that
+ * misunderstood. `MontySyntaxError` still arrives from the paths that do not
+ * type-check, such as stub validation.
+ */
+function classifyStartError(err: unknown, acc: DispatchAccumulators): RunError {
+  if (err instanceof MontySyntaxError) return runError("syntax", err.message, acc);
+  if (err instanceof MontyTypingError) {
+    const diagnostics = err.display();
+    const kind = diagnostics.includes("error[invalid-syntax]") ? "syntax" : "typing";
+    return runError(kind, err.message, acc);
+  }
+  return classifyResumeError(err, acc);
+}
+
+/**
+ * What to tell the caller about a dead worker. `timedOut` is the one
+ * distinction that changes what they should do: a watchdog kill means the code
+ * ran too long, which is actionable, while a bare crash is not the caller's
+ * doing.
+ */
+function crashMessage(err: MontyCrashedError): string {
+  return err.timedOut
+    ? `execution exceeded its time budget and the sandbox was terminated: ${err.message}`
+    : `the sandbox worker died: ${err.message}`;
 }
 
 /**
@@ -308,13 +391,20 @@ function assertMemoryHeadroom(): void {
 // ── Private helpers ──────────────────────────────────────────────
 
 /**
- * Build the type-check prefix: tool stubs + gap declarations.
+ * Build the type-check stub file: tool stubs + input and gap declarations.
  * Gaps are runtime names Monty's type checker rejects (e.g. `open`,
  * `PermissionError`) — we declare them as `name: Any = None`.
+ *
+ * The contents are what 0.0.18 prepended to the user's source as
+ * `typeCheckPrefixCode`. They now travel as `typeCheckStubs`, which the
+ * checker resolves out-of-band, so a diagnostic on line 3 of the user's
+ * snippet reports line 3 (measured) instead of line 3 + the prefix's height.
+ * That removes the type-check contribution to #77's shift; the ~90 lines the
+ * RLM preamble adds are ours and remain.
  */
-function buildTypeCheckPrefix(registry: ToolRegistry, inputNames: string[]): string {
-  const stubs = registry.renderTypeStubs();
-  const gaps = probeTypeCheckerGaps();
+async function buildTypeCheckStubs(registry: ToolRegistry, inputNames: string[]): Promise<string> {
+  const stubs = await registry.renderTypeStubs();
+  const gaps = await probeTypeCheckerGaps();
   const parts: string[] = [];
   // "from typing import Any" must come first for gap/stub/input declarations
   const needsAny =
@@ -420,14 +510,35 @@ function toResourceLimits(limits?: RunLimits): ResourceLimits | undefined {
   };
 }
 
-/** Build MountDir[] from the mount map in RunOptions. */
-function buildMounts(mount?: Record<string, string>): MountDir[] | undefined {
-  if (!mount) return undefined;
-  const dirs: MountDir[] = [];
-  for (const [virtualPath, hostPath] of Object.entries(mount)) {
-    dirs.push(new MountDir(virtualPath, hostPath, { mode: "overlay" }));
+/**
+ * Run `fn` with the mounts from `RunOptions` open, and close them afterwards
+ * whatever happens.
+ *
+ * The close is not housekeeping. A `MountDir` now holds an open handle to the
+ * host directory for its lifetime, and on Windows an open handle blocks the
+ * host from renaming or deleting that directory — so a mount left open by a
+ * run that threw would keep a user's own folder hostage until the process
+ * exits. JS has no deterministic drop, so the `finally` is the whole mechanism.
+ *
+ * The constructor also changed shape: 0.0.18 took `(virtualPath, hostPath)`
+ * positionally, 0.0.21 takes a named record, having concluded that mount tools
+ * disagree about which path comes first often enough to make positional
+ * arguments a hazard.
+ */
+async function withMounts<T>(
+  mount: Record<string, string> | undefined,
+  fn: (mounts: MountDir[] | undefined) => Promise<T>,
+): Promise<T> {
+  const entries = Object.entries(mount ?? {});
+  if (entries.length === 0) return await fn(undefined);
+  const dirs = entries.map(
+    ([virtualPath, hostPath]) => new MountDir({ virtualPath, hostPath, mode: "overlay" }),
+  );
+  try {
+    return await fn(dirs);
+  } finally {
+    for (const dir of dirs) dir.close();
   }
-  return dirs.length > 0 ? dirs : undefined;
 }
 
 // ── Shared dispatch loop ─────────────────────────────────────────
@@ -445,7 +556,7 @@ function buildMounts(mount?: Record<string, string>): MountDir[] | undefined {
  * Monty invokes while the loop is awaiting a resume.
  */
 async function runDispatchLoop(
-  current: MontySnapshot | MontyNameLookup | MontyComplete,
+  current: Snapshot,
   registry: ToolRegistry,
   runOpts: RunOptions | undefined,
   acc: DispatchAccumulators,
@@ -453,14 +564,7 @@ async function runDispatchLoop(
   while (true) {
     // Abort check between iterations
     if (acc.aborted) {
-      return {
-        status: "error",
-        error: "execution aborted",
-        errorKind: "aborted",
-        stdout: acc.stdout,
-        stdoutTruncated: acc.stdoutTruncated,
-        calls: acc.calls,
-      };
+      return runError("aborted", "execution aborted", acc);
     }
 
     if (current instanceof MontyComplete) {
@@ -473,34 +577,63 @@ async function runDispatchLoop(
       };
     }
 
-    if (current instanceof MontyNameLookup) {
+    if (current instanceof NameLookupSnapshot) {
       const name = current.variableName;
       const tool = registry.get(name);
       try {
-        if (tool) {
-          current = current.resume({ value: SENTINEL });
-        } else {
-          current = current.resume();
-        }
+        // Resolving the name to itself is what makes a tool a first-class
+        // value: the sandbox binds a proxy, so `f = echo; f("x")` and
+        // `[echo][0]("x")` both come back as calls to `echo`. 0.0.18 had to
+        // hand over a `SENTINEL` function here and recover the real name at
+        // call time, which worked only for a direct call — aliasing raised
+        // `NameError: SENTINEL` (#66). There is no sentinel to leak now.
+        current = tool ? await current.resume(name) : await current.resume();
       } catch (err) {
         return classifyResumeError(err, acc);
       }
       continue;
     }
 
-    // MontySnapshot — external function call
-    const snapshot = current;
+    if (current instanceof FutureSnapshot) {
+      // Unreachable by construction: a future is only registered when a call
+      // is answered with `resumeFuture()` or by `resumeAuto()` against an
+      // async external, and this loop does neither — every host tool is
+      // awaited here and resumed with its settled value. If one ever arrives,
+      // the sandbox is blocked on a promise nothing in this process is
+      // holding, so there is no honest value to resume it with. Thrown rather
+      // than returned as a `RunError`: this is a defect in this file, not the
+      // user's code failing, and #36's lesson was about the reverse mistake.
+      throw new Error(
+        `sandbox received a FutureSnapshot for call ids [${current.pendingCallIds.join(", ")}], ` +
+          "which this dispatch loop never registers",
+      );
+    }
+
+    // FunctionSnapshot — an external call.
+    const snapshot: FunctionSnapshot = current;
+
+    if (snapshot.isOsFunction) {
+      // An OS call: `open()`, `Path.read_text()`, and friends. `feedStart`
+      // surfaces these as snapshots too — unlike 0.0.18, where mounts were
+      // serviced inside the interpreter and never reached the host — and
+      // `resumeAuto()` is what offers them to the feed's mounts. Getting this
+      // branch wrong does not fail loudly: `resumeNotHandled()` also returns a
+      // snapshot and the run completes, having turned every read of a mounted
+      // file into `PermissionError` (measured).
+      try {
+        current = await snapshot.resumeAuto();
+      } catch (err) {
+        return classifyResumeError(err, acc);
+      }
+      continue;
+    }
+
     const funcName = snapshot.functionName;
     const tool = registry.get(funcName);
 
     if (!tool) {
       try {
-        current = snapshot.resume({
-          exception: {
-            type: "NameError",
-            message: `name '${funcName}' is not defined`,
-          },
-        });
+        current = await snapshot.resumeNotFound();
       } catch (err) {
         return classifyResumeError(err, acc);
       }
@@ -525,12 +658,12 @@ async function runDispatchLoop(
         error: err instanceof Error ? err.message : String(err),
       });
       try {
-        current = snapshot.resume({
-          exception: {
-            type: err instanceof HostToolError ? err.pythonType : "TypeError",
-            message: err instanceof Error ? err.message : String(err),
-          },
-        });
+        current = await snapshot.resumeError(
+          pythonError(
+            err instanceof HostToolError ? err.pythonType : "TypeError",
+            err instanceof Error ? err.message : String(err),
+          ),
+        );
       } catch (resumeErr) {
         return classifyResumeError(resumeErr, acc);
       }
@@ -551,7 +684,7 @@ async function runDispatchLoop(
         return {
           status: "suspended",
           suspendedCall: req,
-          snapshot: snapshot.dump(),
+          snapshot: await snapshot.dump(),
           stdout: acc.stdout,
           stdoutTruncated: acc.stdoutTruncated,
           calls: acc.calls,
@@ -570,12 +703,9 @@ async function runDispatchLoop(
           error: `tool '${tool.name}' requires approval`,
         });
         try {
-          current = snapshot.resume({
-            exception: {
-              type: "PermissionError",
-              message: `tool '${tool.name}' requires approval`,
-            },
-          });
+          current = await snapshot.resumeError(
+            pythonError("PermissionError", `tool '${tool.name}' requires approval`),
+          );
         } catch (err) {
           return classifyResumeError(err, acc);
         }
@@ -631,7 +761,7 @@ async function runDispatchLoop(
         approved,
       });
       try {
-        current = snapshot.resume({ exception: { type: pythonType, message } });
+        current = await snapshot.resumeError(pythonError(pythonType, message));
       } catch (resumeErr) {
         return classifyResumeError(resumeErr, acc);
       }
@@ -650,7 +780,7 @@ async function runDispatchLoop(
       approved,
     });
     try {
-      current = snapshot.resume({ returnValue });
+      current = await snapshot.resume(returnValue);
     } catch (err) {
       return classifyResumeError(err, acc);
     }
@@ -693,81 +823,44 @@ export async function runInSandbox(
 
   const printCallback = makePrintCallback(acc, runOpts);
 
-  // ── 1. Build type-check prefix ──────────────────────────────
+  // ── 1. Build the type-check stub file ───────────────────────
   const inputNames = Object.keys(runOpts?.inputs ?? {});
-  const typeCheckPrefix = buildTypeCheckPrefix(registry, inputNames);
+  const typeCheckStubs = await buildTypeCheckStubs(registry, inputNames);
 
-  // ── 2. Construct Monty instance (without typeCheck to preserve
-  //        syntax vs typing error distinction) ────────────────
-  let monty: Monty;
-  try {
-    monty = new Monty(code, {
-      scriptName,
-      inputs: Object.keys(runOpts?.inputs ?? {}),
-    });
-  } catch (err) {
-    if (err instanceof MontySyntaxError) {
-      return {
-        status: "error",
-        error: err.message,
-        errorKind: "syntax",
-        stdout: acc.stdout,
-        stdoutTruncated: acc.stdoutTruncated,
-        calls: acc.calls,
-      };
-    }
-    throw err;
-  }
-
-  // ── 2b. Type check separately (after syntax parse succeeds) ─
-  try {
-    monty.typeCheck(typeCheckPrefix || undefined);
-  } catch (err) {
-    if (err instanceof MontyTypingError) {
-      return {
-        status: "error",
-        error: err.message,
-        errorKind: "typing",
-        stdout: acc.stdout,
-        stdoutTruncated: acc.stdoutTruncated,
-        calls: acc.calls,
-      };
-    }
-    throw err;
-  }
-
-  // ── 3. Build start options ──────────────────────────────────
-  const limits = toResourceLimits(runOpts?.limits);
-  const mount = buildMounts(runOpts?.mount);
-  const declaredInputs = monty.inputs;
-  const startOpts: Record<string, unknown> = {
-    limits,
-    printCallback,
-    mount,
-  };
-  if (declaredInputs.length > 0 && runOpts?.inputs) {
-    startOpts.inputs = runOpts.inputs;
-  }
-
-  // ── 4. Start and dispatch ───────────────────────────────────
-  let current: MontySnapshot | MontyNameLookup | MontyComplete;
-  try {
-    current = monty.start(startOpts as Parameters<typeof monty.start>[0]);
-  } catch (err) {
-    if (err instanceof MontyRuntimeError) {
-      return {
-        status: "error",
-        error: err.message,
-        errorKind: "runtime",
-        stdout: acc.stdout,
-        stdoutTruncated: acc.stdoutTruncated,
-        calls: acc.calls,
-      };
-    }
-    throw err;
-  }
-
-  return await runDispatchLoop(current, registry, runOpts, acc);
+  // ── 2. Check out a worker and feed the code ─────────────────
+  //
+  // Type checking is now part of the feed rather than a separate call, so
+  // there is one `try` here where 0.0.18 needed three: a syntax error, a type
+  // error and a runtime error all arrive from `feedStart`.
+  return await withMounts(runOpts?.mount, async (mount) =>
+    withSandboxSession(
+      {
+        scriptName,
+        typeCheck: true,
+        typeCheckStubs: typeCheckStubs || undefined,
+        // Explicit, though it is also the default: `full` echoes the offending
+        // source lines under the diagnostic, which is the shape 0.0.18
+        // produced and the more useful one for a model rewriting its own code.
+        // `concise` collapses each diagnostic to a single line and drops the
+        // echo.
+        typeCheckFormat: "full",
+        limits: toResourceLimits(runOpts?.limits),
+      },
+      async (session) => {
+        let current: Snapshot;
+        try {
+          current = await session.feedStart(code, {
+            inputs: runOpts?.inputs,
+            printCallback,
+            mount,
+          });
+        } catch (err) {
+          return classifyStartError(err, acc);
+        }
+        return await runDispatchLoop(current, registry, runOpts, acc);
+      },
+    ),
+  );
 }
 
 // ── Resume suspended execution ──────────────────────────────────
@@ -775,8 +868,8 @@ export async function runInSandbox(
 /**
  * Resume a sandbox execution that was suspended for tool approval.
  *
- * Loads the serialized `MontySnapshot` from `suspended.snapshot`,
- * applies the approval `decision`, and continues the start/resume loop.
+ * Restores the serialized snapshot from `suspended.snapshot` into a fresh
+ * worker, applies the approval `decision`, and continues the dispatch loop.
  *
  * Returns the same discriminated `RunResult` as `runInSandbox()`.
  */
@@ -787,7 +880,6 @@ export async function resumeSuspended(
   runOpts?: RunOptions,
 ): Promise<RunResult> {
   assertMemoryHeadroom();
-  const registry = options.registry;
   const maxStdout = runOpts?.maxStdoutBytes ?? DEFAULT_MAX_STDOUT;
 
   // Accumulators — carry over from suspended state. Built here, before
@@ -813,33 +905,66 @@ export async function resumeSuspended(
   // deny branch a pointless Python resume. Nothing has been traced yet, and
   // nothing should be: the trace must not claim a call that never ran.
   if (acc.aborted) {
-    return {
-      status: "error",
-      error: "execution aborted",
-      errorKind: "aborted",
-      stdout: acc.stdout,
-      stdoutTruncated: acc.stdoutTruncated,
-      calls: acc.calls,
-    };
+    return runError("aborted", "execution aborted", acc);
   }
 
   const printCallback = makePrintCallback(acc, runOpts);
 
-  // Load the snapshot with printCallback attached
-  const snapshot: MontySnapshot = MontySnapshot.load(suspended.snapshot, {
-    printCallback,
-  });
+  // The suspended run's worker was released when it suspended — the dump is
+  // the whole of its state — so resuming takes a fresh one. The mounts have to
+  // be handed back: host paths are not in the dump, and a snapshot restored
+  // without them keeps running, having silently turned every read of a mounted
+  // file into `PermissionError` (measured). 0.0.18's `MontySnapshot.load()`
+  // could not re-establish them at all, which is #38; the half of that issue
+  // living in `session.ts`, where the run options are saved and never read
+  // back, is #84 and is untouched here.
+  return await withMounts(runOpts?.mount, async (mount) =>
+    withSandboxSession(
+      { limits: toResourceLimits(runOpts?.limits) },
+      async (session) =>
+        await resumeInSession(session, suspended, decision, options, runOpts, acc, {
+          printCallback,
+          mount,
+        }),
+    ),
+  );
+}
+
+/** The approval replay and dispatch, against a session holding the restored snapshot. */
+async function resumeInSession(
+  session: MontySession,
+  suspended: RunSuspended,
+  decision: ApprovalDecision,
+  options: SandboxOptions,
+  runOpts: RunOptions | undefined,
+  acc: DispatchAccumulators,
+  loadOpts: { printCallback: PrintCallback; mount: MountDir[] | undefined },
+): Promise<RunResult> {
+  const registry = options.registry;
+
+  let snapshot: Snapshot;
+  try {
+    snapshot = await session.loadSnapshot(suspended.snapshot, loadOpts);
+  } catch (err) {
+    return classifyStartError(err, acc);
+  }
+  if (!(snapshot instanceof FunctionSnapshot)) {
+    // A dump taken anywhere but at a gated call. `resumeSuspended` is only
+    // reachable from a `RunSuspended`, which only the approval gate produces.
+    throw new Error(`restored snapshot is a ${snapshot.constructor.name}, not a paused call`);
+  }
+
   const tool = registry.get(suspended.suspendedCall.tool);
 
   // Replay the approval decision.
   //
   // Each branch decides *what* to resume Python with and traces the call; the
-  // single guarded `snapshot.resume` below then performs it. Keeping the resume
-  // out of the branches is the point: this prologue carried the same defect as
-  // the dispatch loop — the resume sat inside the `try` guarding `tool.execute`,
+  // single guarded resume below then performs it. Keeping the resume out of the
+  // branches is the point: this prologue carried the same defect as the
+  // dispatch loop — the resume sat inside the `try` guarding `tool.execute`,
   // so a resource-limit breach on resume was handled as a tool fault and its
   // `GenericFailure` escaped `resumeSuspended` uncaught (#36).
-  let resumeWith: { returnValue: unknown } | { exception: { type: string; message: string } };
+  let resumeWith: { returnValue: unknown } | { raise: Error };
 
   if (decision === true && tool) {
     const t0 = performance.now();
@@ -889,7 +1014,7 @@ export async function resumeSuspended(
         error: message,
         approved: true,
       });
-      resumeWith = { exception: { type: pythonType, message } };
+      resumeWith = { raise: pythonError(pythonType, message) };
     }
   } else if (decision === false || !tool) {
     const excType = !tool ? "NameError" : "PermissionError";
@@ -905,7 +1030,7 @@ export async function resumeSuspended(
       approved: false,
       error: excMsg,
     });
-    resumeWith = { exception: { type: excType, message: excMsg } };
+    resumeWith = { raise: pythonError(excType, excMsg) };
   } else {
     return {
       status: "suspended",
@@ -917,9 +1042,12 @@ export async function resumeSuspended(
     };
   }
 
-  let current: MontySnapshot | MontyNameLookup | MontyComplete;
+  let current: Snapshot;
   try {
-    current = snapshot.resume(resumeWith);
+    current =
+      "raise" in resumeWith
+        ? await snapshot.resumeError(resumeWith.raise)
+        : await snapshot.resume(resumeWith.returnValue);
   } catch (err) {
     return classifyResumeError(err, acc);
   }

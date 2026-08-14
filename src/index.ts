@@ -42,8 +42,14 @@ export {
   resumeSuspended,
   resolveToolArgs,
   SandboxMemoryError,
+  memoryGuardConfig,
   type SandboxOptions,
 } from "./sandbox.js";
+
+// ── Worker pool ─────────────────────────────────────────────────
+// Python runs in pooled worker subprocesses, so a host that wants to release
+// them — or to change the pool's size between runs — needs these.
+export { getSandboxPool, closeSandboxPool, poolConfig } from "./pool.js";
 
 // ── Session ─────────────────────────────────────────────────────
 export { Session } from "./session.js";

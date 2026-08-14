@@ -24,7 +24,7 @@ interface CacheEntry {
 
 /** Serialized form of the suspended state within a Session dump. */
 interface SuspendedState {
-  /** Base64-encoded MontySnapshot buffer */
+  /** Base64-encoded suspended-snapshot buffer */
   snapshot: string;
   /** The ApprovalRequest that triggered the suspension */
   suspendedCall: ApprovalRequest;
@@ -120,7 +120,7 @@ function createCachingRegistry(
  *
  * Maintains state across multiple `run()` calls via transcript replay:
  * each run concatenates all prior successful snippets + new code in a
- * fresh Monty interpreter. Host-tool side effects are deduplicated
+ * fresh sandbox session. Host-tool side effects are deduplicated
  * through an ordered call cache so they don't repeat on replay.
  */
 export class Session {

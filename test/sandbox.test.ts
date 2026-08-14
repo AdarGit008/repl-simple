@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import { runInSandbox, resumeSuspended, memoryGuardConfig } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
@@ -518,17 +520,82 @@ describe("runInSandbox — inputs", () => {
 // ── Mount ─────────────────────────────────────────────────────────
 
 describe("runInSandbox — mount", () => {
-  it("passes mount to Monty (does not crash)", async () => {
-    const registry = new ToolRegistry();
-    const result = await runInSandbox(
-      "42",
-      { registry },
-      {
-        mount: { "/data": "/tmp" },
-      },
-    );
-    ok(result);
-    assert.equal(result.output, "42");
+  // These read through the mount. The previous test ran `42` with a mount
+  // configured and asserted the result was 42, which held whether the mount
+  // worked, was ignored, or was never built — and a mount that silently does
+  // nothing is exactly the failure this has to catch, because under `feedStart`
+  // a filesystem call reaches the host as a snapshot and it is our dispatch
+  // loop, not the interpreter, that decides whether the mounts get to answer.
+
+  /** A temp dir holding one known file, cleaned up by the caller. */
+  function mountFixture(): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "sandbox-mount-"));
+    writeFileSync(join(dir, "note.txt"), "MOUNTED\n");
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  it("reads a file through a mounted directory", async () => {
+    const { dir, cleanup } = mountFixture();
+    try {
+      const result = await runInSandbox(
+        'open("/data/note.txt").read()',
+        { registry: new ToolRegistry() },
+        { mount: { "/data": dir } },
+      );
+      ok(result);
+      assert.equal(result.output, "MOUNTED\n");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("denies a path outside the mount", async () => {
+    const { dir, cleanup } = mountFixture();
+    try {
+      const result = await runInSandbox(
+        'try:\n    open("/elsewhere/note.txt").read()\nexcept Exception as e:\n    r = type(e).__name__\nr',
+        { registry: new ToolRegistry() },
+        { mount: { "/data": dir } },
+      );
+      ok(result);
+      assert.match(result.output, /Error$/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("keeps the mount readable across a suspend and resume", async () => {
+    // The mount has to be handed back at resume: host paths are not carried in
+    // the dump, and a snapshot restored without them keeps running with every
+    // read turned into a `PermissionError`. That silence is the whole risk —
+    // hence an assertion on the file's contents after the resume, not on the
+    // run merely completing.
+    const { dir, cleanup } = mountFixture();
+    try {
+      const gate: HostTool = {
+        name: "confirm",
+        description: "Gated",
+        params: [],
+        returns: "str",
+        requiresApproval: true,
+        execute: () => "yes",
+      };
+      const registry = new ToolRegistry([gate]);
+      const runOpts = { mount: { "/data": dir } };
+
+      const susp = await runInSandbox(
+        'confirm()\nopen("/data/note.txt").read()',
+        { registry },
+        { ...runOpts, onApproval: () => "suspend" as const },
+      );
+      suspended(susp);
+
+      const result = await resumeSuspended(susp, true, { registry }, runOpts);
+      ok(result);
+      assert.equal(result.output, "MOUNTED\n");
+    } finally {
+      cleanup();
+    }
   });
 });
 
@@ -1098,12 +1165,20 @@ describe("resource-limit breach on the resume after a host tool call", () => {
 
   // Limits are only checked as Python executes instructions, so each snippet
   // has to keep working *after* the call returns — a tool that overruns with no
-  // Python following it completes `ok`, which is what once made the duration
-  // clock look like it measured compute rather than wall time.
+  // Python following it completes `ok`.
+  //
+  // The loop is 5,000,000 iterations rather than 200,000 because the duration
+  // clock inverted with the move to a worker. On 0.0.18 `maxDurationSecs` was
+  // wall clock and the 250 ms sleep alone consumed a 200 ms budget, so a short
+  // loop only had to run long enough to *notice*. 0.0.21's clock advances only
+  // while the interpreter executes and stops while the sandbox is suspended on
+  // a host call, so the sleep now contributes nothing and the loop has to
+  // spend the whole budget by itself (measured: 200,000 iterations cost ~67 ms
+  // of interpreter time, 5,000,000 cost ~555 ms).
   const OVERRUN_THEN_LOOP = [
     "slow()",
     "total = 0",
-    "for i in range(200000):",
+    "for i in range(5000000):",
     "    total += i",
     "total",
   ].join("\n");
@@ -1121,8 +1196,11 @@ describe("resource-limit breach on the resume after a host tool call", () => {
       expected: /TimeoutError/,
     },
     {
+      // 16 MB, not 1 MB: a bare session now holds ~8.7 MB before the user's
+      // first instruction, so a 1 MB ceiling is breached by the sandbox
+      // starting up and the run fails before it can reach the gated call.
       name: "memory",
-      limits: { maxDurationSecs: 30, maxMemory: 1024 * 1024 },
+      limits: { maxDurationSecs: 30, maxMemory: 16 * 1024 * 1024 },
       code: CALL_THEN_ALLOCATE,
       toolMs: 1,
       expected: /MemoryError/,
@@ -1152,10 +1230,12 @@ describe("resource-limit breach on the resume after a host tool call", () => {
     });
 
     it(`resumeSuspended: a ${kind.name} breach returns a runtime RunError`, async () => {
-      // The limit rides on the *initial* run, not the resume. Monty's
-      // `SnapshotLoadOptions` carries only a `printCallback` — there is no
-      // `limits` field — so the budget in force after a resume is the one
-      // `monty.start()` was given, restored with the snapshot.
+      // The limit rides on the *initial* run, not the resume: `resumeSuspended`
+      // is called with no `runOpts` at all here. `loadSnapshot` takes no
+      // `limits` either — they belong to the checkout — so the budget in force
+      // after a resume is the one the suspended feed was given, restored with
+      // the snapshot and, on 0.0.21, still holding whatever it had already
+      // spent.
       const registry = new ToolRegistry([sleepTool(kind.toolMs, { requiresApproval: true })]);
       const susp = await runInSandbox(
         kind.code,
@@ -1173,6 +1253,19 @@ describe("resource-limit breach on the resume after a host tool call", () => {
       assert.match(result.error, kind.expected);
     });
   }
+
+  it("does not charge host-call time to the duration budget", async () => {
+    // The inverted clock, asserted rather than assumed — it is the reason the
+    // loop above had to grow, and the reason #32's host-side wall clock stops
+    // being something `maxDurationSecs` covers by accident. A 400 ms sleep
+    // under a 0.2 s budget, with almost no Python around it, completes.
+    const registry = new ToolRegistry([sleepTool(400)]);
+    const result = await noThrow("runInSandbox", () =>
+      runInSandbox("slow()", { registry }, { limits: { maxDurationSecs: 0.2 } }),
+    );
+
+    assert.equal(result.status, "ok", "host-suspended time must not consume the budget");
+  });
 
   it("traces the breached call exactly once, as the success it was", async () => {
     // The assertion the issue exists for. The old handler recorded the same
@@ -1651,5 +1744,68 @@ describe("memory guards", () => {
         (e: Error) => e.name === "SandboxMemoryError",
       );
     });
+  });
+});
+
+// ── Tool names as values (#66) ──────────────────────────────────
+
+describe("host tools survive being used as values", () => {
+  // On 0.0.18 a name lookup was answered with a shared `SENTINEL` function and
+  // the real tool was recovered from the *call*, so a tool only worked when
+  // called directly by its own name. Anything that stored it first — an alias,
+  // a list, an argument — called the sentinel and raised
+  // `NameError: SENTINEL` (#66). 0.0.21 resolves the lookup to the name
+  // itself, so the sandbox holds a proxy that reports the right name whenever
+  // it is eventually called.
+  //
+  // These are the regression tests bucket 8 requires before #66 can be closed
+  // as fixed upstream; closing it is not this change's business.
+
+  it("dispatches a tool reached through an alias", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox('f = echo\nf("aliased")', { registry });
+
+    ok(result);
+    assert.match(result.output, /aliased/);
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].tool, "echo");
+  });
+
+  it("dispatches a tool stored in a collection", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox('tools = [echo]\ntools[0]("via list")', { registry });
+
+    ok(result);
+    assert.match(result.output, /via list/);
+    assert.equal(result.calls[0].tool, "echo");
+  });
+
+  it("raises NameError when an unregistered name is read as a value", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox("f = definitely_not_a_tool\nf()", { registry });
+
+    err(result);
+    assert.deepEqual(result.calls, [], "a name that resolves to nothing is not a call");
+  });
+});
+
+// ── Calls that never reach a tool ───────────────────────────────
+
+describe("dispatch failures before a tool runs", () => {
+  it("raises TypeError when an argument arrives twice", async () => {
+    // Unpacked through `**kwargs`, because the static check sees the stub and
+    // rejects a literal `echo("a", text="b")` before anything runs. This is
+    // the shape that reaches argument resolution at runtime, and it is where
+    // the host's own duplicate-argument message comes from rather than ty's.
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox(
+      'kw = {"text": "b"}\ntry:\n    echo("a", **kw)\nexcept TypeError as e:\n    r = "caught: " + str(e)\nr',
+      { registry },
+    );
+
+    ok(result);
+    assert.match(result.output, /got multiple values for argument 'text'/);
+    assert.equal(result.calls.length, 1, "the attempt is traced");
+    assert.equal(result.calls[0].ok, false);
   });
 });

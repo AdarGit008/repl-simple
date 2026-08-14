@@ -100,7 +100,7 @@ export class RLMLoop {
 
     // 1. Build system prompt
     const registry = this.buildRlmRegistry();
-    const systemPrompt = this.buildSystemPrompt(registry);
+    const systemPrompt = await this.buildSystemPrompt(registry);
 
     // 2. Inject context as sandbox input variable
     const sandboxInputs: Record<string, string> = {
@@ -269,9 +269,9 @@ export class RLMLoop {
   }
 
   /** Build the system prompt with tool stubs and rules. */
-  private buildSystemPrompt(registry: ToolRegistry): string {
-    const stubs = registry.renderTypeStubs();
-    const importableModules = probeImportableModules();
+  private async buildSystemPrompt(registry: ToolRegistry): Promise<string> {
+    const stubs = await registry.renderTypeStubs();
+    const importableModules = await probeImportableModules();
     const rules = renderPythonToolRules(importableModules);
     const preamble = this.options.preamble;
 
