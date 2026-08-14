@@ -1809,3 +1809,68 @@ describe("dispatch failures before a tool runs", () => {
     assert.equal(result.calls[0].ok, false);
   });
 });
+
+// ── Type-check diagnostics reach the caller whole ───────────────
+
+describe("typing errors report every diagnostic", () => {
+  // `MontyTypingError.message` keeps only the first line of the rendered
+  // diagnostics; the rest — including the source echo that `typeCheckFormat`
+  // is chosen for — lives on `display()`. Reporting `message` looks correct on
+  // any single-error snippet, which is why this asserts on one with two.
+
+  it("reports both unresolved names, not just the first", async () => {
+    const result = await runInSandbox("print(alpha)\nprint(beta)", {
+      registry: new ToolRegistry(),
+    });
+
+    err(result);
+    assert.equal(result.errorKind, "typing");
+    assert.match(result.error, /alpha/);
+    assert.match(result.error, /beta/, "the second diagnostic must survive");
+  });
+
+  it("includes the offending source line", async () => {
+    const result = await runInSandbox("x: int = 'nope'", { registry: new ToolRegistry() });
+
+    err(result);
+    assert.match(result.error, /x: int = 'nope'/, "the source echo must survive");
+  });
+});
+
+// ── A worker that dies ──────────────────────────────────────────
+
+describe("a crashed sandbox worker", () => {
+  // The in-sandbox duration limit is only checked at interpreter checkpoints,
+  // so a single long primitive runs straight past it; the host watchdog then
+  // kills the worker `durationLimitGrace` later. That is the one path to
+  // `MontyCrashedError`, and it has no 0.0.18 analogue — there the same code
+  // froze the event loop until something SIGKILLed the whole process.
+  const UNCHECKPOINTED_RUNAWAY = "x = 10 ** 100000000\n1";
+
+  it("returns errorKind 'crashed', not 'runtime'", async () => {
+    const result = await runInSandbox(
+      UNCHECKPOINTED_RUNAWAY,
+      { registry: new ToolRegistry() },
+      { limits: { maxDurationSecs: 0.5 } },
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "crashed");
+    assert.match(result.error, /time budget/, "a watchdog kill says so");
+  });
+
+  it("leaves the pool able to serve the next run", async () => {
+    // The point of worker isolation: the dead session is replaced, and the
+    // caller after it is unaffected. `withSandboxSession` has to survive
+    // closing a session whose worker is already gone for this to hold.
+    await runInSandbox(
+      UNCHECKPOINTED_RUNAWAY,
+      { registry: new ToolRegistry() },
+      { limits: { maxDurationSecs: 0.5 } },
+    );
+
+    const after = await runInSandbox("1 + 1", { registry: new ToolRegistry() });
+    ok(after);
+    assert.equal(after.output, "2");
+  });
+});

@@ -374,3 +374,27 @@ describe("renderTypeStubs — a stub that does not parse", () => {
     assert.equal(await reg.renderTypeStubs(), await reg.renderTypeStubs());
   });
 });
+
+// ── Stub cache invalidation ─────────────────────────────────────
+
+describe("renderTypeStubs — cache invalidation", () => {
+  it("includes a tool added while an earlier render was in flight", async () => {
+    // Rendering is async, so a result written back *after* its await can
+    // overwrite the invalidation that `add()` performed during it, stranding
+    // the new tool outside the stub file until some later `add()`.
+    const reg = new ToolRegistry([makeTool({ name: "first" })]);
+    const inFlight = reg.renderTypeStubs();
+    reg.add(makeTool({ name: "second" }));
+    await inFlight;
+
+    const stubs = await reg.renderTypeStubs();
+    assert.ok(stubs.includes("second"), `'second' should be present, got: ${stubs}`);
+    assert.ok(stubs.includes("first"), `'first' should still be present, got: ${stubs}`);
+  });
+
+  it("serves concurrent callers from one render", async () => {
+    const reg = new ToolRegistry([makeTool({ name: "shared" })]);
+    const [a, b] = await Promise.all([reg.renderTypeStubs(), reg.renderTypeStubs()]);
+    assert.equal(a, b);
+  });
+});

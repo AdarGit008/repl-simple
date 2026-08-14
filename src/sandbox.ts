@@ -182,13 +182,22 @@ function classifyResumeError(err: unknown, acc: DispatchAccumulators): RunError 
  * is the difference between a model that mistyped and a model that
  * misunderstood. `MontySyntaxError` still arrives from the paths that do not
  * type-check, such as stub validation.
+ *
+ * The reported text is `display()`, not `message`. `MontyTypingError`'s
+ * constructor keeps only the **first line** of the rendered diagnostics as its
+ * message — so `message` drops every diagnostic after the first, and drops the
+ * source echo that `typeCheckFormat: "full"` is selected for, which lives on
+ * the lines below each one. 0.0.18 put the whole rendering in `message`, so
+ * reading it here would have been a silent regression in what the model is
+ * told: two unresolved names would report one, with no indication of the
+ * other.
  */
 function classifyStartError(err: unknown, acc: DispatchAccumulators): RunError {
   if (err instanceof MontySyntaxError) return runError("syntax", err.message, acc);
   if (err instanceof MontyTypingError) {
     const diagnostics = err.display();
     const kind = diagnostics.includes("error[invalid-syntax]") ? "syntax" : "typing";
-    return runError(kind, err.message, acc);
+    return runError(kind, diagnostics, acc);
   }
   return classifyResumeError(err, acc);
 }

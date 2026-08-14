@@ -466,3 +466,35 @@ describe("runRlm() edge cases", () => {
     assert.equal(submitCall.ok, true);
   });
 });
+
+// ── Feedback for a lost sandbox ─────────────────────────────────
+
+describe("runRlm() — a crashed sandbox", () => {
+  it("tells the model its state is gone rather than to fix an error", async () => {
+    // `crashed` was added to `RunErrorKind` when execution moved into worker
+    // subprocesses. Without its own branch the feedback chain falls through
+    // and the model is told nothing at all, then retries against state that no
+    // longer exists.
+    const { llm } = mockLlmCodeGen([
+      "```python\nx = 10 ** 100000000\n1\n```",
+      '```python\nSUBMIT("recovered")\n```',
+    ]);
+    const tools = createRLMTools({
+      onLLMQuery: async () => "",
+      onRLMQuery: async () => "",
+    });
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: new ToolRegistry(tools),
+      maxIterations: 2,
+      runOptions: { limits: { maxDurationSecs: 0.5 } },
+    });
+
+    const feedback = llm
+      .calls()[1]
+      .messages.map((m) => m.content)
+      .join("\n");
+    assert.match(feedback, /state was lost/, `got: ${feedback}`);
+    assert.equal(result.answer, "recovered", "the loop recovers on the next iteration");
+  });
+});

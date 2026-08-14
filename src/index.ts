@@ -48,7 +48,8 @@ export {
 
 // ── Worker pool ─────────────────────────────────────────────────
 // Python runs in pooled worker subprocesses, so a host that wants to release
-// them — or to change the pool's size between runs — needs these.
+// them needs these. Resizing the pool means `closeSandboxPool()` and then
+// letting the next run rebuild it: the size is fixed when the pool is created.
 export { getSandboxPool, closeSandboxPool, poolConfig } from "./pool.js";
 
 // ── Session ─────────────────────────────────────────────────────

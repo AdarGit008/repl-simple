@@ -1,6 +1,6 @@
 import type { HostTool } from "./types.js";
 import { HostToolError } from "./types.js";
-import { MontySyntaxError, MontyTypingError } from "@pydantic/monty/node";
+import { MontyRuntimeError, MontySyntaxError, MontyTypingError } from "@pydantic/monty/node";
 import { withSandboxSession } from "./pool.js";
 
 // ── ToolRegistry ─────────────────────────────────────────────────
@@ -8,7 +8,18 @@ import { withSandboxSession } from "./pool.js";
 /** Holds host tools and renders Python type stubs for monty's type checker. */
 export class ToolRegistry {
   private readonly tools = new Map<string, HostTool>();
-  private typeStubCache: string | null = null;
+  /**
+   * The in-flight or completed stub render, not its result.
+   *
+   * Caching the promise is what keeps the cache honest now that rendering is
+   * async. Storing the resolved string instead means writing it back *after*
+   * an await, so an `add()` that lands during the render clears the cache and
+   * then has its clearing overwritten by the pre-`add` result — leaving the
+   * new tool missing from the stub file until some later `add()` clears it
+   * again. It also means two concurrent first callers each pay the worker
+   * round trip; this way the second awaits the first.
+   */
+  private typeStubCache: Promise<string> | null = null;
 
   constructor(tools: HostTool[] = []) {
     for (const tool of tools) this.add(tool);
@@ -44,9 +55,18 @@ export class ToolRegistry {
    * Cached until the next add().
    */
   async renderTypeStubs(): Promise<string> {
-    if (this.typeStubCache !== null) return this.typeStubCache;
-    this.typeStubCache = await validateStubs(this.list().map((tool) => typeStub(tool)));
-    return this.typeStubCache;
+    if (this.typeStubCache === null) {
+      this.typeStubCache = validateStubs(this.list().map((tool) => typeStub(tool))).catch(
+        (err: unknown) => {
+          // A render that failed is not an answer. Dropping it lets the next
+          // call retry rather than every later call awaiting the same
+          // rejection.
+          this.typeStubCache = null;
+          throw err;
+        },
+      );
+    }
+    return await this.typeStubCache;
   }
 }
 
@@ -231,8 +251,14 @@ export async function probeImportableModules(
       try {
         await session.feedStart(`import ${name}`);
         importable.push(name);
-      } catch {
-        // ModuleNotFoundError leaves the session usable — keep probing.
+      } catch (err) {
+        // A failed import is a `MontyRuntimeError` (`ModuleNotFoundError`) and
+        // leaves the session usable, so the loop keeps going. Anything else
+        // means the session itself is gone — a dead worker poisons it, and
+        // every remaining candidate would throw on the way in. Swallowing that
+        // would answer "these modules do not exist" for a list this never
+        // managed to ask about, and then memoise it.
+        if (!(err instanceof MontyRuntimeError)) throw err;
       }
     }
     return importable;
@@ -282,7 +308,15 @@ export async function probeTypeCheckerGaps(
         // every candidate here (a builtin or an exception class).
       } catch (err) {
         if (err instanceof MontyTypingError) found.push(name);
-        // A runtime error means ty resolved the name; not a gap.
+        // A runtime error means ty resolved the name and evaluating it failed;
+        // resolution is the question here, so that is not a gap. Anything else
+        // means the session is gone, and the remaining candidates would all
+        // throw on entry — caching "no gaps" on that basis would strip every
+        // `name: Any = None` declaration from the stub file for the life of
+        // the process, so every later run touching `open` or `PermissionError`
+        // would fail type-checking. Fail the probe instead; the next call
+        // retries against a fresh worker.
+        else if (!(err instanceof MontyRuntimeError)) throw err;
       }
     }
     return found;

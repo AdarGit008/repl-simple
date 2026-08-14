@@ -25,7 +25,15 @@ const DEFAULT_MAX_PROCESSES = 4;
 /** Seconds a checkout waits for a free worker before failing. Never `undefined`. */
 const DEFAULT_CHECKOUT_TIMEOUT_SECS = 30;
 
-/** Read at call time, not module load, so a caller can change it between runs. */
+/**
+ * Read at call time rather than module load — but note where the only call
+ * is: `getSandboxPool()` reads these when it *constructs* the singleton, and
+ * the pool's size is fixed for its lifetime. Setting `REPL_POOL_MAX_PROCESSES`
+ * after any earlier sandbox call therefore changes nothing until
+ * `closeSandboxPool()` drops the pool. That is upstream's shape, not a choice
+ * made here: `maxProcesses` and `checkoutTimeout` belong to `Monty.create()`,
+ * and `checkout()` reads neither.
+ */
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
