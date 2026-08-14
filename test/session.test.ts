@@ -296,6 +296,53 @@ result
     assert.equal(r2.output, "blocked");
   });
 
+  // The no-callback branch of `resume`, which nothing drove: eight tests pass
+  // an `onApproval` and none omitted it, so `decision = false` could be
+  // mutated to `true` and the suite stayed green. That mutant fails *open* —
+  // a resume with nobody to ask would run the gated call — which is the one
+  // direction this branch must never move (#51 test 6).
+  //
+  // Both shapes of "no callback" are covered because both reach it
+  // differently: `ReplRunner` always passes run options and may leave
+  // `onApproval` undefined inside them, while a direct caller can pass none
+  // at all.
+
+  it("resume with no run options denies the pending call", async () => {
+    // The tool is watched, so "denied" means a call that did not happen
+    // rather than a message about one that did.
+    const executed: string[] = [];
+    const registry = new ToolRegistry([
+      {
+        ...gatedTool,
+        execute: (args) => {
+          executed.push(String(args.x));
+          return `approved: ${args.x}`;
+        },
+      },
+    ]);
+    const session = new Session({ registry });
+
+    await session.run('gated("x")', { onApproval: () => "suspend" });
+    const denied = await session.resume();
+
+    err(denied);
+    assert.match(denied.error, /PermissionError/);
+    assert.deepEqual(executed, [], "a resume with nobody to ask ran the call anyway");
+  });
+
+  it("resume with run options but no onApproval denies too", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    await session.run('gated("x")', { onApproval: () => "suspend" });
+
+    // The shape `ReplRunner.resume` produces when the extension has no
+    // callback to give it.
+    const denied = await session.resume({});
+    err(denied);
+    assert.match(denied.error, /PermissionError/);
+  });
+
   it("abandon() clears suspended state", async () => {
     const registry = new ToolRegistry([gatedTool]);
     const session = new Session({ registry });
