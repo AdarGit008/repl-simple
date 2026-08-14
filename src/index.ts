@@ -43,6 +43,7 @@ export {
   resolveToolArgs,
   SandboxMemoryError,
   memoryGuardConfig,
+  limitsConfig,
   type SandboxOptions,
 } from "./sandbox.js";
 
@@ -50,7 +51,12 @@ export {
 // Python runs in pooled worker subprocesses, so a host that wants to release
 // them needs these. Resizing the pool means `closeSandboxPool()` and then
 // letting the next run rebuild it: the size is fixed when the pool is created.
-export { getSandboxPool, closeSandboxPool, poolConfig } from "./pool.js";
+export {
+  getSandboxPool,
+  closeSandboxPool,
+  poolConfig,
+  SandboxUnavailableError,
+} from "./pool.js";
 
 // ── Session ─────────────────────────────────────────────────────
 export { Session } from "./session.js";

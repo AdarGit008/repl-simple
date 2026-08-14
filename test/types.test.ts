@@ -122,7 +122,17 @@ describe("Interface shapes (compile-time)", () => {
     };
     assert.equal(opts.maxStdoutBytes, 50000);
     assert.equal(opts.scriptName, "<repl>");
-    assert.equal(opts.limits?.maxDurationSecs, 30);
+    assert.notEqual(opts.limits, "unbounded");
+    assert.equal((opts.limits as RunLimits).maxDurationSecs, 30);
+  });
+
+  it("RunOptions can opt out of limits entirely", () => {
+    // The escape hatch is a literal string rather than `undefined`, so that
+    // opting out is something a caller typed and something a reviewer can
+    // grep for. Omitting `limits` now means "use the defaults", not "no
+    // limits" — the inversion #32 exists for.
+    const opts: RunOptions = { limits: "unbounded" };
+    assert.equal(opts.limits, "unbounded");
   });
 
   it("ApprovalRequest object literal", () => {
