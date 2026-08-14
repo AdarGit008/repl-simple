@@ -33,6 +33,13 @@ refused — so `~/.ssh`, `~/.aws`, `~/.config` and sibling checkouts are out of 
 cost when the thing you want to read genuinely lives there. The escape hatch is a `bash` call, which
 asks for approval first. See [docs/path-jail.md](docs/path-jail.md).
 
+`bash` runs with an **allowlisted environment**, not the host's: `PATH`, `HOME`, the locale and the
+toolchain paths are inherited, and everything else — `ANTHROPIC_API_KEY`, `SSH_AUTH_SOCK`,
+`npm_config_*`, `PI_*` and whatever else you have exported — is withheld, because approving "run a
+shell command" is not approving "disclose my keys". A failed command says how many variables were
+withheld, and names the one it referenced. `REPL_BASH_ENV_ALLOW` passes named variables through, and
+`REPL_BASH_ENV_ALLOW='*'` turns the filter off. See [docs/bash-env.md](docs/bash-env.md).
+
 **Builtins:** `read_file`, `list_files`, `http_get`
 
 `http_get` is the only way out of the sandbox to the network, so it is never both silent and
