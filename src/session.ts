@@ -240,6 +240,19 @@ export class Session {
       .map((g) => ({ tool: g.tool, remaining: g.remaining }));
   }
 
+  // ── Suspension state ───────────────────────────────────────
+
+  /**
+   * Whether a gated call is paused here, waiting for a decision.
+   *
+   * `resume()` throws without one, which is the right contract for a caller
+   * that knows the state. `ReplRunner` does not — the model chooses when to
+   * call `repl_resume` — so it asks first and answers in a sentence (#48).
+   */
+  isSuspended(): boolean {
+    return this.suspended !== null;
+  }
+
   // ── run ────────────────────────────────────────────────────
 
   /**

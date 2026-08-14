@@ -6,6 +6,27 @@ import { loadSavedTools } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
 
+// ── Outcomes ───────────────────────────────────────────────────────
+//
+// `abandon` and `reset` used to answer `boolean` and `GrantSummary[]`, which
+// both fold two different states into one: "no such session" and "the session
+// is there and has nothing pending" are indistinguishable, so the extension
+// could only ever print one sentence for both. The model acts differently on
+// each — one means run some code, the other means the approval it was waiting
+// for is already gone — so each state gets its own name here and its own
+// sentence at the call site (#48).
+
+/** What `ReplRunner.abandon` found when it went looking for a suspension. */
+export type AbandonOutcome = "abandoned" | "nothing-pending" | "no-session";
+
+/** What `ReplRunner.reset` cleared, and whether there was anything to clear. */
+export interface ResetOutcome {
+  /** `false` when the session was never created — nothing was reset. */
+  existed: boolean;
+  /** Approval grants live at the moment of the reset. Empty for an unknown session. */
+  revoked: GrantSummary[];
+}
+
 // ── ReplRunner ─────────────────────────────────────────────────────
 
 /**
@@ -46,7 +67,7 @@ export class ReplRunner {
   ): Promise<string> {
     const session = await this.getOrCreateSession(sessionId);
     const result = await session.run(code, { onApproval, signal });
-    return formatResult(result);
+    return formatResult(result, sessionId);
   }
 
   /**
@@ -58,7 +79,9 @@ export class ReplRunner {
    *
    * `signal` carries the same meaning as in `run`.
    *
-   * @throws If the session has no pending suspension.
+   * Never throws: the model decides when to call `repl_resume`, so every state
+   * it can believe it is in — no such session, session with nothing pending —
+   * gets a sentence back rather than an exception (#48).
    */
   async resume(
     sessionId: string,
@@ -69,31 +92,39 @@ export class ReplRunner {
     if (!session) {
       return `No session '${sessionId}' exists. Run some code first.`;
     }
+    if (!session.isSuspended()) {
+      return (
+        `Session '${sessionId}' has nothing waiting for approval. ` +
+        `Nothing was resumed — run code with repl to continue.`
+      );
+    }
     const result = await session.resume({ onApproval, signal });
-    return formatResult(result);
+    return formatResult(result, sessionId);
   }
 
   /**
    * Discard a pending suspension without approving or denying.
    *
-   * @returns `true` if there was a suspension to abandon, `false` otherwise.
+   * @returns which of the three states the session was in — see
+   *          {@link AbandonOutcome}.
    */
-  abandon(sessionId: string): boolean {
+  abandon(sessionId: string): AbandonOutcome {
     const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    return session.abandon();
+    if (!session) return "no-session";
+    return session.abandon() ? "abandoned" : "nothing-pending";
   }
 
   /**
    * Clear all state in a session.
    *
-   * @returns the approval grants that were live when the reset happened —
-   *          empty for an unknown session, and empty in the usual case where
-   *          no call is paused at a suspension.
+   * @returns whether the session existed, and the approval grants that were
+   *          live when the reset happened — empty for an unknown session, and
+   *          empty in the usual case where no call is paused at a suspension.
    */
-  reset(sessionId: string): GrantSummary[] {
+  reset(sessionId: string): ResetOutcome {
     const session = this.sessions.get(sessionId);
-    return session ? session.reset() : [];
+    if (!session) return { existed: false, revoked: [] };
+    return { existed: true, revoked: session.reset() };
   }
 
   // ── Private helpers ─────────────────────────────────────────
@@ -128,7 +159,7 @@ export class ReplRunner {
  * its own. One tool result is therefore bounded at 48 KiB plus this framing.
  * See docs/truncation-policy.md.
  */
-function formatResult(result: RunResult): string {
+function formatResult(result: RunResult, sessionId: string): string {
   if (result.status === "ok") {
     const parts: string[] = [];
     if (result.stdout) {
@@ -148,10 +179,13 @@ function formatResult(result: RunResult): string {
     return parts.join("\n");
   }
 
-  // suspended
+  // Suspended. The session is named because more than one can be live at
+  // once, and "use repl_resume" without saying what to resume leaves the
+  // model to guess which (#48).
   return (
     `Tool '${result.suspendedCall.tool}' requires approval.\n` +
     `${result.suspendedCall.description}\n\n` +
-    `Use repl_resume to approve or repl_abandon to discard.`
+    `Session: '${sessionId}'. Use repl_resume(sessionId='${sessionId}') to approve, ` +
+    `or repl_abandon(sessionId='${sessionId}') to discard.`
   );
 }
