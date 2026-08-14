@@ -261,18 +261,28 @@ export default function (pi: ReplExtensionApi) {
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const sessionId = params.sessionId ?? "default";
-        const revoked = getRunner(ctx.cwd).reset(sessionId);
+        const { existed, revoked } = getRunner(ctx.cwd).reset(sessionId);
 
         // State the approval posture on the way out. A reset is the moment
         // someone is asking what this session is still holding, and "which
         // mode am I in" is half of that answer.
-        const parts = [`Session '${sessionId}' reset.`, `Approval mode: ${approvalMode}.`];
-        parts.push(
-          revoked.length === 0
-            ? "No approval grants were outstanding."
-            : `Revoked ${revoked.length} approval grant(s): ` +
-                revoked.map((g) => `${g.tool} (${g.remaining} use(s) left)`).join(", "),
-        );
+        const parts = [
+          existed
+            ? `Session '${sessionId}' reset.`
+            : `No session '${sessionId}' exists — nothing to reset.`,
+          `Approval mode: ${approvalMode}.`,
+        ];
+        // A session that was never created held nothing, so the grant
+        // sentence would be true and useless. Report it only where it is
+        // about something ([N12], #48).
+        if (existed) {
+          parts.push(
+            revoked.length === 0
+              ? "No approval grants were outstanding."
+              : `Revoked ${revoked.length} approval grant(s): ` +
+                  revoked.map((g) => `${g.tool} (${g.remaining} use(s) left)`).join(", "),
+          );
+        }
 
         return {
           content: [{ type: "text" as const, text: parts.join(" ") }],
@@ -301,14 +311,20 @@ export default function (pi: ReplExtensionApi) {
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const r = getRunner(ctx.cwd);
-        const ok = r.abandon(params.sessionId ?? "default");
+        const sessionId = params.sessionId ?? "default";
+
+        // Three states, three sentences. "No pending suspension" for a
+        // session that does not exist reads as a bug report about the one
+        // the caller meant, and the two states need different next moves:
+        // one is "run some code", the other is "the pause is over" (#48).
+        const text = {
+          abandoned: `Suspension in session '${sessionId}' abandoned. The suspended code was dropped; the session is ready for new code.`,
+          "nothing-pending": `Session '${sessionId}' exists but has no pending approval. Nothing to abandon.`,
+          "no-session": `No session '${sessionId}' exists. Nothing to abandon — run some code first.`,
+        }[r.abandon(sessionId)];
+
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: ok ? "Suspension abandoned." : "No pending suspension.",
-            },
-          ],
+          content: [{ type: "text" as const, text }],
           details: {},
         };
       },

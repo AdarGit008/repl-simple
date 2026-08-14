@@ -1,9 +1,10 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
+import type { ApprovalDecision } from "../src/types.js";
 import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -19,9 +20,17 @@ function cleanup(): void {
   if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
 }
 
-// The `deny` / `approve` helpers were deleted here in #23 — unused, and the
-// mark of a repl_resume round-trip test that was planned and dropped. #48
-// restores them together with that test; it kills mutations M7 and M8.
+// The `deny` / `approve` helpers were deleted in #23 — unused, and the mark of
+// a repl_resume round-trip test that was planned and dropped. #48 restores
+// them together with that test.
+//
+// `suspend` is how a test reaches the suspended state at all: it is the answer
+// the extension gives for "decide later", and the only route to a session with
+// something pending.
+
+const approve = async (): Promise<ApprovalDecision> => true;
+const deny = async (): Promise<ApprovalDecision> => false;
+const suspend = async (): Promise<ApprovalDecision> => "suspend";
 
 // ── Basic execution ──────────────────────────────────────────────
 
@@ -334,8 +343,15 @@ describe("ReplRunner — reset", () => {
 
   // "reset of non-existent session does not throw" was deleted here in #23 —
   // it had no assertion. The real behaviour it gestured at is a defect: reset
-  // reports `Session 'X' reset.` for sessions that never existed ([N12]).
-  // #48 owns the test that actually pins that.
+  // reported `Session 'X' reset.` for sessions that never existed ([N12]).
+  it("does not claim to have reset a session that never existed", () => {
+    assert.deepEqual(runner.reset("never-ran"), { existed: false, revoked: [] });
+  });
+
+  it("reports that a session it did reset existed", async () => {
+    await runner.run("y = 1", "lived");
+    assert.deepEqual(runner.reset("lived"), { existed: true, revoked: [] });
+  });
 });
 
 // ── Abandon ──────────────────────────────────────────────────────
@@ -350,8 +366,11 @@ describe("ReplRunner — abandon", () => {
 
   after(cleanup);
 
-  it("returns false when no suspension exists", () => {
-    assert.equal(runner.abandon("default"), false);
+  it("distinguishes a session that does not exist from one with nothing pending", async () => {
+    assert.equal(runner.abandon("never-ran"), "no-session");
+
+    await runner.run("z = 1", "quiet");
+    assert.equal(runner.abandon("quiet"), "nothing-pending");
   });
 });
 
@@ -434,5 +453,108 @@ describe("ReplRunner — one approval is one execution (#44)", () => {
 
     assert.match(out, /PermissionError/);
     assert.equal(readFileSync(join(cwd, "f.txt"), "utf8"), before);
+  });
+});
+
+// ── Every tool answers, in every state (#48) ────────────────────
+
+/**
+ * The four shipped tools are the model's whole view of this package, and their
+ * descriptions instruct it to call them. Two of them could not succeed: a
+ * `repl_resume` on a live session threw `Error("No suspended execution to
+ * resume")` out of `session.ts`, one line below a branch that answers the
+ * no-session case in a friendly sentence.
+ *
+ * Mutations **M7** (`if (!session)` → `if (true)`) and **M8**
+ * (`return session.abandon()` → `return true`) both survived here, because
+ * nothing drove `resume()` at all.
+ */
+describe("ReplRunner — every tool answers, in every state (#48)", () => {
+  let runner: ReplRunner;
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("resume on a live session with nothing pending answers instead of throwing (M7)", async () => {
+    await runner.run("a = 1", "live");
+
+    const out = await runner.resume("live", approve);
+
+    assert.match(out, /nothing waiting for approval/i);
+    // M7 turns the no-session guard into `if (true)`, so it would answer the
+    // unknown-session sentence for a session that plainly exists.
+    assert.doesNotMatch(out, /No session/i);
+  });
+
+  it("resume on a session that does not exist keeps its friendly message", async () => {
+    const out = await runner.resume("never-ran", approve);
+    assert.match(out, /No session 'never-ran' exists/);
+  });
+
+  it("names the session in the suspended message", async () => {
+    const out = await runner.run("write('s.txt', 'v1')", "named", suspend);
+
+    assert.match(out, /requires approval/);
+    assert.match(out, /named/, "the model cannot resume a session it is not told the name of");
+    assert.match(out, /repl_resume\(sessionId='named'\)/);
+    assert.match(out, /repl_abandon\(sessionId='named'\)/);
+  });
+
+  it("suspend → resume(approve) runs the pending call", async () => {
+    const suspendedOut = await runner.run("write('ok.txt', 'v1')", "approve-rt", suspend);
+    assert.match(suspendedOut, /requires approval/);
+    assert.equal(existsSync(join(cwd, "ok.txt")), false, "suspended means not yet run");
+
+    const out = await runner.resume("approve-rt", approve);
+
+    assert.doesNotMatch(out, /PermissionError/);
+    // Also the mutant that drops `onApproval` from `session.resume()` (#110):
+    // without the callback the resume denies, and nothing reaches the disk.
+    assert.equal(readFileSync(join(cwd, "ok.txt"), "utf8"), "v1");
+  });
+
+  it("suspend → resume(deny) raises PermissionError in the resumed code", async () => {
+    const code = [
+      "try:",
+      "    write('denied.txt', 'v1')",
+      "    result = 'no-error'",
+      "except PermissionError:",
+      "    result = 'blocked'",
+      "result",
+    ].join("\n");
+
+    await runner.run(code, "deny-rt", suspend);
+    const out = await runner.resume("deny-rt", deny);
+
+    assert.match(out, /blocked/);
+    assert.equal(existsSync(join(cwd, "denied.txt")), false);
+  });
+
+  it("abandon reports the suspension it discarded, and resume then says so", async () => {
+    await runner.run("write('gone.txt', 'v1')", "abandoned", suspend);
+
+    assert.equal(runner.abandon("abandoned"), "abandoned");
+    // The pause is over: the same call now finds nothing, and says the other
+    // sentence rather than repeating itself.
+    assert.equal(runner.abandon("abandoned"), "nothing-pending");
+
+    const out = await runner.resume("abandoned", approve);
+    assert.match(out, /nothing waiting for approval/i);
+    assert.equal(existsSync(join(cwd, "gone.txt")), false);
+  });
+
+  it("reset clears a suspension too, and resume answers afterwards", async () => {
+    await runner.run("write('reset.txt', 'v1')", "reset-me", suspend);
+
+    assert.equal(runner.reset("reset-me").existed, true);
+
+    const out = await runner.resume("reset-me", approve);
+    assert.match(out, /nothing waiting for approval/i);
+    assert.equal(existsSync(join(cwd, "reset.txt")), false);
   });
 });

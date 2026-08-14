@@ -581,20 +581,89 @@ describe("repl extension — repl_reset reports approvals", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
+  const ctx = () => ({ cwd, hasUI: true, ui: { confirm: async () => true } });
+
   it("names the mode and says nothing is outstanding", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const reset = tools.find((t) => t.name === "repl_reset");
+    assert.ok(repl);
+    assert.ok(reset);
+
+    // The session has to exist for a reset to be about anything — this test
+    // used to reset a session that was never created and assert it said
+    // "reset", which is the [N12] defect stated as an expectation (#48).
+    await repl.execute("r-0", { code: "x = 1" }, undefined, undefined, ctx());
+
+    const result = await reset.execute("r-1", {}, undefined, undefined, ctx());
+
+    const text = result.content[0].text;
+    assert.match(text, /Session 'default' reset/);
+    assert.match(text, /Approval mode: strict/);
+    assert.match(text, /No approval grants were outstanding/);
+  });
+
+  it("does not claim to have reset a session that never existed ([N12])", async () => {
     const { tools } = await load();
     const reset = tools.find((t) => t.name === "repl_reset");
     assert.ok(reset);
 
-    const result = await reset.execute("r-1", {}, undefined, undefined, {
-      cwd,
-      hasUI: true,
-      ui: { confirm: async () => true },
-    });
+    const result = await reset.execute(
+      "r-2",
+      { sessionId: "never-ran" },
+      undefined,
+      undefined,
+      ctx(),
+    );
 
     const text = result.content[0].text;
-    assert.match(text, /reset/);
+    assert.match(text, /No session 'never-ran' exists/);
+    assert.doesNotMatch(text, /'never-ran' reset/);
+    // Nothing was held, so there is nothing to report about grants.
+    assert.doesNotMatch(text, /grants/);
     assert.match(text, /Approval mode: strict/);
-    assert.match(text, /No approval grants were outstanding/);
+  });
+});
+
+// ── repl_abandon tells the two empty states apart (#48) ──────────
+
+describe("repl extension — repl_abandon distinguishes its empty states", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-abandon-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("says 'no such session' and 'nothing pending' differently", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const abandon = tools.find((t) => t.name === "repl_abandon");
+    assert.ok(repl);
+    assert.ok(abandon);
+
+    const ctx = () => ({ cwd, hasUI: true, ui: { confirm: async () => true } });
+
+    const unknown = await abandon.execute(
+      "a-1",
+      { sessionId: "never-ran" },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    assert.match(unknown.content[0].text, /No session 'never-ran' exists/);
+
+    await repl.execute("a-2", { code: "x = 1" }, undefined, undefined, ctx());
+    const quiet = await abandon.execute("a-3", {}, undefined, undefined, ctx());
+
+    assert.match(quiet.content[0].text, /no pending approval/i);
+    assert.doesNotMatch(
+      quiet.content[0].text,
+      /No session/,
+      "the session exists — saying otherwise sends the model to create it again",
+    );
   });
 });

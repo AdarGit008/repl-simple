@@ -69,6 +69,13 @@ than being swallowed, and a dialog nobody answers denies itself after five minut
 `REPL_APPROVAL_TIMEOUT_MS` changes that bound, and `0` removes it.
 See [#49](https://github.com/AdarGit008/repl-simple/issues/49).
 
+All four tools also **answer in every state**, with a sentence rather than an exception or a message
+about some other state. `repl_resume` on a session with nothing pending says so instead of throwing;
+`repl_abandon` tells "no such session" apart from "nothing to abandon"; `repl_reset` does not claim
+to have reset a session that never existed. A suspension names the session it belongs to, so with
+more than one live the model knows which to resume.
+See [#48](https://github.com/AdarGit008/repl-simple/issues/48).
+
 ## API
 
 ```typescript
