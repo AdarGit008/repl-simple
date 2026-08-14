@@ -66,7 +66,12 @@ export {
 } from "./pool.js";
 
 // ── Session ─────────────────────────────────────────────────────
-export { Session } from "./session.js";
+export {
+  Session,
+  DEFAULT_GRANT_USES,
+  type GrantSummary,
+  type SessionOptions,
+} from "./session.js";
 
 // ── RLM Tools ───────────────────────────────────────────────────
 export { createRLMTools, type RLMToolOptions } from "./rlm_tools.js";

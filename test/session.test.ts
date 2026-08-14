@@ -4,7 +4,7 @@ import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
-import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
+import type { ApprovalRequest, HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -704,5 +704,205 @@ describe("Session — SUBMIT", () => {
     // Session should be empty — snippet was not appended
     const dump = JSON.parse(session.dump());
     assert.equal(dump.snippets.length, 0);
+  });
+});
+
+// ── Approval grants (#44) ───────────────────────────────────────
+
+/**
+ * One approval used to mean unlimited silent re-execution: the gate matched a
+ * position-independent `Set` of every key ever executed, so approving
+ * `bash("date")` once bought every later `bash("date")` in the session, with
+ * no ceiling and no expiry.
+ *
+ * What replaces it: a call is auto-approved only when it is the *replay* of
+ * one already executed — which runs nothing — or when a grant from an approval
+ * given earlier in the same call has uses left. `DEFAULT_GRANT_USES` is 1, so
+ * in the shipped configuration the second branch never fires and every
+ * execution is approved on its own.
+ *
+ * These are the six tests #44 asks for. Test 4 is the one protecting the fix
+ * from itself.
+ */
+describe("Session — approval grants are scoped and counted (#44)", () => {
+  /** A gated tool that counts what it actually ran, not what it was asked. */
+  function makeGatedCounter(name = "gated") {
+    let executions = 0;
+    const tool: HostTool = {
+      name,
+      description: "Gated; counts real executions",
+      params: [{ name: "v", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `${name}:${args.v}:${++executions}`,
+    };
+    return { tool, executions: () => executions };
+  }
+
+  it("1 — the measured loop prompts on every new execution", async () => {
+    // #44's reproduction, in the shape it was measured: approve the call once,
+    // then run it three more times from a *later* call. That measured 0
+    // prompts and 3 real executions.
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    const prompts: string[] = [];
+    const onApproval = (req: ApprovalRequest) => {
+      prompts.push(req.tool);
+      return true;
+    };
+
+    ok(await session.run('gated("x")', { onApproval }));
+    assert.equal(prompts.length, 1);
+
+    const loop = await session.run('[gated("x") for _ in range(3)]', { onApproval });
+    ok(loop);
+
+    assert.equal(executions(), 4, "all three iterations must really run");
+    assert.equal(prompts.length, 4, "3 executions must not cost 1 prompt — or 0");
+  });
+
+  it("1b — and identical executions within one call are not free either", async () => {
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    const prompts: string[] = [];
+    const result = await session.run('[gated("x") for _ in range(3)]', {
+      onApproval: (req) => {
+        prompts.push(req.tool);
+        return true;
+      },
+    });
+
+    ok(result);
+    assert.equal(executions(), 3, "all three iterations must really run");
+    assert.equal(prompts.length, 3, "and each must have been approved on its own");
+  });
+
+  it("2 — a grant does not survive into the next repl call", async () => {
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    const prompts: string[] = [];
+    const onApproval = (req: ApprovalRequest) => {
+      prompts.push(req.tool);
+      return true;
+    };
+
+    ok(await session.run('gated("x")', { onApproval }));
+    assert.equal(prompts.length, 1);
+
+    // Same tool, same arguments, new call. The replayed copy of the first
+    // snippet is served from the cache silently; the *new* execution asks.
+    ok(await session.run('gated("x")', { onApproval }));
+    assert.equal(prompts.length, 2, "the second call must ask again");
+    assert.equal(executions(), 2, "and must have executed exactly once more");
+  });
+
+  it("3 — the use count is enforced: the N+1th execution re-prompts", async () => {
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) }, undefined, {
+      grantUses: 2,
+    });
+
+    const prompts: string[] = [];
+    const result = await session.run('[gated("x") for _ in range(3)]', {
+      onApproval: (req) => {
+        prompts.push(req.tool);
+        return true;
+      },
+    });
+
+    ok(result);
+    assert.equal(executions(), 3);
+    // Approve → runs, and covers one more. The third exhausts the grant.
+    assert.equal(prompts.length, 2, "one approval covers exactly two executions at grantUses: 2");
+  });
+
+  it("3b — grantUses below 1 is refused, not clamped", () => {
+    const { tool } = makeGatedCounter();
+    const opts = { registry: new ToolRegistry([tool]) };
+    assert.throws(() => new Session(opts, undefined, { grantUses: 0 }), RangeError);
+    assert.throws(() => new Session(opts, undefined, { grantUses: 1.5 }), RangeError);
+  });
+
+  it("4 — a genuine positional replay auto-approves, with no callback and no re-execution", async () => {
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    const first = await session.run('v = gated("x")', { onApproval: () => true });
+    ok(first);
+    assert.equal(executions(), 1);
+
+    // No onApproval at all. The replay must not ask — and must not run.
+    const second = await session.run("v");
+    ok(second);
+    assert.equal(second.output, "gated:x:1", "the replayed value came from the cache");
+    assert.equal(executions(), 1, "replay must not re-execute the tool");
+  });
+
+  it("5 — no callback still denies, and nothing executes", async () => {
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    const result = await session.run('gated("x")');
+    err(result);
+    assert.match(result.error, /PermissionError/);
+    assert.equal(executions(), 0);
+  });
+
+  it("6 — outstanding grants are reported, and reset revokes them", async () => {
+    const first = makeGatedCounter("gated");
+    const second = makeGatedCounter("gated2");
+    const session = new Session(
+      { registry: new ToolRegistry([first.tool, second.tool]) },
+      undefined,
+      { grantUses: 2 },
+    );
+
+    // Suspend on the first call; approve it on resume, which leaves a grant
+    // with one use left; then suspend again on the second tool. A grant is
+    // outstanding only while a call is paused like this.
+    suspended(await session.run('gated("a")\ngated2("b")', { onApproval: () => "suspend" }));
+    suspended(
+      await session.resume({
+        onApproval: (req) => (req.tool === "gated" ? true : "suspend"),
+      }),
+    );
+
+    assert.deepEqual(session.outstandingGrants(), [{ tool: "gated", remaining: 1 }]);
+
+    // reset() hands back what it revoked, and leaves nothing behind.
+    assert.deepEqual(session.reset(), [{ tool: "gated", remaining: 1 }]);
+    assert.deepEqual(session.outstandingGrants(), []);
+  });
+
+  it("a completed call leaves no grant behind", async () => {
+    const { tool } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) }, undefined, {
+      grantUses: 5,
+    });
+
+    ok(await session.run('gated("x")', { onApproval: () => true }));
+    assert.deepEqual(session.outstandingGrants(), [], "grants die with the call that made them");
+  });
+
+  it("abandoning a suspension revokes its grants", async () => {
+    const first = makeGatedCounter("gated");
+    const second = makeGatedCounter("gated2");
+    const session = new Session(
+      { registry: new ToolRegistry([first.tool, second.tool]) },
+      undefined,
+      { grantUses: 2 },
+    );
+
+    suspended(await session.run('gated("a")\ngated2("b")', { onApproval: () => "suspend" }));
+    suspended(
+      await session.resume({ onApproval: (req) => (req.tool === "gated" ? true : "suspend") }),
+    );
+    assert.equal(session.outstandingGrants().length, 1);
+
+    assert.equal(session.abandon(), true);
+    assert.deepEqual(session.outstandingGrants(), []);
   });
 });

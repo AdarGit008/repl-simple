@@ -43,6 +43,18 @@ link-local destinations are refused on every redirect hop. See
 
 **Tool store:** `save_tool`, `delete_tool`, `list_saved_tools`, `read_tool`
 
+### Approvals
+
+`bash`, `edit` and `write` ask before they run, and an approval covers **one execution**. The same
+command later in the same call, or in the next one, asks again — approving `bash("date")` once buys
+that call and nothing else. The one thing that still runs unasked is the replay of a call already
+approved and executed, which is served from the cache and executes nothing.
+
+That is strict mode, and it is the default. `/repl-approvals yolo` turns the gate off for the rest of
+the pi process; `/repl-approvals strict` and restarting both put it back. Nothing is auto-approved
+without a UI, in either mode. `repl_reset` reports the current mode.
+See [docs/approval-grants.md](docs/approval-grants.md).
+
 ## API
 
 ```typescript

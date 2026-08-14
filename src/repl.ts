@@ -1,4 +1,4 @@
-import { Session } from "./session.js";
+import { Session, type GrantSummary } from "./session.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
@@ -74,10 +74,16 @@ export class ReplRunner {
     return session.abandon();
   }
 
-  /** Clear all state in a session. */
-  reset(sessionId: string): void {
+  /**
+   * Clear all state in a session.
+   *
+   * @returns the approval grants that were live when the reset happened —
+   *          empty for an unknown session, and empty in the usual case where
+   *          no call is paused at a suspension.
+   */
+  reset(sessionId: string): GrantSummary[] {
     const session = this.sessions.get(sessionId);
-    if (session) session.reset();
+    return session ? session.reset() : [];
   }
 
   // ── Private helpers ─────────────────────────────────────────

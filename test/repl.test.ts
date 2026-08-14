@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
@@ -371,5 +371,68 @@ describe("ReplRunner — default sessionId", () => {
     await runner.run("counter = 1");
     const out = await runner.run("counter");
     assert.ok(out.includes("1"));
+  });
+});
+
+// ── One approval is one execution (#44) ─────────────────────────
+
+/**
+ * The second reproduction in #44, through the shipped path: approve
+ * `write('f.txt','v1')` once and the same call, repeated later, used to run
+ * **7 times behind 1 prompt**. The gate matched a set of every key ever
+ * executed, so a grant had neither a ceiling nor an end.
+ *
+ * The first test here is also mutation **M22** — dropping `onApproval` from
+ * `session.run` in `repl.ts`. Nothing drove an approved gated call through
+ * `ReplRunner` and asserted the side effect happened, so the mutant survived:
+ * the suite could not tell "approval reaches the session" from "approval is
+ * discarded and everything is denied".
+ */
+describe("ReplRunner — one approval is one execution (#44)", () => {
+  let runner: ReplRunner;
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("an approved write really writes — the callback reaches the session (M22)", async () => {
+    const prompts: string[] = [];
+    const out = await runner.run("write('f.txt', 'v1')", "m22", async (req) => {
+      prompts.push(req.tool);
+      return true;
+    });
+
+    assert.deepEqual(prompts, ["write"], "the write must ask exactly once");
+    assert.doesNotMatch(out, /PermissionError/, "an approved write must not be denied");
+    assert.equal(readFileSync(join(cwd, "f.txt"), "utf8"), "v1", "and must reach the disk");
+  });
+
+  it("repeating that identical call in a later repl call asks every time", async () => {
+    const prompts: string[] = [];
+    const out = await runner.run(
+      "for _ in range(3):\n    write('f.txt', 'v1')\n'done'",
+      "m22",
+      async (req) => {
+        prompts.push(req.tool);
+        return true;
+      },
+    );
+
+    assert.doesNotMatch(out, /PermissionError/);
+    // The replayed copy of the first snippet is served from the cache and
+    // costs nothing. The three new executions cost three prompts.
+    assert.equal(prompts.length, 3, "3 executions must not hide behind an earlier approval");
+  });
+
+  it("denying leaves the file untouched", async () => {
+    const before = readFileSync(join(cwd, "f.txt"), "utf8");
+    const out = await runner.run("write('f.txt', 'DENIED')", "m22-deny", async () => false);
+
+    assert.match(out, /PermissionError/);
+    assert.equal(readFileSync(join(cwd, "f.txt"), "utf8"), before);
   });
 });
