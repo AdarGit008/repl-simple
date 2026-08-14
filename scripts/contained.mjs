@@ -24,6 +24,20 @@
  *     swap thrash shows up as test *timeouts*, which is precisely the flapping
  *     signal #109 is trying to measure.
  *
+ * A breach must not be silent. It was, once: on 2026-08-14 a full mutation run
+ * hit the 12G ceiling at 24%, systemd tore the scope down under the default
+ * `OOMPolicy=stop`, and this wrapper reported **exit 0** — because the kill
+ * landed on the scope, not on `systemd-run`, so `result.signal` was null and
+ * the status was 0. Forty minutes of dead run looked like a clean pass. Two
+ * changes stop that repeating:
+ *
+ *   - `OOMPolicy=continue`, so one OOM kill no longer tears down the whole
+ *     scope. The pane is protected by this job living in a scope of its *own*,
+ *     not by the teardown, so nothing is lost — and the victim's real exit
+ *     status now propagates to the caller instead of vanishing.
+ *   - the scope is given a known name and its journal is read afterwards, so
+ *     an OOM is reported even when the command itself exits 0.
+ *
  * Usage:
  *   node scripts/contained.mjs [--limit SIZE] <command> [args...]
  *
@@ -89,19 +103,41 @@ if (command.length === 0) {
 
 const skipReason = containmentSkipReason();
 
+/**
+ * Whether systemd recorded an OOM kill against this scope.
+ *
+ * The exit status cannot be trusted to carry this: the kill lands on a process
+ * inside the scope, so the caller can — and did — see 0. The journal is the
+ * only place the truth is written down.
+ */
+function scopeWasOOMKilled(unit) {
+  const log = spawnSync("journalctl", ["--user", "-u", unit, "--no-pager", "-q"], {
+    encoding: "utf8",
+  });
+  if (log.status !== 0 || !log.stdout) return false;
+  return /killed by the OOM killer|result 'oom-kill'/.test(log.stdout);
+}
+
 let result;
+let unit = null;
 if (skipReason === null) {
-  process.stderr.write(`contained: MemoryMax=${limit}, no swap — ${command.join(" ")}\n`);
+  unit = `contained-${process.pid}.scope`;
+  process.stderr.write(`contained: MemoryMax=${limit}, no swap, unit=${unit}\n`);
   result = spawnSync(
     "systemd-run",
     [
       "--user",
       "--scope",
       "--quiet",
+      `--unit=${unit}`,
       "-p",
       `MemoryMax=${limit}`,
       "-p",
       "MemorySwapMax=0",
+      // Without this, one OOM kill stops the entire scope and the failure
+      // reaches the caller as a success. See the header.
+      "-p",
+      "OOMPolicy=continue",
       "--",
       ...command,
     ],
@@ -119,6 +155,15 @@ if (result.error) {
 // A scope killed on its memory ceiling reports the signal, not an exit code.
 if (result.signal) {
   process.stderr.write(`contained: killed by ${result.signal} — likely the ${limit} ceiling\n`);
+  process.exit(137);
+}
+// ...and sometimes reports neither, which is why the journal is consulted even
+// when the command claims to have succeeded.
+if (unit !== null && scopeWasOOMKilled(unit)) {
+  process.stderr.write(
+    `contained: OOM kill recorded against ${unit} — the ${limit} ceiling was breached.\n` +
+      "contained: whatever the command reported, its results are incomplete.\n",
+  );
   process.exit(137);
 }
 process.exit(result.status ?? 1);

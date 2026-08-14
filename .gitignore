@@ -5,3 +5,4 @@ dist/
 .stryker-tmp/
 reports/
 .stryker-incremental.json
+.stryker-harness-deaths.log
