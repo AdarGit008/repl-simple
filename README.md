@@ -29,6 +29,12 @@ Pi extension — sandboxed Python execution via [Monty](https://github.com/pydan
 
 **Builtins:** `read_file`, `list_files`, `http_get`
 
+`http_get` is the only way out of the sandbox to the network, so it is never both silent and
+unrestricted: with `REPL_HTTP_ALLOWLIST` set the listed hosts are fetched without a prompt and every
+other host is refused, and without it every fetch asks for approval. Either way, private, loopback and
+link-local destinations are refused on every redirect hop. See
+[docs/http-egress.md](docs/http-egress.md).
+
 **Tool store:** `save_tool`, `delete_tool`, `list_saved_tools`, `read_tool`
 
 ## API
@@ -97,7 +103,7 @@ npm run mutation # stryker, contained in a memory-capped systemd scope
 npm run test:contained # the suite, likewise contained
 ```
 
-Seven environment variables tune the sandbox, all read at call time.
+Nine environment variables tune the sandbox, all read at call time.
 
 Three are the default resource limits every run gets. A caller who passes no `limits` gets these,
 not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
@@ -129,6 +135,14 @@ runs in a worker subprocess, so a script allocating gigabytes grows the worker a
 `RunLimits.maxMemory` inside it, not by these. What they still catch is growth on *our* side of the
 line — accumulated messages, buffers, a caller looping over runs — which is what a host ceiling can
 honestly speak to.
+
+Two bound `http_get`. They are egress policy, not resource limits; the reasoning is in
+[docs/http-egress.md](docs/http-egress.md).
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_HTTP_ALLOWLIST` | empty | Comma-separated hosts `http_get` may reach, as a hostname or a `*.`-prefixed suffix. Set → those hosts need no approval and every other host is refused. Unset → every fetch requires approval. |
+| `REPL_HTTP_TIMEOUT_SECS` | `30` | Deadline for one `http_get`, redirect chain and body read included. Breach → `TimeoutError` in Python. |
 
 Two size the worker pool. Neither is left to `@pydantic/monty`'s own default, because both of those
 fail open: `maxProcesses` follows the CPU count, and `checkoutTimeout` waits **forever**, so an

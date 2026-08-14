@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostToolError, type HostTool } from "../src/types.js";
-import { createBuiltinTools, type BuiltinToolsOptions } from "../src/builtins.js";
+import { createBuiltinTools, isBlockedAddress, type BuiltinToolsOptions } from "../src/builtins.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -14,6 +14,17 @@ function findTool(tools: HostTool[], name: string): HostTool {
   if (!tool) throw new Error(`Tool '${name}' not found`);
   return tool;
 }
+
+/**
+ * Every hostname resolves to one public address.
+ *
+ * `http_get` resolves before it fetches, so a test with a mock `fetch` and a
+ * real resolver would still touch the network — and would fail closed on a
+ * machine with no DNS. Every `http_get` test injects a resolver for that
+ * reason; the ones about the policy inject one that answers what the case is
+ * about.
+ */
+const PUBLIC_LOOKUP = async () => ["93.184.216.34"];
 
 // ── createBuiltinTools — structure ──────────────────────────────
 
@@ -266,7 +277,7 @@ describe("list_files — integration", () => {
 
 describe("http_get — unit", () => {
   function makeTools(opts?: Partial<BuiltinToolsOptions>) {
-    return createBuiltinTools({ root: "/tmp", ...opts });
+    return createBuiltinTools({ root: "/tmp", lookupImpl: PUBLIC_LOOKUP, ...opts });
   }
 
   it("returns response body text via mock fetchImpl", async () => {
@@ -439,6 +450,7 @@ describe("Truncation", () => {
       root: "/tmp",
       maxHttpBytes: 2048,
       fetchImpl: mockFetch,
+      lookupImpl: PUBLIC_LOOKUP,
     });
     const result = await findTool(tools, "http_get").execute({
       url: "https://example.com",
@@ -456,6 +468,7 @@ describe("Truncation", () => {
       root: "/tmp",
       maxHttpBytes: 2048,
       fetchImpl: mockFetch,
+      lookupImpl: PUBLIC_LOOKUP,
     });
     const result = await findTool(tools, "http_get").execute({
       url: "https://example.com",
@@ -466,7 +479,11 @@ describe("Truncation", () => {
   it("http_get default maxHttpBytes is 256 KiB", async () => {
     const content = "B".repeat(256 * 1024);
     const mockFetch: typeof fetch = async () => new Response(content, { status: 200 });
-    const tools = createBuiltinTools({ root: "/tmp", fetchImpl: mockFetch });
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: mockFetch,
+      lookupImpl: PUBLIC_LOOKUP,
+    });
     const result = await findTool(tools, "http_get").execute({
       url: "https://example.com",
     });
@@ -476,12 +493,575 @@ describe("Truncation", () => {
   it("http_get truncates beyond the default 256 KiB", async () => {
     const content = "B".repeat(256 * 1024 + 1);
     const mockFetch: typeof fetch = async () => new Response(content, { status: 200 });
-    const tools = createBuiltinTools({ root: "/tmp", fetchImpl: mockFetch });
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: mockFetch,
+      lookupImpl: PUBLIC_LOOKUP,
+    });
     const result = await findTool(tools, "http_get").execute({
       url: "https://example.com",
     });
     assert.ok(result.includes("truncated at"));
     assert.ok(bytes(result) <= 256 * 1024);
     assert.ok(!result.includes(content));
+  });
+});
+
+// ── http_get — egress policy (#42) ───────────────────────────────
+
+describe("isBlockedAddress", () => {
+  const blocked = [
+    "127.0.0.1",
+    "127.255.255.254",
+    "0.0.0.0",
+    "10.0.0.1",
+    "172.16.0.1",
+    "172.31.255.255",
+    "192.168.1.1",
+    "169.254.169.254",
+    "100.64.0.1",
+    "192.0.0.1",
+    "192.0.2.7",
+    "198.18.0.1",
+    "224.0.0.1",
+    "255.255.255.255",
+    "::1",
+    "::",
+    "fe80::1",
+    "fd00::1",
+    "fc00::1",
+    "ff02::1",
+    "::ffff:127.0.0.1",
+    "::ffff:169.254.169.254",
+    "::7f00:1",
+    "64:ff9b::127.0.0.1",
+    "2002:7f00:1::",
+  ];
+
+  const allowed = [
+    "93.184.216.34",
+    "8.8.8.8",
+    "172.32.0.1",
+    "172.15.255.255",
+    "100.63.255.255",
+    "100.128.0.1",
+    "192.1.0.1",
+    "198.20.0.1",
+    "223.255.255.255",
+    "2606:2800:220:1:248:1893:25c8:1946",
+    "::ffff:93.184.216.34",
+    "2002:5db8:d822::",
+    "64:ff9b::93.184.216.34",
+  ];
+
+  for (const address of blocked) {
+    it(`blocks ${address}`, () => {
+      assert.equal(isBlockedAddress(address), true);
+    });
+  }
+
+  for (const address of allowed) {
+    it(`allows ${address}`, () => {
+      assert.equal(isBlockedAddress(address), false);
+    });
+  }
+
+  it("blocks anything that is not an address at all", () => {
+    // Reached only if a resolver hands back something unparseable; refusing is
+    // the answer that cannot leak.
+    assert.equal(isBlockedAddress("not-an-ip"), true);
+    assert.equal(isBlockedAddress(""), true);
+  });
+
+  it("ignores an IPv6 zone id", () => {
+    assert.equal(isBlockedAddress("fe80::1%eth0"), true);
+  });
+});
+
+describe("http_get — gating", () => {
+  it("requires approval when no allowlist is configured", () => {
+    const tools = createBuiltinTools({ root: "/tmp", httpAllowlist: [] });
+    assert.equal(findTool(tools, "http_get").requiresApproval, true);
+  });
+
+  it("does not require approval when an allowlist is configured", () => {
+    const tools = createBuiltinTools({ root: "/tmp", httpAllowlist: ["api.example.com"] });
+    assert.equal(findTool(tools, "http_get").requiresApproval, false);
+  });
+
+  it("reads the allowlist from REPL_HTTP_ALLOWLIST", () => {
+    const previous = process.env.REPL_HTTP_ALLOWLIST;
+    process.env.REPL_HTTP_ALLOWLIST = " api.example.com , ,*.internal.dev ";
+    try {
+      const tools = createBuiltinTools({ root: "/tmp" });
+      assert.equal(findTool(tools, "http_get").requiresApproval, false);
+    } finally {
+      if (previous === undefined) delete process.env.REPL_HTTP_ALLOWLIST;
+      else process.env.REPL_HTTP_ALLOWLIST = previous;
+    }
+  });
+
+  it("an explicit empty allowlist beats the environment", () => {
+    const previous = process.env.REPL_HTTP_ALLOWLIST;
+    process.env.REPL_HTTP_ALLOWLIST = "api.example.com";
+    try {
+      const tools = createBuiltinTools({ root: "/tmp", httpAllowlist: [] });
+      assert.equal(findTool(tools, "http_get").requiresApproval, true);
+    } finally {
+      if (previous === undefined) delete process.env.REPL_HTTP_ALLOWLIST;
+      else process.env.REPL_HTTP_ALLOWLIST = previous;
+    }
+  });
+
+  it("read-only file tools stay ungated", () => {
+    const tools = createBuiltinTools({ root: "/tmp" });
+    assert.ok(!findTool(tools, "read_file").requiresApproval);
+    assert.ok(!findTool(tools, "list_files").requiresApproval);
+  });
+});
+
+describe("http_get — allowlist", () => {
+  const okFetch: typeof fetch = async () => new Response("body", { status: 200 });
+
+  function allowlisted(allowlist: string[]) {
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      httpAllowlist: allowlist,
+      fetchImpl: okFetch,
+      lookupImpl: PUBLIC_LOOKUP,
+    });
+    return findTool(tools, "http_get");
+  }
+
+  it("allows an exact host", async () => {
+    assert.equal(
+      await allowlisted(["api.example.com"]).execute({ url: "https://api.example.com/x" }),
+      "body",
+    );
+  });
+
+  it("matches the host case-insensitively", async () => {
+    assert.equal(
+      await allowlisted(["API.Example.COM"]).execute({ url: "https://api.example.com/x" }),
+      "body",
+    );
+  });
+
+  it("ignores the port", async () => {
+    assert.equal(
+      await allowlisted(["api.example.com"]).execute({ url: "https://api.example.com:8443/x" }),
+      "body",
+    );
+  });
+
+  it("a '*.' entry matches a subdomain", async () => {
+    assert.equal(
+      await allowlisted(["*.example.com"]).execute({ url: "https://a.b.example.com/" }),
+      "body",
+    );
+  });
+
+  it("a '*.' entry matches the bare domain too", async () => {
+    assert.equal(
+      await allowlisted(["*.example.com"]).execute({ url: "https://example.com/" }),
+      "body",
+    );
+  });
+
+  it("refuses a host that is not on the list", async () => {
+    await assertRefused(
+      allowlisted(["api.example.com"]).execute({ url: "https://evil.example.net/" }),
+      /not on the http_get allowlist/,
+    );
+  });
+
+  it("a '*.' entry does not match a suffix that is not a subdomain", async () => {
+    await assertRefused(
+      allowlisted(["*.example.com"]).execute({ url: "https://notexample.com/" }),
+      /not on the http_get allowlist/,
+    );
+  });
+
+  it("an allowlisted host that resolves privately is still refused", async () => {
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      httpAllowlist: ["api.example.com"],
+      fetchImpl: okFetch,
+      lookupImpl: async () => ["10.0.0.5"],
+    });
+    await assertRefused(
+      findTool(tools, "http_get").execute({ url: "https://api.example.com/" }),
+      /private or reserved/,
+    );
+  });
+});
+
+/** Assert a promise rejects with a `PermissionError` matching `pattern`. */
+async function assertRefused(result: unknown, pattern: RegExp): Promise<void> {
+  try {
+    await result;
+    assert.fail("expected the request to be refused");
+  } catch (e) {
+    assert.ok(e instanceof HostToolError, `expected HostToolError, got ${e}`);
+    assert.equal((e as HostToolError).pythonType, "PermissionError");
+    assert.match((e as Error).message, pattern);
+  }
+}
+
+describe("http_get — direct destinations", () => {
+  const okFetch: typeof fetch = async () => new Response("INTERNAL", { status: 200 });
+
+  function tool(lookupImpl?: (h: string) => Promise<string[]>) {
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: okFetch,
+      lookupImpl: lookupImpl ?? PUBLIC_LOOKUP,
+    });
+    return findTool(tools, "http_get");
+  }
+
+  for (const url of [
+    "http://127.0.0.1:8080/secret",
+    "http://localhost.localdomain.example/", // resolved, see below
+    "http://169.254.169.254/latest/meta-data/",
+    "http://10.1.2.3/",
+    "http://192.168.0.1/",
+    "http://[::1]/",
+    "http://[fe80::1]/",
+  ]) {
+    it(`refuses ${url}`, async () => {
+      // The one hostname here resolves to loopback; the rest are literals and
+      // never reach a resolver at all.
+      await assertRefused(
+        tool(async (h) => (h.endsWith(".example") ? ["127.0.0.1"] : ["93.184.216.34"])).execute({
+          url,
+        }),
+        /private or reserved/,
+      );
+    });
+  }
+
+  it("refuses a name whose second address is private", async () => {
+    // Every address is validated, not just the first: a name that answers with
+    // one public and one private address is a name that reaches the private one.
+    await assertRefused(
+      tool(async () => ["93.184.216.34", "127.0.0.1"]).execute({ url: "http://dual.example.com/" }),
+      /private or reserved/,
+    );
+  });
+
+  it("does not resolve a literal address", async () => {
+    let resolverCalls = 0;
+    const t = tool(async () => {
+      resolverCalls++;
+      return ["93.184.216.34"];
+    });
+    assert.equal(await t.execute({ url: "http://93.184.216.34/" }), "INTERNAL");
+    assert.equal(resolverCalls, 0);
+  });
+
+  it("the default resolver is wired up: 'localhost' is refused", async () => {
+    // No `lookupImpl`, so this goes through the real `dns.lookup` — the one the
+    // shipped tool uses. `localhost` comes from the hosts file, so the test
+    // needs no network, and whether it answers 127.0.0.1 or ::1 the verdict is
+    // the same.
+    const tools = createBuiltinTools({ root: "/tmp", fetchImpl: okFetch });
+    await assertRefused(
+      findTool(tools, "http_get").execute({ url: "http://localhost:9/" }),
+      /private or reserved/,
+    );
+  });
+
+  it("reports a resolver failure as OSError", async () => {
+    const t = tool(async () => {
+      throw new Error("ENOTFOUND");
+    });
+    await assert.rejects(
+      async () => t.execute({ url: "http://nope.example.com/" }),
+      (e: unknown) => {
+        assert.ok(e instanceof HostToolError);
+        assert.equal((e as HostToolError).pythonType, "OSError");
+        assert.match((e as Error).message, /cannot resolve/);
+        return true;
+      },
+    );
+  });
+
+  it("reports an empty resolver answer as OSError", async () => {
+    const t = tool(async () => []);
+    await assert.rejects(
+      async () => t.execute({ url: "http://nope.example.com/" }),
+      (e: unknown) => {
+        assert.match((e as Error).message, /no addresses/);
+        return true;
+      },
+    );
+  });
+
+  it("rejects a string that passes the scheme test but is not a URL", async () => {
+    await assert.rejects(
+      async () => tool().execute({ url: "http://" }),
+      (e: unknown) => {
+        assert.equal((e as HostToolError).pythonType, "ValueError");
+        assert.match((e as Error).message, /not a valid URL/);
+        return true;
+      },
+    );
+  });
+});
+
+describe("http_get — redirects", () => {
+  /** A fetch that answers from a table and records every URL it was handed. */
+  function routed(routes: Record<string, Response | (() => Response)>) {
+    const seen: string[] = [];
+    const impl: typeof fetch = async (input, init) => {
+      const url = String(input);
+      seen.push(url);
+      assert.equal(init?.redirect, "manual", "redirects must not be followed by fetch");
+      const route = routes[url];
+      if (!route) throw new Error(`unrouted: ${url}`);
+      return typeof route === "function" ? route() : route;
+    };
+    return { impl, seen };
+  }
+
+  const redirect = (location: string, status = 302) =>
+    new Response("redirecting", { status, headers: { location } });
+
+  function toolFor(
+    impl: typeof fetch,
+    lookupImpl: (h: string) => Promise<string[]> = PUBLIC_LOOKUP,
+  ) {
+    return findTool(createBuiltinTools({ root: "/tmp", fetchImpl: impl, lookupImpl }), "http_get");
+  }
+
+  it("refuses a redirect into loopback", async () => {
+    const { impl, seen } = routed({
+      "http://public.example.com/": redirect("http://127.0.0.1:9000/secret"),
+    });
+    await assertRefused(
+      toolFor(impl).execute({ url: "http://public.example.com/" }),
+      /private or reserved/,
+    );
+    assert.deepEqual(seen, ["http://public.example.com/"], "the internal hop must not be fetched");
+  });
+
+  it("refuses at the third hop of public → public → loopback", async () => {
+    const { impl, seen } = routed({
+      "http://a.example.com/": redirect("http://b.example.com/"),
+      "http://b.example.com/": redirect("http://internal.example.com/"),
+      "http://internal.example.com/": new Response("SECRET", { status: 200 }),
+    });
+    const lookupImpl = async (h: string) =>
+      h === "internal.example.com" ? ["127.0.0.1"] : ["93.184.216.34"];
+    await assertRefused(
+      toolFor(impl, lookupImpl).execute({ url: "http://a.example.com/" }),
+      /private or reserved/,
+    );
+    assert.deepEqual(seen, ["http://a.example.com/", "http://b.example.com/"]);
+  });
+
+  it("follows a redirect that stays public", async () => {
+    const { impl, seen } = routed({
+      "http://a.example.com/": redirect("http://b.example.com/final"),
+      "http://b.example.com/final": new Response("arrived", { status: 200 }),
+    });
+    assert.equal(await toolFor(impl).execute({ url: "http://a.example.com/" }), "arrived");
+    assert.equal(seen.length, 2);
+  });
+
+  it("resolves a relative Location against the current hop", async () => {
+    const { impl } = routed({
+      "http://a.example.com/one/two": redirect("../three"),
+      "http://a.example.com/three": new Response("arrived", { status: 200 }),
+    });
+    assert.equal(await toolFor(impl).execute({ url: "http://a.example.com/one/two" }), "arrived");
+  });
+
+  it("refuses a redirect that leaves http(s)", async () => {
+    const { impl } = routed({
+      "http://a.example.com/": redirect("file:///etc/passwd"),
+    });
+    await assert.rejects(
+      async () => toolFor(impl).execute({ url: "http://a.example.com/" }),
+      (e: unknown) => {
+        assert.equal((e as HostToolError).pythonType, "ValueError");
+        assert.match((e as Error).message, /only http\(s\)/);
+        return true;
+      },
+    );
+  });
+
+  it("reports an unusable Location as OSError", async () => {
+    const { impl } = routed({ "http://a.example.com/": redirect("http://[") });
+    await assert.rejects(
+      async () => toolFor(impl).execute({ url: "http://a.example.com/" }),
+      (e: unknown) => {
+        assert.match((e as Error).message, /unusable location/);
+        return true;
+      },
+    );
+  });
+
+  it("gives up after too many hops", async () => {
+    const routes: Record<string, Response | (() => Response)> = {};
+    for (let i = 0; i < 12; i++) {
+      routes[`http://h${i}.example.com/`] = () => redirect(`http://h${i + 1}.example.com/`);
+    }
+    const { impl, seen } = routed(routes);
+    await assert.rejects(
+      async () => toolFor(impl).execute({ url: "http://h0.example.com/" }),
+      (e: unknown) => {
+        assert.match((e as Error).message, /too many redirects/);
+        return true;
+      },
+    );
+    assert.equal(seen.length, 6, "MAX_REDIRECT_HOPS + the original request");
+  });
+
+  it("treats a 3xx without a Location as the error status it is", async () => {
+    const { impl } = routed({
+      "http://a.example.com/": new Response("no location", { status: 302 }),
+    });
+    await assert.rejects(
+      async () => toolFor(impl).execute({ url: "http://a.example.com/" }),
+      (e: unknown) => {
+        assert.match((e as Error).message, /HTTP 302/);
+        return true;
+      },
+    );
+  });
+
+  it("does not treat a 200 with a Location header as a redirect", async () => {
+    const { impl, seen } = routed({
+      "http://a.example.com/": new Response("done", {
+        status: 200,
+        headers: { location: "http://127.0.0.1/" },
+      }),
+    });
+    assert.equal(await toolFor(impl).execute({ url: "http://a.example.com/" }), "done");
+    assert.equal(seen.length, 1);
+  });
+});
+
+describe("http_get — timeout", () => {
+  it("aborts a request that never answers", async () => {
+    const hanging: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        // `AbortSignal.timeout`'s timer is unref'd, so it is not by itself a
+        // reason for the process to stay alive. A real hanging request holds an
+        // open socket, which is; a mock that touches nothing leaves the loop
+        // empty, and node 22's test runner then reports the still-pending
+        // promise instead of letting the deadline fire. This stands in for the
+        // socket.
+        const socket = setTimeout(() => {}, 5_000);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(socket);
+          reject(init.signal?.reason);
+        });
+      });
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: hanging,
+      lookupImpl: PUBLIC_LOOKUP,
+      httpTimeoutSecs: 0.05,
+    });
+    await assert.rejects(
+      async () => findTool(tools, "http_get").execute({ url: "http://slow.example.com/" }),
+      (e: unknown) => {
+        assert.ok(e instanceof HostToolError);
+        assert.equal((e as HostToolError).pythonType, "TimeoutError");
+        assert.match((e as Error).message, /timed out/);
+        return true;
+      },
+    );
+  });
+
+  it("one deadline covers the whole redirect chain", async () => {
+    // Each hop answers instantly, so only a budget spanning all of them can end
+    // this; a per-hop timer would let it run forever.
+    const impl: typeof fetch = async (input, init) => {
+      await new Promise((r) => setTimeout(r, 15));
+      if (init?.signal?.aborted) throw init.signal.reason;
+      const n = Number(/h(\d+)/.exec(String(input))?.[1] ?? 0);
+      return new Response("", {
+        status: 302,
+        headers: { location: `http://h${n + 1}.example.com/` },
+      });
+    };
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: impl,
+      lookupImpl: PUBLIC_LOOKUP,
+      httpTimeoutSecs: 0.03,
+    });
+    await assert.rejects(
+      async () => findTool(tools, "http_get").execute({ url: "http://h0.example.com/" }),
+      (e: unknown) => {
+        assert.equal((e as HostToolError).pythonType, "TimeoutError");
+        return true;
+      },
+    );
+  });
+
+  it("reads REPL_HTTP_TIMEOUT_SECS", async () => {
+    const previous = process.env.REPL_HTTP_TIMEOUT_SECS;
+    process.env.REPL_HTTP_TIMEOUT_SECS = "not a number";
+    try {
+      // Unparseable falls back to the default rather than to zero, which would
+      // abort every request before it started.
+      const tools = createBuiltinTools({
+        root: "/tmp",
+        fetchImpl: async () => new Response("ok", { status: 200 }),
+        lookupImpl: PUBLIC_LOOKUP,
+      });
+      assert.equal(
+        await findTool(tools, "http_get").execute({ url: "http://a.example.com/" }),
+        "ok",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.REPL_HTTP_TIMEOUT_SECS;
+      else process.env.REPL_HTTP_TIMEOUT_SECS = previous;
+    }
+  });
+
+  it("surfaces a body-stream timeout as TimeoutError", async () => {
+    const failing =
+      (error: unknown): typeof fetch =>
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(error);
+            },
+          }),
+          { status: 200 },
+        );
+    const tools = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: failing(new DOMException("aborted", "TimeoutError")),
+      lookupImpl: PUBLIC_LOOKUP,
+    });
+    await assert.rejects(
+      async () => findTool(tools, "http_get").execute({ url: "http://a.example.com/" }),
+      (e: unknown) => {
+        assert.equal((e as HostToolError).pythonType, "TimeoutError");
+        return true;
+      },
+    );
+
+    const broken = createBuiltinTools({
+      root: "/tmp",
+      fetchImpl: failing(new Error("connection reset")),
+      lookupImpl: PUBLIC_LOOKUP,
+    });
+    await assert.rejects(
+      async () => findTool(broken, "http_get").execute({ url: "http://a.example.com/" }),
+      (e: unknown) => {
+        assert.equal((e as HostToolError).pythonType, "OSError");
+        assert.match((e as Error).message, /connection reset/);
+        return true;
+      },
+    );
   });
 });
