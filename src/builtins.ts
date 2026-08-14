@@ -1,7 +1,8 @@
 import { lookup } from "node:dns/promises";
-import { open, readdir, realpath, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { isIP } from "node:net";
-import { isAbsolute, resolve, sep } from "node:path";
+import { resolve } from "node:path";
+import { createPathJail } from "./pathjail.js";
 import { requireString } from "./registry.js";
 import {
   Truncator,
@@ -334,30 +335,10 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
   const lookupImpl = options.lookupImpl ?? defaultLookup;
 
   // Resolves a sandbox-relative path and rejects anything outside the root,
-  // including symlink escapes.
-  async function resolveInRoot(relPath: string): Promise<string> {
-    if (isAbsolute(relPath)) {
-      throw new HostToolError("PermissionError", `absolute paths are not allowed: '${relPath}'`);
-    }
-    const resolved = resolve(root, relPath);
-    if (resolved !== root && !resolved.startsWith(root + sep)) {
-      throw new HostToolError("PermissionError", `path escapes the workspace root: '${relPath}'`);
-    }
-    let real: string;
-    try {
-      real = await realpath(resolved);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
-        throw new HostToolError("FileNotFoundError", `no such file or directory: '${relPath}'`);
-      }
-      throw new HostToolError("OSError", String((e as Error).message));
-    }
-    const realRoot = await realpath(root);
-    if (real !== realRoot && !real.startsWith(realRoot + sep)) {
-      throw new HostToolError("PermissionError", `path escapes the workspace root: '${relPath}'`);
-    }
-    return real;
-  }
+  // including symlink escapes. Shared with the bridged read tools (#43) —
+  // see src/pathjail.ts for why there is exactly one of these.
+  const jail = createPathJail(root);
+  const resolveInRoot = (relPath: string): Promise<string> => jail.resolve(relPath);
 
   const readFileTool: HostTool = {
     name: "read_file",

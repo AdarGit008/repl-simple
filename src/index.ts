@@ -36,6 +36,13 @@ export { createBuiltinTools, type BuiltinToolsOptions } from "./builtins.js";
 // ── Bridge ──────────────────────────────────────────────────────
 export { createPiBridgeTools, type BridgeOptions } from "./bridge.js";
 
+// ── Path jail ───────────────────────────────────────────────────
+// The one containment check the file-reading tools share. Exported so a host
+// adding its own read tool confines it the same way rather than writing a
+// second version — which is exactly how the bridged tools came to be
+// unconfined (#43).
+export { createPathJail, type PathJail, type PathJailOptions } from "./pathjail.js";
+
 // ── Sandbox ─────────────────────────────────────────────────────
 export {
   runInSandbox,
