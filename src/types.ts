@@ -171,8 +171,35 @@ export interface RunSuspended {
   calls: ToolCallTrace[];
 }
 
-/** Discriminated union of run outcomes */
-export type RunResult = RunOk | RunError | RunSuspended;
+/**
+ * A suspension that a later `run()` threw away, reported on that run's result.
+ *
+ * A suspension belongs to the call that created it. When the caller runs new
+ * code instead of resuming, `Session.run` drops the pending decision — and has
+ * to say so, because the alternative is a side effect the caller stopped
+ * expecting firing later, against variables the newer code has moved past
+ * (#129). The description is the same string the approval dialog showed, so
+ * the notice names the call the user was actually looking at.
+ */
+export interface DiscardedSuspension {
+  /** The tool whose approval was pending. */
+  tool: string;
+  /** The dialog description of the call that will now never run. */
+  description: string;
+}
+
+/**
+ * Discriminated union of run outcomes.
+ *
+ * `discardedSuspension` sits on the union rather than inside the three
+ * variants because it is not something the sandbox can produce: `runInSandbox`
+ * knows about one execution, and only `Session` knows a previous one was left
+ * pending. It rides along on whatever this run turned out to be — ok, error,
+ * or a fresh suspension — because the discard happened either way.
+ */
+export type RunResult = (RunOk | RunError | RunSuspended) & {
+  discardedSuspension?: DiscardedSuspension;
+};
 
 // ── RLM types ────────────────────────────────────────────────────
 

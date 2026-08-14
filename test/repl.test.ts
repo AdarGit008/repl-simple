@@ -558,3 +558,54 @@ describe("ReplRunner — every tool answers, in every state (#48)", () => {
     assert.equal(existsSync(join(cwd, "reset.txt")), false);
   });
 });
+
+// ── A suspension does not outlive its call (#129) ─────────────────
+
+/**
+ * #129, end to end: the sequence a model actually produces — gate a call,
+ * decide later, then call `repl` again instead of `repl_resume`.
+ *
+ * Before the fix this printed `2`, then wrote `a.txt` containing `1` on the
+ * late resume, and every later run in the session saw `v == 1` again. The
+ * assertions below are the four the issue asks for, in that order.
+ */
+describe("ReplRunner — a suspension does not outlive its call (#129)", () => {
+  let runner: ReplRunner;
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("running new code discards the pending approval, says so, and does not rewind", async () => {
+    const pending = await runner.run("v = 1\nwrite('a.txt', str(v))", "stale", suspend);
+    assert.match(pending, /requires approval/);
+
+    // The model moves on rather than resuming.
+    const moved = await runner.run("v = 2\nv", "stale");
+
+    // 4 — it says what it dropped, before the result it was asked for.
+    assert.match(moved, /^\[discarded\]/);
+    assert.match(moved, /write\(path="a\.txt", content="1"\)/);
+    assert.match(moved, /\[result\]\n2/);
+
+    // 1 — the old suspension is gone, whichever way it was closed.
+    const late = await runner.resume("stale", approve);
+    assert.match(late, /nothing waiting for approval/i);
+
+    // 3 — the stale write never reached the disk.
+    assert.equal(existsSync(join(cwd, "a.txt")), false, "a superseded side effect ran");
+
+    // 2 — the variable did not rewind.
+    const after = await runner.run("v", "stale");
+    assert.match(after, /\[result\]\n2/);
+  });
+
+  it("a run with nothing pending is not decorated", async () => {
+    const out = await runner.run("1 + 1", "quiet");
+    assert.doesNotMatch(out, /discarded/i);
+  });
+});

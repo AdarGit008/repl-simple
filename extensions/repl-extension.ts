@@ -196,7 +196,8 @@ export default function (pi: ReplExtensionApi) {
         "Execute Python code in a sandboxed environment with persistent sessions. " +
         "Variables, imports, and function definitions persist across calls with the " +
         "same sessionId. File system, shell, and HTTP tools are available as Python " +
-        "functions.",
+        "functions. If the session has a tool call waiting for approval, running new " +
+        "code discards it — call repl_resume first if you still want that call.",
       parameters: Type.Object({
         code: Type.String({ description: "Python code to execute." }),
         sessionId: Type.Optional(

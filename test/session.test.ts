@@ -906,3 +906,134 @@ describe("Session — approval grants are scoped and counted (#44)", () => {
     assert.deepEqual(session.outstandingGrants(), []);
   });
 });
+
+// ── A suspension does not outlive its call (#129) ────────────────
+
+/**
+ * #129: `run` used to leave `this.suspended` alone, so a suspension survived
+ * any number of later calls and `resume()` then pushed its snippet *after*
+ * newer ones. The measured consequence was a session that silently rewound —
+ * `v` went back to 1 after being set to 2 — while a side effect from the
+ * abandoned code reached the disk.
+ *
+ * The fix abandons rather than refuses: deferring means "not now", and a new
+ * `run` is the caller moving on. What makes that honest instead of silent is
+ * the notice on the result, so it is tested as hard as the discard itself.
+ */
+describe("Session — a suspension does not outlive its call (#129)", () => {
+  /** A gated tool that counts what it actually ran. */
+  function makeGatedCounter(name = "gated") {
+    let executions = 0;
+    const tool: HostTool = {
+      name,
+      description: "Gated; counts real executions",
+      params: [{ name: "v", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `${name}:${args.v}:${++executions}`,
+    };
+    return { tool, executions: () => executions };
+  }
+
+  it("the session does not rewind: snippets stay in execution order", async () => {
+    // #129's reproduction. `v = 1` belongs to code the caller moved past; it
+    // must not replay after `v = 2`.
+    const { tool } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    suspended(await session.run("v = 1\ngated(str(v))", { onApproval: () => "suspend" }));
+
+    const moved = await session.run("v = 2\nv", { onApproval: () => "suspend" });
+    ok(moved);
+    assert.equal(moved.output, "2");
+
+    const after = await session.run("v");
+    ok(after);
+    assert.equal(after.output, "2", "v rewound to 1 — the suspended snippet replayed last");
+  });
+
+  it("the stale call never executes, and cannot be resumed", async () => {
+    const { tool, executions } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    suspended(await session.run('gated("stale")', { onApproval: () => "suspend" }));
+    ok(await session.run("1 + 1"));
+
+    assert.equal(session.isSuspended(), false);
+    await assert.rejects(async () => {
+      await session.resume({ onApproval: () => true });
+    }, /no suspended execution/i);
+    assert.equal(executions(), 0, "the abandoned call reached the tool");
+  });
+
+  it("says what it dropped, naming the call the dialog showed", async () => {
+    const { tool } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    const pending = await session.run('gated("x")', { onApproval: () => "suspend" });
+    suspended(pending);
+
+    const next = await session.run("1 + 1");
+    ok(next);
+    assert.equal(next.discardedSuspension?.tool, "gated");
+    assert.equal(next.discardedSuspension?.description, pending.suspendedCall.description);
+  });
+
+  it("carries the notice on an errored run too — the discard happened either way", async () => {
+    const { tool } = makeGatedCounter();
+    const session = new Session({ registry: new ToolRegistry([tool]) });
+
+    suspended(await session.run('gated("x")', { onApproval: () => "suspend" }));
+
+    const broken = await session.run("raise ValueError('boom')");
+    err(broken);
+    assert.equal(broken.discardedSuspension?.tool, "gated");
+  });
+
+  it("a run that suspends again reports the old discard, and stores a clean suspension", async () => {
+    const first = makeGatedCounter("gated");
+    const second = makeGatedCounter("gated2");
+    const session = new Session({ registry: new ToolRegistry([first.tool, second.tool]) });
+
+    suspended(await session.run('gated("old")', { onApproval: () => "suspend" }));
+
+    const again = await session.run('gated2("new")', { onApproval: () => "suspend" });
+    suspended(again);
+    assert.equal(again.discardedSuspension?.tool, "gated", "the old discard is not reported");
+    assert.equal(again.suspendedCall.tool, "gated2", "the new suspension is the pending one");
+
+    // The stored state describes itself, not the call before it.
+    const resumed = await session.resume({ onApproval: () => true });
+    ok(resumed);
+    assert.equal(resumed.output, "gated2:new:1");
+    assert.equal(resumed.discardedSuspension, undefined, "the notice leaked into the resume");
+    assert.equal(first.executions(), 0, "the discarded call ran on resume");
+  });
+
+  it("adds nothing when there was no suspension to discard", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+
+    const clean = await session.run("1 + 1");
+    ok(clean);
+    assert.equal(clean.discardedSuspension, undefined);
+  });
+
+  it("revokes the grants the discarded suspension was holding", async () => {
+    const first = makeGatedCounter("gated");
+    const second = makeGatedCounter("gated2");
+    const session = new Session(
+      { registry: new ToolRegistry([first.tool, second.tool]) },
+      undefined,
+      { grantUses: 2 },
+    );
+
+    suspended(await session.run('gated("a")\ngated2("b")', { onApproval: () => "suspend" }));
+    suspended(
+      await session.resume({ onApproval: (req) => (req.tool === "gated" ? true : "suspend") }),
+    );
+    assert.equal(session.outstandingGrants().length, 1, "precondition: a grant is live");
+
+    ok(await session.run("1 + 1"));
+    assert.deepEqual(session.outstandingGrants(), [], "a grant outlived the call it belonged to");
+  });
+});

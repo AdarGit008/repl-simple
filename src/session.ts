@@ -8,6 +8,7 @@ import type {
   RunOptions,
   ToolCallTrace,
   ApprovalRequest,
+  DiscardedSuspension,
 } from "./types.js";
 
 // ── Constants ────────────────────────────────────────────────────
@@ -178,6 +179,20 @@ export interface SessionOptions {
   grantUses?: number;
 }
 
+// ── Discarded suspensions ────────────────────────────────────────
+
+/**
+ * Attach the discard notice to a result, or return it untouched.
+ *
+ * A copy, never a mutation: the caller of `run` may be holding the same object
+ * as `this.suspended`, and the stored suspension must stay a description of
+ * itself.
+ */
+function withDiscardNotice(result: RunResult, discarded?: DiscardedSuspension): RunResult {
+  if (!discarded) return result;
+  return { ...result, discardedSuspension: discarded };
+}
+
 // ── Session ──────────────────────────────────────────────────────
 
 /**
@@ -266,8 +281,17 @@ export class Session {
    * On success the snippet is appended for future runs.
    * On error the snippet is dropped.
    * On suspension the state is saved for later `resume()`.
+   *
+   * **A pending suspension does not survive this call.** Running new code is
+   * the caller moving on, so the deferred decision is discarded here and
+   * reported on the result — see {@link DiscardedSuspension} for why it cannot
+   * simply be left pending (#129).
    */
   async run(code: string, runOpts?: RunOptions): Promise<RunResult> {
+    // Before anything replays: the old call is over, whatever it was waiting
+    // for. Doing this first is what keeps `snippets` in execution order.
+    const discarded = this.discardPendingSuspension();
+
     // Build the full transcript: preamble + prior snippets + new code
     const parts: string[] = [];
     if (this.preamble) parts.push(this.preamble);
@@ -277,9 +301,9 @@ export class Session {
     // Record the cache length BEFORE this run (for trace filtering)
     const priorEntryCount = this.callCacheEntries.length;
 
-    // A grant belongs to one call. Whatever the last one left behind — it can
-    // only be a suspension that was never resumed — does not carry into this
-    // one.
+    // A grant belongs to one call. The discard above already cleared the only
+    // path that can leave one behind — a suspension that was never resumed —
+    // and this keeps that true however the previous call ended.
     this.grants.clear();
 
     // New entries discovered during this run
@@ -311,17 +335,18 @@ export class Session {
       // Success: add snippet, append new entries, filter trace
       this.snippets.push(code);
       this.callCacheEntries.push(...newEntries);
-      return this.filterCachedCalls(result, priorEntryCount);
+      return withDiscardNotice(this.filterCachedCalls(result, priorEntryCount), discarded);
     } else if (result.status === "suspended") {
-      // Save suspension state
+      // Save suspension state — the raw result, so the notice about the *last*
+      // suspension is not carried into the state describing this one.
       this.suspended = result;
       this.suspendedCode = code;
       this.suspendedRunOpts = runOpts;
       // Don't add to snippets or cache — the snippet didn't complete
-      return result;
+      return withDiscardNotice(result, discarded);
     } else {
       // Error: drop snippet, don't update cache
-      return result;
+      return withDiscardNotice(result, discarded);
     }
   }
 
@@ -529,6 +554,23 @@ export class Session {
   }
 
   // ── Private helpers ────────────────────────────────────────
+
+  /**
+   * Close out a suspension left over from an earlier call, if there is one.
+   *
+   * Abandon rather than refuse: deferring an approval means "not now", and a
+   * fresh `run` is the caller deciding to move on. Refusing would turn a
+   * forgotten decision into a wall the caller must clear before the session
+   * works again. What abandoning costs is silence — which is why the call it
+   * dropped is described back to the caller rather than only discarded.
+   */
+  private discardPendingSuspension(): DiscardedSuspension | undefined {
+    const pending = this.suspended;
+    if (!pending) return undefined;
+    const { tool, description } = pending.suspendedCall;
+    this.abandon();
+    return { tool, description };
+  }
 
   /**
    * The approval gate, shared by `run()` and `resume()`.
