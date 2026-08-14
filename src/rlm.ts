@@ -249,12 +249,22 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     options.onIteration?.(iteration);
 
     // 6. Check for SUBMIT
-    // SubmitSignal → sandbox returns status:"ok" with output=answer
-    // and a SUBMIT call in the trace with ok:true.
-    const submitCall = result.calls.find((c) => c.tool === "SUBMIT");
-    if (submitCall) {
-      const answer = result.status === "ok" ? result.output : (submitCall.error ?? "");
-      return { status: "ok", answer, iterations };
+    //
+    // SubmitSignal → sandbox returns status:"ok" with output=answer and a
+    // SUBMIT entry in the trace with ok:true. `ok` is the whole condition, not
+    // decoration: a call whose arguments do not resolve — `SUBMIT("a",
+    // **{"answer": "b"})`, which Monty's checker cannot see through — is traced
+    // ok:false and re-raised into Python as a TypeError. Stopping on it
+    // returned either that TypeError or, if the model caught it, the script's
+    // last expression value, both presented as the final answer (#71).
+    // Requiring ok lets the error reach the next iteration's feedback instead.
+    // The status test is the same invariant read from the other end — a
+    // successful SubmitSignal short-circuits the sandbox to "ok" — and it is
+    // what lets `output` be read without a fallback for a status that cannot
+    // occur here.
+    const submitted = result.calls.some((c) => c.tool === "SUBMIT" && c.ok);
+    if (submitted && result.status === "ok") {
+      return { status: "ok", answer: result.output, iterations };
     }
 
     // 7. Append iteration to conversation

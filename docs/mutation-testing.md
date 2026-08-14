@@ -306,8 +306,16 @@ Severity is lower than M22's: `src/session.ts:257` resolves a missing callback t
 — it fails closed. This breaks the resume feature rather than opening an approval bypass.
 **[judgement]**
 
-Two more equivalent-mutant notes, so nobody re-investigates them:
+Three more equivalent-mutant notes, so nobody re-investigates them:
 
 - `src/repl.ts:95:55`, `{ gateMutating: true } → {}` survives **legitimately**. `src/bridge.ts:209`
   defaults `options.gateMutating ?? true`, so the mutation is semantically identical to the original.
+- `src/rlm.ts`, `submitted && result.status === "ok"` → `submitted && true` survives
+  **legitimately**. A `SUBMIT` traced `ok: true` means `SubmitSignal` was thrown, and
+  `src/sandbox.ts` returns `status: "ok"` on that path without another statement running — so the
+  two conditions cannot disagree and no test can separate them. The clause is there to make that
+  invariant checkable by the compiler, which is what lets `result.output` be read with no fallback
+  for a status that cannot occur (#71). Its sibling mutant on the same line — dropping the
+  `c.tool === "SUBMIT"` name check — **is** killed, by
+  `test/rlm.test.ts` "does not treat some other tool's success as a submission".
 - `src/index.ts` yields 0 mutants because it is a re-export barrel.
