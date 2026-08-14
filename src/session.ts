@@ -14,6 +14,23 @@ import type {
 
 const CURRENT_VERSION = 1;
 
+/**
+ * How many executions one approval authorises, by default.
+ *
+ * One. An approval answers the question it was shown — "run *this* call?" —
+ * and authorises nothing past it. The knob exists because #44 requires the
+ * count to be a real, enforced ceiling rather than a comment, and because
+ * bucket 5's richer dialog will want to hand out "allow the next N" grants
+ * from a prompt that actually says so. Until such a prompt exists, the only
+ * honest default is the number the current dialog implies.
+ *
+ * Note what this is *not*: it is not the escape hatch. A user who wants to
+ * stop being asked switches approval mode (`/repl-approvals yolo`), which is
+ * a decision they make once, out loud, and can see in `repl_reset`'s output —
+ * rather than one inferred from a single tired click on one dialog.
+ */
+export const DEFAULT_GRANT_USES = 1;
+
 // ── Types ────────────────────────────────────────────────────────
 
 /** A single cached tool call: the key + the result it produced. */
@@ -62,6 +79,21 @@ function cacheKey(toolName: string, args: Record<string, unknown>): string {
   return `${toolName}::${JSON.stringify(sorted)}`;
 }
 
+/** A replay-cached registry, plus the one question the approval gate asks it. */
+interface CachingRegistry {
+  registry: ToolRegistry;
+  /**
+   * True when a call with this key is the *next* entry the replay cursor will
+   * serve — so it will be answered from the cache and will not execute.
+   *
+   * This is the only place the cursor is visible outside the replay itself,
+   * and it is deliberately here rather than in the gate: when #40 removes
+   * transcript replay, this function and its caller's `true` branch go with
+   * it, and the grant model above is untouched.
+   */
+  willReplayKey(key: string): boolean;
+}
+
 /**
  * Wraps a parent ToolRegistry with a replay cache.
  *
@@ -74,7 +106,7 @@ function createCachingRegistry(
   parent: ToolRegistry,
   replayEntries: CacheEntry[],
   newEntries: CacheEntry[],
-): ToolRegistry {
+): CachingRegistry {
   let replayIndex = 0;
 
   const tools = parent.list().map((tool): HostTool => {
@@ -110,7 +142,40 @@ function createCachingRegistry(
     };
   });
 
-  return new ToolRegistry(tools);
+  return {
+    registry: new ToolRegistry(tools),
+    willReplayKey: (key) =>
+      replayIndex < replayEntries.length && replayEntries[replayIndex].key === key,
+  };
+}
+
+// ── Approval grants ──────────────────────────────────────────────
+
+/** A live approval, and what is left of it. */
+interface Grant {
+  /** Tool name, kept for reporting — the key itself carries the args. */
+  tool: string;
+  /** Executions still authorised. Reaching 0 means the next call re-prompts. */
+  remaining: number;
+}
+
+/**
+ * An outstanding grant, as reported by `outstandingGrants()`.
+ *
+ * The arguments are deliberately not included. They are in the key, and the
+ * key is a `bash` command line — the one string in this system most likely to
+ * hold a credential someone pasted. The tool name and the count are what a
+ * user needs to decide whether to reset.
+ */
+export interface GrantSummary {
+  tool: string;
+  remaining: number;
+}
+
+/** Per-session knobs that are not sandbox configuration. */
+export interface SessionOptions {
+  /** Executions one approval authorises. Default {@link DEFAULT_GRANT_USES}. */
+  grantUses?: number;
 }
 
 // ── Session ──────────────────────────────────────────────────────
@@ -134,12 +199,45 @@ export class Session {
   private suspended: RunSuspended | null = null;
   private suspendedCode: string | null = null;
   private suspendedRunOpts: RunOptions | undefined;
+  /**
+   * Approvals granted by the user, live only for the current logical call.
+   *
+   * Keyed by `cacheKey(tool, resolvedArgs)`. Cleared when a `run()` starts and
+   * again when a call finishes, so a grant reaches the next `repl` call only
+   * by way of a suspension — which is the same call, paused. Never serialized:
+   * see `dump()`.
+   */
+  private grants = new Map<string, Grant>();
+  private grantUses: number;
 
   // ── Constructor ────────────────────────────────────────────
 
-  constructor(sandboxOptions: SandboxOptions, preamble?: string) {
+  constructor(sandboxOptions: SandboxOptions, preamble?: string, options: SessionOptions = {}) {
     this.sandboxOptions = sandboxOptions;
     this.preamble = preamble;
+
+    const uses = options.grantUses ?? DEFAULT_GRANT_USES;
+    if (!Number.isInteger(uses) || uses < 1) {
+      // Refused rather than clamped: 0 and 0.5 are both someone believing
+      // something false about the approval model, and a security ceiling
+      // should not be quietly rounded into a different one.
+      throw new RangeError(`grantUses must be an integer >= 1, got ${uses}`);
+    }
+    this.grantUses = uses;
+  }
+
+  // ── Grants ─────────────────────────────────────────────────
+
+  /**
+   * Approvals still live in this session, for `repl_reset` to report.
+   *
+   * Non-empty only while a call is paused at a suspension, or when
+   * `grantUses > 1` left something over.
+   */
+  outstandingGrants(): GrantSummary[] {
+    return [...this.grants.values()]
+      .filter((g) => g.remaining > 0)
+      .map((g) => ({ tool: g.tool, remaining: g.remaining }));
   }
 
   // ── run ────────────────────────────────────────────────────
@@ -166,43 +264,24 @@ export class Session {
     // Record the cache length BEFORE this run (for trace filtering)
     const priorEntryCount = this.callCacheEntries.length;
 
-    // Build a lookup set of cache keys for quick approval bypass
-    const cachedKeys = new Set(this.callCacheEntries.map((e) => e.key));
+    // A grant belongs to one call. Whatever the last one left behind — it can
+    // only be a suspension that was never resumed — does not carry into this
+    // one.
+    this.grants.clear();
 
     // New entries discovered during this run
     const newEntries: CacheEntry[] = [];
 
     // Build caching registry with the current replay list
-    const cachingRegistry = createCachingRegistry(
+    const { registry: cachingRegistry, willReplayKey } = createCachingRegistry(
       this.sandboxOptions.registry,
       this.callCacheEntries,
       newEntries,
     );
 
-    // Auto-approve gated tool calls that are in the replay cache.
-    // The approval gate fires before tool.execute(), so the caching
-    // wrapper alone can't suppress it. We check the cache here.
-    const userOnApproval = runOpts?.onApproval;
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
-      onApproval: async (req) => {
-        // Resolve args to build the cache key
-        const tool = this.sandboxOptions.registry.get(req.tool);
-        if (tool) {
-          let resolved: Record<string, unknown>;
-          try {
-            resolved = resolveToolArgs(tool, req.args, req.kwargs as Record<string, unknown>);
-            const key = cacheKey(req.tool, resolved);
-            if (cachedKeys.has(key)) {
-              return true; // Already approved and cached — auto-approve
-            }
-          } catch {
-            // Can't resolve — fall through to user callback
-          }
-        }
-        // Not in cache — delegate to user callback, or deny
-        return userOnApproval ? userOnApproval(req) : false;
-      },
+      onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
 
     const result = await runInSandbox(
@@ -210,6 +289,9 @@ export class Session {
       { ...this.sandboxOptions, registry: cachingRegistry },
       wrappedRunOpts,
     );
+
+    // Anything but a suspension ends the call, and the grants with it.
+    if (result.status !== "suspended") this.grants.clear();
 
     // Post-process based on result
     if (result.status === "ok") {
@@ -257,38 +339,30 @@ export class Session {
       decision = false; // No callback → deny
     }
 
+    // An approval here is the user answering the dialog for *this* call, so it
+    // grants what any other approval grants — including the one use this call
+    // is about to spend, which is why the grant recorded is one short.
+    const suspendedCall = this.suspended.suspendedCall;
+    if (decision) this.recordGrant(this.keyFor(suspendedCall), suspendedCall.tool);
+
     // Use a caching registry so the suspended tool's return value
     // (and any subsequent tool calls) are captured for future replays.
     // resumeSuspended calls tool.execute() directly on the suspended
     // call (bypassing the approval gate), so the caching wrapper sees
     // it without double-execution.
     const newEntries: CacheEntry[] = [];
-    const cachingRegistry = createCachingRegistry(
+    const { registry: cachingRegistry, willReplayKey } = createCachingRegistry(
       this.sandboxOptions.registry,
       [], // No replay entries — the suspended call was already decided
       newEntries,
     );
 
-    // Auto-approve any subsequent gated calls that are already cached
-    const userOnApproval = runOpts?.onApproval;
+    // The same gate as `run()`. With no replay entries its cache branch is
+    // dead here, so every gated call in the resumed continuation is decided by
+    // a grant or by the user — never by "something like it ran once".
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
-      onApproval: async (req) => {
-        const tool = this.sandboxOptions.registry.get(req.tool);
-        if (tool) {
-          let resolved: Record<string, unknown>;
-          try {
-            resolved = resolveToolArgs(tool, req.args, req.kwargs as Record<string, unknown>);
-            const key = cacheKey(req.tool, resolved);
-            if (this.callCacheEntries.some((e) => e.key === key)) {
-              return true;
-            }
-          } catch {
-            /* fall through */
-          }
-        }
-        return userOnApproval ? userOnApproval(req) : false;
-      },
+      onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
 
     const result = await resumeSuspended(
@@ -297,6 +371,9 @@ export class Session {
       { ...this.sandboxOptions, registry: cachingRegistry },
       wrappedRunOpts,
     );
+
+    // The call is over unless it suspended again.
+    if (result.status !== "suspended") this.grants.clear();
 
     // Save copies before clearing
     const suspendedCode = this.suspendedCode!;
@@ -336,18 +413,28 @@ export class Session {
     this.suspended = null;
     this.suspendedCode = null;
     this.suspendedRunOpts = undefined;
+    // Abandoning ends the call the grants belonged to.
+    this.grants.clear();
     return true;
   }
 
   // ── reset ──────────────────────────────────────────────────
 
-  /** Clear all session state: snippets, cache, and any suspension. */
-  reset(): void {
+  /**
+   * Clear all session state: snippets, cache, grants, and any suspension.
+   *
+   * @returns the grants that were live at the moment of the reset, so the
+   *          caller can tell the user what it just revoked.
+   */
+  reset(): GrantSummary[] {
+    const revoked = this.outstandingGrants();
     this.snippets = [];
     this.callCacheEntries = [];
     this.suspended = null;
     this.suspendedCode = null;
     this.suspendedRunOpts = undefined;
+    this.grants.clear();
+    return revoked;
   }
 
   // ── dump ───────────────────────────────────────────────────
@@ -355,6 +442,11 @@ export class Session {
   /**
    * Serialize the session to a JSON string for persistent storage.
    * The returned string can be passed to `Session.load()`.
+   *
+   * **Grants are not included, and must not be.** They authorise executions in
+   * the call that is running now; a grant that survives into another process
+   * is the unbounded lifetime #44 removed, rebuilt through the back door. A
+   * restored session re-asks.
    */
   dump(): string {
     const obj: SessionDump = {
@@ -424,6 +516,83 @@ export class Session {
   }
 
   // ── Private helpers ────────────────────────────────────────
+
+  /**
+   * The approval gate, shared by `run()` and `resume()`.
+   *
+   * Three ways a gated call gets through, in order:
+   *
+   * 1. **It is a replay.** The caching registry is about to answer this exact
+   *    call from the cache, in cursor order, so nothing executes. Approving
+   *    what will not run is not a grant; it is the absence of a question. This
+   *    is the one branch that must keep working — a session that re-asks for
+   *    every prior call on every run is a session nobody keeps, and the fix
+   *    gets reverted.
+   * 2. **A live grant.** The user approved this exact tool and arguments
+   *    earlier in *this* call and the grant has uses left.
+   * 3. **The user says so.** Anything else reaches the callback. No callback
+   *    means no approval — this is the fail-closed path, and dropping it is
+   *    mutation M22.
+   *
+   * What is gone is the fourth way: matching any key ever executed, forever.
+   */
+  private makeApprovalGate(
+    userOnApproval: RunOptions["onApproval"],
+    willReplayKey: (key: string) => boolean,
+  ): NonNullable<RunOptions["onApproval"]> {
+    return async (req) => {
+      const key = this.keyFor(req);
+
+      if (key !== null) {
+        if (willReplayKey(key)) return true;
+
+        const grant = this.grants.get(key);
+        if (grant && grant.remaining > 0) {
+          grant.remaining--;
+          return true;
+        }
+      }
+
+      const decision = userOnApproval ? await userOnApproval(req) : false;
+      // A `"suspend"` is not consent — it defers the question to `resume()`,
+      // which records the grant if the answer there is yes.
+      if (decision === true) this.recordGrant(key, req.tool);
+      return decision;
+    };
+  }
+
+  /**
+   * The cache key for an approval request, or `null` if the arguments cannot
+   * be resolved.
+   *
+   * `null` is not an error path with a fallback — it means this call cannot be
+   * matched against anything, so it can neither replay nor be covered by a
+   * grant, and has to be asked about.
+   */
+  private keyFor(req: ApprovalRequest): string | null {
+    const tool = this.sandboxOptions.registry.get(req.tool);
+    if (!tool) return null;
+    try {
+      const resolved = resolveToolArgs(tool, req.args, req.kwargs as Record<string, unknown>);
+      return cacheKey(req.tool, resolved);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Record the grant an approval leaves behind.
+   *
+   * One use is spent by the call being approved right now, so a `grantUses` of
+   * 1 — the default — stores nothing at all: the next identical call asks
+   * again. That is the intended shape, not a degenerate case.
+   */
+  private recordGrant(key: string | null, tool: string): void {
+    if (key === null) return;
+    const remaining = this.grantUses - 1;
+    if (remaining < 1) return;
+    this.grants.set(key, { tool, remaining });
+  }
 
   /**
    * Remove ToolCallTrace entries that were served from the replay
