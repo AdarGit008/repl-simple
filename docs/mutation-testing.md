@@ -1,7 +1,14 @@
 # Mutation testing
 
-**Status:** Baseline re-measured on a guarded harness · **Issue:** #24 (Bucket 1, step 6) ·
-**Tree:** `b0d298d`
+**Status:** Baseline re-measured on a guarded harness — **and now stale** · **Issue:** #24 (Bucket 1,
+step 6) · **Tree:** `b0d298d`
+
+> **The numbers below predate the Monty 0.0.21 migration (#40).** That change rewrote
+> `src/sandbox.ts`, added `src/pool.ts`, and moved Python execution into worker subprocesses, so the
+> mutant population, the per-file scores and the 58.09% baseline have all moved by an amount nobody
+> has measured. `thresholds.break` is still 58 and mutation is not part of CI, so nothing is
+> silently passing — but the floor is unverified until a full sweep re-baselines it. The per-file
+> analysis and the harness findings below remain valid for every file the migration did not touch.
 
 This document records the full Stryker runs on this repository: the score, what it cost, how to
 reproduce it, and the findings the runs turned up that are not about the score at all.

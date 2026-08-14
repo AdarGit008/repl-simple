@@ -144,24 +144,24 @@ describe("ToolRegistry", () => {
   });
 
   describe("renderTypeStubs", () => {
-    it("returns a string", () => {
+    it("returns a string", async () => {
       const reg = new ToolRegistry();
       reg.add(makeTool({ name: "read_file" }));
-      const stubs = reg.renderTypeStubs();
+      const stubs = await reg.renderTypeStubs();
       assert.equal(typeof stubs, "string");
     });
 
-    it("includes registered tool names", () => {
+    it("includes registered tool names", async () => {
       const reg = new ToolRegistry();
       reg.add(makeTool({ name: "my_tool" }));
-      const stubs = reg.renderTypeStubs();
+      const stubs = await reg.renderTypeStubs();
       assert.ok(stubs.includes("my_tool"), `stubs should mention 'my_tool', got: ${stubs}`);
     });
 
-    it("includes tool names with params", () => {
+    it("includes tool names with params", async () => {
       const reg = new ToolRegistry();
       reg.add(makeParamTool());
-      const stubs = reg.renderTypeStubs();
+      const stubs = await reg.renderTypeStubs();
       assert.ok(stubs.includes("add"), `stubs should mention 'add', got: ${stubs}`);
     });
   });
@@ -257,37 +257,30 @@ describe("renderPythonToolRules", () => {
 });
 
 // ── probeImportableModules / probeTypeCheckerGaps ────────────────
-// These functions depend on the @pydantic/monty runtime.
-// Tests verify the function signatures and graceful behavior when
-// monty is not installed (no crash).
+// Both ask the installed interpreter a question, so both assert against a
+// real answer. The pair used to check only that the functions existed and
+// returned arrays of strings, on the premise that monty might not be
+// installed — it is a dependency, and a probe that returns an empty list
+// because nothing ran passes a shape assertion just as well as one that
+// worked.
 
 describe("probeImportableModules / probeTypeCheckerGaps", () => {
-  it("probeImportableModules is a function", () => {
-    assert.equal(typeof probeImportableModules, "function");
-  });
-
-  it("probeImportableModules accepts optional candidates and returns string[]", () => {
-    const result = probeImportableModules(["json", "this_does_not_exist_xyz"]);
-    assert.ok(Array.isArray(result));
-    for (const item of result) {
-      assert.equal(typeof item, "string");
-    }
-    // "this_does_not_exist_xyz" should NOT appear
+  it("reports a module the interpreter has, and not one it lacks", async () => {
+    const result = await probeImportableModules(["json", "this_does_not_exist_xyz"]);
+    assert.ok(result.includes("json"), `expected json to be importable, got: ${result}`);
     assert.ok(!result.includes("this_does_not_exist_xyz"));
-    // "json" is only importable if monty is installed
-    // (no package.json yet — monty not available; result is empty)
   });
 
-  it("probeTypeCheckerGaps is a function", () => {
-    assert.equal(typeof probeTypeCheckerGaps, "function");
+  it("reports a name the type checker cannot resolve", async () => {
+    // Still a gap on 0.0.21 — measured, along with the other five candidates.
+    // If this ever goes green upstream the probe self-prunes and this test is
+    // the thing that notices.
+    const result = await probeTypeCheckerGaps(["PermissionError"]);
+    assert.deepEqual(result, ["PermissionError"]);
   });
 
-  it("probeTypeCheckerGaps accepts optional candidates and returns string[]", () => {
-    const result = probeTypeCheckerGaps(["PermissionError"]);
-    assert.ok(Array.isArray(result));
-    for (const item of result) {
-      assert.equal(typeof item, "string");
-    }
+  it("reports nothing for a name the type checker resolves", async () => {
+    assert.deepEqual(await probeTypeCheckerGaps(["len"]), []);
   });
 });
 
@@ -304,36 +297,104 @@ describe("probe memoisation", () => {
     assert.equal(probeInvocations().tyGap, 1);
   });
 
-  it("probeImportableModules executes once across repeated calls", () => {
+  it("probeImportableModules executes once across repeated calls", async () => {
     resetProbeMemos();
-    for (let i = 0; i < 3; i++) probeImportableModules();
+    for (let i = 0; i < 3; i++) await probeImportableModules();
     assert.equal(probeInvocations().importable, 1);
   });
 
-  it("the memo can be reset", () => {
+  it("the memo can be reset", async () => {
     resetProbeMemos();
-    probeTypeCheckerGaps();
-    probeImportableModules();
+    await probeTypeCheckerGaps();
+    await probeImportableModules();
     assert.deepEqual(probeInvocations(), { importable: 1, tyGap: 1 });
     resetProbeMemos();
     assert.deepEqual(probeInvocations(), { importable: 0, tyGap: 0 });
-    probeTypeCheckerGaps();
+    await probeTypeCheckerGaps();
     assert.equal(probeInvocations().tyGap, 1, "a reset memo re-probes");
   });
 
-  it("a caller-supplied candidate list is never served from the memo", () => {
+  it("a caller-supplied candidate list is never served from the memo", async () => {
     resetProbeMemos();
-    probeImportableModules();
-    probeImportableModules(["json"]);
-    probeImportableModules([...CANDIDATE_MODULES]); // same contents, different array
+    await probeImportableModules();
+    await probeImportableModules(["json"]);
+    await probeImportableModules([...CANDIDATE_MODULES]); // same contents, different array
     assert.equal(probeInvocations().importable, 3, "only the default list is cached");
   });
 
-  it("memoised results are still correct", () => {
+  it("memoised results are still correct", async () => {
     resetProbeMemos();
-    const first = probeTypeCheckerGaps();
-    const second = probeTypeCheckerGaps();
+    const first = await probeTypeCheckerGaps();
+    const second = await probeTypeCheckerGaps();
     assert.deepEqual(second, first);
     assert.ok(first.every((n) => typeof n === "string"));
+  });
+});
+
+// ── Stub validation ─────────────────────────────────────────────
+
+describe("renderTypeStubs — a stub that does not parse", () => {
+  // A tool name is checked against a Python identifier on `add`, but nothing
+  // checks the *parameter* names or the type strings, so a caller can produce
+  // a stub file that does not parse. It must not be handed to the type checker
+  // as-is: a signature the parser cannot read is not dropped, it is
+  // misunderstood, and the resulting diagnostics are reported against the
+  // user's own source (measured — `def echo(class: str)` makes a correct
+  // `echo("x")` fail as `too-many-positional-arguments`).
+
+  function toolWithParam(name: string, param: string): HostTool {
+    return {
+      name,
+      description: "d",
+      params: [{ name: param, type: "str", description: "p" }],
+      returns: "str",
+      execute: () => "",
+    };
+  }
+
+  it("degrades the offending stub to an Any declaration", async () => {
+    const reg = new ToolRegistry([toolWithParam("broken", "class")]);
+    const stubs = await reg.renderTypeStubs();
+    assert.equal(stubs, "broken: Any = None");
+  });
+
+  it("leaves the other tools' stubs intact", async () => {
+    const reg = new ToolRegistry([
+      toolWithParam("broken", "class"),
+      toolWithParam("healthy", "text"),
+    ]);
+    const stubs = await reg.renderTypeStubs();
+
+    assert.ok(stubs.includes("broken: Any = None"), `got: ${stubs}`);
+    assert.ok(stubs.includes("def healthy(text: str) -> str:"), `got: ${stubs}`);
+  });
+
+  it("caches the validated result rather than re-checking per call", async () => {
+    const reg = new ToolRegistry([toolWithParam("broken", "class")]);
+    assert.equal(await reg.renderTypeStubs(), await reg.renderTypeStubs());
+  });
+});
+
+// ── Stub cache invalidation ─────────────────────────────────────
+
+describe("renderTypeStubs — cache invalidation", () => {
+  it("includes a tool added while an earlier render was in flight", async () => {
+    // Rendering is async, so a result written back *after* its await can
+    // overwrite the invalidation that `add()` performed during it, stranding
+    // the new tool outside the stub file until some later `add()`.
+    const reg = new ToolRegistry([makeTool({ name: "first" })]);
+    const inFlight = reg.renderTypeStubs();
+    reg.add(makeTool({ name: "second" }));
+    await inFlight;
+
+    const stubs = await reg.renderTypeStubs();
+    assert.ok(stubs.includes("second"), `'second' should be present, got: ${stubs}`);
+    assert.ok(stubs.includes("first"), `'first' should still be present, got: ${stubs}`);
+  });
+
+  it("serves concurrent callers from one render", async () => {
+    const reg = new ToolRegistry([makeTool({ name: "shared" })]);
+    const [a, b] = await Promise.all([reg.renderTypeStubs(), reg.renderTypeStubs()]);
+    assert.equal(a, b);
   });
 });

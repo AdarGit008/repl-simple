@@ -90,13 +90,20 @@ describe("ReplRunner — session persistence", () => {
   });
 
   it("isolates different sessionIds", async () => {
+    // Both halves are asserted. The previous version of this test ran the
+    // reference to `x` inside `try/except NameError` and asserted only that
+    // the output contained "NameError" — which the *source echo* under a
+    // typing diagnostic satisfies, since line 3 of that snippet is
+    // `except NameError as e:`. It passed whether or not the sessions were
+    // isolated. An unresolved name never reaches the runtime to raise
+    // `NameError` at all: the type checker rejects it first, on 0.0.18 and
+    // 0.0.21 alike (measured).
     await runner.run("x = 100", "session-a");
-    // Different session should not have x defined
-    const out = await runner.run(
-      "try:\n    print(x)\nexcept NameError as e:\n    print('NameError:', e)",
-      "session-b",
-    );
-    assert.ok(out.includes("NameError"));
+    const same = await runner.run("x", "session-a");
+    assert.ok(same.includes("100"), `session-a should still hold x, got: ${same}`);
+
+    const other = await runner.run("x", "session-b");
+    assert.ok(other.includes("used when not defined"), `session-b should not see x, got: ${other}`);
   });
 });
 

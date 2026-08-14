@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Monty } from "@pydantic/monty";
+import { MontySyntaxError, MontyTypingError } from "@pydantic/monty/node";
+import { withSandboxSession } from "../src/pool.js";
 import { ToolRegistry, probeTypeCheckerGaps } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
@@ -134,27 +135,54 @@ async function runRlmCode(
 // ── Tests ───────────────────────────────────────────────────────
 
 describe("repl_server.py — parse & preamble", () => {
-  it("is valid Python that monty can parse", () => {
-    // Should not throw MontySyntaxError
-    const m = new Monty(REPL_SERVER);
-    // Should not throw — just constructing is enough
-    assert.ok(m instanceof Monty);
+  it("is valid Python that monty can parse", async () => {
+    // Feeding is what parses now: there is no construct-only step to lean on.
+    // The preamble is fed to a real interpreter on every run anyway, so this
+    // is the same thing production does, minus the user code after it.
+    const err = await withSandboxSession({ typeCheck: false }, async (session) => {
+      try {
+        await session.feedStart(REPL_SERVER);
+        return null;
+      } catch (e) {
+        return e;
+      }
+    });
+    assert.ok(!(err instanceof MontySyntaxError), `repl_server.py does not parse: ${err}`);
   });
 
-  it("type-checks with RLM tools + gap declarations", () => {
+  it("type-checks with RLM tools + gap declarations", async () => {
     const { registry } = makeRlmRegistry();
-    const stubs = registry.renderTypeStubs();
-    const gaps = probeTypeCheckerGaps();
-    const prefix = ["from typing import Any", stubs, ...gaps.map((n) => `${n}: Any = None`)]
+    const stubs = await registry.renderTypeStubs();
+    const gaps = await probeTypeCheckerGaps();
+    const typeCheckStubs = [
+      "from typing import Any",
+      stubs,
+      // The preamble reads `context`, which every real run supplies as an
+      // input and `runInSandbox` declares the same way. Its absence here is
+      // why this assertion has teeth now: the previous version type-checked
+      // the string `"pass"` against this prefix and never looked at
+      // repl_server.py at all.
+      "context: Any = None",
+      ...gaps.map((n) => `${n}: Any = None`),
+    ]
       .filter(Boolean)
       .join("\n");
 
-    // Should not throw MontyTypingError
-    const m = new Monty("pass", {
-      typeCheck: true,
-      typeCheckPrefixCode: prefix,
-    });
-    assert.ok(m instanceof Monty);
+    const err = await withSandboxSession(
+      { typeCheck: true, typeCheckStubs, typeCheckFormat: "concise" },
+      async (session) => {
+        try {
+          await session.feedStart(REPL_SERVER);
+          return null;
+        } catch (e) {
+          return e;
+        }
+      },
+    );
+    assert.ok(
+      !(err instanceof MontyTypingError),
+      `repl_server.py does not type-check: ${err instanceof MontyTypingError ? err.display() : err}`,
+    );
   });
 
   it("can be read as a non-empty string", () => {

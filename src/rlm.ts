@@ -112,6 +112,17 @@ function buildFeedback(result: RunResult): string {
       feedback += "\n\nFix the runtime error. Check your logic.";
     } else if (result.errorKind === "aborted") {
       feedback += "\n\nExecution was aborted.";
+    } else if (result.errorKind === "crashed") {
+      // Distinct advice, because the situation is distinct: the sandbox is
+      // gone rather than merely unhappy, so every variable, import and
+      // definition from earlier in the run went with it. Telling the model to
+      // "fix the error" would invite it to build on state that no longer
+      // exists.
+      feedback +=
+        "\n\nThe sandbox was terminated and all its state was lost. " +
+        "Retry with self-contained code that does not rely on anything " +
+        "defined earlier, and make it cheaper — the usual cause is running " +
+        "too long.";
     }
     return feedback;
   }

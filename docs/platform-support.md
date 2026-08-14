@@ -16,8 +16,10 @@ The published platform packages are:
 
 | Version | Platform packages |
 |---|---|
-| `0.0.18` (current) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc`, `wasm32-wasi` |
-| `0.0.21` (latest) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc` |
+| `0.0.18` (previous) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc`, `wasm32-wasi` |
+| `0.0.21` (current) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc` |
+
+`platformTriple()` hard-codes `linux-${arch}-gnu`, so there is not even a triple for npm to miss.
 
 The failure mode is the expensive one: **`npm install` succeeds and the module fails at load.** All
 platform binaries are `optionalDependencies`, so npm silently skips every one that does not match the
@@ -26,6 +28,26 @@ host and exits 0.
 The WASI package is not an escape hatch. `@pydantic/monty-wasm32-wasi` is declared `"cpu": ["wasm32"]`,
 so npm skips it on an x64 or arm64 host — the napi loader's WASI fallback has nothing to fall back to.
 And `0.0.21` dropped the WASI package entirely.
+
+### The `0.0.21` wasm entry is a trap, not a replacement
+
+`0.0.21` bundles a wasm runtime reachable at `@pydantic/monty/wasm`, and it is the more dangerous
+shape of the same gap, because **it runs**.
+
+It does not work out of the box: it imports `@bjorn3/browser_wasi_shim`, which `0.0.21` declares only
+in `devDependencies`, so the import fails with `ERR_MODULE_NOT_FOUND` until you install that package
+yourself. Do that and `feedRun('2 + 3')` returns `5`, which looks like an Alpine story.
+
+It is not one. On Node the wasm entry selects an **in-process** factory — there is no worker
+subprocess at all. Measured on it: `session.workerPid` is `undefined`; `while True: pass` under a 1 s
+budget fires **0** host timer ticks against 9 on the native path; and with no `maxDurationSecs` set,
+the same loop wedges the host permanently and needs a SIGKILL. That is precisely the `0.0.18` failure
+mode this project migrated away from, so the wasm entry would forfeit crash isolation, event-loop
+survival and the host backstop in one step, while appearing to work.
+
+Every result here is glibc x64 on Node 24; no container runtime was used, so actual Alpine behaviour
+is inferred rather than measured. `src/` therefore imports `@pydantic/monty/node` explicitly rather
+than the package root, so this path cannot be selected by accident.
 
 Reproduced on `node:22-alpine`:
 
