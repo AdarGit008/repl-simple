@@ -10,7 +10,7 @@
   "scripts": {
     "test": "tsx --test test/*.test.ts",
     "test:contained": "node scripts/contained.mjs tsx --test test/*.test.ts",
-    "mutation": "node scripts/contained.mjs --limit 12G stryker run",
+    "mutation": "node scripts/contained.mjs --limit 12G stryker run; s=$?; node scripts/mutation-guard.mjs --report; r=$?; exit $((s>r?s:r))",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "coverage": "node scripts/coverage.mjs",

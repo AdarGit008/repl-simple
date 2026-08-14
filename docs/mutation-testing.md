@@ -1,24 +1,26 @@
 # Mutation testing
 
-**Status:** Baseline measured · **Issue:** #24 (Bucket 1, step 6) · **Tree:** `e556a70`
+**Status:** Baseline re-measured on a guarded harness · **Issue:** #24 (Bucket 1, step 6) ·
+**Tree:** `b0d298d`
 
-This document records the first full Stryker run on this repository: the score, what it cost, how to
-reproduce it, and the two findings the run turned up that are not about the score at all.
+This document records the full Stryker runs on this repository: the score, what it cost, how to
+reproduce it, and the findings the runs turned up that are not about the score at all.
 
-Everything below is marked **[measured]** — reproduced on this tree at `e556a70`, with the numbers
-given — or **[judgement]** — reasoned, and stated so you can disagree with it.
+Everything below is marked **[measured]** — reproduced with the numbers given — or **[judgement]** —
+reasoned, and stated so you can disagree with it.
 
 ---
 
 ## The baseline
 
-**58.28%** — 1235 detected of 2119 valid mutants. **[measured]**
+**58.09%** — 1296 detected of 2231 valid mutants. **[measured]** Measured at `b0d298d`, node 22.23.2,
+6-core/30 GB host, `concurrency: 2`, 140 minutes, **zero harness deaths**.
 
 | | count |
 |---|---|
-| Killed | 1206 |
-| Timeout | 29 |
-| Survived | 884 |
+| Killed | 1281 |
+| Timeout | 15 |
+| Survived | 935 |
 | NoCoverage | 0 |
 | Compile / runtime errors | 0 |
 
@@ -26,16 +28,16 @@ Per file, ascending:
 
 | File | Score | Detected / valid |
 |---|---|---|
-| `src/rlm.ts` | **35.92%** | 74 / 206 |
+| `src/rlm.ts` | **30.58%** | 63 / 206 |
 | `extensions/repl-extension.ts` | **40.26%** | 31 / 77 |
 | `src/bridge.ts` | **41.51%** | 66 / 159 |
-| `src/registry.ts` | 56.69% | 72 / 127 |
-| `src/rlm_loop.ts` | 58.38% | 108 / 185 |
+| `src/truncate.ts` | 59.78% | 217 / 363 |
+| `src/rlm_loop.ts` | 60.21% | 115 / 191 |
 | `src/toolstore.ts` | 61.18% | 93 / 152 |
-| `src/truncate.ts` | 61.43% | 223 / 363 |
+| `src/registry.ts` | 61.69% | 95 / 154 |
 | `src/repl.ts` | 62.71% | 37 / 59 |
-| `src/sandbox.ts` | 63.40% | 246 / 388 |
-| `src/session.ts` | 68.97% | 120 / 174 |
+| `src/sandbox.ts` | 63.17% | 295 / 467 |
+| `src/session.ts` | 68.39% | 119 / 174 |
 | `src/builtins.ts` | 71.35% | 127 / 178 |
 | `src/rlm_tools.ts` | 71.74% | 33 / 46 |
 | `src/types.ts` | 100% | 2 / 2 |
@@ -46,14 +48,28 @@ mutable expressions. That is correct, not a coverage gap.
 
 `rlm.ts` being last is consistent with #24's hand campaign, which scored it **0/9**.
 
-### The floor is set below the baseline, deliberately
+### This supersedes the 58.28% baseline, which was inflated
 
-`thresholds.break` is **57**, not 58.28. This is not slack for future regressions — it is the
-measured reproducibility band of the suite itself. See
-[The suite is not deterministic](#the-suite-is-not-deterministic): re-scoring the same tree from an
-independent run yields **57.86%**. A floor at the measured score fails CI on unchanged code.
+The first baseline read **58.28%** — 1235 of 2119 at `e556a70`. It was measured with a harness that
+counted an OOM-killed test run as a caught mutant, so it credited kills the tests never made. See
+[Why the first baseline was wrong](#why-the-first-baseline-was-wrong).
 
-Raise the floor when #109 lands and the band collapses. **[judgement]**
+`rlm.ts` is where that shows most plainly: **74/206 then, 63/206 now**, on an identical mutant count
+in a file unchanged between the two trees. Eleven kills evaporated when the harness stopped inventing
+them — and `rlm.ts` is exactly the file whose mutants change sandbox call counts, hence memory, hence
+OOM. Elsewhere the tree genuinely improved: `registry.ts` gained 27 mutants and five points from
+#116's memoisation tests, and the tree as a whole gained 112 mutants over nine commits.
+
+### The floor sits just under the baseline
+
+`thresholds.break` is **58**. The old floor of 57 was not slack for regressions — it was the
+reproducibility band of a broken instrument, and it cost a real point of gate strength. With the
+instrument fixed the band collapses: 63 pinned mutants held identical verdicts across 16 runs
+spanning two hosts, node 22 and 24, `--test-concurrency` 1/3/4 and Stryker `concurrency` 1 and 2.
+**[measured]**
+
+58 rather than 58.09 leaves 0.09 for rounding, not for drift. If a run comes in under it, treat that
+as a regression to explain — not a threshold to lower. **[judgement]**
 
 ---
 
@@ -116,10 +132,17 @@ time.
 | 3 | 996 MB | 8 s |
 | default (8 here) | 1615 MB | — |
 
-Compare 9040 MB at default fan-out before the fix. One Stryker worker runs one suite at
-`--test-concurrency=3`, so `concurrency: 2` is roughly 2 GB — which is why it is back to 2, and why
-there is real headroom above it. Size by measuring your own host; the arithmetic is no longer
-adversarial.
+Compare 9040 MB at default fan-out before the fix.
+
+**Do not size from that table alone — it is the *unmutated* suite.** This section has now been wrong
+three times, and the third time was concluding from those numbers that `concurrency: 2` is "roughly
+2 GB". A mutant can change what the suite does. Three of them disable the RLM recursion depth guard
+and drive a single worker to **5.6 GB** (see [What the fix costs you in
+memory](#what-the-fix-costs-you-in-memory)), so two workers reach ~11 GB and a 12G ceiling breaches
+— which is exactly what happened on 2026-08-14.
+
+Size the ceiling against the *worst mutant*, not the baseline suite: **~6 GB per worker**, so
+`concurrency: 2` wants 20G and a host with the RAM to back it. **[measured]**
 
 ### Running it
 
@@ -128,16 +151,19 @@ npm run mutation
 ```
 
 That wraps Stryker in a transient systemd scope with a hard memory ceiling
-(`scripts/contained.mjs`). The scope is a *sibling* of your terminal's, not a child, so a breach
-kills the mutation run alone — where an uncontained breach takes down the whole tmux pane, editor
-session included, via `DefaultOOMPolicy=stop`. Raise or lower the ceiling with `--limit`:
+(`scripts/contained.mjs`), and runs `mutation-guard.mjs --report` afterwards so a run that scored any
+mutant from a dead harness fails instead of printing a number. The scope is a *sibling* of your
+terminal's, not a child, so a breach kills the mutation run alone — where an uncontained breach takes
+down the whole tmux pane, editor session included, via `DefaultOOMPolicy=stop`. Raise or lower the
+ceiling with `--limit`:
 
 ```sh
-node scripts/contained.mjs --limit 8G stryker run
+node scripts/contained.mjs --limit 20G stryker run
 ```
 
-`concurrency` is **2**. It was briefly 1, sized against the leaking footprint where two workers came
-to ~18 GB; with #68 fixed two workers are roughly 2 GB and the pin was unnecessary.
+`concurrency` is **2**, which needs a ~20G ceiling and a host with the RAM behind it — see the sizing
+note above. On a smaller box drop to `concurrency: 1` rather than lowering the ceiling; a breach now
+fails loudly, but a run that fails at 24% is still two wasted hours.
 
 Containment is skipped automatically where there is no systemd user session (CI, containers), so
 the command still works everywhere — it just stops protecting you.
@@ -160,44 +186,72 @@ host missing them was caught this way before it could contaminate a shard.
 
 ---
 
-## The suite is not deterministic
+## Why the first baseline was wrong
 
-**18 mutants change verdict between runs of an identical tree.** **[measured]**
+**Stryker's `command` runner scored a mutant on the exit code alone. A test harness killed by the
+OOM killer was recorded as a caught mutant.** **[measured]** — this was #109, now fixed.
 
-Two independent runs at `e556a70`, differing only in `--test-concurrency` (3 vs 4):
+`command-test-runner.js` reads nothing but the status:
 
-| File | Mutants | Agree | **Differ** |
-|---|---|---|---|
-| `src/bridge.ts` | 159 | 159 | **0** |
-| `src/rlm.ts` | 206 | 197 | **9** |
-| `src/rlm_loop.ts` | 185 | 176 | **9** |
+```js
+if (exitCode === 0) { TestStatus.Success } else { TestStatus.Failed }   // -> Killed
+```
 
-`bridge.ts` reproducing 159/159 is what makes this a finding rather than noise: the instability is
-specific to `rlm.ts` and `rlm_loop.ts`.
+A signal-killed process reports `code === null`, which lands in the `else`. So "a test caught the
+mutant" and "the harness died" are the same event, and the *more* memory a run consumed the *better*
+the tree appeared to be tested.
 
-These are `Killed ↔ Survived` flips, which move the score. `rlm.ts`'s nine are all one direction
-(Survived → Killed) and cluster at lines 40–129; `rlm_loop.ts`'s go both ways. Scoring the tree from
-one run gives 58.28%, from the other **57.86%**.
+That is what moved the score between runs. Mutants **in** `rlm.ts`/`rlm_loop.ts` change loop
+iteration counts, hence sandbox call counts, hence memory — and against the ~41 MB/call leak that
+#116 later fixed, that reached OOM. Mutants in `bridge.ts` cannot change sandbox call counts, which
+is exactly why it reproduced 159/159 and made the instability look like a property of the other two
+files. Raising `--test-concurrency` from 3 to 4 raised the pressure, producing nine one-directional
+`Survived → Killed` flips in `rlm.ts` and a score of 58.28% against the calmer run's 57.86%.
 
-Filed as **#109**. This is *not* #91, which is closed: that was the suite downloading `fd`/`rg`
-mid-run, fixed by the `PI_OFFLINE=1` guard in `test/support/bridge-tools.ts`. Both runs here had
-those binaries present with offline mode on, and `bridge.ts` — the only file that shells out to
-them — reproduced perfectly. Different cause. The coordinates:
+Demonstrated, not inferred: SIGKILLing the harness *after a fully green suite*, for one chosen
+mutant, flips a stably-surviving mutant to `Killed`. **[measured]**
 
-| File | Line:col | Mutator | Run A | Run B |
-|---|---|---|---|---|
-| `rlm.ts` | 40:24 | MethodExpression | Survived | Killed |
-| `rlm.ts` | 53:23 | BlockStatement | Survived | Killed |
-| `rlm.ts` | 54:28 | StringLiteral | Survived | Killed |
-| `rlm.ts` | 60:47 | ObjectLiteral | Survived | Killed |
-| `rlm.ts` | 79:7 | ConditionalExpression (×2) | Survived | Killed |
-| `rlm.ts` | 128:7 | ConditionalExpression | Survived | Killed |
-| `rlm.ts` | 128:25 | StringLiteral | Survived | Killed |
-| `rlm.ts` | 129:12 | StringLiteral | Survived | Killed |
-| `rlm_loop.ts` | 86:9, 89:9, 146:11 | ConditionalExpression | Killed | Survived |
-| `rlm_loop.ts` | 146:29, 204:23 | StringLiteral, LogicalOperator | Killed | Timeout |
-| `rlm_loop.ts` | 208:32, 212:15, 305:38 | BlockStatement, StringLiteral, ConditionalExpression | Timeout | mixed |
-| `rlm_loop.ts` | 293:7 | StringLiteral | Survived | Killed |
+### The guard
+
+`scripts/mutation-guard.mjs` is the test command now. Node's test runner prints a `fail N` summary
+on every genuine outcome, so its absence means the suite did not finish, whatever the exit code says:
+
+| what the run produced | verdict |
+|---|---|
+| summary, `fail 0` | exit 0 — the mutant survived |
+| summary, `fail > 0` | exit 1 — killed, by a real test |
+| no summary | retry; if it keeps dying, log it and fail the run |
+
+The first row is the demonstrated failure exactly: a suite that passes and *then* dies is a
+surviving mutant. Stryker's command runner has no "measurement failed" channel, only pass and fail,
+so an unrecoverable death cannot be given an honest verdict — it goes to
+`.stryker-harness-deaths.log` and `npm run mutation` fails on it afterwards.
+
+Both output dialects are accepted: node 24 prints `ℹ fail 0`, node 22 prints TAP's `# fail 0`.
+A parser that knew only one would read every run on the other as a harness death.
+
+### It stays fixed only if breaches stay loud
+
+`contained.mjs` had the same defect one layer up. A full run hit the 12G ceiling at 24%, systemd tore
+the scope down under `OOMPolicy=stop`, and the wrapper reported **exit 0** — the kill landed on the
+scope, not on `systemd-run`, so no signal reached the caller. Forty minutes of dead run looked like a
+clean pass. It now names its scope, reads the journal, and sets `OOMPolicy=continue` so one kill no
+longer stops everything. **[measured]**
+
+Two layers of this repo's own tooling turned a dead run into a green one. When a measurement can only
+report pass or fail, assume the third outcome is being silently folded into one of them, and go
+looking for it.
+
+### What the fix costs you in memory
+
+Three mutants disable the RLM recursion depth guard at `rlm_loop.ts:223-227` — `depth ?? 0` to
+`depth && 0`, and the `depth >= maxDepth` comparison to `false` and to `depth < maxDepth`. Each
+produces unbounded nested fan-out, and each drives one worker to **5.6 GB against a 667 MB baseline**.
+**[measured]** Nothing else bounds that nesting; `maxIterations` bounds iterations *within* a loop.
+
+At `concurrency: 2` two of them together exceed a 12G ceiling, which is what killed the run above.
+Size the ceiling for it — 20G was ample — and note this is a standing proof of impact for **#87**
+(no global spend budget across nested fan-out): in production that path burns tokens, not RAM.
 
 ### Timeouts are a measurement artifact, and are score-neutral here
 
@@ -214,6 +268,11 @@ in `registry.ts`, whose only loop is a bounded `for…of`, and one was in `submi
 
 Set `timeoutMS` generously (60 s here) and keep the machine off its memory limit.
 
+Both runs in that comparison predate the guard, so some of those "kills" may themselves have been
+harness deaths. The conclusion survives it — `Killed` and `Timeout` both count as detected, which is
+arithmetic, not measurement — but the 58.15% figure should not be read as a baseline. The guarded
+run reported 15 timeouts across the full tree. **[measured]**
+
 ---
 
 ## Survivors worth naming
@@ -224,6 +283,9 @@ Set `timeoutMS` generously (60 s here) and keep the machine off its memory limit
 |---|---|---|---|
 | **M9** — `gateMutating: true → false` | `src/repl.ts:95:71` | Survived | **Killed** |
 | **M22** — drop `onApproval` from `session.run` | `src/repl.ts:41:44` | Survived | **Killed** |
+
+Both were re-checked on the guarded run rather than carried over — a kill recorded by the old
+harness is exactly the kind of claim this document can no longer make on trust. Both hold.
 
 The run found M22's untracked sibling:
 

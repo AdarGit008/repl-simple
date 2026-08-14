@@ -3,7 +3,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "REQUIRE_BRIDGE_TOOLS=1 npx tsx --test --test-concurrency=3 test/*.test.ts"
+    "command": "node scripts/mutation-guard.mjs"
   },
   "mutate": ["src/**/*.ts", "extensions/**/*.ts"],
   "coverageAnalysis": "off",
@@ -15,5 +15,5 @@
   "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
   "timeoutMS": 60000,
   "tempDirName": ".stryker-tmp",
-  "thresholds": { "high": 100, "low": 0, "break": 57 }
+  "thresholds": { "high": 100, "low": 0, "break": 58 }
 }
