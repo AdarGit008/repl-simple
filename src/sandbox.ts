@@ -27,7 +27,7 @@ import {
   type ResourceLimits,
   type Snapshot,
 } from "@pydantic/monty/node";
-import { withSandboxSession } from "./pool.js";
+import { SandboxUnavailableError, withSandboxSession } from "./pool.js";
 import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import {
   Truncator,
@@ -161,9 +161,32 @@ function runError(kind: RunErrorKind, error: string, acc: DispatchAccumulators):
  * is working with nothing.
  */
 function classifyResumeError(err: unknown, acc: DispatchAccumulators): RunError {
-  if (err instanceof MontyRuntimeError) return runError("runtime", err.message, acc);
+  if (err instanceof MontyRuntimeError) return runError(runtimeKind(err), err.message, acc);
   if (err instanceof MontyCrashedError) return runError("crashed", crashMessage(err), acc);
   throw err;
+}
+
+/**
+ * Which ceiling a `MontyRuntimeError` represents, if any.
+ *
+ * Read off `exception.typeName` rather than matched against the message, which
+ * carries the measured figures (`time limit exceeded: 2.000000044s > 2s`) and
+ * is upstream's to reword. The two names are the ones Monty raises for the two
+ * limits we set — verified on 0.0.21, alongside `RecursionError`, which stays
+ * `runtime`: it is the caller's own recursion, not a ceiling of ours.
+ *
+ * Every other name is genuinely the user's code failing, which is what
+ * `runtime` means to a model reading the feedback.
+ */
+function runtimeKind(err: MontyRuntimeError): RunErrorKind {
+  switch (err.exception.typeName) {
+    case "TimeoutError":
+      return "timeout";
+    case "MemoryError":
+      return "memory";
+    default:
+      return "runtime";
+  }
 }
 
 /**
@@ -510,13 +533,199 @@ export function resolveToolArgs(
   return resolved;
 }
 
-/** Convert our RunLimits to Monty's ResourceLimits. */
-function toResourceLimits(limits?: RunLimits): ResourceLimits | undefined {
-  if (!limits) return undefined;
+// ── Resource limits ──────────────────────────────────────────────
+//
+// Every default here exists because its absence fails open, and fails open
+// silently. Before #32, `toResourceLimits` returned `undefined` for a caller
+// who passed nothing — and nothing in this repository passed anything — so the
+// shipped configuration was no limits at all. On 0.0.21 that is not merely
+// permissive: an unbounded `while True: pass` never returns and never releases
+// its pooled worker, so `REPL_POOL_MAX_PROCESSES` runaways deny service to
+// every later caller in the process (measured).
+//
+// Opting out is still possible, but only by saying `limits: "unbounded"`.
+
+/** Interpreter compute seconds. Not wall clock — host-tool time is free. */
+const DEFAULT_MAX_DURATION_SECS = 30;
+/** Sandbox heap ceiling, MB. A bare session holds ~8.7 MB before user code. */
+const DEFAULT_MAX_MEMORY_MB = 512;
+/**
+ * Host wall-clock seconds for a whole run, host-tool time included. Generous
+ * on purpose: its job is to catch a tool that will never return, not to
+ * second-guess a slow one. `bash("npm test")` is a legitimate five minutes.
+ */
+const DEFAULT_MAX_WALL_CLOCK_SECS = 300;
+
+/**
+ * The limits as they would apply right now. Exists for the same reason
+ * `memoryGuardConfig()` and `poolConfig()` do: every test that cares sets its
+ * own, so shipping defaults that never take effect would pass all of them.
+ */
+export function limitsConfig(): {
+  maxDurationSecs: number;
+  maxMemory: number;
+  maxWallClockSecs: number;
+} {
   return {
-    maxDurationSecs: limits.maxDurationSecs,
-    maxMemory: limits.maxMemory,
+    maxDurationSecs: envInt("REPL_MAX_DURATION_SECS", DEFAULT_MAX_DURATION_SECS),
+    maxMemory: envInt("REPL_MAX_MEMORY_MB", DEFAULT_MAX_MEMORY_MB) * 1_048_576,
+    maxWallClockSecs: envInt("REPL_MAX_WALL_CLOCK_SECS", DEFAULT_MAX_WALL_CLOCK_SECS),
   };
+}
+
+/**
+ * Positive-integer env reader. Zero and negatives fall back to the default: a
+ * budget of 0 would fail closed to the point of running nothing, and it is the
+ * shape a caller reaches for when they mean "off" — which is
+ * `limits: "unbounded"`, not an environment variable.
+ */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Convert our `RunLimits` to Monty's `ResourceLimits`, filling every unset knob
+ * from `limitsConfig()`.
+ *
+ * Returns `undefined` — genuinely no limits — only for the explicit
+ * `"unbounded"`. That is the whole point: the one path to an uncontained run is
+ * one a caller had to type.
+ *
+ * `maxWallClockSecs` is ours and is not passed on; Monty has no host-side
+ * clock. `gcInterval` and `maxRecursionDepth` are passed through undefaulted,
+ * so Monty's own defaults apply — they are tuning knobs, not containment, and
+ * dropping a knob the caller set is the other half of the bug being fixed here.
+ *
+ * Exported for the test that asserts the mapping field by field. `gcInterval`
+ * has no observable effect to assert behaviourally, so a silent drop of it —
+ * the exact defect being fixed — is catchable only here.
+ */
+export function toResourceLimits(limits?: RunLimits | "unbounded"): ResourceLimits | undefined {
+  if (limits === "unbounded") return undefined;
+  const defaults = limitsConfig();
+  return {
+    maxDurationSecs: limits?.maxDurationSecs ?? defaults.maxDurationSecs,
+    maxMemory: limits?.maxMemory ?? defaults.maxMemory,
+    gcInterval: limits?.gcInterval,
+    maxRecursionDepth: limits?.maxRecursionDepth,
+  };
+}
+
+/**
+ * When the host budget runs out, as an absolute timestamp — or null when the
+ * caller opted out.
+ *
+ * Absolute rather than a duration because the clock starts at the top of the
+ * call and the timer is armed later, once a worker is in hand: the budget is
+ * the caller's whole wait, not just the part after the queue.
+ */
+function hostDeadlineAt(limits?: RunLimits | "unbounded"): number | null {
+  if (limits === "unbounded") return null;
+  return Date.now() + (limits?.maxWallClockSecs ?? limitsConfig().maxWallClockSecs) * 1000;
+}
+
+/**
+ * How long an abort gives the run to end itself before the race ends it.
+ *
+ * Not zero, and that is the whole subtlety. The dispatch loop notices
+ * `acc.aborted` at the top of its next iteration and returns an `aborted`
+ * result with a complete trace — including the tool call that was in flight
+ * when the abort arrived, which really did run and whose side effects really
+ * did happen. Racing that loop instantly would drop it from the trace, telling
+ * the caller nothing ran when a `bash` or a `write` already had (the reverse
+ * of #28's mistake, and just as wrong). So the loop is given a moment to
+ * finish saying so, and only a run that cannot — one parked in a tool that
+ * will not return — is cut off without it.
+ */
+const ABORT_SETTLE_GRACE_MS = 250;
+
+/**
+ * Bound `fn` by the host wall clock and the abort signal.
+ *
+ * This is the fail-safe the in-sandbox limits cannot be. Monty's clock is
+ * polled inside the worker and advances only while the interpreter executes,
+ * so it cannot fire while the host is awaiting a tool: `bash("sleep 99999")`
+ * would hang the `repl` tool forever with every `ResourceLimits` field armed.
+ *
+ * It also has a second job the issue did not have when filed, and that job
+ * dictates where this sits. `withSandboxSession` returns the pooled worker in a
+ * `finally` reached only once its body settles, so under a hung tool the worker
+ * is held for as long as the hang lasts — and losing this race is what settles
+ * that body. It therefore has to be *inside* the checkout, not wrapped around
+ * it: raced from outside, the deadline returns to the caller on time and leaves
+ * the worker held forever, which is the leak restated rather than fixed
+ * (measured, on the first draft of this change).
+ *
+ * What this does *not* do is stop the losing work. A host tool's promise runs
+ * to completion in the background; a runaway inside the sandbox is stopped by
+ * `maxDurationSecs`, not by this. It bounds the caller and frees the worker.
+ */
+async function withHostDeadline(
+  deadlineAt: number | null,
+  runOpts: RunOptions | undefined,
+  acc: DispatchAccumulators,
+  fn: () => Promise<RunResult>,
+): Promise<RunResult> {
+  const signal = runOpts?.signal;
+  if (deadlineAt === null && !signal) return await fn();
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  // `Promise.race` subscribes to every entry, so a body that loses and rejects
+  // later is already observed and cannot surface as an unhandled rejection.
+  const racers: Promise<RunResult>[] = [fn()];
+
+  if (deadlineAt !== null) {
+    const remainingMs = Math.max(0, deadlineAt - Date.now());
+    racers.push(
+      new Promise<RunResult>((resolve) => {
+        timer = setTimeout(
+          () =>
+            resolve(
+              runError(
+                "timeout",
+                "run exceeded its host wall-clock budget — a host tool did not return in time, " +
+                  "or the run as a whole took too long. This budget covers host-tool time, " +
+                  "which the sandbox's own duration limit does not.",
+                acc,
+              ),
+            ),
+          remainingMs,
+        );
+      }),
+    );
+  }
+
+  if (signal) {
+    racers.push(
+      new Promise<RunResult>((resolve) => {
+        const cutOff = () => {
+          abortTimer = setTimeout(
+            () => resolve(runError("aborted", "execution aborted", acc)),
+            ABORT_SETTLE_GRACE_MS,
+          );
+        };
+        onAbort = cutOff;
+        if (signal.aborted) cutOff();
+        else signal.addEventListener("abort", cutOff, { once: true });
+      }),
+    );
+  }
+
+  try {
+    return await Promise.race(racers);
+  } finally {
+    // All three are mandatory, not tidiness: a live timer keeps the event loop
+    // alive past the run that armed it, and a listener left on a caller-owned
+    // signal outlives every run that shares it.
+    if (timer !== undefined) clearTimeout(timer);
+    if (abortTimer !== undefined) clearTimeout(abortTimer);
+    if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /**
@@ -832,44 +1041,61 @@ export async function runInSandbox(
 
   const printCallback = makePrintCallback(acc, runOpts);
 
-  // ── 1. Build the type-check stub file ───────────────────────
-  const inputNames = Object.keys(runOpts?.inputs ?? {});
-  const typeCheckStubs = await buildTypeCheckStubs(registry, inputNames);
+  // Started here, not at the checkout: the budget is the caller's whole wait,
+  // and the stub build below can queue for a worker of its own.
+  const deadlineAt = hostDeadlineAt(runOpts?.limits);
 
-  // ── 2. Check out a worker and feed the code ─────────────────
-  //
-  // Type checking is now part of the feed rather than a separate call, so
-  // there is one `try` here where 0.0.18 needed three: a syntax error, a type
-  // error and a runtime error all arrive from `feedStart`.
-  return await withMounts(runOpts?.mount, async (mount) =>
-    withSandboxSession(
-      {
-        scriptName,
-        typeCheck: true,
-        typeCheckStubs: typeCheckStubs || undefined,
-        // Explicit, though it is also the default: `full` echoes the offending
-        // source lines under the diagnostic, which is the shape 0.0.18
-        // produced and the more useful one for a model rewriting its own code.
-        // `concise` collapses each diagnostic to a single line and drops the
-        // echo.
-        typeCheckFormat: "full",
-        limits: toResourceLimits(runOpts?.limits),
-      },
-      async (session) => {
-        let current: Snapshot;
-        try {
-          current = await session.feedStart(code, {
-            inputs: runOpts?.inputs,
-            printCallback,
-            mount,
-          });
-        } catch (err) {
-          return classifyStartError(err, acc);
-        }
-        return await runDispatchLoop(current, registry, runOpts, acc);
-      },
-    ),
-  );
+  try {
+    // ── 1. Build the type-check stub file ───────────────────────
+    const inputNames = Object.keys(runOpts?.inputs ?? {});
+    const typeCheckStubs = await buildTypeCheckStubs(registry, inputNames);
+
+    // ── 2. Check out a worker and feed the code ─────────────────
+    //
+    // Type checking is now part of the feed rather than a separate call, so
+    // there is one `try` here where 0.0.18 needed three: a syntax error, a type
+    // error and a runtime error all arrive from `feedStart`.
+    return await withMounts(runOpts?.mount, async (mount) =>
+      withSandboxSession(
+        {
+          scriptName,
+          typeCheck: true,
+          typeCheckStubs: typeCheckStubs || undefined,
+          // Explicit, though it is also the default: `full` echoes the offending
+          // source lines under the diagnostic, which is the shape 0.0.18
+          // produced and the more useful one for a model rewriting its own code.
+          // `concise` collapses each diagnostic to a single line and drops the
+          // echo.
+          typeCheckFormat: "full",
+          limits: toResourceLimits(runOpts?.limits),
+        },
+        // Inside the checkout, so that losing the race settles this body and
+        // runs the `finally` that returns the worker.
+        async (session) =>
+          await withHostDeadline(deadlineAt, runOpts, acc, async () => {
+            let current: Snapshot;
+            try {
+              current = await session.feedStart(code, {
+                inputs: runOpts?.inputs,
+                printCallback,
+                mount,
+              });
+            } catch (err) {
+              return classifyStartError(err, acc);
+            }
+            return await runDispatchLoop(current, registry, runOpts, acc);
+          }),
+      ),
+    );
+  } catch (err) {
+    // The checkout that never succeeded. It escapes from outside every
+    // `classify*` guard — `buildTypeCheckStubs` reaches the pool before any
+    // user code exists to blame — and this function is contracted to return a
+    // `RunResult`, so it is turned into one here rather than thrown at a caller
+    // with no reason to be in a `try` (#36).
+    if (err instanceof SandboxUnavailableError) return runError("unavailable", err.message, acc);
+    throw err;
+  }
 }
 
 // ── Resume suspended execution ──────────────────────────────────
@@ -927,16 +1153,29 @@ export async function resumeSuspended(
   // could not re-establish them at all, which is #38; the half of that issue
   // living in `session.ts`, where the run options are saved and never read
   // back, is #84 and is untouched here.
-  return await withMounts(runOpts?.mount, async (mount) =>
-    withSandboxSession(
-      { limits: toResourceLimits(runOpts?.limits) },
-      async (session) =>
-        await resumeInSession(session, suspended, decision, options, runOpts, acc, {
-          printCallback,
-          mount,
-        }),
-    ),
-  );
+  const deadlineAt = hostDeadlineAt(runOpts?.limits);
+
+  try {
+    return await withMounts(runOpts?.mount, async (mount) =>
+      withSandboxSession(
+        { limits: toResourceLimits(runOpts?.limits) },
+        async (session) =>
+          await withHostDeadline(
+            deadlineAt,
+            runOpts,
+            acc,
+            async () =>
+              await resumeInSession(session, suspended, decision, options, runOpts, acc, {
+                printCallback,
+                mount,
+              }),
+          ),
+      ),
+    );
+  } catch (err) {
+    if (err instanceof SandboxUnavailableError) return runError("unavailable", err.message, acc);
+    throw err;
+  }
 }
 
 /** The approval replay and dispatch, against a session holding the restored snapshot. */

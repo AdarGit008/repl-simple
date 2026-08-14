@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { ToolRegistry } from "../src/registry.js";
-import type { LlmClient, RlmIteration } from "../src/types.js";
+import type { LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
-import { runRlm, extractPythonCode } from "../src/rlm.js";
+import { runRlm, extractPythonCode, buildFeedback } from "../src/rlm.js";
 
 // ── Section 5.2: extractPythonCode() — unit tests ────────────────
 
@@ -496,5 +496,93 @@ describe("runRlm() — a crashed sandbox", () => {
       .join("\n");
     assert.match(feedback, /state was lost/, `got: ${feedback}`);
     assert.equal(result.answer, "recovered", "the loop recovers on the next iteration");
+  });
+});
+
+// ── Feedback for a breached ceiling ─────────────────────────────
+
+describe("runRlm() — a run that hit a limit", () => {
+  // `timeout` and `memory` were both flattened into `runtime` until #32, which
+  // is why they need branches of their own here: "fix the runtime error, check
+  // your logic" is advice for a bug, and neither of these is one. The code may
+  // be perfectly correct and simply too expensive, and a model hunting for a
+  // defect that is not there will rewrite the wrong thing.
+  const CASES = [
+    {
+      name: "duration",
+      code: "total = 0\nfor i in range(50000000):\n    total += i\ntotal",
+      limits: { maxDurationSecs: 0.3 },
+      kind: "timeout",
+      advice: /out of time/,
+    },
+    {
+      name: "memory",
+      code: "x = [0] * 20000000\nlen(x)",
+      limits: { maxDurationSecs: 30, maxMemory: 16 * 1024 * 1024 },
+      kind: "memory",
+      advice: /out of memory/,
+    },
+  ] as const;
+
+  for (const c of CASES) {
+    it(`tells the model it ran out of ${c.name}, not to check its logic`, async () => {
+      const { llm } = mockLlmCodeGen([
+        `\`\`\`python\n${c.code}\n\`\`\``,
+        '```python\nSUBMIT("recovered")\n```',
+      ]);
+      const tools = createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      });
+
+      const result = await runRlm("q", {
+        llmClient: llm,
+        registry: new ToolRegistry(tools),
+        maxIterations: 2,
+        runOptions: { limits: c.limits },
+      });
+
+      assert.equal(result.iterations[0].result.status, "error");
+      assert.equal(
+        (result.iterations[0].result as { errorKind?: string }).errorKind,
+        c.kind,
+        "a ceiling this library imposes has to be named, not flattened to 'runtime'",
+      );
+      const feedback = llm
+        .calls()[1]
+        .messages.map((m) => m.content)
+        .join("\n");
+      assert.match(feedback, c.advice, `got: ${feedback}`);
+      assert.doesNotMatch(feedback, /Check your logic/, "there is no logic error to find");
+      assert.equal(result.answer, "recovered");
+    });
+  }
+
+  it("says something specific for every error kind", async () => {
+    // Including `unavailable`, which is only reachable in anger by starving a
+    // real pool. A kind with no branch here does not fail loudly: the model is
+    // handed the raw error and no instruction at all, and retries blind.
+    const KINDS: Array<[RunErrorKind, RegExp]> = [
+      ["syntax", /syntax error/],
+      ["typing", /type error/],
+      ["runtime", /Check your logic/],
+      ["timeout", /out of time/],
+      ["memory", /out of memory/],
+      ["aborted", /aborted/],
+      ["crashed", /state was lost/],
+      ["unavailable", /not your code/],
+    ];
+
+    for (const [errorKind, advice] of KINDS) {
+      const feedback = buildFeedback({
+        status: "error",
+        error: "boom",
+        errorKind,
+        stdout: "",
+        stdoutTruncated: false,
+        calls: [],
+      });
+      assert.match(feedback, advice, `${errorKind}: got ${feedback}`);
+    }
   });
 });

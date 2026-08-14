@@ -63,10 +63,19 @@ export function poolConfig(): { maxProcesses: number; checkoutTimeoutSecs: numbe
  */
 let poolPromise: Promise<Monty> | null = null;
 
+/**
+ * The settings the live pool was actually built with — which is not what
+ * `poolConfig()` returns once the environment has moved on. A checkout failure
+ * has to name the cap that refused it, not the one that would apply to a pool
+ * built now.
+ */
+let livePoolConfig = poolConfig();
+
 /** The process-wide pool, created on first use. */
 export async function getSandboxPool(): Promise<Monty> {
   if (poolPromise === null) {
     const { maxProcesses, checkoutTimeoutSecs } = poolConfig();
+    livePoolConfig = { maxProcesses, checkoutTimeoutSecs };
     poolPromise = Monty.create({
       maxProcesses,
       checkoutTimeout: checkoutTimeoutSecs,
@@ -98,6 +107,24 @@ export async function closeSandboxPool(): Promise<void> {
 }
 
 /**
+ * The pool would not hand out a worker.
+ *
+ * A distinct class because the caller's response is distinct, and because
+ * `runInSandbox` has to tell this apart from every other throw to honour its
+ * "returns a `RunResult`" contract (#36). Nothing ran: the failure is the
+ * host's capacity, not the code's. The usual cause is other runs holding every
+ * worker — before #32 an unbounded runaway held one forever, so four of them
+ * denied service to every later caller in the process, including one running
+ * `1 + 1` (measured).
+ */
+export class SandboxUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SandboxUnavailableError";
+  }
+}
+
+/**
  * Run `fn` against a checked-out session and always return the worker.
  *
  * The `close()` is guarded because a crashed worker has already been discarded
@@ -111,7 +138,21 @@ export async function withSandboxSession<T>(
   fn: (session: MontySession) => Promise<T>,
 ): Promise<T> {
   const pool = await getSandboxPool();
-  const session = await pool.checkout(checkoutOpts);
+  let session: MontySession;
+  try {
+    session = await pool.checkout(checkoutOpts);
+  } catch (err) {
+    // Wrapped at the one place it can happen, rather than sniffed for later by
+    // its message. `checkout()` rejects with a plain `Error` after
+    // `checkoutTimeout`, and matching on the text of an upstream string is a
+    // classification that breaks silently the next time upstream rewords it.
+    throw new SandboxUnavailableError(
+      `no monty worker became available within the ${livePoolConfig.checkoutTimeoutSecs}s checkout ` +
+        `timeout (cap: ${livePoolConfig.maxProcesses} workers): ` +
+        (err instanceof Error ? err.message : String(err)),
+      { cause: err },
+    );
+  }
   try {
     return await fn(session);
   } finally {

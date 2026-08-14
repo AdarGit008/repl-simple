@@ -40,6 +40,15 @@ export interface BridgeOptions {
 
 // ── Tool definitions ────────────────────────────────────────────
 
+/**
+ * Seconds a `bash` call runs before pi kills it, when the caller names none.
+ *
+ * Under the sandbox's default 300 s host wall clock, so a hung command fails
+ * as itself — one tool call raising, with the script still live to handle it —
+ * rather than as the death of the whole run.
+ */
+const DEFAULT_BASH_TIMEOUT_SECS = 120;
+
 interface ToolSpec {
   name: string;
   // pi's tool factories each return a differently-shaped AgentTool and the
@@ -157,9 +166,30 @@ const TOOL_SPECS: ToolSpec[] = [
     factory: (cwd, opts) => createBashTool(cwd, opts.bash),
     params: [
       { name: "command", type: "str", description: "Shell command to execute." },
-      { name: "timeout", type: "int", description: "Timeout in seconds.", optional: true },
+      {
+        name: "timeout",
+        type: "int",
+        description: `Timeout in seconds. Default ${DEFAULT_BASH_TIMEOUT_SECS}.`,
+        optional: true,
+      },
     ],
     mutating: true,
+    prepareArgs: (args) => {
+      // Pi's schema documents "no default timeout", and it means it: a command
+      // that never returns is awaited forever. That hangs the whole run and,
+      // since the pooled worker is released only once the run settles, holds a
+      // worker for as long as it lasts (#32 item 3). The sandbox's own
+      // `maxDurationSecs` cannot help — its clock stops while the interpreter
+      // is suspended on this very call.
+      //
+      // A default here rather than only the host wall clock because the two
+      // bound different things: the wall clock ends the *run*, while this ends
+      // the *command*, leaving the script running with a failure it can handle.
+      if (args.timeout === undefined || args.timeout === null) {
+        return { ...args, timeout: DEFAULT_BASH_TIMEOUT_SECS };
+      }
+      return args;
+    },
   },
   {
     name: "edit",

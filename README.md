@@ -97,7 +97,25 @@ npm run mutation # stryker, contained in a memory-capped systemd scope
 npm run test:contained # the suite, likewise contained
 ```
 
-Four environment variables tune the sandbox, all read at call time.
+Seven environment variables tune the sandbox, all read at call time.
+
+Three are the default resource limits every run gets. A caller who passes no `limits` gets these,
+not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
+anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
+which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
+lasts.
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
+| `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
+| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included. The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
+
+The last of those is the fail-safe the other two cannot be. Monty's clock is polled inside the
+worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
+otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
+`createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails
+as one tool call — leaving the script alive to handle it — rather than as the death of the run.
 
 Two guard against a runaway exhausting the host:
 
@@ -119,7 +137,7 @@ exhausted pool hangs with no error and no log rather than failing.
 | variable | default | effect |
 |---|---|---|
 | `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~8.5 MB each), not by core count. |
-| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing. |
+| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
 
 ### The worker pool
 

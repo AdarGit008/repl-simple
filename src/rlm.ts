@@ -100,8 +100,14 @@ function extractBestAnswer(iterations: RlmIteration[]): string {
 /**
  * Build the feedback message for the LLM after a sandbox run.
  * Tells the LLM what happened and what to do next.
+ *
+ * Exported for the test over every `RunErrorKind`. Two of the kinds are only
+ * reachable in anger by exhausting a real worker pool, which is not something a
+ * unit test should do to the process it shares with the rest of the suite —
+ * and a kind that falls through this chain silently tells the model nothing at
+ * all, which is the failure being guarded against.
  */
-function buildFeedback(result: RunResult): string {
+export function buildFeedback(result: RunResult): string {
   if (result.status === "error") {
     let feedback = `Error: ${result.error}\nstdout: ${result.stdout}`;
     if (result.errorKind === "syntax") {
@@ -110,6 +116,23 @@ function buildFeedback(result: RunResult): string {
       feedback += "\n\nFix the type error in your Python code.";
     } else if (result.errorKind === "runtime") {
       feedback += "\n\nFix the runtime error. Check your logic.";
+    } else if (result.errorKind === "timeout") {
+      // Not "check your logic": the code may be perfectly correct and simply
+      // too expensive, and a model told to fix a bug it cannot find will
+      // rewrite the wrong thing. What it can act on is the cost.
+      feedback +=
+        "\n\nExecution ran out of time. Do less work: shrink the input, lower the " +
+        "iteration count, or split the task across turns.";
+    } else if (result.errorKind === "memory") {
+      feedback +=
+        "\n\nExecution ran out of memory. Hold less at once: stream or chunk the data " +
+        "instead of building the whole result in a list.";
+    } else if (result.errorKind === "unavailable") {
+      // Nothing ran, so there is nothing to fix. Saying so keeps the model from
+      // "correcting" code that was never the problem.
+      feedback +=
+        "\n\nThe sandbox could not be started — the host was out of capacity, not your code. " +
+        "Retry the same code.";
     } else if (result.errorKind === "aborted") {
       feedback += "\n\nExecution was aborted.";
     } else if (result.errorKind === "crashed") {

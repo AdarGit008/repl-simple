@@ -197,6 +197,39 @@ describe("createPiBridgeTools — bash execution", () => {
       await bash.execute({ command: "nonexistent-command-xyz" });
     }, /command not found/);
   });
+
+  it("gives a command with no timeout one anyway", async () => {
+    // Pi's schema says "no default timeout" and means it: without this, `sleep
+    // 99999` is awaited forever, hanging the run and holding its pooled worker
+    // for as long as it lasts (#32 item 3). The sandbox's own `maxDurationSecs`
+    // cannot help — its clock stops while the interpreter is suspended on this
+    // very call.
+    //
+    // Asserted at the seam where it matters, on what pi is actually handed,
+    // rather than by waiting two minutes for it to fire.
+    const seen: Array<number | undefined> = [];
+    const recording: BridgeOptions = {
+      bash: {
+        operations: {
+          exec: async (_command, _cwd, opts) => {
+            seen.push(opts.timeout);
+            return { exitCode: 0 };
+          },
+        },
+      },
+    };
+    const bash = findTool(createPiBridgeTools(tmpDir, recording), "bash");
+
+    await bash.execute({ command: "true" });
+    await bash.execute({ command: "true", timeout: 5 });
+
+    assert.deepEqual(seen, [120, 5], "default when unset; the caller's own when set");
+    assert.equal(
+      bash.params.find((p) => p.name === "timeout")?.description,
+      "Timeout in seconds. Default 120.",
+      "a default the model is not told about is one it cannot reason about",
+    );
+  });
 });
 
 // ── Tool execution — write ──────────────────────────────────────

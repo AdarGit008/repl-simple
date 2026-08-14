@@ -3,7 +3,14 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
-import { runInSandbox, resumeSuspended, memoryGuardConfig } from "../src/sandbox.js";
+import {
+  runInSandbox,
+  resumeSuspended,
+  memoryGuardConfig,
+  limitsConfig,
+  toResourceLimits,
+} from "../src/sandbox.js";
+import { closeSandboxPool } from "../src/pool.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
@@ -40,8 +47,8 @@ function echoTool(): HostTool {
   return makeTool();
 }
 
-function ok(result: unknown): asserts result is RunOk {
-  assert.equal((result as RunOk).status, "ok");
+function ok(result: unknown, message?: string): asserts result is RunOk {
+  assert.equal((result as RunOk).status, "ok", message);
 }
 
 function err(result: unknown): asserts result is RunError {
@@ -1194,6 +1201,7 @@ describe("resource-limit breach on the resume after a host tool call", () => {
       code: OVERRUN_THEN_LOOP,
       toolMs: 250,
       expected: /TimeoutError/,
+      errorKind: "timeout",
     },
     {
       // 16 MB, not 1 MB: a bare session now holds ~8.7 MB before the user's
@@ -1204,6 +1212,7 @@ describe("resource-limit breach on the resume after a host tool call", () => {
       code: CALL_THEN_ALLOCATE,
       toolMs: 1,
       expected: /MemoryError/,
+      errorKind: "memory",
     },
   ] as const;
 
@@ -1218,18 +1227,18 @@ describe("resource-limit breach on the resume after a host tool call", () => {
   }
 
   for (const kind of LIMIT_KINDS) {
-    it(`runInSandbox: a ${kind.name} breach returns a runtime RunError`, async () => {
+    it(`runInSandbox: a ${kind.name} breach returns a ${kind.errorKind} RunError`, async () => {
       const registry = new ToolRegistry([sleepTool(kind.toolMs)]);
       const result = await noThrow("runInSandbox", () =>
         runInSandbox(kind.code, { registry }, { limits: kind.limits }),
       );
 
       err(result);
-      assert.equal(result.errorKind, "runtime");
+      assert.equal(result.errorKind, kind.errorKind);
       assert.match(result.error, kind.expected);
     });
 
-    it(`resumeSuspended: a ${kind.name} breach returns a runtime RunError`, async () => {
+    it(`resumeSuspended: a ${kind.name} breach returns a ${kind.errorKind} RunError`, async () => {
       // The limit rides on the *initial* run, not the resume: `resumeSuspended`
       // is called with no `runOpts` at all here. `loadSnapshot` takes no
       // `limits` either — they belong to the checkout — so the budget in force
@@ -1249,7 +1258,7 @@ describe("resource-limit breach on the resume after a host tool call", () => {
       );
 
       err(result);
-      assert.equal(result.errorKind, "runtime");
+      assert.equal(result.errorKind, kind.errorKind);
       assert.match(result.error, kind.expected);
     });
   }
@@ -1310,7 +1319,7 @@ describe("resource-limit breach on the resume after a host tool call", () => {
       ] as const) {
         const where = `${entry} / ${kind.name}`;
         err(result);
-        assert.equal(result.errorKind, "runtime", where);
+        assert.equal(result.errorKind, kind.errorKind, where);
         assert.match(result.error, kind.expected, where);
         assert.equal(result.calls.length, 1, `${where}: one trace entry`);
       }
@@ -1872,5 +1881,337 @@ describe("a crashed sandbox worker", () => {
     const after = await runInSandbox("1 + 1", { registry: new ToolRegistry() });
     ok(after);
     assert.equal(after.output, "2");
+  });
+});
+
+// ── Default resource limits ─────────────────────────────────────
+
+describe("the shipped resource limits", () => {
+  // Before #32 a caller who passed no `limits` got none, and nothing in this
+  // repository passed any — so the shipped configuration was an unbounded
+  // sandbox. On 0.0.21 that is not merely permissive: an unbounded runaway
+  // never returns and never releases its pooled worker, so
+  // `REPL_POOL_MAX_PROCESSES` of them deny service to every later caller in
+  // the process, including one running `1 + 1`.
+  //
+  // Every test here that relies on a default sets it small through the
+  // environment. A suite that waited out the real 30 s budget would be a suite
+  // nobody runs, and one that asserted only explicit limits would have passed
+  // against the fail-open version.
+
+  const registry = new ToolRegistry();
+
+  /** Runs `fn` with env vars applied, restoring whatever was there before. */
+  async function withEnv(vars: Record<string, string>, fn: () => Promise<void>): Promise<void> {
+    const prior: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(vars)) {
+      prior[k] = process.env[k];
+      process.env[k] = v;
+    }
+    try {
+      await fn();
+    } finally {
+      for (const [k, v] of Object.entries(prior)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  it("ships a finite duration, memory and wall-clock budget", () => {
+    // The assertion every other test here cannot make, because every other
+    // test sets its own: shipping all three as unlimited would pass them all.
+    const { maxDurationSecs, maxMemory, maxWallClockSecs } = limitsConfig();
+    assert.ok(maxDurationSecs > 0 && Number.isFinite(maxDurationSecs));
+    assert.ok(maxMemory > 0 && Number.isFinite(maxMemory));
+    assert.ok(maxWallClockSecs > 0 && Number.isFinite(maxWallClockSecs));
+  });
+
+  it("reads the environment at call time, rejecting values that are not positive", async () => {
+    const shipped = limitsConfig();
+    await withEnv({ REPL_MAX_DURATION_SECS: "7", REPL_MAX_MEMORY_MB: "64" }, async () => {
+      assert.equal(limitsConfig().maxDurationSecs, 7);
+      assert.equal(limitsConfig().maxMemory, 64 * 1_048_576);
+    });
+    for (const bad of ["0", "-1", "not-a-number", ""]) {
+      await withEnv({ REPL_MAX_DURATION_SECS: bad }, async () => {
+        assert.equal(
+          limitsConfig().maxDurationSecs,
+          shipped.maxDurationSecs,
+          `'${bad}' should not become the duration budget — a 0 s budget runs nothing`,
+        );
+      });
+    }
+  });
+
+  it("a runaway loop with no limits argument times out on the default budget", async () => {
+    // Test 1 of the issue. `while True: pass` is the case that motivated all of
+    // this: no host timer can interrupt it, no abort signal reaches it, and
+    // before #32 it ran until the process was killed.
+    await withEnv({ REPL_MAX_DURATION_SECS: "1" }, async () => {
+      const started = Date.now();
+      const result = await runInSandbox("while True: pass", { registry });
+
+      err(result);
+      assert.equal(result.errorKind, "timeout");
+      assert.match(result.error, /TimeoutError/);
+      assert.ok(
+        Date.now() - started < 15_000,
+        "the default budget has to bound it, not the test runner's patience",
+      );
+    });
+  });
+
+  it("a memory bomb with no limits argument fails on the default ceiling", async () => {
+    // Test 2. Enforced inside the worker as a catchable error rather than an
+    // OOM kill, so the host survives and the caller is told why.
+    await withEnv({ REPL_MAX_MEMORY_MB: "32" }, async () => {
+      const result = await runInSandbox("x = [0] * 20000000\nlen(x)", { registry });
+
+      err(result);
+      assert.equal(result.errorKind, "memory");
+      assert.match(result.error, /MemoryError/);
+    });
+  });
+
+  it("limits: 'unbounded' genuinely disables the ceiling", async () => {
+    // Test 3. An escape hatch that quietly kept enforcing would be worse than
+    // none: the caller believes they opted out. Paired with the same code under
+    // the same environment, so the only difference is the opt-out itself.
+    await withEnv({ REPL_MAX_MEMORY_MB: "32" }, async () => {
+      const bounded = await runInSandbox("x = [0] * 20000000\nlen(x)", { registry });
+      err(bounded);
+      assert.equal(
+        bounded.errorKind,
+        "memory",
+        "the default has to be enforcing for this to mean anything",
+      );
+
+      const unbounded = await runInSandbox(
+        "x = [0] * 20000000\nlen(x)",
+        { registry },
+        {
+          limits: "unbounded",
+        },
+      );
+      ok(unbounded);
+      assert.equal(unbounded.output, "20000000");
+    });
+  });
+
+  it("passes every knob the caller sets through to Monty", async () => {
+    // Test 6, the field-by-field half. `gcInterval` has no observable effect at
+    // this level, so a silent drop of it — precisely the defect #32 fixes — is
+    // catchable only against the mapping itself.
+    assert.deepEqual(
+      toResourceLimits({
+        maxDurationSecs: 3,
+        maxMemory: 7 * 1_048_576,
+        gcInterval: 500,
+        maxRecursionDepth: 64,
+      }),
+      { maxDurationSecs: 3, maxMemory: 7 * 1_048_576, gcInterval: 500, maxRecursionDepth: 64 },
+    );
+
+    // Unset knobs take the default; `maxWallClockSecs` is the host's and is not
+    // Monty's to receive.
+    const defaults = limitsConfig();
+    assert.deepEqual(toResourceLimits({ maxWallClockSecs: 9 }), {
+      maxDurationSecs: defaults.maxDurationSecs,
+      maxMemory: defaults.maxMemory,
+      gcInterval: undefined,
+      maxRecursionDepth: undefined,
+    });
+
+    // The one path to no limits at all, and it has to be typed.
+    assert.equal(toResourceLimits("unbounded"), undefined);
+    assert.notEqual(toResourceLimits(undefined), undefined);
+  });
+
+  it("enforces a caller's maxRecursionDepth", async () => {
+    // Test 6, behavioural half — and the one knob whose loss a default would
+    // hide: Monty's own ceiling of 1000 raises `RecursionError` too, so the
+    // recursion here is 100 deep. It completes under the default and fails only
+    // if the caller's 50 actually arrived.
+    const recurse = "def f(n):\n    return 0 if n == 0 else f(n - 1)\nf(100)";
+
+    const bounded = await runInSandbox(
+      recurse,
+      { registry },
+      {
+        limits: { maxRecursionDepth: 50 },
+      },
+    );
+    err(bounded);
+    assert.equal(
+      bounded.errorKind,
+      "runtime",
+      "the caller's own recursion is not a ceiling of ours",
+    );
+    assert.match(bounded.error, /RecursionError/);
+
+    const unbounded = await runInSandbox(recurse, { registry });
+    ok(unbounded, "100 frames is well inside Monty's default of 1000");
+  });
+});
+
+// ── The host wall clock ─────────────────────────────────────────
+
+describe("the host wall clock", () => {
+  /** A tool that never returns within the life of a test. */
+  function hangingTool(): HostTool {
+    return {
+      name: "hang",
+      description: "Never returns",
+      params: [],
+      returns: "str",
+      execute: () => new Promise<string>(() => {}),
+    };
+  }
+
+  it("interrupts a host tool that Monty's clock cannot", async () => {
+    // Test 4, and the whole point of the issue. `maxDurationSecs` is armed and
+    // irrelevant: the sandbox clock advances only while the interpreter
+    // executes, and the interpreter is suspended waiting for this tool. Nothing
+    // inside the worker can end this run.
+    const registry = new ToolRegistry([hangingTool()]);
+    const started = Date.now();
+
+    const result = await runInSandbox(
+      "hang()",
+      { registry },
+      {
+        limits: { maxDurationSecs: 30, maxWallClockSecs: 1 },
+      },
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+    assert.match(result.error, /host wall-clock/);
+    assert.ok(Date.now() - started < 10_000, `returned in ${Date.now() - started}ms`);
+  });
+
+  it("returns the worker, so a hung run cannot starve the pool", async () => {
+    // Test 7's sibling for the tool-hang route, and the reason the deadline is
+    // load-bearing rather than a convenience: `withSandboxSession` releases the
+    // worker in a `finally` that is reached only once the run settles. Losing
+    // the race is what settles it.
+    await closeSandboxPool();
+    const prior = process.env.REPL_POOL_MAX_PROCESSES;
+    process.env.REPL_POOL_MAX_PROCESSES = "2";
+    try {
+      const registry = new ToolRegistry([hangingTool()]);
+      for (let i = 0; i < 3; i++) {
+        const hung = await runInSandbox(
+          "hang()",
+          { registry },
+          {
+            limits: { maxWallClockSecs: 1 },
+          },
+        );
+        err(hung);
+        assert.equal(hung.errorKind, "timeout", `hang ${i}`);
+      }
+
+      const after = await runInSandbox("1 + 1", { registry: new ToolRegistry() });
+      ok(after, "a well-behaved caller must not pay for the hangs before it");
+      assert.equal(after.output, "2");
+    } finally {
+      if (prior === undefined) delete process.env.REPL_POOL_MAX_PROCESSES;
+      else process.env.REPL_POOL_MAX_PROCESSES = prior;
+      await closeSandboxPool();
+    }
+  });
+
+  it("an aborted signal ends a run parked in a host tool", async () => {
+    // The dispatch loop checks `acc.aborted` between iterations, and a run
+    // waiting on a tool is between iterations by definition — so before the
+    // race, an abort was noticed only once the tool it was meant to interrupt
+    // had returned.
+    const registry = new ToolRegistry([hangingTool()]);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+
+    const result = await runInSandbox("hang()", { registry }, { signal: controller.signal });
+
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+  });
+});
+
+// ── An exhausted pool ───────────────────────────────────────────
+
+describe("a pool with no worker to give", () => {
+  it("a runaway does not cost the pool a worker", async () => {
+    // Test 7. Fails against the fail-open version at the checkout timeout,
+    // with `no monty worker became available`, on a caller running `1 + 1`.
+    // The default limits are what end each runaway and hand its worker back.
+    await closeSandboxPool();
+    const prior = {
+      procs: process.env.REPL_POOL_MAX_PROCESSES,
+      dur: process.env.REPL_MAX_DURATION_SECS,
+    };
+    process.env.REPL_POOL_MAX_PROCESSES = "2";
+    process.env.REPL_MAX_DURATION_SECS = "1";
+    try {
+      const registry = new ToolRegistry();
+      for (let i = 0; i < 3; i++) {
+        const runaway = await runInSandbox("while True: pass", { registry });
+        err(runaway);
+        assert.equal(runaway.errorKind, "timeout", `runaway ${i}`);
+      }
+
+      const after = await runInSandbox("1 + 1", { registry });
+      ok(after, "the caller after three runaways was never at fault");
+      assert.equal(after.output, "2");
+    } finally {
+      if (prior.procs === undefined) delete process.env.REPL_POOL_MAX_PROCESSES;
+      else process.env.REPL_POOL_MAX_PROCESSES = prior.procs;
+      if (prior.dur === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+      else process.env.REPL_MAX_DURATION_SECS = prior.dur;
+      await closeSandboxPool();
+    }
+  });
+
+  it("an exhausted pool returns a RunError rather than throwing", async () => {
+    // #36's contract, arriving by a route #36 never covered: the refusal comes
+    // from `buildTypeCheckStubs` reaching the pool before any user code exists,
+    // so it escapes from outside every `classify*` guard. A caller with no
+    // reason to be in a `try` gets a `RunResult` like every other outcome.
+    await closeSandboxPool();
+    const prior = {
+      procs: process.env.REPL_POOL_MAX_PROCESSES,
+      checkout: process.env.REPL_POOL_CHECKOUT_TIMEOUT_SECS,
+    };
+    process.env.REPL_POOL_MAX_PROCESSES = "1";
+    process.env.REPL_POOL_CHECKOUT_TIMEOUT_SECS = "1";
+    try {
+      const holdTool: HostTool = {
+        name: "hold",
+        description: "Holds the only worker",
+        params: [],
+        returns: "str",
+        execute: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 4000));
+          return "held";
+        },
+      };
+      const holder = runInSandbox("hold()", { registry: new ToolRegistry([holdTool]) });
+      // Let the holder check the single worker out before competing for it.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const refused = await runInSandbox("1 + 1", { registry: new ToolRegistry() });
+      err(refused);
+      assert.equal(refused.errorKind, "unavailable");
+      assert.match(refused.error, /no monty worker became available/);
+
+      await holder;
+    } finally {
+      if (prior.procs === undefined) delete process.env.REPL_POOL_MAX_PROCESSES;
+      else process.env.REPL_POOL_MAX_PROCESSES = prior.procs;
+      if (prior.checkout === undefined) delete process.env.REPL_POOL_CHECKOUT_TIMEOUT_SECS;
+      else process.env.REPL_POOL_CHECKOUT_TIMEOUT_SECS = prior.checkout;
+      await closeSandboxPool();
+    }
   });
 });
