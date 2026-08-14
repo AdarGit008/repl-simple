@@ -23,6 +23,12 @@ import {
   readFile as fsReadFile,
   readdir as fsReaddir,
 } from "node:fs/promises";
+import {
+  createBashEnvHook,
+  describeWithheld,
+  filterBashEnv,
+  resolveBashEnvAllow,
+} from "./bashenv.js";
 import { createPathJail, type PathJail } from "./pathjail.js";
 import { HostToolError } from "./types.js";
 import type { HostTool, HostToolParam } from "./types.js";
@@ -49,6 +55,13 @@ export interface BridgeOptions {
   ls?: LsToolOptions;
   /** Passed through to createBashTool. */
   bash?: BashToolOptions;
+  /**
+   * Host environment variables `bash` may inherit beyond the standing
+   * allowlist, by name. `["*"]` inherits everything — the explicit opt-out.
+   * Defaults to `REPL_BASH_ENV_ALLOW` (comma-separated); an explicit `[]`
+   * means "no extras" and beats the variable. See docs/bash-env.md (#45).
+   */
+  bashEnvAllow?: string[];
   /** Passed through to createEditTool. */
   edit?: EditToolOptions;
   /** Passed through to createWriteTool. */
@@ -163,6 +176,11 @@ interface ToolSpec {
   mutating: boolean;
   /** Optional arg pre-processing before passing to Pi tool */
   prepareArgs?: (args: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * A note appended when the tool fails, or `undefined` for none. Lets a
+   * refusal this bridge imposed be told apart from the tool's own failure.
+   */
+  failureNote?: (opts: BridgeOptions, context: string) => string | undefined;
 }
 
 const TOOL_SPECS: ToolSpec[] = [
@@ -274,7 +292,20 @@ const TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: "bash",
-    factory: (cwd, opts) => createBashTool(cwd, opts.bash),
+    factory: (cwd, opts) => {
+      const allow = resolveBashEnvAllow(opts.bashEnvAllow);
+      return createBashTool(cwd, {
+        ...opts.bash,
+        // PI_* session variables are dropped with everything else: the model
+        // has no use for the host's session id, and `PI_SESSION_FILE` points
+        // at the transcript on disk, which is the one file a jailed read tool
+        // must not be handed a route to. Turning pi's injection off as well
+        // keeps the tool's advertised behaviour honest rather than promising
+        // variables the filter then removes; the filter still decides.
+        exposeSessionEnvironment: opts.bash?.exposeSessionEnvironment ?? false,
+        spawnHook: createBashEnvHook(allow, opts.bash?.spawnHook),
+      });
+    },
     params: [
       { name: "command", type: "str", description: "Shell command to execute." },
       {
@@ -301,6 +332,15 @@ const TOOL_SPECS: ToolSpec[] = [
       }
       return args;
     },
+    // Recomputed from `process.env` rather than recorded by the hook: the
+    // filter is a pure function of the host environment, so a second
+    // evaluation gives the same answer without a mutable field that two
+    // in-flight calls could disagree about.
+    failureNote: (opts, context) =>
+      describeWithheld(
+        filterBashEnv(process.env, resolveBashEnvAllow(opts.bashEnvAllow)).withheld,
+        context,
+      ),
   },
   {
     name: "edit",
@@ -346,6 +386,10 @@ const TOOL_SPECS: ToolSpec[] = [
  * therefore the only way to reach outside the root, and it is gated —
  * see docs/path-jail.md.
  *
+ * `bash` also runs with an allowlisted environment rather than the host's, so
+ * one approved command cannot disclose the credentials the pi process happens
+ * to hold — see docs/bash-env.md.
+ *
  * Each tool executes against `cwd` — the working directory for
  * relative paths and command execution.
  */
@@ -371,17 +415,32 @@ export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): H
       execute: async (args: Record<string, unknown>): Promise<string> => {
         const jailed = spec.mutating ? args : await jailPathArg(args, jail);
         const processed = spec.prepareArgs ? spec.prepareArgs(jailed) : jailed;
-        const result = await agentTool.execute(
-          randomUUID(),
-          // `processed` is a plain Record built from Monty's dynamically-typed
-          // args; pi types this parameter per-tool via its own schema. There is
-          // nothing to narrow to at this seam — the validation that matters is
-          // pi's, inside execute().
-          // biome-ignore lint/suspicious/noExplicitAny: per-tool schema, typed inside pi
-          processed as any,
-          undefined, // signal
-          undefined, // onUpdate
-        );
+        const result = await agentTool
+          .execute(
+            randomUUID(),
+            // `processed` is a plain Record built from Monty's dynamically-typed
+            // args; pi types this parameter per-tool via its own schema. There is
+            // nothing to narrow to at this seam — the validation that matters is
+            // pi's, inside execute().
+            // biome-ignore lint/suspicious/noExplicitAny: per-tool schema, typed inside pi
+            processed as any,
+            undefined, // signal
+            undefined, // onUpdate
+          )
+          .catch((err: unknown) => {
+            // Pi signals a non-zero exit by throwing, with the output as the
+            // message. The note rides along on the same string, since that is
+            // the only channel the sandbox re-raises into Python. It is shown
+            // the command as well as the output, since a shell that dies on an
+            // unset variable may name it in either.
+            const message = err instanceof Error ? err.message : String(err);
+            const note = spec.failureNote?.(
+              options,
+              `${String(processed.command ?? "")}\n${message}`,
+            );
+            if (note === undefined) throw err;
+            throw new Error(`${message}\n\n${note}`, { cause: err });
+          });
         // Extract text blocks from AgentToolResult.content
         const content: Array<{ type: string; text?: string }> = result.content;
         return content

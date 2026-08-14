@@ -502,6 +502,110 @@ describe("createPiBridgeTools — bash execution", () => {
   });
 });
 
+// ── Tool execution — the bash environment (#45) ─────────────────
+
+describe("createPiBridgeTools — bash environment", () => {
+  /** Sentinels exported into the *pi process*, as a real deployment has. */
+  const HOST_SECRETS = {
+    ANTHROPIC_API_KEY: "sk-ant-BRIDGE-TEST-secret-value",
+    MY_COMPANY_PASSPHRASE: "user-defined-BRIDGE-TEST-secret-value",
+  };
+
+  function withHostSecrets<T>(fn: () => Promise<T>): Promise<T> {
+    for (const [name, value] of Object.entries(HOST_SECRETS)) process.env[name] = value;
+    return fn().finally(() => {
+      for (const name of Object.keys(HOST_SECRETS)) delete process.env[name];
+    });
+  }
+
+  it("`env` discloses no host credential, and still has what a build needs", async () => {
+    await withHostSecrets(async () => {
+      const bash = findTool(createPiBridgeTools(tmpDir), "bash");
+      const out = await bash.execute({ command: "env" });
+
+      // The values are what matter: one approved call must not return them.
+      for (const value of Object.values(HOST_SECRETS)) {
+        assert.ok(!out.includes(value), "a host secret reached the model");
+      }
+      assert.ok(!/^ANTHROPIC_API_KEY=/m.test(out));
+      assert.ok(
+        !/^MY_COMPANY_PASSPHRASE=/m.test(out),
+        "a denylist of *_KEY would have missed this",
+      );
+      assert.ok(!/^PI_[A-Z_]*=/m.test(out), "PI_* session variables are dropped too");
+
+      // A filter that breaks `npm test` gets turned off, so this is the half
+      // that protects the fix.
+      assert.match(out, /^PATH=.+/m);
+      assert.match(out, /^HOME=.+/m);
+      assert.match(out, /^REPL_BASH_ENV_FILTERED=1$/m, "the shell can tell it is filtered");
+    });
+  });
+
+  it("a failed command says a variable was withheld", async () => {
+    await withHostSecrets(async () => {
+      const bash = findTool(createPiBridgeTools(tmpDir), "bash");
+      // Without the note, "unbound variable" reads as an ordinary failure and
+      // the model retries the same command until it runs out of iterations.
+      await assert.rejects(
+        async () => await bash.execute({ command: 'set -u; echo "$ANTHROPIC_API_KEY"' }),
+        (err: Error) =>
+          /ANTHROPIC_API_KEY/.test(err.message) && /REPL_BASH_ENV_ALLOW/.test(err.message),
+      );
+
+      // And a success carries no footer: the note is for failures only.
+      const ok = await bash.execute({ command: "echo fine" });
+      assert.ok(!ok.includes("REPL_BASH_ENV_ALLOW"));
+    });
+  });
+
+  it("`bashEnvAllow` names one variable through, without opening the rest", async () => {
+    await withHostSecrets(async () => {
+      const bash = findTool(
+        createPiBridgeTools(tmpDir, { bashEnvAllow: ["MY_COMPANY_PASSPHRASE"] }),
+        "bash",
+      );
+      const out = await bash.execute({ command: "env" });
+      assert.ok(out.includes(HOST_SECRETS.MY_COMPANY_PASSPHRASE), "the named one is inherited");
+      assert.ok(!out.includes(HOST_SECRETS.ANTHROPIC_API_KEY), "and only the named one");
+    });
+  });
+
+  it("the filter is the last word: no second entry point can bypass it", async () => {
+    await withHostSecrets(async () => {
+      // Both seams a caller has — a spawn hook that adds a variable, and a
+      // custom execution backend that reads the environment — are covered,
+      // because the policy is applied above both.
+      let seen: NodeJS.ProcessEnv | undefined;
+      const bash = findTool(
+        createPiBridgeTools(tmpDir, {
+          bash: {
+            spawnHook: (ctx) => ({ ...ctx, env: { ...ctx.env, SNEAKED_TOKEN: "leaked" } }),
+            exposeSessionEnvironment: true,
+            operations: {
+              exec: async (_command, _cwd, opts) => {
+                seen = opts.env;
+                return { exitCode: 0 };
+              },
+            },
+          },
+        }),
+        "bash",
+      );
+
+      await bash.execute({ command: "true" });
+
+      assert.ok(seen, "the backend was reached");
+      assert.equal(seen.SNEAKED_TOKEN, undefined, "a caller hook cannot reintroduce a secret");
+      assert.equal(seen.ANTHROPIC_API_KEY, undefined);
+      assert.equal(seen.MY_COMPANY_PASSPHRASE, undefined);
+      assert.equal(seen.PI_SESSION_ID, undefined, "nor can exposeSessionEnvironment");
+      assert.equal(seen.REPL_BASH_ENV_FILTERED, "1");
+      assert.ok(seen.PATH, "and the backend still gets a usable environment");
+    });
+  });
+});
+
 // ── Tool execution — write ──────────────────────────────────────
 
 describe("createPiBridgeTools — write execution", () => {
