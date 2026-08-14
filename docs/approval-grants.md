@@ -57,9 +57,14 @@ no grant at all and the next identical call asks again. In the shipped configura
 fires.
 
 It is built, and enforced, and tested anyway, for two reasons. #44 requires the count to be a real
-ceiling rather than a promise. And bucket 5 (#51) replaces `ctx.ui.confirm` with a dialog that can
-offer "allow the next N" — a grant that authorises more than one execution is defensible exactly
-when the prompt granting it said so, and not before.
+ceiling rather than a promise. And a dialog that says "allow the next N" is the one thing that would
+make branch 2 honest — a grant that authorises more than one execution is defensible exactly when the
+prompt granting it said so, and not before.
+
+#51 replaced `ctx.ui.confirm` with a `ctx.ui.select`, which is where such an answer would go, and did
+not add one: its three options are approve, deny, and decide later. "Decide later" spends nothing —
+it records no grant, because deferring a question is not answering it. Until an option says
+otherwise, `DEFAULT_GRANT_USES` stays at 1 and branch 2 stays dead.
 
 `grantUses` is per-`Session`, and values below 1 are refused rather than clamped: 0 and 0.5 are both
 someone believing something false about the model, and a security ceiling should not be silently

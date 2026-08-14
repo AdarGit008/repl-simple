@@ -22,6 +22,22 @@ type ApprovalMode = "strict" | "yolo";
 
 const MODE_HELP = "Usage: /repl-approvals [strict|yolo]";
 
+// ── Approval dialog ──────────────────────────────────────────────
+
+/**
+ * The three answers to an approval dialog, in the order they are offered.
+ *
+ * Approve first because it is the common answer, deny second because it is
+ * the safe one, and "decide later" last because it is the one that needs
+ * reading. They are constants rather than inline strings because the choice
+ * comes back from `ui.select` as the string itself: a typo in one of the two
+ * places would silently become a denial. Exported for the same reason — a
+ * test that retyped them would be pinning its own copy, not the dialog.
+ */
+export const APPROVE_CHOICE = "Approve — run this call";
+export const DENY_CHOICE = "Deny — refuse this call";
+export const LATER_CHOICE = "Decide later — keep it waiting";
+
 // ── Dialog lifetime ──────────────────────────────────────────────
 
 /**
@@ -31,7 +47,7 @@ const MODE_HELP = "Usage: /repl-approvals [strict|yolo]";
  * permanently wedged Pi (#49). `showExtensionSelector` overwrites
  * `this.extensionSelector` without invoking the previous component's
  * `onSelect`/`onCancel`, so a second dialog opened while a first is up leaves
- * the first `await ctx.ui.confirm` unsettled forever — and on abort the agent
+ * the first `await ctx.ui.select` unsettled forever — and on abort the agent
  * loop still awaits every in-flight tool, which makes Escape a permanent no-op.
  * The orphaned component's countdown keeps ticking, so a timeout is what
  * eventually settles it.
@@ -96,7 +112,14 @@ export default function (pi: ReplExtensionApi) {
   }
 
   /**
-   * Build an onApproval callback that uses Pi's native confirm dialog.
+   * Build an onApproval callback that uses Pi's native select dialog.
+   *
+   * Three answers, because there are three (#51). `confirm` offers two and
+   * cannot distinguish Escape from "No" — `showExtensionConfirm` returns
+   * `result === "Yes"`, so cancel, timeout and abort all arrive as a denial —
+   * and the third answer the sandbox already understands, `"suspend"`, had
+   * nowhere to come from. A `select` can say all three and can tell a
+   * dismissal from an answer.
    *
    * `signal` is the abort signal for the tool call the approval belongs to. It
    * is handed to the dialog so that Escape dismisses it and the promise
@@ -107,11 +130,11 @@ export default function (pi: ReplExtensionApi) {
     ctx: {
       hasUI: boolean;
       ui: {
-        confirm: (
+        select: (
           title: string,
-          message: string,
+          options: string[],
           opts?: { signal?: AbortSignal; timeout?: number },
-        ) => Promise<boolean>;
+        ) => Promise<string | undefined>;
       };
     },
     signal?: AbortSignal,
@@ -126,11 +149,22 @@ export default function (pi: ReplExtensionApi) {
       // An already-aborted turn has nobody left to ask: opening a dialog here
       // would put one on screen after the user has said stop.
       if (signal?.aborted) return false;
-      const approved = await ctx.ui.confirm("Approve tool call?", `Allow ${req.description}?`, {
-        signal,
-        timeout: approvalTimeoutMs(),
-      });
-      return approved;
+
+      const choice = await ctx.ui.select(
+        `Allow ${req.description}?`,
+        [APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE],
+        { signal, timeout: approvalTimeoutMs() },
+      );
+
+      if (choice === APPROVE_CHOICE) return true;
+      if (choice === LATER_CHOICE) return "suspend";
+      // `undefined` is Escape, the timeout, or the abort — no answer at all.
+      // It denies, deliberately: the one property that must not regress is
+      // that a call nobody approved does not run. "Decide later" is the
+      // answer for a user who wants to keep the call alive, and it is on
+      // screen next to this one, so a dismissal does not have to carry that
+      // meaning as well.
+      return false;
     };
   }
 
@@ -229,7 +263,9 @@ export default function (pi: ReplExtensionApi) {
       label: "Resume REPL",
       description:
         "Resume a suspended REPL session. Call after a tool requires " +
-        "approval — this shows a confirmation dialog for the pending tool call.",
+        "approval — this asks the user to approve, deny, or keep the call " +
+        "waiting. If they keep it waiting the session stays suspended and " +
+        "calling this again asks once more.",
       parameters: Type.Object({
         sessionId: Type.Optional(
           Type.String({ description: "Session to resume. Default: 'default'." }),

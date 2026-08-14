@@ -1,8 +1,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE } from "../extensions/repl-extension.js";
 
 /**
  * Tests for `extensions/repl-extension.ts` — the only file a consumer of this
@@ -156,16 +157,16 @@ describe("repl extension — headless approval", () => {
   });
 
   function makeCtx(hasUI: boolean, approved: boolean) {
-    const calls = { confirm: 0 };
+    const calls = { asked: 0 };
     return {
       calls,
       ctx: {
         cwd,
         hasUI,
         ui: {
-          confirm: async () => {
-            calls.confirm++;
-            return approved;
+          select: async () => {
+            calls.asked++;
+            return approved ? APPROVE_CHOICE : DENY_CHOICE;
           },
         },
       },
@@ -193,8 +194,8 @@ describe("repl extension — headless approval", () => {
       "the gated write executed despite there being no UI to approve it",
     );
 
-    // Never even asked: hasUI === false short-circuits before ctx.ui.confirm.
-    assert.equal(calls.confirm, 0, "confirm was called with hasUI false");
+    // Never even asked: hasUI === false short-circuits before ctx.ui.select.
+    assert.equal(calls.asked, 0, "the dialog opened with hasUI false");
 
     // And the model is told why, rather than the failure being silent.
     const text = result.content[0].text;
@@ -222,7 +223,7 @@ describe("repl extension — headless approval", () => {
       true,
       "an approved gated write did not happen",
     );
-    assert.equal(calls.confirm, 1, "expected exactly one approval prompt");
+    assert.equal(calls.asked, 1, "expected exactly one approval prompt");
   });
 });
 
@@ -282,14 +283,14 @@ describe("repl extension — approval mode", () => {
     const repl = tools.find((t) => t.name === "repl");
     assert.ok(repl);
 
-    const confirms = { count: 0 };
+    const dialogs = { count: 0 };
     const ctx = {
       cwd,
       hasUI: true,
       ui: {
-        confirm: async () => {
-          confirms.count++;
-          return true;
+        select: async () => {
+          dialogs.count++;
+          return APPROVE_CHOICE;
         },
       },
     };
@@ -298,14 +299,14 @@ describe("repl extension — approval mode", () => {
     await repl.execute("y-1", { code: "write('yolo.txt', 'x')" }, undefined, undefined, ctx);
 
     assert.equal(existsSync(join(cwd, "yolo.txt")), true, "yolo did not run the gated write");
-    assert.equal(confirms.count, 0, "yolo must not open a dialog");
+    assert.equal(dialogs.count, 0, "yolo must not open a dialog");
 
     // And back. The toggle has to work in both directions or it is a one-way
     // door dressed up as a setting.
     await commands[0].handler("strict", notifyCtx().ctx);
     await repl.execute("y-2", { code: "write('strict.txt', 'x')" }, undefined, undefined, ctx);
 
-    assert.equal(confirms.count, 1, "strict must ask again");
+    assert.equal(dialogs.count, 1, "strict must ask again");
     assert.equal(existsSync(join(cwd, "strict.txt")), true);
   });
 
@@ -321,7 +322,7 @@ describe("repl extension — approval mode", () => {
       { code: "write('headless-yolo.txt', 'x')" },
       undefined,
       undefined,
-      { cwd, hasUI: false, ui: { confirm: async () => true } },
+      { cwd, hasUI: false, ui: { select: async () => APPROVE_CHOICE } },
     );
 
     assert.equal(
@@ -374,25 +375,34 @@ async function waitFor(predicate: () => boolean, ms: number, what: string): Prom
 type DialogOpts = { signal?: AbortSignal; timeout?: number };
 
 /**
- * A `ui.confirm` that reproduces the bug above: no user answer ever settles
+ * A `ui.select` that reproduces the bug above: no user answer ever settles
  * it, and opening a second one orphans the first. Only `opts.signal` and
  * `opts.timeout` can settle a dialog here — which is exactly the property the
  * real component has, and exactly why the extension passes both.
+ *
+ * A dismissed `select` resolves `undefined` rather than the `false` its
+ * `confirm` predecessor returned. That difference is the point of #51: the
+ * extension is what turns "no answer" into a denial, and this fake hands it
+ * the ambiguous value so the mapping is under test rather than assumed.
  */
-function clobberingConfirm() {
+function clobberingSelect() {
   const opened: DialogOpts[] = [];
   const timers: NodeJS.Timeout[] = [];
 
-  const confirm = (_title: string, _message: string, opts?: DialogOpts): Promise<boolean> => {
+  const select = (
+    _title: string,
+    _options: string[],
+    opts?: DialogOpts,
+  ): Promise<string | undefined> => {
     opened.push({ signal: opts?.signal, timeout: opts?.timeout });
-    return new Promise<boolean>((resolve) => {
+    return new Promise<string | undefined>((resolve) => {
       if (opts?.signal?.aborted) {
-        resolve(false);
+        resolve(undefined);
         return;
       }
-      opts?.signal?.addEventListener("abort", () => resolve(false), { once: true });
+      opts?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
       if (opts?.timeout && opts.timeout > 0) {
-        timers.push(setTimeout(() => resolve(false), opts.timeout));
+        timers.push(setTimeout(() => resolve(undefined), opts.timeout));
       }
     });
   };
@@ -401,7 +411,7 @@ function clobberingConfirm() {
     for (const t of timers) clearTimeout(t);
   };
 
-  return { opened, confirm, dispose };
+  return { opened, select, dispose };
 }
 
 describe("repl extension — a dialog always settles (#49)", () => {
@@ -436,7 +446,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
 
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
-    const ui = clobberingConfirm();
+    const ui = clobberingSelect();
     const controller = new AbortController();
 
     // What is asserted is the bound the dialog was opened with — waiting the
@@ -447,7 +457,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
       { code: "write('default.txt', 'x')", sessionId: "hang-default" },
       controller.signal,
       undefined,
-      { cwd, hasUI: true, ui: { confirm: ui.confirm } },
+      { cwd, hasUI: true, ui: { select: ui.select } },
     );
 
     await waitFor(() => ui.opened.length === 1, 15_000, "no dialog opened");
@@ -463,7 +473,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
 
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
-    const ui = clobberingConfirm();
+    const ui = clobberingSelect();
 
     const result = await withDeadline(
       repl.execute(
@@ -471,7 +481,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
         { code: "write('timeout.txt', 'x')", sessionId: "hang-timeout" },
         undefined,
         undefined,
-        { cwd, hasUI: true, ui: { confirm: ui.confirm } },
+        { cwd, hasUI: true, ui: { select: ui.select } },
       ),
       15_000,
       "the repl call never returned",
@@ -495,7 +505,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
 
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
-    const ui = clobberingConfirm();
+    const ui = clobberingSelect();
     const controller = new AbortController();
 
     const pending = repl.execute(
@@ -503,7 +513,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
       { code: "write('abort.txt', 'x')", sessionId: "hang-abort" },
       controller.signal,
       undefined,
-      { cwd, hasUI: true, ui: { confirm: ui.confirm } },
+      { cwd, hasUI: true, ui: { select: ui.select } },
     );
 
     await waitFor(() => ui.opened.length === 1, 15_000, "no dialog opened");
@@ -534,8 +544,8 @@ describe("repl extension — a dialog always settles (#49)", () => {
 
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
-    const ui = clobberingConfirm();
-    const ctx = { cwd, hasUI: true, ui: { confirm: ui.confirm } };
+    const ui = clobberingSelect();
+    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
 
     const results = await withDeadline(
       Promise.all([
@@ -581,7 +591,7 @@ describe("repl extension — repl_reset reports approvals", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  const ctx = () => ({ cwd, hasUI: true, ui: { confirm: async () => true } });
+  const ctx = () => ({ cwd, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
 
   it("names the mode and says nothing is outstanding", async () => {
     const { tools } = await load();
@@ -645,7 +655,7 @@ describe("repl extension — repl_abandon distinguishes its empty states", () =>
     assert.ok(repl);
     assert.ok(abandon);
 
-    const ctx = () => ({ cwd, hasUI: true, ui: { confirm: async () => true } });
+    const ctx = () => ({ cwd, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
 
     const unknown = await abandon.execute(
       "a-1",
@@ -665,5 +675,266 @@ describe("repl extension — repl_abandon distinguishes its empty states", () =>
       /No session/,
       "the session exists — saying otherwise sends the model to create it again",
     );
+  });
+});
+
+// ── Suspension is reachable (#51) ────────────────────────────────
+//
+// `status: "suspended"` was designed, typed and implemented, and then thrown
+// away twice on the way to the user: `makeOnApproval` could only answer
+// `boolean`, and `Session.resume` narrowed whatever it was given with
+// `d === true`. Either layer alone was enough to make "decide later"
+// unreachable, so these tests drive the whole seam — the real extension, the
+// real sandbox, and a real file on disk — rather than one side of it.
+
+/**
+ * A `ui.select` that answers with a scripted sequence of choices.
+ *
+ * `undefined` is a legal answer and means the dialog was dismissed — Escape,
+ * the timeout, or an abort. An unscripted dialog throws rather than defaulting,
+ * because a test that opened one more dialog than it meant to is a test whose
+ * subject has changed.
+ */
+function scriptedSelect(answers: Array<string | undefined>) {
+  const opened: Array<{ title: string; options: string[] }> = [];
+  let next = 0;
+
+  const select = async (title: string, options: string[]): Promise<string | undefined> => {
+    opened.push({ title, options });
+    if (next >= answers.length) throw new Error(`unscripted approval dialog: ${title}`);
+    return answers[next++];
+  };
+
+  return { opened, select, answered: () => next };
+}
+
+describe("repl extension — suspension is reachable (#51)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-suspend-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("offers approve, deny and decide-later, and names the call in the title", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const ui = scriptedSelect([DENY_CHOICE]);
+    await repl.execute(
+      "s-0",
+      { code: "write('offered.txt', 'x')", sessionId: "offered" },
+      undefined,
+      undefined,
+      { cwd, hasUI: true, ui: { select: ui.select } },
+    );
+
+    assert.equal(ui.opened.length, 1);
+    assert.deepEqual(
+      ui.opened[0].options,
+      [APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE],
+      "a dialog that does not offer the third answer makes suspension unreachable again",
+    );
+    // The user has to be told what they are approving; `select` has no message
+    // parameter, so the description has to be in the title.
+    assert.match(ui.opened[0].title, /write/);
+    assert.match(ui.opened[0].title, /offered\.txt/);
+  });
+
+  it("decide later → repl_resume → approve completes the call", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl);
+    assert.ok(resume);
+
+    // Decide later at the first dialog, again at the second — the answer has
+    // to survive `Session.resume` too, not only `makeOnApproval` — and approve
+    // at the third.
+    const ui = scriptedSelect([LATER_CHOICE, LATER_CHOICE, APPROVE_CHOICE]);
+    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+
+    const suspended = await repl.execute(
+      "s-1",
+      { code: "write('round-trip.txt', 'v1')", sessionId: "rt" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.match(suspended.content[0].text, /requires approval/);
+    assert.match(
+      suspended.content[0].text,
+      /repl_resume\(sessionId='rt'\)/,
+      "the model cannot resume a session it is not told the name of (#48)",
+    );
+    assert.equal(
+      existsSync(join(cwd, "round-trip.txt")),
+      false,
+      "a suspended call is a call that has not run",
+    );
+
+    // Still undecided: the session stays suspended and nothing has happened.
+    const again = await resume.execute("s-2", { sessionId: "rt" }, undefined, undefined, ctx);
+    assert.match(
+      again.content[0].text,
+      /requires approval/,
+      "a second 'decide later' was collapsed into a denial",
+    );
+    assert.equal(existsSync(join(cwd, "round-trip.txt")), false);
+
+    const done = await resume.execute("s-3", { sessionId: "rt" }, undefined, undefined, ctx);
+
+    assert.doesNotMatch(done.content[0].text, /PermissionError/);
+    assert.equal(
+      readFileSync(join(cwd, "round-trip.txt"), "utf8"),
+      "v1",
+      "the approved call never ran",
+    );
+    assert.equal(ui.answered(), 3, "expected exactly three dialogs");
+  });
+
+  it("decide later → repl_resume → deny raises PermissionError and leaves the session usable", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl);
+    assert.ok(resume);
+
+    const ui = scriptedSelect([LATER_CHOICE, DENY_CHOICE]);
+    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+
+    await repl.execute(
+      "d-1",
+      { code: "write('denied-later.txt', 'v1')", sessionId: "deny-rt" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const denied = await resume.execute("d-2", { sessionId: "deny-rt" }, undefined, undefined, ctx);
+
+    assert.match(denied.content[0].text, /PermissionError/);
+    assert.equal(existsSync(join(cwd, "denied-later.txt")), false);
+
+    // A denial ends the call, not the session (#50). Nothing is left pending,
+    // and the next snippet runs — with no dialog, so the script does not need
+    // a fourth answer.
+    const after = await repl.execute(
+      "d-3",
+      { code: "2 + 3", sessionId: "deny-rt" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(after.content[0].text, /\[result\]\n5/);
+    assert.doesNotMatch(after.content[0].text, /discarded/i);
+  });
+
+  it("decide later → repl_abandon discards the call and the session continues", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const abandon = tools.find((t) => t.name === "repl_abandon");
+    assert.ok(repl);
+    assert.ok(abandon);
+
+    const ui = scriptedSelect([LATER_CHOICE]);
+    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+
+    await repl.execute(
+      "b-1",
+      { code: "kept = 7\nwrite('abandoned.txt', 'v1')", sessionId: "aband" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const dropped = await abandon.execute("b-2", { sessionId: "aband" }, undefined, undefined, ctx);
+    assert.match(dropped.content[0].text, /discarded|abandoned/i);
+
+    // The snippet never completed, so `kept` is not part of the session — but
+    // the session itself is fine and takes new code.
+    const after = await repl.execute(
+      "b-3",
+      { code: "kept = 8\nkept", sessionId: "aband" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(after.content[0].text, /\[result\]\n8/);
+    assert.equal(
+      existsSync(join(cwd, "abandoned.txt")),
+      false,
+      "an abandoned call ran its side effect anyway",
+    );
+  });
+
+  it("a dismissed dialog denies — Escape is not 'decide later' and not 'yes'", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const abandon = tools.find((t) => t.name === "repl_abandon");
+    assert.ok(repl);
+    assert.ok(abandon);
+
+    const ui = scriptedSelect([undefined]);
+    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+
+    const result = await repl.execute(
+      "e-1",
+      { code: "write('escaped.txt', 'v1')", sessionId: "escape" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.match(result.content[0].text, /PermissionError/);
+    assert.equal(
+      existsSync(join(cwd, "escaped.txt")),
+      false,
+      "a dismissed dialog approved the call it never asked about",
+    );
+
+    // And it is a decision, not a deferral: nothing is left waiting.
+    const pending = await abandon.execute(
+      "e-2",
+      { sessionId: "escape" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(pending.content[0].text, /no pending approval/i);
+  });
+
+  it("a headless resume still denies, with no dialog to ask (M22's sibling)", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl);
+    assert.ok(resume);
+
+    const ui = scriptedSelect([LATER_CHOICE]);
+
+    await repl.execute(
+      "h-1",
+      { code: "write('headless-resume.txt', 'v1')", sessionId: "headless" },
+      undefined,
+      undefined,
+      { cwd, hasUI: true, ui: { select: ui.select } },
+    );
+
+    // Same session, now with nobody at the terminal. `hasUI === false`
+    // short-circuits before any dialog, on the resume path as on the run path.
+    const denied = await resume.execute("h-2", { sessionId: "headless" }, undefined, undefined, {
+      cwd,
+      hasUI: false,
+      ui: { select: ui.select },
+    });
+
+    assert.match(denied.content[0].text, /PermissionError/);
+    assert.equal(existsSync(join(cwd, "headless-resume.txt")), false);
+    assert.equal(ui.answered(), 1, "a headless resume opened a dialog");
   });
 });

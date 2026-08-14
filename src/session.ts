@@ -8,6 +8,7 @@ import type {
   RunOptions,
   ToolCallTrace,
   ApprovalRequest,
+  ApprovalDecision,
   DiscardedSuspension,
 } from "./types.js";
 
@@ -355,9 +356,10 @@ export class Session {
   /**
    * Resume execution after an approval-gate suspension.
    *
-   * Uses `runOpts.onApproval(suspendedCall)` to decide whether to
-   * approve or deny the suspended tool call. If no callback is
-   * provided, the call is denied.
+   * Uses `runOpts.onApproval(suspendedCall)` to decide the suspended tool
+   * call's fate. All three answers are honoured: approve, deny, and
+   * `"suspend"` — "not now", which leaves the suspension exactly where it was.
+   * If no callback is provided, the call is denied.
    *
    * On success the original code is appended to the snippet list.
    *
@@ -368,14 +370,25 @@ export class Session {
       throw new Error("No suspended execution to resume");
     }
 
-    // Resolve the decision for the suspended call
-    let decision: boolean;
+    // Resolve the decision for the suspended call. The type is
+    // `ApprovalDecision`, not `boolean`: narrowing here is what silently turned
+    // every "decide later" into a denial, one layer below the extension that
+    // was discarding it too (#51). Two layers each dropping the same value is
+    // why both had to widen for either to matter.
+    let decision: ApprovalDecision;
     if (runOpts?.onApproval) {
-      const d = await runOpts.onApproval(this.suspended.suspendedCall);
-      decision = d === true;
+      decision = await runOpts.onApproval(this.suspended.suspendedCall);
     } else {
       decision = false; // No callback → deny
     }
+
+    // "Decide later" is not a decision, so nothing happens: no grant, no
+    // snapshot restored, no state advanced. Answering it by round-tripping the
+    // snapshot through a fresh worker would be the same restore that #129 had
+    // to make faithful, run for a call that has not been decided — so the
+    // stored suspension is simply handed back, and the next `resume` asks
+    // again. `resumeSuspended` still handles this case for its own callers.
+    if (decision === "suspend") return this.suspended;
 
     // An approval here is the user answering the dialog for *this* call, so it
     // grants what any other approval grants — including the one use this call
