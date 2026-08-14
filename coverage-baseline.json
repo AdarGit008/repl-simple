@@ -1,5 +1,5 @@
 {
-  "global": 96.85,
+  "global": 97.18,
   "files": {
     "extensions/repl-extension.ts": 83.44,
     "src/bridge.ts": 100,
@@ -9,7 +9,7 @@
     "src/repl.ts": 92.19,
     "src/rlm_loop.ts": 98.34,
     "src/rlm_tools.ts": 99.07,
-    "src/rlm.ts": 94.35,
+    "src/rlm.ts": 95.71,
     "src/sandbox.ts": 97.09,
     "src/session.ts": 94.87,
     "src/submit_signal.ts": 100,

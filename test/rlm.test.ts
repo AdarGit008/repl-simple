@@ -586,3 +586,152 @@ describe("runRlm() — a run that hit a limit", () => {
     }
   });
 });
+
+// ── A SUBMIT that never resolved ────────────────────────────────
+
+describe("runRlm() — a SUBMIT call that failed to resolve", () => {
+  // The loop used to stop on *any* SUBMIT entry in the trace, `ok` unchecked.
+  // A malformed call is recorded `ok: false` and re-raised into Python as a
+  // TypeError, so a bad call from the model ended the run and handed back
+  // either the TypeError text or whatever the script evaluated to last —
+  // presented as the final answer, with no signal that it was not one (#71).
+  //
+  // The splat is load-bearing. #71's repro was the literal `SUBMIT("a",
+  // answer="b")`, which Monty 0.0.21 now rejects statically — `resolveToolArgs`
+  // is never reached, no trace entry is written, and the loop continues for a
+  // reason that has nothing to do with this fix. Written that way the test
+  // would pass against the unfixed code and guard nothing. `**{...}` is opaque
+  // to the checker, so resolution still happens at call time and the defective
+  // path is the one under test. Any future shape that reaches a host tool with
+  // arguments the checker did not vet lands here too.
+  const MALFORMED = 'SUBMIT("a", **{"answer": "b"})';
+
+  /** Registry with the three RLM tools. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "the sub-LLM said something",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("keeps iterating after a malformed SUBMIT and returns the real answer", async () => {
+    const { llm } = mockLlmCodeGen([
+      `\`\`\`python\n${MALFORMED}\n\`\`\``,
+      '```python\nSUBMIT("the real answer")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "the real answer");
+    assert.equal(result.iterations.length, 2, "the malformed call must not end the run");
+
+    // Iteration 0 recorded the SUBMIT — but as a failure.
+    const failed = result.iterations[0].result.calls.find((c) => c.tool === "SUBMIT");
+    assert.ok(failed);
+    assert.equal(failed.ok, false);
+  });
+
+  it("does not end the run when Python swallows the TypeError", async () => {
+    // The swallowed case is the dangerous one: the run reports `ok`, so the
+    // answer became the script's last expression value.
+    const { llm } = mockLlmCodeGen([
+      [
+        "```python",
+        "try:",
+        `    ${MALFORMED}`,
+        "except TypeError:",
+        "    pass",
+        '"GARBAGE"',
+        "```",
+      ].join("\n"),
+      '```python\nSUBMIT("the real answer")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "the real answer");
+    assert.doesNotMatch(result.answer, /GARBAGE/, "a stray expression value is not an answer");
+    assert.equal(result.iterations.length, 2);
+    assert.equal(
+      result.iterations[0].result.status,
+      "ok",
+      "Python caught the error, so the run is ok",
+    );
+  });
+
+  it("still ends the run on the first valid SUBMIT", async () => {
+    // Guards against over-correcting: requiring `ok` must not make a good
+    // SUBMIT invisible.
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT("done")\n```',
+      '```python\nSUBMIT("never reached")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "done");
+    assert.equal(result.iterations.length, 1);
+  });
+
+  it("does not treat some other tool's success as a submission", async () => {
+    // The other half of the predicate. `ok` alone is not the condition — every
+    // successful host-tool call carries it — and a guard that dropped the name
+    // check would end the run on the first `llm_query`, handing back whatever
+    // the script happened to evaluate to.
+    const { llm } = mockLlmCodeGen([
+      '```python\nanswer = llm_query("hi")\nprint(answer)\n```',
+      '```python\nSUBMIT("the real answer")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.answer, "the real answer");
+    assert.equal(result.iterations.length, 2, "a successful llm_query is not a submission");
+
+    const called = result.iterations[0].result.calls.find((c) => c.tool === "llm_query");
+    assert.ok(called, "the run has to reach the tool for this to be testing anything");
+    assert.equal(called.ok, true);
+  });
+
+  it("feeds the TypeError back so the next iteration can fix it", async () => {
+    // Continuing without telling the model why wastes the iteration it just
+    // bought.
+    const { llm } = mockLlmCodeGen([
+      `\`\`\`python\n${MALFORMED}\n\`\`\``,
+      '```python\nSUBMIT("the real answer")\n```',
+    ]);
+
+    await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    const feedback = llm
+      .calls()[1]
+      .messages.map((m) => m.content)
+      .join("\n");
+    assert.match(feedback, /got multiple values for argument 'answer'/, `got: ${feedback}`);
+  });
+});
