@@ -62,6 +62,13 @@ the pi process; `/repl-approvals strict` and restarting both put it back. Nothin
 without a UI, in either mode. `repl_reset` reports the current mode.
 See [docs/approval-grants.md](docs/approval-grants.md).
 
+Every approval dialog is **answerable and bounded**. The four `repl` tools declare
+`executionMode: "sequential"`, so two of them never run at once — two dialogs open together leaves
+the first one orphaned and pi with no way back. Escape dismisses a dialog and aborts the run rather
+than being swallowed, and a dialog nobody answers denies itself after five minutes.
+`REPL_APPROVAL_TIMEOUT_MS` changes that bound, and `0` removes it.
+See [#49](https://github.com/AdarGit008/repl-simple/issues/49).
+
 ## API
 
 ```typescript

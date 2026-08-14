@@ -31,14 +31,21 @@ export class ReplRunner {
    * Creates the session on first use. The `onApproval` callback is
    * wired to `RunOptions.onApproval` and handles gated tool calls
    * (bash, edit, write). Session auto-approves cached calls on replay.
+   *
+   * `signal` is the caller's abort — Pi's turn signal, when the caller is the
+   * extension. Passing it is what makes Escape mean something: Pi checks
+   * `signal.aborted` only *between* tool calls and never cancels one that is
+   * running, so a tool that ignores its signal is a tool the user cannot stop
+   * (#49). The sandbox honours it and returns an `aborted` result.
    */
   async run(
     code: string,
     sessionId = "default",
     onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
+    signal?: AbortSignal,
   ): Promise<string> {
     const session = await this.getOrCreateSession(sessionId);
-    const result = await session.run(code, { onApproval });
+    const result = await session.run(code, { onApproval, signal });
     return formatResult(result);
   }
 
@@ -49,17 +56,20 @@ export class ReplRunner {
    * execution suspends again (nested gated calls), returns a
    * suspended message so the LLM can call `repl_resume` again.
    *
+   * `signal` carries the same meaning as in `run`.
+   *
    * @throws If the session has no pending suspension.
    */
   async resume(
     sessionId: string,
     onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
+    signal?: AbortSignal,
   ): Promise<string> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       return `No session '${sessionId}' exists. Run some code first.`;
     }
-    const result = await session.resume({ onApproval });
+    const result = await session.resume({ onApproval, signal });
     return formatResult(result);
   }
 
