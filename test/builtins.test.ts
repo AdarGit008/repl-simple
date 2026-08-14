@@ -948,7 +948,17 @@ describe("http_get — timeout", () => {
   it("aborts a request that never answers", async () => {
     const hanging: typeof fetch = (_input, init) =>
       new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        // `AbortSignal.timeout`'s timer is unref'd, so it is not by itself a
+        // reason for the process to stay alive. A real hanging request holds an
+        // open socket, which is; a mock that touches nothing leaves the loop
+        // empty, and node 22's test runner then reports the still-pending
+        // promise instead of letting the deadline fire. This stands in for the
+        // socket.
+        const socket = setTimeout(() => {}, 5_000);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(socket);
+          reject(init.signal?.reason);
+        });
       });
     const tools = createBuiltinTools({
       root: "/tmp",
