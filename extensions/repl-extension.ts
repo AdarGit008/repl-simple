@@ -22,6 +22,41 @@ type ApprovalMode = "strict" | "yolo";
 
 const MODE_HELP = "Usage: /repl-approvals [strict|yolo]";
 
+// ── Dialog lifetime ──────────────────────────────────────────────
+
+/**
+ * Milliseconds an approval dialog stays open before it denies itself.
+ *
+ * This is not a UX preference, it is the last line of defence against a
+ * permanently wedged Pi (#49). `showExtensionSelector` overwrites
+ * `this.extensionSelector` without invoking the previous component's
+ * `onSelect`/`onCancel`, so a second dialog opened while a first is up leaves
+ * the first `await ctx.ui.confirm` unsettled forever — and on abort the agent
+ * loop still awaits every in-flight tool, which makes Escape a permanent no-op.
+ * The orphaned component's countdown keeps ticking, so a timeout is what
+ * eventually settles it.
+ *
+ * `executionMode: "sequential"` below is what should stop two dialogs from
+ * overlapping in the first place; this is what stops the failure being
+ * unrecoverable if anything else opens one anyway.
+ *
+ * Five minutes is long enough to read a `bash` command and decide, and the
+ * expiry denies, so the fail-closed posture is unchanged. Set
+ * `REPL_APPROVAL_TIMEOUT_MS` to change it, or to `0` to remove the bound.
+ */
+const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
+const APPROVAL_TIMEOUT_VAR = "REPL_APPROVAL_TIMEOUT_MS";
+
+/** The dialog timeout as it applies right now, or `undefined` for unbounded. */
+function approvalTimeoutMs(): number | undefined {
+  const raw = process.env[APPROVAL_TIMEOUT_VAR];
+  if (raw === undefined) return DEFAULT_APPROVAL_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  // An unparseable value is a typo, not a request to remove the bound.
+  if (!Number.isFinite(parsed)) return DEFAULT_APPROVAL_TIMEOUT_MS;
+  return parsed > 0 ? parsed : undefined;
+}
+
 /** Extension registration surface — the subset of pi's API this file uses. */
 interface ReplExtensionApi {
   registerTool: (tool: ReturnType<typeof defineTool>) => void;
@@ -60,11 +95,27 @@ export default function (pi: ReplExtensionApi) {
     return runner;
   }
 
-  /** Build an onApproval callback that uses Pi's native confirm dialog. */
-  function makeOnApproval(ctx: {
-    hasUI: boolean;
-    ui: { confirm: (title: string, message: string) => Promise<boolean> };
-  }): (req: ApprovalRequest) => Promise<ApprovalDecision> {
+  /**
+   * Build an onApproval callback that uses Pi's native confirm dialog.
+   *
+   * `signal` is the abort signal for the tool call the approval belongs to. It
+   * is handed to the dialog so that Escape dismisses it and the promise
+   * settles, rather than leaving a dialog nobody can answer and a tool nobody
+   * can stop (#49).
+   */
+  function makeOnApproval(
+    ctx: {
+      hasUI: boolean;
+      ui: {
+        confirm: (
+          title: string,
+          message: string,
+          opts?: { signal?: AbortSignal; timeout?: number },
+        ) => Promise<boolean>;
+      };
+    },
+    signal?: AbortSignal,
+  ): (req: ApprovalRequest) => Promise<ApprovalDecision> {
     return async (req: ApprovalRequest): Promise<ApprovalDecision> => {
       // Fail closed first, and before the mode is consulted. `yolo` is set by
       // a human at a terminal; a headless run has nobody who could have set
@@ -72,7 +123,13 @@ export default function (pi: ReplExtensionApi) {
       // way. This ordering is what `extension.test.ts` pins.
       if (!ctx.hasUI) return false;
       if (approvalMode === "yolo") return true;
-      const approved = await ctx.ui.confirm("Approve tool call?", `Allow ${req.description}?`);
+      // An already-aborted turn has nobody left to ask: opening a dialog here
+      // would put one on screen after the user has said stop.
+      if (signal?.aborted) return false;
+      const approved = await ctx.ui.confirm("Approve tool call?", `Allow ${req.description}?`, {
+        signal,
+        timeout: approvalTimeoutMs(),
+      });
       return approved;
     };
   }
@@ -111,10 +168,29 @@ export default function (pi: ReplExtensionApi) {
   });
 
   // ── repl ──────────────────────────────────────────────────
+  //
+  // Every tool below declares `executionMode: "sequential"`. `ToolDefinition`
+  // defaults to `parallel`, so two `repl` calls in one assistant message —
+  // which a model does whenever it wants two sessions, or simply retries —
+  // execute concurrently. Three consequences, each worse than the last (#49):
+  //
+  //  1. Two sessions is not what concurrency buys here. These four tools all
+  //     mutate one `ReplRunner` keyed by `sessionId`, and two calls on the
+  //     same session interleave into a state neither of them asked for
+  //     (`repl.ts` in-flight race, #59) — a `repl_reset` racing a `repl` being
+  //     the sharpest case.
+  //  2. Two approval dialogs at once wedges Pi. The second overwrites the
+  //     first without settling it (`showExtensionSelector`), and the agent
+  //     loop then awaits an in-flight tool that will never return, so Escape
+  //     stops working. See `DEFAULT_APPROVAL_TIMEOUT_MS` above.
+  //  3. Nothing is lost by serialising. A REPL call is a human-scale
+  //     interaction with a shared interpreter; there is no throughput here
+  //     that parallelism was buying.
 
   pi.registerTool(
     defineTool({
       name: "repl",
+      executionMode: "sequential",
       label: "Python REPL",
       description:
         "Execute Python code in a sandboxed environment with persistent sessions. " +
@@ -130,9 +206,14 @@ export default function (pi: ReplExtensionApi) {
           }),
         ),
       }),
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const r = getRunner(ctx.cwd);
-        const text = await r.run(params.code, params.sessionId ?? "default", makeOnApproval(ctx));
+        const text = await r.run(
+          params.code,
+          params.sessionId ?? "default",
+          makeOnApproval(ctx, signal),
+          signal,
+        );
         return { content: [{ type: "text" as const, text }], details: {} };
       },
     }),
@@ -143,6 +224,7 @@ export default function (pi: ReplExtensionApi) {
   pi.registerTool(
     defineTool({
       name: "repl_resume",
+      executionMode: "sequential",
       label: "Resume REPL",
       description:
         "Resume a suspended REPL session. Call after a tool requires " +
@@ -152,9 +234,13 @@ export default function (pi: ReplExtensionApi) {
           Type.String({ description: "Session to resume. Default: 'default'." }),
         ),
       }),
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const r = getRunner(ctx.cwd);
-        const text = await r.resume(params.sessionId ?? "default", makeOnApproval(ctx));
+        const text = await r.resume(
+          params.sessionId ?? "default",
+          makeOnApproval(ctx, signal),
+          signal,
+        );
         return { content: [{ type: "text" as const, text }], details: {} };
       },
     }),
@@ -165,6 +251,7 @@ export default function (pi: ReplExtensionApi) {
   pi.registerTool(
     defineTool({
       name: "repl_reset",
+      executionMode: "sequential",
       label: "Reset REPL session",
       description: "Clear all state (variables, imports, tool call cache) in a REPL session.",
       parameters: Type.Object({
@@ -200,6 +287,7 @@ export default function (pi: ReplExtensionApi) {
   pi.registerTool(
     defineTool({
       name: "repl_abandon",
+      executionMode: "sequential",
       label: "Abandon REPL suspension",
       description:
         "Discard a pending tool approval in a REPL session. The suspended " +

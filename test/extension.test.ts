@@ -333,6 +333,241 @@ describe("repl extension — approval mode", () => {
   });
 });
 
+// ── Concurrency and dialog lifetime (#49) ────────────────────────
+//
+// `ToolDefinition.executionMode` defaults to `parallel`, so two `repl` calls
+// in one assistant message run at the same time. Pi's dialog cannot survive
+// that: `showExtensionSelector` assigns `this.extensionSelector` before
+// disposing what was there, and `disposeActiveSelector()` only touches the
+// *built-in* selector slot — so the second dialog orphans the first without
+// invoking its `onSelect`/`onCancel`, and the first `await ctx.ui.confirm`
+// never resolves. Abort does not rescue it either: the agent loop still awaits
+// every in-flight tool, so Escape becomes a permanent no-op.
+//
+// The tests below drive the defect rather than the declaration — an assertion
+// that `executionMode` is set would pass against a dialog that still hangs.
+
+/** Deadline wrapper: turns "this never settled" into a failure, not a hang. */
+async function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} within ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Poll until `predicate` holds, or give up. */
+async function waitFor(predicate: () => boolean, ms: number, what: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`${what} within ${ms}ms`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+type DialogOpts = { signal?: AbortSignal; timeout?: number };
+
+/**
+ * A `ui.confirm` that reproduces the bug above: no user answer ever settles
+ * it, and opening a second one orphans the first. Only `opts.signal` and
+ * `opts.timeout` can settle a dialog here — which is exactly the property the
+ * real component has, and exactly why the extension passes both.
+ */
+function clobberingConfirm() {
+  const opened: DialogOpts[] = [];
+  const timers: NodeJS.Timeout[] = [];
+
+  const confirm = (_title: string, _message: string, opts?: DialogOpts): Promise<boolean> => {
+    opened.push({ signal: opts?.signal, timeout: opts?.timeout });
+    return new Promise<boolean>((resolve) => {
+      if (opts?.signal?.aborted) {
+        resolve(false);
+        return;
+      }
+      opts?.signal?.addEventListener("abort", () => resolve(false), { once: true });
+      if (opts?.timeout && opts.timeout > 0) {
+        timers.push(setTimeout(() => resolve(false), opts.timeout));
+      }
+    });
+  };
+
+  const dispose = () => {
+    for (const t of timers) clearTimeout(t);
+  };
+
+  return { opened, confirm, dispose };
+}
+
+describe("repl extension — a dialog always settles (#49)", () => {
+  let cwd: string;
+  let priorTimeout: string | undefined;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-hang-"));
+    priorTimeout = process.env.REPL_APPROVAL_TIMEOUT_MS;
+  });
+
+  after(() => {
+    if (priorTimeout === undefined) delete process.env.REPL_APPROVAL_TIMEOUT_MS;
+    else process.env.REPL_APPROVAL_TIMEOUT_MS = priorTimeout;
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("declares executionMode sequential on all four tools", async () => {
+    // Cheap guard against someone removing it later without understanding
+    // why it is there. The three tests below are the reason.
+    for (const tool of await loadTools()) {
+      assert.equal(
+        (tool as unknown as { executionMode?: string }).executionMode,
+        "sequential",
+        `${tool.name} would run concurrently with other tool calls`,
+      );
+    }
+  });
+
+  it("bounds the dialog by default, without being asked to", async () => {
+    delete process.env.REPL_APPROVAL_TIMEOUT_MS;
+
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+    const ui = clobberingConfirm();
+    const controller = new AbortController();
+
+    // What is asserted is the bound the dialog was opened with — waiting the
+    // real default out would take five minutes — so the call is abandoned
+    // through its signal rather than left dangling and holding a worker.
+    const pending = repl.execute(
+      "d-1",
+      { code: "write('default.txt', 'x')", sessionId: "hang-default" },
+      controller.signal,
+      undefined,
+      { cwd, hasUI: true, ui: { confirm: ui.confirm } },
+    );
+
+    await waitFor(() => ui.opened.length === 1, 15_000, "no dialog opened");
+    assert.equal(ui.opened[0].timeout, 300_000, "the dialog was opened unbounded");
+
+    controller.abort();
+    await withDeadline(pending, 15_000, "the abandoned repl call never returned");
+    ui.dispose();
+  });
+
+  it("settles on the dialog timeout, denying", async () => {
+    process.env.REPL_APPROVAL_TIMEOUT_MS = "200";
+
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+    const ui = clobberingConfirm();
+
+    const result = await withDeadline(
+      repl.execute(
+        "t-1",
+        { code: "write('timeout.txt', 'x')", sessionId: "hang-timeout" },
+        undefined,
+        undefined,
+        { cwd, hasUI: true, ui: { confirm: ui.confirm } },
+      ),
+      15_000,
+      "the repl call never returned",
+    );
+
+    assert.equal(ui.opened[0]?.timeout, 200);
+    assert.match(result.content[0].text, /PermissionError/);
+    assert.equal(
+      existsSync(join(cwd, "timeout.txt")),
+      false,
+      "an expired dialog approved the write it never asked about",
+    );
+
+    ui.dispose();
+  });
+
+  it("settles on abort, so Escape is not a no-op", async () => {
+    // Unbounded on purpose: with no timeout, the signal is the only thing
+    // that can settle this dialog, which is what the test is for.
+    process.env.REPL_APPROVAL_TIMEOUT_MS = "0";
+
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+    const ui = clobberingConfirm();
+    const controller = new AbortController();
+
+    const pending = repl.execute(
+      "a-1",
+      { code: "write('abort.txt', 'x')", sessionId: "hang-abort" },
+      controller.signal,
+      undefined,
+      { cwd, hasUI: true, ui: { confirm: ui.confirm } },
+    );
+
+    await waitFor(() => ui.opened.length === 1, 15_000, "no dialog opened");
+    assert.equal(ui.opened[0].timeout, undefined, "the timeout was not opted out of");
+    assert.ok(ui.opened[0].signal, "the dialog was opened without a signal");
+
+    controller.abort();
+
+    const result = await withDeadline(pending, 15_000, "the aborted repl call never returned");
+
+    // Either shape is a settled promise with a decision in it: the denial
+    // reaches the sandbox, or the abort cuts the run off first.
+    assert.match(result.content[0].text, /PermissionError|aborted/);
+    assert.equal(
+      existsSync(join(cwd, "abort.txt")),
+      false,
+      "an aborted call wrote the file it was asking permission for",
+    );
+
+    ui.dispose();
+  });
+
+  it("settles both calls when two dialogs are open at once", async () => {
+    // The defect itself. Two gated calls, concurrent, on the clobbering
+    // dialog: the first is orphaned the moment the second opens, and only the
+    // timeout can settle it.
+    process.env.REPL_APPROVAL_TIMEOUT_MS = "200";
+
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+    const ui = clobberingConfirm();
+    const ctx = { cwd, hasUI: true, ui: { confirm: ui.confirm } };
+
+    const results = await withDeadline(
+      Promise.all([
+        repl.execute(
+          "p-1",
+          { code: "write('par-a.txt', 'x')", sessionId: "hang-par-a" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+        repl.execute(
+          "p-2",
+          { code: "write('par-b.txt', 'x')", sessionId: "hang-par-b" },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      ]),
+      30_000,
+      "a concurrent repl call was left dangling",
+    );
+
+    assert.equal(results.length, 2);
+    for (const r of results) {
+      assert.match(r.content[0].text, /PermissionError/);
+    }
+    assert.equal(ui.opened.length, 2, "both calls should have asked");
+
+    ui.dispose();
+  });
+});
+
 // ── repl_reset surfaces the approval state (#44) ─────────────────
 
 describe("repl extension — repl_reset reports approvals", () => {
