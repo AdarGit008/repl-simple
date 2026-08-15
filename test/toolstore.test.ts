@@ -11,7 +11,13 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createToolStoreTools, loadSavedTools, type ToolStoreOptions } from "../src/toolstore.js";
+import {
+  createToolStoreTools,
+  loadSavedTools,
+  savedToolNames,
+  DEFAULT_PREAMBLE_LIMITS,
+  type ToolStoreOptions,
+} from "../src/toolstore.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
 
@@ -38,6 +44,24 @@ function makeTools(root: string): { tools: HostTool[]; opts: ToolStoreOptions } 
   const opts: ToolStoreOptions = { root };
   const tools = createToolStoreTools(opts);
   return { tools, opts };
+}
+
+/** Where `opts` puts saved tools — the default the loader also computes. */
+function toolsDirOf(opts: ToolStoreOptions): string {
+  return opts.toolsDir ?? join(opts.root, ".pi", "code-tools");
+}
+
+/**
+ * Put a tool on disk directly, bypassing `save_tool`.
+ *
+ * The limit tests need exact byte counts and dozens of files; going through
+ * `save_tool` would add a header of its own to every one of them and make the
+ * arithmetic a second implementation of the thing under test.
+ */
+function writeSavedTool(opts: ToolStoreOptions, name: string, source: string): void {
+  const dir = toolsDirOf(opts);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.py`), source);
 }
 
 // ── Structure ──────────────────────────────────────────────────
@@ -402,10 +426,12 @@ describe("loadSavedTools", () => {
         description: "Multiply two numbers",
       });
 
-      const preamble = await loadSavedTools(opts);
+      const { preamble, loaded, skipped } = await loadSavedTools(opts);
       assert.ok(preamble.includes("def add(a, b):"));
       assert.ok(preamble.includes("def mul(a, b):"));
       assert.ok(preamble.includes("Loaded tools"));
+      assert.deepEqual(loaded, ["add", "mul"]);
+      assert.deepEqual(skipped, []);
     } finally {
       cleanup();
     }
@@ -415,8 +441,7 @@ describe("loadSavedTools", () => {
     const root = makeTempDir();
     try {
       const { opts } = makeTools(root);
-      const preamble = await loadSavedTools(opts);
-      assert.equal(preamble, "");
+      assert.deepEqual(await loadSavedTools(opts), { preamble: "", loaded: [], skipped: [] });
     } finally {
       cleanup();
     }
@@ -426,8 +451,135 @@ describe("loadSavedTools", () => {
     const root = makeTempDir();
     try {
       // Don't create any tools — raw directory
-      const preamble = await loadSavedTools({ root });
-      assert.equal(preamble, "");
+      assert.deepEqual(await loadSavedTools({ root }), { preamble: "", loaded: [], skipped: [] });
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── savedToolNames ─────────────────────────────────────────────
+
+/**
+ * The half of the toolstore an untrusted project may use: names, no content.
+ *
+ * `ReplRunner` needs the names to tell the model what it withheld (#53), and
+ * reading a directory listing is not reading — still less executing — the file
+ * the listing names.
+ */
+describe("savedToolNames", () => {
+  it("lists the saved tools in load order without reading them", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "zebra", "def zebra():\n    return 1\n");
+      writeSavedTool(opts, "alpha", "def alpha():\n    return 2\n");
+      // Not a tool: the loader only ever runs `.py`.
+      writeFileSync(join(toolsDirOf(opts), "notes.md"), "# not python\n");
+
+      assert.deepEqual(await savedToolNames(opts), ["alpha", "zebra"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns [] when the directory does not exist", async () => {
+    const root = makeTempDir();
+    try {
+      assert.deepEqual(await savedToolNames({ root }), []);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── Preamble limits ────────────────────────────────────────────
+
+/**
+ * A resource control, not a security control (#53). Trust decides whether the
+ * saved code runs at all; these decide how much of it may be prepended to
+ * every single run, and they apply to a trusted project too.
+ */
+describe("loadSavedTools — preamble limits", () => {
+  it("loads up to maxFiles in name order and reports the rest", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      for (const name of ["a", "b", "c", "d"]) {
+        writeSavedTool(opts, name, `def ${name}():\n    return "${name}"\n`);
+      }
+
+      const { preamble, loaded, skipped } = await loadSavedTools(opts, {
+        maxFiles: 2,
+        maxBytes: 1024 * 1024,
+      });
+
+      assert.deepEqual(loaded, ["a", "b"]);
+      assert.deepEqual(skipped, ["c", "d"]);
+      assert.ok(preamble.includes("def a():"));
+      assert.ok(!preamble.includes("def c():"), "a capped file was loaded anyway");
+      // A human reading the transcript sees the same thing the model is told.
+      assert.ok(preamble.includes("c, d"), "the header must name what was dropped");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("skips a file whole rather than truncating it past maxBytes", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      const big = `def big():\n    return "${"x".repeat(400)}"\n`;
+      writeSavedTool(opts, "a_big", big);
+      writeSavedTool(opts, "b_small", "def small():\n    return 1\n");
+
+      const { preamble, loaded, skipped } = await loadSavedTools(opts, {
+        maxFiles: 100,
+        maxBytes: Buffer.byteLength(big) + 10,
+      });
+
+      assert.deepEqual(loaded, ["a_big"]);
+      assert.deepEqual(skipped, ["b_small"]);
+      // Half a Python file is a SyntaxError that takes every earlier tool with
+      // it, so the cap drops files, never bytes.
+      assert.ok(preamble.includes(`"${"x".repeat(400)}"`), "a loaded file was truncated");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reports the skips even when nothing fits at all", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "only", "def only():\n    return 1\n");
+
+      const { preamble, loaded, skipped } = await loadSavedTools(opts, {
+        maxFiles: 100,
+        maxBytes: 1,
+      });
+
+      assert.equal(preamble, "", "an empty preamble must not carry a header");
+      assert.deepEqual(loaded, []);
+      assert.deepEqual(skipped, ["only"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("defaults to DEFAULT_PREAMBLE_LIMITS", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      for (let i = 0; i <= DEFAULT_PREAMBLE_LIMITS.maxFiles; i++) {
+        const name = `t${String(i).padStart(3, "0")}`;
+        writeSavedTool(opts, name, `def ${name}():\n    return ${i}\n`);
+      }
+
+      const { loaded, skipped } = await loadSavedTools(opts);
+
+      assert.equal(loaded.length, DEFAULT_PREAMBLE_LIMITS.maxFiles);
+      assert.deepEqual(skipped, [`t${String(DEFAULT_PREAMBLE_LIMITS.maxFiles).padStart(3, "0")}`]);
     } finally {
       cleanup();
     }
@@ -451,7 +603,7 @@ describe("toolstore — sandbox integration", () => {
       });
 
       // Load as preamble
-      const preamble = await loadSavedTools(opts);
+      const { preamble } = await loadSavedTools(opts);
       assert.ok(preamble.includes("def square(x):"));
 
       // The preamble can be injected into sandbox code
@@ -475,7 +627,7 @@ describe("toolstore — sandbox integration", () => {
         description: "Add two numbers",
       });
 
-      const preamble = await loadSavedTools(opts);
+      const { preamble } = await loadSavedTools(opts);
       const code = `${preamble}\nresult = add(3, 4)\nSUBMIT(str(result))`;
 
       // Run in real sandbox

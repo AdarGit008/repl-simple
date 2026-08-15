@@ -50,6 +50,15 @@ link-local destinations are refused on every redirect hop. See
 
 **Tool store:** `save_tool`, `delete_tool`, `list_saved_tools`, `read_tool`
 
+Saved tools are `.py` files under `.pi/code-tools`, and they execute before your code on every `repl`
+call. Because `.pi/` travels with a clone, that used to mean cloning a repository and asking one
+question was enough to run its author's Python. They are now loaded **only in a project you have
+trusted in pi** — an untrusted project's files are never even read, the session works without them,
+and the model is told by name what was withheld so it does not call one and get a bare `NameError`.
+Trusted or not, the preamble is capped at 32 files and 64 KiB, and revoking trust stops the code
+running rather than waiting for the next session.
+See [docs/project-trust.md](docs/project-trust.md).
+
 ### Approvals
 
 `bash`, `edit` and `write` ask before they run, and an approval covers **one execution**. The same
@@ -108,6 +117,8 @@ import {
   createRLMTools,
   createToolStoreTools,
   loadSavedTools,
+  savedToolNames,
+  DEFAULT_PREAMBLE_LIMITS,
   // Types
   HostToolError,
   SubmitSignal,

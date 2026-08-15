@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
@@ -653,5 +653,244 @@ describe("ReplRunner — a suspension does not outlive its call (#129)", () => {
   it("a run with nothing pending is not decorated", async () => {
     const out = await runner.run("1 + 1", "quiet");
     assert.doesNotMatch(out, /discarded/i);
+  });
+});
+
+// ── The preamble is gated on project trust (#53) ─────────────────
+
+/**
+ * `.pi/code-tools/*.py` is concatenated and executed before user code on every
+ * run, with full host-tool access and no approval — and `.pi/` travels with a
+ * clone. Cloning a hostile repository and asking anything that reaches `repl`
+ * was therefore enough to run its author's code, silently.
+ *
+ * The tests below assert on the **side effect the hostile file attempts**, not
+ * on the absence of an error: a preamble that failed to load for an unrelated
+ * reason would pass a weaker test while leaving the hole open.
+ *
+ * See `docs/project-trust.md` for the model and for what a trust change does.
+ */
+
+/** Write a saved tool into `<cwd>/.pi/code-tools`, as `save_tool` would. */
+function saveToolFile(cwd: string, name: string, source: string): void {
+  const dir = join(cwd, ".pi", "code-tools");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${name}.py`), source);
+}
+
+/** A preamble whose whole purpose is a side effect the test can see. */
+const HOSTILE = "write('pwned.txt', 'owned')\n";
+
+describe("ReplRunner — an untrusted project's preamble does not run (#53)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    saveToolFile(cwd, "hostile", HOSTILE);
+  });
+
+  after(cleanup);
+
+  it("does not execute it, does not ask, and still runs the user's code", async () => {
+    // No options: an embedder that has no trust decision to offer has not made
+    // one, and the default has to be the safe answer.
+    const runner = new ReplRunner(cwd);
+
+    const prompts: string[] = [];
+    const out = await runner.run("1 + 1", "untrusted", async (req) => {
+      prompts.push(req.tool);
+      return true;
+    });
+
+    assert.equal(
+      existsSync(join(cwd, "pwned.txt")),
+      false,
+      "the hostile preamble executed in an untrusted project",
+    );
+    assert.deepEqual(prompts, [], "the hostile preamble reached the approval gate");
+    assert.match(out, /\[result\]\n2/, "withholding the preamble broke the session");
+  });
+
+  it("tells the model what was withheld, once", async () => {
+    const runner = new ReplRunner(cwd);
+
+    // Without this the tools are still on disk and still listed by
+    // list_saved_tools, so the model calls one and gets a bare NameError.
+    const first = await runner.run("1 + 1", "told");
+    assert.match(first, /^\[preamble withheld\]/);
+    assert.match(first, /hostile/, "the notice must name what is missing");
+    assert.match(first, /NameError/, "the notice must say what calling one will do");
+
+    // News, not a banner: repeating it on every result would train the model
+    // to skip the line that matters.
+    const second = await runner.run("2 + 2", "told");
+    assert.doesNotMatch(second, /preamble withheld/);
+  });
+});
+
+describe("ReplRunner — a trusted project's preamble runs (#53)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    saveToolFile(cwd, "adder", "def add_two(a, b):\n    return a + b\n");
+    saveToolFile(cwd, "hostile", HOSTILE);
+  });
+
+  after(cleanup);
+
+  it("loads the saved tools and makes them callable", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const out = await runner.run("add_two(2, 3)", "trusted", approve);
+
+    assert.match(out, /\[result\]\n5/, "a saved tool was not callable in a trusted project");
+    assert.doesNotMatch(out, /preamble withheld/);
+  });
+
+  it("runs the same file the untrusted project refused", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const prompts: string[] = [];
+    await runner.run("1 + 1", "trusted-side-effect", async (req) => {
+      prompts.push(req.tool);
+      return true;
+    });
+
+    // The mirror of the test above: same file, same runner, opposite decision.
+    // Trust is the only variable, which is what makes the pair evidence.
+    assert.deepEqual(prompts, ["write"]);
+    assert.equal(readFileSync(join(cwd, "pwned.txt"), "utf8"), "owned");
+  });
+});
+
+describe("ReplRunner — the preamble is capped, trusted or not (#53)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    // One past DEFAULT_PREAMBLE_LIMITS.maxFiles (32). Sorted load order makes
+    // t32 the one that does not fit.
+    for (let i = 0; i <= 32; i++) {
+      const name = `t${String(i).padStart(2, "0")}`;
+      saveToolFile(cwd, name, `def ${name}():\n    return ${i}\n`);
+    }
+  });
+
+  after(cleanup);
+
+  it("loads up to the file cap and says which tools it dropped", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const out = await runner.run("t00()", "capped", approve);
+
+    assert.match(out, /^\[preamble truncated\]/);
+    assert.match(out, /t32/, "the notice must name the tool that is missing");
+    assert.match(out, /\[result\]\n0/, "the tools under the cap must still load");
+
+    // The cap is a real cap, not a warning: t32 is not defined.
+    const missing = await runner.run("t32()", "capped", approve);
+    assert.match(missing, /\[error:/);
+  });
+});
+
+describe("ReplRunner — revoking trust stops the preamble (#53)", () => {
+  let cwd: string;
+  let trusted: boolean;
+  let runner: ReplRunner;
+
+  before(() => {
+    cwd = makeTempDir();
+    saveToolFile(cwd, "hostile", HOSTILE);
+    trusted = true;
+    runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+  });
+
+  after(cleanup);
+
+  it("stops executing a withdrawn preamble, and says what that cost", async () => {
+    const prompts: string[] = [];
+    const ask = async (req: { tool: string }) => {
+      prompts.push(req.tool);
+      return true;
+    };
+
+    await runner.run("x = 1\nx", "revoke", ask);
+    assert.equal(readFileSync(join(cwd, "pwned.txt"), "utf8"), "owned");
+    assert.deepEqual(prompts, ["write"]);
+
+    rmSync(join(cwd, "pwned.txt"));
+    trusted = false;
+
+    const after = await runner.run("2 + 2", "revoke", ask);
+
+    // The preamble is prepended to every run, not loaded once, so revocation
+    // that only applied to sessions not yet created would apply to nothing.
+    assert.equal(
+      existsSync(join(cwd, "pwned.txt")),
+      false,
+      "the withdrawn preamble ran again after trust was revoked",
+    );
+    assert.deepEqual(prompts, ["write"], "the withdrawn preamble reached the approval gate");
+    assert.match(after, /^\[trust changed\]/);
+    assert.match(after, /\[result\]\n4/);
+
+    // What the rebuild cost, stated rather than discovered later.
+    assert.match(after, /variables/);
+    const gone = await runner.run("x", "revoke");
+    assert.match(gone, /\[error:/, "the rebuilt session kept the old state");
+  });
+});
+
+describe("ReplRunner — a trust change does not resume under the old one (#53)", () => {
+  let cwd: string;
+  let trusted: boolean;
+  let runner: ReplRunner;
+
+  before(() => {
+    cwd = makeTempDir();
+    // Benign, so the only approval in flight is the one the test asks for.
+    saveToolFile(cwd, "marker", "def marker():\n    return 'loaded'\n");
+    trusted = true;
+    runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+  });
+
+  after(cleanup);
+
+  it("drops a pending approval rather than answering it under a new decision", async () => {
+    const pending = await runner.run("write('suspended.txt', 'v1')", "revoke-suspended", suspend);
+    assert.match(pending, /requires approval/);
+
+    trusted = false;
+    const out = await runner.resume("revoke-suspended", approve);
+
+    assert.match(out, /^\[trust changed\]/);
+    assert.match(out, /never executed/, "a dropped approval must say the call did not run");
+    assert.equal(
+      existsSync(join(cwd, "suspended.txt")),
+      false,
+      "resuming ran the call under a decision that no longer applies",
+    );
+  });
+
+  it("costs nothing when the decision changes nothing", async () => {
+    // A project with no saved tools has the same empty preamble either way, so
+    // trusting it mid-session must not wipe the session to prove a point.
+    // Its own directory, and not through makeTempDir: that helper owns the
+    // module-level handle this suite's `after(cleanup)` deletes.
+    const bare = mkdtempSync(join(tmpdir(), "repl-test-bare-"));
+    let bareTrust = false;
+    const bareRunner = new ReplRunner(bare, { isProjectTrusted: () => bareTrust });
+
+    try {
+      await bareRunner.run("y = 7", "bare");
+      bareTrust = true;
+      const out = await bareRunner.run("y", "bare");
+
+      assert.doesNotMatch(out, /trust changed/);
+      assert.match(out, /\[result\]\n7/, "an inert trust change wiped the session");
+    } finally {
+      rmSync(bare, { recursive: true, force: true });
+    }
   });
 });

@@ -189,18 +189,68 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   return [saveTool, deleteTool, listSavedTools, readTool];
 }
 
-// ── loadSavedTools ────────────────────────────────────────────────
+// ── Preamble limits ───────────────────────────────────────────────
 
 /**
- * Load all saved tools as a Python code preamble.
+ * Caps on how much saved code may be prepended to a run.
  *
- * Reads every `.py` file in the tools directory and returns their
- * concatenated content. Use this as the preamble in sandbox execution
- * to make saved tools available to user code.
+ * These are a **resource control, not a security control** — the security
+ * gate is project trust, applied by the caller (`ReplRunner`, #53). A trusted
+ * project is not thereby entitled to inject a megabyte of Python before every
+ * single run: the preamble is re-executed on each `run()`, so its cost is paid
+ * per call, by Monty's parser and type checker, on the user's latency.
  *
- * Returns "" if the directory doesn't exist or has no `.py` files.
+ * Both apply in trusted and untrusted projects alike, because a cap that only
+ * held for code that never runs would be no cap at all.
  */
-export async function loadSavedTools(options: ToolStoreOptions): Promise<string> {
+export interface PreambleLimits {
+  /** Most `.py` files to load, in sorted order. */
+  maxFiles: number;
+  /** Most bytes of tool source to load, summed across files. */
+  maxBytes: number;
+}
+
+/**
+ * 32 files and 64 KiB.
+ *
+ * Sized against what the toolstore is for — a handful of small helpers the
+ * agent saved — rather than against what a disk can hold. A project that hits
+ * either number is not using saved tools, it is using the preamble as a
+ * module system, and the honest failure is to say so on the result.
+ */
+export const DEFAULT_PREAMBLE_LIMITS: PreambleLimits = {
+  maxFiles: 32,
+  maxBytes: 64 * 1024,
+};
+
+/** The outcome of loading saved tools: what ran, and what did not. */
+export interface SavedToolsPreamble {
+  /** Python source to prepend to user code. `""` when nothing loaded. */
+  preamble: string;
+  /** Tool names in the preamble, in load order. */
+  loaded: string[];
+  /**
+   * Tool names present on disk but left out because a limit was reached.
+   *
+   * Non-empty means the caller **must tell the model**: a tool that is on
+   * disk, listed by `list_saved_tools` and absent from the interpreter is a
+   * `NameError` the model has no way to explain.
+   */
+  skipped: string[];
+}
+
+// ── savedToolNames ────────────────────────────────────────────────
+
+/**
+ * Names of the saved tools on disk, without reading any of their code.
+ *
+ * This is the untrusted-project path (#53): the names are needed to tell the
+ * model what was withheld, and reading a directory listing is not reading —
+ * still less executing — the hostile file the listing names.
+ *
+ * Returns `[]` when the directory does not exist.
+ */
+export async function savedToolNames(options: ToolStoreOptions): Promise<string[]> {
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
@@ -208,23 +258,78 @@ export async function loadSavedTools(options: ToolStoreOptions): Promise<string>
   try {
     entries = await readdir(toolsDir);
   } catch {
-    return ""; // Directory doesn't exist — no tools to load
+    return []; // Directory doesn't exist — no tools to name
   }
 
-  const pyFiles = entries.filter((e) => extname(e) === ".py").sort();
+  return entries
+    .filter((e) => extname(e) === ".py")
+    .map((e) => e.slice(0, -3))
+    .sort();
+}
 
-  if (pyFiles.length === 0) return "";
+// ── loadSavedTools ────────────────────────────────────────────────
 
-  const parts: string[] = [
+/**
+ * Load saved tools as a Python code preamble.
+ *
+ * Reads the `.py` files in the tools directory, in name order, up to
+ * {@link PreambleLimits}, and returns their concatenated content.
+ *
+ * **This returns code that will execute with full host-tool access.** Call it
+ * only for a project whose code the user has agreed to run — see
+ * `docs/project-trust.md`. `savedToolNames` is the safe half of this function
+ * for callers that only need to know what is there.
+ */
+export async function loadSavedTools(
+  options: ToolStoreOptions,
+  limits: PreambleLimits = DEFAULT_PREAMBLE_LIMITS,
+): Promise<SavedToolsPreamble> {
+  const root = resolve(options.root);
+  const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
+
+  const names = await savedToolNames({ root, toolsDir });
+  if (names.length === 0) return { preamble: "", loaded: [], skipped: [] };
+
+  const loaded: string[] = [];
+  const skipped: string[] = [];
+  const sources: string[] = [];
+  let bytes = 0;
+
+  for (const name of names) {
+    if (loaded.length >= limits.maxFiles) {
+      skipped.push(name);
+      continue;
+    }
+
+    const content = await readFile(join(toolsDir, `${name}.py`), "utf-8");
+    const size = Buffer.byteLength(content, "utf-8");
+
+    // Skipped whole, never truncated: half a Python file is a SyntaxError,
+    // and a SyntaxError in the preamble takes every later tool down with it.
+    if (bytes + size > limits.maxBytes) {
+      skipped.push(name);
+      continue;
+    }
+
+    bytes += size;
+    loaded.push(name);
+    sources.push(content);
+  }
+
+  if (loaded.length === 0) return { preamble: "", loaded: [], skipped };
+
+  const header = [
     "# ── Loaded tools ──",
-    `# ${pyFiles.length} tool(s) from ${toolsDir}`,
+    `# ${loaded.length} tool(s) from ${toolsDir}`,
+    ...(skipped.length > 0
+      ? [`# ${skipped.length} not loaded — preamble limit reached: ${skipped.join(", ")}`]
+      : []),
     "",
   ];
 
-  for (const file of pyFiles) {
-    const content = await readFile(join(toolsDir, file), "utf-8");
-    parts.push(content, "");
-  }
-
-  return parts.join("\n");
+  return {
+    preamble: [...header, ...sources.flatMap((s) => [s, ""])].join("\n"),
+    loaded,
+    skipped,
+  };
 }

@@ -106,8 +106,21 @@ export default function (pi: ReplExtensionApi) {
   // ctx.cwd is only available inside execute(), not at module load.
   let runner: ReplRunner | null = null;
 
-  function getRunner(cwd: string): ReplRunner {
-    if (!runner) runner = new ReplRunner(cwd);
+  /**
+   * Pi's project-trust decision, as of the most recent tool call.
+   *
+   * The runner reads it through a closure rather than receiving a boolean,
+   * because the runner outlives the `ctx` that built it and the decision can
+   * change while pi runs — trusting a project mid-session, or withdrawing it,
+   * has to reach the next `repl` call (#53). Refreshed on the way in below;
+   * `false` until a real `ctx` has been seen, which is the same fail-closed
+   * default `ReplRunner` applies for callers that pass nothing.
+   */
+  let projectTrusted = false;
+
+  function getRunner(ctx: { cwd: string; isProjectTrusted(): boolean }): ReplRunner {
+    projectTrusted = ctx.isProjectTrusted();
+    if (!runner) runner = new ReplRunner(ctx.cwd, { isProjectTrusted: () => projectTrusted });
     return runner;
   }
 
@@ -242,7 +255,7 @@ export default function (pi: ReplExtensionApi) {
         ),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const r = getRunner(ctx.cwd);
+        const r = getRunner(ctx);
         const text = await r.run(
           params.code,
           params.sessionId ?? "default",
@@ -272,7 +285,7 @@ export default function (pi: ReplExtensionApi) {
         ),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const r = getRunner(ctx.cwd);
+        const r = getRunner(ctx);
         const text = await r.resume(
           params.sessionId ?? "default",
           makeOnApproval(ctx, signal),
@@ -298,7 +311,7 @@ export default function (pi: ReplExtensionApi) {
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const sessionId = params.sessionId ?? "default";
-        const { existed, revoked } = getRunner(ctx.cwd).reset(sessionId);
+        const { existed, revoked } = getRunner(ctx).reset(sessionId);
 
         // State the approval posture on the way out. A reset is the moment
         // someone is asking what this session is still holding, and "which
@@ -347,7 +360,7 @@ export default function (pi: ReplExtensionApi) {
         ),
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const r = getRunner(ctx.cwd);
+        const r = getRunner(ctx);
         const sessionId = params.sessionId ?? "default";
 
         // Three states, three sentences. "No pending suspension" for a

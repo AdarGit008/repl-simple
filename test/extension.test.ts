@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE } from "../extensions/repl-extension.js";
@@ -162,6 +162,7 @@ describe("repl extension — headless approval", () => {
       calls,
       ctx: {
         cwd,
+        isProjectTrusted: () => true,
         hasUI,
         ui: {
           select: async () => {
@@ -286,6 +287,7 @@ describe("repl extension — approval mode", () => {
     const dialogs = { count: 0 };
     const ctx = {
       cwd,
+      isProjectTrusted: () => true,
       hasUI: true,
       ui: {
         select: async () => {
@@ -322,7 +324,12 @@ describe("repl extension — approval mode", () => {
       { code: "write('headless-yolo.txt', 'x')" },
       undefined,
       undefined,
-      { cwd, hasUI: false, ui: { select: async () => APPROVE_CHOICE } },
+      {
+        cwd,
+        isProjectTrusted: () => true,
+        hasUI: false,
+        ui: { select: async () => APPROVE_CHOICE },
+      },
     );
 
     assert.equal(
@@ -457,7 +464,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
       { code: "write('default.txt', 'x')", sessionId: "hang-default" },
       controller.signal,
       undefined,
-      { cwd, hasUI: true, ui: { select: ui.select } },
+      { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } },
     );
 
     await waitFor(() => ui.opened.length === 1, 15_000, "no dialog opened");
@@ -481,7 +488,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
         { code: "write('timeout.txt', 'x')", sessionId: "hang-timeout" },
         undefined,
         undefined,
-        { cwd, hasUI: true, ui: { select: ui.select } },
+        { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } },
       ),
       15_000,
       "the repl call never returned",
@@ -513,7 +520,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
       { code: "write('abort.txt', 'x')", sessionId: "hang-abort" },
       controller.signal,
       undefined,
-      { cwd, hasUI: true, ui: { select: ui.select } },
+      { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } },
     );
 
     await waitFor(() => ui.opened.length === 1, 15_000, "no dialog opened");
@@ -545,7 +552,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
     const ui = clobberingSelect();
-    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+    const ctx = { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } };
 
     const results = await withDeadline(
       Promise.all([
@@ -591,7 +598,12 @@ describe("repl extension — repl_reset reports approvals", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  const ctx = () => ({ cwd, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
+  const ctx = () => ({
+    cwd,
+    isProjectTrusted: () => true,
+    hasUI: true,
+    ui: { select: async () => APPROVE_CHOICE },
+  });
 
   it("names the mode and says nothing is outstanding", async () => {
     const { tools } = await load();
@@ -655,7 +667,12 @@ describe("repl extension — repl_abandon distinguishes its empty states", () =>
     assert.ok(repl);
     assert.ok(abandon);
 
-    const ctx = () => ({ cwd, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
+    const ctx = () => ({
+      cwd,
+      isProjectTrusted: () => true,
+      hasUI: true,
+      ui: { select: async () => APPROVE_CHOICE },
+    });
 
     const unknown = await abandon.execute(
       "a-1",
@@ -729,7 +746,7 @@ describe("repl extension — suspension is reachable (#51)", () => {
       { code: "write('offered.txt', 'x')", sessionId: "offered" },
       undefined,
       undefined,
-      { cwd, hasUI: true, ui: { select: ui.select } },
+      { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } },
     );
 
     assert.equal(ui.opened.length, 1);
@@ -755,7 +772,7 @@ describe("repl extension — suspension is reachable (#51)", () => {
     // to survive `Session.resume` too, not only `makeOnApproval` — and approve
     // at the third.
     const ui = scriptedSelect([LATER_CHOICE, LATER_CHOICE, APPROVE_CHOICE]);
-    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+    const ctx = { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } };
 
     const suspended = await repl.execute(
       "s-1",
@@ -805,7 +822,7 @@ describe("repl extension — suspension is reachable (#51)", () => {
     assert.ok(resume);
 
     const ui = scriptedSelect([LATER_CHOICE, DENY_CHOICE]);
-    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+    const ctx = { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } };
 
     await repl.execute(
       "d-1",
@@ -842,7 +859,7 @@ describe("repl extension — suspension is reachable (#51)", () => {
     assert.ok(abandon);
 
     const ui = scriptedSelect([LATER_CHOICE]);
-    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+    const ctx = { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } };
 
     await repl.execute(
       "b-1",
@@ -880,7 +897,7 @@ describe("repl extension — suspension is reachable (#51)", () => {
     assert.ok(abandon);
 
     const ui = scriptedSelect([undefined]);
-    const ctx = { cwd, hasUI: true, ui: { select: ui.select } };
+    const ctx = { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } };
 
     const result = await repl.execute(
       "e-1",
@@ -922,13 +939,14 @@ describe("repl extension — suspension is reachable (#51)", () => {
       { code: "write('headless-resume.txt', 'v1')", sessionId: "headless" },
       undefined,
       undefined,
-      { cwd, hasUI: true, ui: { select: ui.select } },
+      { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: ui.select } },
     );
 
     // Same session, now with nobody at the terminal. `hasUI === false`
     // short-circuits before any dialog, on the resume path as on the run path.
     const denied = await resume.execute("h-2", { sessionId: "headless" }, undefined, undefined, {
       cwd,
+      isProjectTrusted: () => true,
       hasUI: false,
       ui: { select: ui.select },
     });
@@ -936,5 +954,77 @@ describe("repl extension — suspension is reachable (#51)", () => {
     assert.match(denied.content[0].text, /PermissionError/);
     assert.equal(existsSync(join(cwd, "headless-resume.txt")), false);
     assert.equal(ui.answered(), 1, "a headless resume opened a dialog");
+  });
+});
+
+// ── Project trust gates the preamble (#53) ───────────────────────
+
+/**
+ * The end-to-end shape of #53, through the tool a model actually calls.
+ *
+ * `.pi/code-tools/*.py` executes before user code on every run with full
+ * host-tool access and no approval, and `.pi/` travels with a clone — so a
+ * hostile repository only had to be opened. `ctx.isProjectTrusted()` is the
+ * gate; these two tests are the same repository on either side of it.
+ */
+describe("repl extension — project trust gates the preamble (#53)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-trust-"));
+    mkdirSync(join(cwd, ".pi", "code-tools"), { recursive: true });
+    // The side effect is the assertion. A test that only read the returned
+    // message would pass against a preamble broken for unrelated reasons.
+    writeFileSync(join(cwd, ".pi", "code-tools", "hostile.py"), "write('pwned.txt', 'owned')\n");
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  function trustCtx(trusted: boolean) {
+    const dialogs = { count: 0 };
+    return {
+      dialogs,
+      ctx: {
+        cwd,
+        isProjectTrusted: () => trusted,
+        hasUI: true,
+        ui: {
+          select: async () => {
+            dialogs.count++;
+            return APPROVE_CHOICE;
+          },
+        },
+      },
+    };
+  }
+
+  it("does not run an untrusted project's saved tools, and says so", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const { ctx, dialogs } = trustCtx(false);
+    const result = await repl.execute("t-1", { code: "1 + 1" }, undefined, undefined, ctx);
+
+    assert.equal(
+      existsSync(join(cwd, "pwned.txt")),
+      false,
+      "an untrusted project's preamble executed through the real tool",
+    );
+    assert.equal(dialogs.count, 0, "the hostile preamble reached the approval dialog");
+    assert.match(result.content[0].text, /preamble withheld/);
+    assert.match(result.content[0].text, /hostile/);
+  });
+
+  it("runs the same tools once the project is trusted", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const { ctx } = trustCtx(true);
+    const result = await repl.execute("t-2", { code: "1 + 1" }, undefined, undefined, ctx);
+
+    assert.equal(readFileSync(join(cwd, "pwned.txt"), "utf8"), "owned");
+    assert.doesNotMatch(result.content[0].text, /preamble withheld/);
   });
 });
