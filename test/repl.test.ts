@@ -559,6 +559,52 @@ describe("ReplRunner — every tool answers, in every state (#48)", () => {
   });
 });
 
+// ── Decide later survives the resume (#51) ───────────────────────
+
+/**
+ * The lower half of the seam #51 fixes. `Session.resume` resolved its
+ * decision with `d === true`, so the one answer that is neither approve nor
+ * deny — `"suspend"` — arrived as a denial: asking to decide later *destroyed*
+ * the call you were deferring. The extension is the other half, covered in
+ * `extension.test.ts`; this is the half that fails if the narrowing comes back.
+ */
+describe("ReplRunner — decide later survives the resume (#51)", () => {
+  let runner: ReplRunner;
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("resume(suspend) keeps the call pending instead of denying it", async () => {
+    const first = await runner.run("write('later.txt', 'v1')", "later", suspend);
+    assert.match(first, /requires approval/);
+
+    // Deferred again. The old narrowing answered this with a PermissionError
+    // and cleared the suspension, so both assertions below failed.
+    const second = await runner.resume("later", suspend);
+    assert.match(second, /requires approval/);
+    assert.doesNotMatch(second, /PermissionError/, "'decide later' was answered as a denial");
+    assert.equal(existsSync(join(cwd, "later.txt")), false);
+
+    // Still the same pending call, and still answerable.
+    const done = await runner.resume("later", approve);
+    assert.doesNotMatch(done, /PermissionError/);
+    assert.equal(readFileSync(join(cwd, "later.txt"), "utf8"), "v1");
+  });
+
+  it("a deferred call can still be abandoned", async () => {
+    await runner.run("write('deferred.txt', 'v1')", "defer-abandon", suspend);
+    await runner.resume("defer-abandon", suspend);
+
+    assert.equal(runner.abandon("defer-abandon"), "abandoned");
+    assert.equal(existsSync(join(cwd, "deferred.txt")), false);
+  });
+});
+
 // ── A suspension does not outlive its call (#129) ─────────────────
 
 /**

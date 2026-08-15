@@ -62,7 +62,14 @@ the pi process; `/repl-approvals strict` and restarting both put it back. Nothin
 without a UI, in either mode. `repl_reset` reports the current mode.
 See [docs/approval-grants.md](docs/approval-grants.md).
 
-Every approval dialog is **answerable and bounded**. The four `repl` tools declare
+Every approval dialog offers **three answers**: approve, deny, and *decide later*. Deciding later
+suspends the session with the call still pending — `repl_resume` asks again, `repl_abandon` throws
+it away, and running new code discards it and says so. It is the answer for a call you want to think
+about, and it is the only reason `status: "suspended"` exists. Dismissing the dialog is not that
+answer: Escape, the timeout and an abort all **deny**.
+See [#51](https://github.com/AdarGit008/repl-simple/issues/51).
+
+Every approval dialog is also **answerable and bounded**. The four `repl` tools declare
 `executionMode: "sequential"`, so two of them never run at once — two dialogs open together leaves
 the first one orphaned and pi with no way back. Escape dismisses a dialog and aborts the run rather
 than being swallowed, and a dialog nobody answers denies itself after five minutes.

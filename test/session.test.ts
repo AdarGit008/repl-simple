@@ -296,6 +296,114 @@ result
     assert.equal(r2.output, "blocked");
   });
 
+  it("resume with 'suspend' hands the stored suspension straight back", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    const first = await session.run('gated("x")', { onApproval: () => "suspend" });
+    suspended(first);
+
+    const second = await session.resume({ onApproval: () => "suspend" });
+    suspended(second);
+
+    // Identity, not equality. Deferring decides nothing, so nothing should
+    // happen — and the cheapest proof that no snapshot was restored into a
+    // fresh worker is that the object handed back is the one already held.
+    // A rebuilt result would be equal and would have cost a full round trip
+    // through the sandbox to arrive back where it started.
+    assert.equal(second, first, "a deferral rebuilt the suspension instead of returning it");
+    assert.equal(second.suspendedCall.tool, "gated");
+  });
+
+  it("a denial on resume authorises nothing, even where a grant could be recorded", async () => {
+    // `grantUses: 2` is the only configuration where `recordGrant` stores
+    // anything at all, and therefore the only one where "does a denial record
+    // a grant?" is an observable question. It must not: the next identical
+    // call has to ask again rather than ride in on the answer to a question
+    // that was refused.
+    let executions = 0;
+    const counted: HostTool = {
+      ...gatedTool,
+      execute: (args) => {
+        executions++;
+        return `approved: ${args.x}`;
+      },
+    };
+    const session = new Session({ registry: new ToolRegistry([counted]) }, undefined, {
+      grantUses: 2,
+    });
+
+    const code = [
+      "try:",
+      '    gated("x")',
+      "except PermissionError:",
+      "    pass",
+      'gated("x")',
+    ].join("\n");
+    suspended(await session.run(code, { onApproval: () => "suspend" }));
+
+    let asked = 0;
+    const result = await session.resume({
+      onApproval: () => {
+        asked++;
+        return false;
+      },
+    });
+
+    err(result);
+    // Twice: once for the suspended call, once for the identical call after
+    // it. A grant recorded by the denial would have swallowed the second ask.
+    assert.equal(asked, 2, "the second identical call was covered by a denial's grant");
+    assert.equal(executions, 0, "a denied call executed");
+  });
+
+  // The no-callback branch of `resume`, which nothing drove: eight tests pass
+  // an `onApproval` and none omitted it, so `decision = false` could be
+  // mutated to `true` and the suite stayed green. That mutant fails *open* —
+  // a resume with nobody to ask would run the gated call — which is the one
+  // direction this branch must never move (#51 test 6).
+  //
+  // Both shapes of "no callback" are covered because both reach it
+  // differently: `ReplRunner` always passes run options and may leave
+  // `onApproval` undefined inside them, while a direct caller can pass none
+  // at all.
+
+  it("resume with no run options denies the pending call", async () => {
+    // The tool is watched, so "denied" means a call that did not happen
+    // rather than a message about one that did.
+    const executed: string[] = [];
+    const registry = new ToolRegistry([
+      {
+        ...gatedTool,
+        execute: (args) => {
+          executed.push(String(args.x));
+          return `approved: ${args.x}`;
+        },
+      },
+    ]);
+    const session = new Session({ registry });
+
+    await session.run('gated("x")', { onApproval: () => "suspend" });
+    const denied = await session.resume();
+
+    err(denied);
+    assert.match(denied.error, /PermissionError/);
+    assert.deepEqual(executed, [], "a resume with nobody to ask ran the call anyway");
+  });
+
+  it("resume with run options but no onApproval denies too", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    await session.run('gated("x")', { onApproval: () => "suspend" });
+
+    // The shape `ReplRunner.resume` produces when the extension has no
+    // callback to give it.
+    const denied = await session.resume({});
+    err(denied);
+    assert.match(denied.error, /PermissionError/);
+  });
+
   it("abandon() clears suspended state", async () => {
     const registry = new ToolRegistry([gatedTool]);
     const session = new Session({ registry });
