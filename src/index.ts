@@ -91,6 +91,10 @@ export {
 export {
   createToolStoreTools,
   loadSavedTools,
+  savedToolNames,
+  DEFAULT_PREAMBLE_LIMITS,
+  type PreambleLimits,
+  type SavedToolsPreamble,
   type ToolStoreOptions,
 } from "./toolstore.js";
 
@@ -104,7 +108,12 @@ export {
 // ── Repl ────────────────────────────────────────────────────────
 // The two outcome types are the return types of `abandon` and `reset`; a
 // caller that switches on them needs their names.
-export { ReplRunner, type AbandonOutcome, type ResetOutcome } from "./repl.js";
+export {
+  ReplRunner,
+  type AbandonOutcome,
+  type ReplRunnerOptions,
+  type ResetOutcome,
+} from "./repl.js";
 
 // ── Truncation ──────────────────────────────────────────────────
 // The single implementation behind every model-facing byte cap.

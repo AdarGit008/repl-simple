@@ -2,7 +2,7 @@ import { Session, type GrantSummary } from "./session.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
-import { loadSavedTools } from "./toolstore.js";
+import { loadSavedTools, savedToolNames } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
 
@@ -27,21 +27,63 @@ export interface ResetOutcome {
   revoked: GrantSummary[];
 }
 
+// ── Project trust ──────────────────────────────────────────────────
+
+/** Construction-time options for {@link ReplRunner}. */
+export interface ReplRunnerOptions {
+  /**
+   * Reads the project's trust decision, live, at every call.
+   *
+   * `.pi/code-tools/*.py` is executed before user code on every run, with
+   * full host-tool access and no approval, and `.pi/` travels with a clone —
+   * so cloning a hostile repository and asking anything that touches `repl`
+   * used to be enough to run its code (#53). This is the gate.
+   *
+   * A function rather than a boolean because the decision can change while pi
+   * is running, and a snapshot taken at construction would keep executing code
+   * the user has since said no to.
+   *
+   * **Defaults to untrusted.** A caller who has no trust decision to offer has
+   * not made one, and the failure mode of guessing wrong in the other
+   * direction is arbitrary code execution.
+   */
+  isProjectTrusted?: () => boolean;
+}
+
+/** A live session, plus what the preamble decision for it was. */
+interface LiveSession {
+  session: Session;
+  /** The trust value this session's preamble was loaded (or withheld) under. */
+  trusted: boolean;
+  /** Whether that decision actually put saved code in front of every run. */
+  hasPreamble: boolean;
+  /**
+   * A one-shot notice about the preamble, prepended to the next result.
+   *
+   * Cleared once delivered. It is written at the moment the environment was
+   * decided — session creation — because that is the only moment it is news.
+   */
+  notice?: string;
+}
+
 // ── ReplRunner ─────────────────────────────────────────────────────
 
 /**
  * Manages persistent REPL sessions.
  *
  * Each session (keyed by `sessionId`) wraps a `Session` with a composed
- * tool registry (bridge + builtins) and auto-loaded toolstore preamble.
- * No RLM tools — this is a direct REPL, not an RLM loop.
+ * tool registry (bridge + builtins) and, **in a trusted project only**, the
+ * auto-loaded toolstore preamble. No RLM tools — this is a direct REPL, not an
+ * RLM loop.
  */
 export class ReplRunner {
-  private sessions = new Map<string, Session>();
+  private sessions = new Map<string, LiveSession>();
   private cwd: string;
+  private isProjectTrusted: () => boolean;
 
-  constructor(cwd: string) {
+  constructor(cwd: string, options: ReplRunnerOptions = {}) {
     this.cwd = cwd;
+    this.isProjectTrusted = options.isProjectTrusted ?? (() => false);
   }
 
   // ── Public API ──────────────────────────────────────────────
@@ -65,9 +107,9 @@ export class ReplRunner {
     onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
     signal?: AbortSignal,
   ): Promise<string> {
-    const session = await this.getOrCreateSession(sessionId);
-    const result = await session.run(code, { onApproval, signal });
-    return formatResult(result, sessionId);
+    const live = await this.getOrCreateSession(sessionId);
+    const result = await live.session.run(code, { onApproval, signal });
+    return withNotice(live, formatResult(result, sessionId));
   }
 
   /**
@@ -88,18 +130,25 @@ export class ReplRunner {
     onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
     signal?: AbortSignal,
   ): Promise<string> {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
+    const live = this.sessions.get(sessionId);
+    if (!live) {
       return `No session '${sessionId}' exists. Run some code first.`;
     }
-    if (!session.isSuspended()) {
+    // Resuming replays the whole transcript, preamble included, so a trust
+    // decision made during the pause has to be honoured here too — otherwise
+    // revoking trust and answering the pending dialog runs the withdrawn code
+    // anyway.
+    if (await this.trustChangeDiscards(sessionId, live)) {
+      return trustChangedMessage(sessionId, live.session.isSuspended());
+    }
+    if (!live.session.isSuspended()) {
       return (
         `Session '${sessionId}' has nothing waiting for approval. ` +
         `Nothing was resumed — run code with repl to continue.`
       );
     }
-    const result = await session.resume({ onApproval, signal });
-    return formatResult(result, sessionId);
+    const result = await live.session.resume({ onApproval, signal });
+    return withNotice(live, formatResult(result, sessionId));
   }
 
   /**
@@ -109,9 +158,9 @@ export class ReplRunner {
    *          {@link AbandonOutcome}.
    */
   abandon(sessionId: string): AbandonOutcome {
-    const session = this.sessions.get(sessionId);
-    if (!session) return "no-session";
-    return session.abandon() ? "abandoned" : "nothing-pending";
+    const live = this.sessions.get(sessionId);
+    if (!live) return "no-session";
+    return live.session.abandon() ? "abandoned" : "nothing-pending";
   }
 
   /**
@@ -122,30 +171,147 @@ export class ReplRunner {
    *          empty in the usual case where no call is paused at a suspension.
    */
   reset(sessionId: string): ResetOutcome {
-    const session = this.sessions.get(sessionId);
-    if (!session) return { existed: false, revoked: [] };
-    return { existed: true, revoked: session.reset() };
+    const live = this.sessions.get(sessionId);
+    if (!live) return { existed: false, revoked: [] };
+    return { existed: true, revoked: live.session.reset() };
   }
 
   // ── Private helpers ─────────────────────────────────────────
 
-  private async getOrCreateSession(sessionId: string): Promise<Session> {
+  /**
+   * The session for `sessionId`, built under the trust decision in force now.
+   *
+   * A session whose trust value no longer matches is **discarded, not
+   * reused**. The preamble is not something a session merely loaded once: it
+   * is prepended to the transcript on every `run()`, so a session created
+   * while trusted goes on executing that code for as long as it lives. Keeping
+   * it would make the gate apply only to sessions that do not exist yet.
+   *
+   * The cost is that a trust change clears variables, and it is charged in
+   * both directions so the rule stays one sentence rather than two.
+   */
+  private async getOrCreateSession(sessionId: string): Promise<LiveSession> {
     const existing = this.sessions.get(sessionId);
-    if (existing) return existing;
+    let rebuilt = false;
+    if (existing) {
+      if (!(await this.trustChangeDiscards(sessionId, existing))) return existing;
+      rebuilt = true;
+    }
 
-    const session = await this.createSession();
-    this.sessions.set(sessionId, session);
-    return session;
+    const live = await this.createSession(this.isProjectTrusted(), rebuilt ? sessionId : undefined);
+    this.sessions.set(sessionId, live);
+    return live;
   }
 
-  private async createSession(): Promise<Session> {
+  /**
+   * Bring a live session into line with the trust decision in force now.
+   *
+   * A session is discarded only when the change alters **what runs**: losing
+   * trust matters when saved code is being prepended to every run, gaining it
+   * matters when there is saved code to gain. A trust decision that changes
+   * neither is recorded and costs the user nothing — wiping variables for a
+   * preamble that is empty either way would be a wipe with no security in it.
+   *
+   * @returns whether the session was dropped and must be rebuilt.
+   */
+  private async trustChangeDiscards(sessionId: string, live: LiveSession): Promise<boolean> {
+    const trusted = this.isProjectTrusted();
+    if (live.trusted === trusted) return false;
+
+    const changesPreamble = trusted
+      ? (await savedToolNames({ root: this.cwd })).length > 0
+      : live.hasPreamble;
+
+    if (!changesPreamble) {
+      live.trusted = trusted;
+      return false;
+    }
+
+    this.sessions.delete(sessionId);
+    return true;
+  }
+
+  private async createSession(trusted: boolean, rebuiltId?: string): Promise<LiveSession> {
     const bridgeTools = createPiBridgeTools(this.cwd, { gateMutating: true });
     const builtinTools = createBuiltinTools({ root: this.cwd });
     const registry = new ToolRegistry([...bridgeTools, ...builtinTools]);
     const sandboxOpts: SandboxOptions = { registry };
-    const preamble = await loadSavedTools({ root: this.cwd });
-    return new Session(sandboxOpts, preamble || undefined);
+
+    const notices: string[] = [];
+    if (rebuiltId !== undefined) notices.push(trustChangedMessage(rebuiltId, false));
+
+    let preamble = "";
+    if (trusted) {
+      const load = await loadSavedTools({ root: this.cwd });
+      preamble = load.preamble;
+      if (load.skipped.length > 0) notices.push(limitNotice(load.skipped));
+    } else {
+      // Names only. Reading the listing is not reading the files, and the
+      // model needs the names or it will call a tool that is not defined and
+      // get a NameError it cannot explain.
+      const withheld = await savedToolNames({ root: this.cwd });
+      if (withheld.length > 0) notices.push(untrustedNotice(withheld));
+    }
+
+    return {
+      session: new Session(sandboxOpts, preamble || undefined),
+      trusted,
+      hasPreamble: preamble !== "",
+      notice: notices.length > 0 ? notices.join("\n\n") : undefined,
+    };
   }
+}
+
+// ── Preamble notices ─────────────────────────────────────────────
+//
+// Silence about a withheld preamble trades one bug for another: the tools are
+// still on disk and still listed by `list_saved_tools`, so a model that is not
+// told will call one and get a bare NameError (#53).
+
+/** What the model is told when project trust withheld the saved tools. */
+function untrustedNotice(withheld: string[]): string {
+  return (
+    `[preamble withheld] ${withheld.length} saved tool(s) in .pi/code-tools were not loaded ` +
+    `because this project is not trusted: ${withheld.join(", ")}. ` +
+    `They are not defined in this session — calling one raises NameError. ` +
+    `Trust the project in pi to load them, or paste the code you need.`
+  );
+}
+
+/** What the model is told when the preamble limits dropped some tools. */
+function limitNotice(skipped: string[]): string {
+  return (
+    `[preamble truncated] ${skipped.length} saved tool(s) were not loaded because the ` +
+    `preamble size limit was reached: ${skipped.join(", ")}. ` +
+    `They are not defined in this session — calling one raises NameError. ` +
+    `Delete tools you no longer need with delete_tool.`
+  );
+}
+
+/**
+ * What the model is told when a trust change discarded its session.
+ *
+ * `lostSuspension` is what turns this from housekeeping into news: a pending
+ * approval that goes away without being answered means the call never ran, and
+ * that is the same thing `formatResult` reports for a discarded suspension.
+ */
+function trustChangedMessage(sessionId: string, lostSuspension: boolean): string {
+  return (
+    `[trust changed] The project's trust decision changed, so session '${sessionId}' was ` +
+    `rebuilt: variables, imports and cached tool calls are gone, and the saved-tool preamble ` +
+    `now follows the new decision.` +
+    (lostSuspension
+      ? ` The approval that was pending went with it — that call never executed. Run it again if you still want it.`
+      : "")
+  );
+}
+
+/** Prepend a session's one-shot notice to a result, and consume it. */
+function withNotice(live: LiveSession, body: string): string {
+  const notice = live.notice;
+  if (notice === undefined) return body;
+  live.notice = undefined;
+  return `${notice}\n\n${body}`;
 }
 
 // ── Output formatting ────────────────────────────────────────────
