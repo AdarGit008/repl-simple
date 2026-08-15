@@ -1,7 +1,13 @@
-import { describe, it, after } from "node:test";
+import { describe, it, after, mock } from "node:test";
 import assert from "node:assert/strict";
-import { closeSandboxPool, getSandboxPool, poolConfig, withSandboxSession } from "../src/pool.js";
-import { MontyComplete } from "@pydantic/monty/node";
+import {
+  SandboxUnavailableError,
+  closeSandboxPool,
+  getSandboxPool,
+  poolConfig,
+  withSandboxSession,
+} from "../src/pool.js";
+import { Monty, MontyComplete } from "@pydantic/monty/node";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -92,6 +98,35 @@ describe("the process-wide pool", () => {
     await closeSandboxPool();
     await closeSandboxPool();
   });
+
+  it("does not cache a failed create — the next caller can still get a pool", async () => {
+    // The property the comment at `pool.ts` states and nothing held: a
+    // rejected `Monty.create()` must not be left in `poolPromise`, or every
+    // later caller awaits that same rejection forever with no way to retry.
+    // `Monty.create` is a writable static and `pool.ts` calls it as a property
+    // lookup, so the mock is the binding the module actually reaches — no
+    // sleep, no race, and no dependence on how V8 attributes an arrow nobody
+    // invokes (#132).
+    await closeSandboxPool();
+    const create = mock.method(Monty, "create", () => Promise.reject(new Error("create refused")));
+    try {
+      await assert.rejects(() => getSandboxPool(), /create refused/);
+      await assert.rejects(() => getSandboxPool(), /create refused/);
+      // The load-bearing assertion. A cached rejection satisfies both rejects
+      // above while never calling `create` a second time.
+      assert.equal(
+        create.mock.callCount(),
+        2,
+        "the second caller must reach Monty.create, not a cached rejection",
+      );
+    } finally {
+      create.mock.restore();
+    }
+    // And the pool is not poisoned once the cause clears.
+    const pool = await getSandboxPool();
+    assert.equal(await getSandboxPool(), pool);
+    await closeSandboxPool();
+  });
 });
 
 // ── Session checkout ────────────────────────────────────────────
@@ -107,6 +142,35 @@ describe("withSandboxSession", () => {
       return snap instanceof MontyComplete ? snap.output : null;
     });
     assert.equal(out, 42);
+  });
+
+  it("refuses a checkout no worker can serve, naming the cap that refused it", async () => {
+    // The same refusal `test/sandbox.test.ts` reaches end-to-end, but with the
+    // race taken out: there, a 300 ms sleep hopes the holder checks the single
+    // worker out first. Here the competing checkout runs *inside* the callback
+    // that holds it, so "the pool is exhausted" is not a hope about timing —
+    // it is where we are standing. #132.
+    await closeSandboxPool();
+    await withEnv(
+      { REPL_POOL_MAX_PROCESSES: "1", REPL_POOL_CHECKOUT_TIMEOUT_SECS: "1" },
+      async () => {
+        await withSandboxSession({}, async () => {
+          await assert.rejects(
+            () => withSandboxSession({}, async () => "unreachable"),
+            (err: unknown) => {
+              assert.ok(err instanceof SandboxUnavailableError, `got ${err}`);
+              // The message names the live pool's settings, not the ones that
+              // would apply to a pool built now.
+              assert.match(err.message, /within the 1s checkout timeout \(cap: 1 workers\)/);
+              assert.ok(err.cause instanceof Error, "upstream's rejection survives as the cause");
+              return true;
+            },
+          );
+        });
+      },
+    );
+    // Built with a cap of 1; do not leave it for the next test.
+    await closeSandboxPool();
   });
 
   it("returns the worker even when the body throws", async () => {
