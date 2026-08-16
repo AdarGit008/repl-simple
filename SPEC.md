@@ -47,11 +47,17 @@ removing the bad entry makes the next **new** session load normally with no rest
 - **Only regular files load — decided by `lstat`, not by exception.** Anything whose `lstat`
   reports non-regular (directory, FIFO, socket, symlink — to nowhere **or** to anywhere) is
   skipped with reason `"not a regular file"`. A preamble is auto-executed code with full
-  host-tool access, and a symlink inside `.pi/code-tools` can point **outside the project
-  root**; following one would be an escape the path jail exists to prevent. Working symlinks
-  do not load either — one rule, no special cases, and `save_tool` only ever writes regular
-  files anyway. This is the "skip anything that is not a regular file" the issue demands,
-  decided up front rather than discovered as `EISDIR`.
+  host-tool access, and a symlink **entry** inside `.pi/code-tools` can point outside the
+  project root; following one would be an escape the path jail exists to prevent. Working
+  symlinks do not load either — one rule, no special cases, and `save_tool` only ever writes
+  regular files anyway. This is the "skip anything that is not a regular file" the issue
+  demands, decided up front rather than discovered as `EISDIR`. **Scope of the gate:** it
+  refuses symlinks at the *entry* level. A symlinked `.pi` or `.pi/code-tools` *directory* is
+  still followed — that content is part of the trusted project's own tree (the project
+  authored the link), so project trust, not a path jail, is the boundary there (audit
+  finding, recorded as a residual). Hard links are regular files by `lstat` and pass; they
+  also require write access to the directory, which in a trusted project is already the
+  stronger primitive.
 - **The read itself is wrapped.** `lstat` and `readFile` each get their own try/catch: a file
   deleted or swapped between `readdir` and `readFile` (TOCTOU), or unreadable by permission,
   becomes `{ file, reason: <error message> }`. The reason is kept on the struct for humans and
@@ -213,6 +219,38 @@ branch's four commits, plus an independent file-by-file pass. Findings:
   entry still appears in the untrusted path's withheld list. The claim ("not loaded") is
   true for it too; #57 may tighten this when it makes `list_saved_tools` honest.
 
+## Review remediation round 2 (code-reviewer + security-auditor + test-engineer fan-out)
+
+All three agents returned **zero Critical and zero Required** findings. Remediated here:
+
+- **Test isolation (code-reviewer):** the three runner tests shared one temp dir and the
+  recovery test mutated it (`rmSync` of `dir.py`) — order-dependent. Each test now owns its
+  `makeCwd()` + `try/finally cleanup()`.
+- **FIFO regression would hang CI (test-engineer):** `npm test` has no per-test timeout, so
+  a loader that regresses on the lstat gate blocks the FIFO test forever. The FIFO test now
+  declares `{ timeout: 5000 }` — a hung read is a failing test, not a hung job.
+- **Escape path unpinned (test-engineer):** a runner-level test now pins that the unreadable
+  notice escapes control characters in filenames (`dir\nesc.py` → `dir\u{a}esc.py`), the
+  same rule the #54 refusal notice is pinned against.
+- **Chmod test under-pinned (test-engineer nit):** the skipped-entry assertion is now a
+  `deepEqual` over the file list (a double-report would fail it), with the `/EACCES/`
+  reason pin kept.
+- **`reason` is attacker-influenced (security-auditor):** `UnreadableTool.reason` JSDoc now
+  says "for humans and tests — escape before rendering into model-facing or terminal text".
+- **Refusal branch asymmetry (code-reviewer):** the refusal return now comments why
+  `skipped` stays `[]` there (the #54 decision: limits are never evaluated when a preamble
+  is refused).
+- **Artifact drift (code-reviewer nit):** `tasks/plan.md` checkboxes now match
+  `tasks/todo.md`.
+- **Spec wording corrected (security-auditor):** the lstat gate's scope is now stated
+  precisely — entry-level symlink refusal; a symlinked *directory* component is followed
+  and is covered by project trust, not the gate (residual below).
+
+Not remediated (recorded as accepted residuals below, none exploitable): directory-component
+symlinks, hard links, bidi controls in `escapeNoticeName` and the unescaped sibling notices
+(`untrustedNotice`, `limitNotice` — pre-existing #53/#54 text), and unbounded notice length
+(pre-existing pattern across the whole notice family).
+
 ## Residual risks (recorded for the ship report)
 
 - **An unreadable entry is skipped forever, silently after the first call.** The notice is
@@ -225,3 +263,20 @@ branch's four commits, plus an independent file-by-file pass. Findings:
 - **Limit-header interpolation of `skipped` names is unescaped** (pre-existing, assumption 7).
 - **Recovery needs a new session** — by design (sessions cache their preamble); the notice
   says exactly that, pinned by a test.
+- **A symlinked `.pi` or `.pi/code-tools` directory is followed** (audit finding, accepted).
+  The lstat gate refuses symlink *entries*; directory components resolve normally. The
+  content a symlinked directory loads is part of the trusted project's own tree — the
+  project authored the link — so project trust, not a path jail, is the boundary. A
+  `realpath` containment check would make the claim literal if the trust model ever
+  narrows.
+- **Hard links pass the regular-file gate** (audit finding, accepted). `lstat` reports a
+  hard link as a regular file, and creating one requires write access to
+  `.pi/code-tools` — which in a trusted project is already arbitrary auto-executed code.
+  No marginal risk.
+- **`escapeNoticeName` does not neutralize bidi controls, and the sibling notices
+  (`untrustedNotice`, `limitNotice`) do not escape at all** (audit finding, pre-existing
+  from #53/#54, not widened here). A crafted filename can visually reorder notice text.
+  Candidate for the #57 sweep.
+- **Notice length is unbounded** (audit finding, pre-existing pattern across the whole
+  notice family): thousands of junk `.py`-named entries produce a megabyte-scale notice.
+  A name-count cap belongs to the family, not to this issue.

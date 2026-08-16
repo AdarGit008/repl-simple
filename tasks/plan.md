@@ -36,24 +36,24 @@ and starting a new session, no restart.
 ## Task List
 
 ### Phase 1: Loader resilience
-- [ ] Task 1: `loadSavedTools` skips unreadable entries + loader tests
+- [x] Task 1: `loadSavedTools` skips unreadable entries + loader tests
   (toolstore.ts, index.ts, toolstore.test.ts)
 
 ### Checkpoint: Loader
-- [ ] `npx tsx --test test/toolstore.test.ts` green; `npm run check` clean
+- [x] `npx tsx --test test/toolstore.test.ts` green; `npm run check` clean
 
 ### Phase 2: Runner wiring
-- [ ] Task 2: `ReplRunner` renders the unreadable notice + runner tests
+- [x] Task 2: `ReplRunner` renders the unreadable notice + runner tests
   (repl.ts, repl.test.ts)
 
 ### Checkpoint: Runner
-- [ ] `npx tsx --test test/repl.test.ts` green; `npm run check` clean
+- [x] `npx tsx --test test/repl.test.ts` green; `npm run check` clean
 
 ### Phase 3: Verify and record
-- [ ] Task 3: full suite + check + lint + build; commit
+- [x] Task 3: full suite + check + lint + build; commit
 
 ### Checkpoint: Complete
-- [ ] `npm test && npm run check && npm run lint && npm run build` all green; tree clean
+- [x] `npm test && npm run check && npm run lint && npm run build` all green; tree clean
 
 ## Risks and Mitigations
 

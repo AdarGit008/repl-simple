@@ -489,7 +489,13 @@ export interface RefusedTool {
 export interface UnreadableTool {
   /** The `.py` file that was not loaded. */
   file: string;
-  /** Why: `not a regular file` (lstat), or the stat/read error's message. */
+  /**
+   * Why: `not a regular file` (lstat), or the stat/read error's message.
+   *
+   * For humans and tests. Raw errno text, attacker-influenced through the
+   * filename — escape before rendering into any model-facing or terminal
+   * text.
+   */
   reason: string;
 }
 
@@ -636,7 +642,8 @@ export async function loadSavedTools(
   // predict from the source, and the issue forbids both that and doing
   // nothing silently. The caller must turn `refused` into a notice. The
   // unreadable entries from the same pass ride along: "nothing loaded" is the
-  // whole truth either way.
+  // whole truth either way. `skipped` stays `[]` by the #54 decision — the
+  // limits are never evaluated when a preamble is refused.
   if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], unreadable, refused };
 
   if (loaded.length === 0) return { preamble: "", loaded: [], skipped, unreadable, refused };

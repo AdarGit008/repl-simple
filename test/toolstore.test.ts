@@ -812,8 +812,11 @@ describe("loadSavedTools — unreadable entries are skipped, not fatal (#55)", (
     }
   });
 
-  it("a FIFO is skipped, not fatal", async (t) => {
+  it("a FIFO is skipped, not fatal", { timeout: 5000 }, async (t) => {
     if (process.platform === "win32") return t.skip("no FIFOs on Windows");
+    // The timeout is the regression guard: a loader that forgets the lstat
+    // gate reads the FIFO and blocks forever — a failing test, not a hung CI
+    // job.
     const root = makeTempDir();
     try {
       const { opts } = makeTools(root);
@@ -845,8 +848,11 @@ describe("loadSavedTools — unreadable entries are skipped, not fatal (#55)", (
       const { loaded, unreadable } = await loadSavedTools(opts);
 
       assert.deepEqual(loaded, ["good"]);
-      assert.equal(unreadable.length, 1);
-      assert.equal(unreadable[0].file, "locked.py");
+      assert.deepEqual(
+        unreadable.map((u) => u.file),
+        ["locked.py"],
+        "a skipped entry was double-reported or missed",
+      );
       assert.match(unreadable[0].reason, /EACCES/);
     } finally {
       cleanup();
