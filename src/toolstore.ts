@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { constants, type Stats } from "node:fs";
 import { join, resolve, extname } from "node:path";
 import { requireString } from "./registry.js";
@@ -577,7 +577,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       // fd, because the fd is what is read. The loader's lstat-first check
       // would not have protected the read itself (#55 refused the static
       // case; this closes the window).
-      let handle;
+      let handle: FileHandle;
       try {
         handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       } catch (err) {
