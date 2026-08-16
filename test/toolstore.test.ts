@@ -64,6 +64,7 @@ function status(
     skipped?: readonly string[];
     refused?: readonly string[];
     unreadable?: readonly string[];
+    identity?: ReadonlyMap<string, { size: number; mtimeMs: number }>;
   } = {},
 ): PreambleStatus {
   return {
@@ -73,6 +74,7 @@ function status(
     skipped: new Set(partial.skipped ?? []),
     refused: new Set(partial.refused ?? []),
     unreadable: new Set(partial.unreadable ?? []),
+    identity: partial.identity,
   };
 }
 
@@ -1006,6 +1008,7 @@ describe("loadSavedTools", () => {
       assert.deepEqual(await loadSavedTools(opts), {
         preamble: "",
         loaded: [],
+        loadedIdentity: new Map(),
         skipped: [],
         unreadable: [],
         refused: [],
@@ -1022,6 +1025,7 @@ describe("loadSavedTools", () => {
       assert.deepEqual(await loadSavedTools({ root }), {
         preamble: "",
         loaded: [],
+        loadedIdentity: new Map(),
         skipped: [],
         unreadable: [],
         refused: [],
@@ -1863,6 +1867,95 @@ describe("read_tool refusal ordering (#57)", () => {
       await assert.rejects(async () => {
         await findTool(tools, "read_tool").execute({ name: "fifo" });
       }, /not a regular file/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── Content identity: a changed file is not "loaded" (#57) ──────
+
+describe("loaded tools whose file changed after the session started (#57)", () => {
+  function makeViewedTools(root: string, view: PreambleStatus) {
+    const opts: ToolStoreOptions = { root, preambleStatus: view };
+    return { tools: createToolStoreTools(opts), opts };
+  }
+
+  /** The identity the loader records for the content it actually loaded. */
+  function identityOf(root: string, name: string): Map<string, { size: number; mtimeMs: number }> {
+    const st = statSync(join(root, ".pi", "code-tools", `${name}.py`));
+    return new Map([[name, { size: st.size, mtimeMs: st.mtimeMs }]]);
+  }
+
+  it("list annotates a loaded tool whose file changed since", async () => {
+    const root = makeTempDir();
+    try {
+      await makeTools(root)
+        .tools.find((t) => t.name === "save_tool")!
+        .execute({ name: "mut", code: "def mut(): return 'old'", description: "mutable" });
+      const identity = identityOf(root, "mut");
+      const view = status({ loaded: ["mut"], identity });
+      const { tools } = makeViewedTools(root, view);
+
+      // The session runs the old bytes; the disk now holds different ones.
+      writeFileSync(
+        join(root, ".pi", "code-tools", "mut.py"),
+        "def mut(): return 'new'\n# much longer than before\n",
+      );
+
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.ok(
+        out.includes(
+          "mut [loaded in this session — file changed since; the session runs the earlier copy]",
+        ),
+        `a changed file was listed as loaded: ${out}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("read_tool annotates the changed content it returns", async () => {
+    const root = makeTempDir();
+    try {
+      await makeTools(root)
+        .tools.find((t) => t.name === "save_tool")!
+        .execute({ name: "mut", code: "def mut(): return 'old'", description: "mutable" });
+      const identity = identityOf(root, "mut");
+      const view = status({ loaded: ["mut"], identity });
+      const { tools } = makeViewedTools(root, view);
+
+      writeFileSync(
+        join(root, ".pi", "code-tools", "mut.py"),
+        "def mut(): return 'new'\n# much longer than before\n",
+      );
+
+      const out = await findTool(tools, "read_tool").execute({ name: "mut" });
+      assert.ok(
+        out.includes(
+          "# NOTE: the file changed after this session loaded it — this session runs the earlier copy",
+        ),
+        out,
+      );
+      assert.ok(out.includes("return 'new'"), out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a loaded tool whose file is unchanged stays a plain name and a plain read", async () => {
+    const root = makeTempDir();
+    try {
+      await makeTools(root)
+        .tools.find((t) => t.name === "save_tool")!
+        .execute({ name: "same", code: "def same(): return 1", description: "stable" });
+      const identity = identityOf(root, "same");
+      const view = status({ loaded: ["same"], identity });
+      const { tools } = makeViewedTools(root, view);
+
+      assert.equal(await findTool(tools, "list_saved_tools").execute({}), "same");
+      const read = await findTool(tools, "read_tool").execute({ name: "same" });
+      assert.doesNotMatch(read, /NOTE: the file changed/, "an unchanged file was annotated");
     } finally {
       cleanup();
     }

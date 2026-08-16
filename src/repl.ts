@@ -274,6 +274,7 @@ export class ReplRunner {
         skipped: new Set(load.skipped),
         refused: new Set(load.refused.map((r) => r.file.slice(0, -3))),
         unreadable: new Set(load.unreadable.map((u) => u.file.slice(0, -3))),
+        identity: load.loadedIdentity,
       };
       if (load.refused.length > 0) notices.push(refusalNotice(load.refused));
       if (load.unreadable.length > 0) notices.push(unreadableNotice(load.unreadable));

@@ -47,6 +47,23 @@ export interface PreambleStatus {
   refused: ReadonlySet<string>;
   /** Names on disk whose files could not be loaded (#55). */
   unreadable: ReadonlySet<string>;
+  /**
+   * The size and mtime of each loaded file as the loader saw them.
+   *
+   * The snapshot records *names*; this records *which bytes* those names
+   * stood for. A file overwritten after session creation is still "loaded"
+   * by name — the session runs the old bytes — and `list_saved_tools` /
+   * `read_tool` annotate that instead of presenting the new bytes as what
+   * runs. Absent, changed-file detection is off (back-compat for callers
+   * that build the view by hand).
+   */
+  identity?: ReadonlyMap<string, PreambleFileIdentity>;
+}
+
+/** Size and mtime of one loaded file — enough to notice a rewrite, no hashing. */
+export interface PreambleFileIdentity {
+  size: number;
+  mtimeMs: number;
 }
 
 export interface ToolStoreOptions {
@@ -454,15 +471,44 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
    * load whose file has since been deleted: it still runs here and is gone
    * from new sessions, and the line says both.
    */
-  function annotate(name: string, onDisk: boolean, view: PreambleStatus): string {
+  function annotate(name: string, onDisk: boolean, view: PreambleStatus): Promise<string> {
     const shown = renderName(name);
-    if (view.loaded.has(name)) {
-      return onDisk
-        ? shown
-        : `${shown} [loaded in this session — file deleted; gone from new sessions]`;
+    if (!view.loaded.has(name)) {
+      return Promise.resolve(`${shown} [not loaded: ${notLoadedReason(name, view)}]`);
     }
-    const reason = notLoadedReason(name, view);
-    return `${shown} [not loaded: ${reason}]`;
+    if (!onDisk) {
+      return Promise.resolve(
+        `${shown} [loaded in this session — file deleted; gone from new sessions]`,
+      );
+    }
+    return identityStatus(name, shown, view);
+  }
+
+  /**
+   * Whether the loaded file still holds the bytes the session loaded.
+   *
+   * Returns the plain name when it does, the changed-file annotation when it
+   * does not, and the deleted annotation when the stat cannot see it. Size
+   * and mtime are a rewrite detector, not a proof — an attacker who rewrites
+   * identical bytes with a restored mtime passes; hashing is deliberately not
+   * paid for on every list.
+   */
+  async function identityStatus(
+    name: string,
+    shown: string,
+    view: PreambleStatus,
+  ): Promise<string> {
+    const identity = view.identity?.get(name);
+    if (!identity) return shown;
+    try {
+      const st = await lstat(toolPath(toolsDir, name));
+      if (st.size !== identity.size || st.mtimeMs !== identity.mtimeMs) {
+        return `${shown} [loaded in this session — file changed since; the session runs the earlier copy]`;
+      }
+      return shown;
+    } catch {
+      return `${shown} [loaded in this session — file deleted; gone from new sessions]`;
+    }
   }
 
   /** Why `name` did not load, derived from the session view and its invariants. */
@@ -508,7 +554,9 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       // executes in this one, and hiding it would claim it stopped.
       const all = [...new Set([...disk, ...view.loaded])].sort();
       if (all.length === 0) return "(no saved tools)";
-      return all.map((name) => annotate(name, disk.has(name), view)).join("\n");
+      return (await Promise.all(all.map((name) => annotate(name, disk.has(name), view)))).join(
+        "\n",
+      );
     },
   };
 
@@ -600,7 +648,20 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
           throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
         }
         const content = await handle.readFile("utf-8");
-        if (!view || view.loaded.has(name)) return content;
+        if (!view || view.loaded.has(name)) {
+          // The name is loaded — but the bytes may not be what loaded. The
+          // session runs the old copy; presenting the new one unannotated
+          // would have the model reason about code that never ran.
+          const identity = view?.identity?.get(name);
+          if (identity && (st.size !== identity.size || st.mtimeMs !== identity.mtimeMs)) {
+            return (
+              "# NOTE: the file changed after this session loaded it — " +
+              "this session runs the earlier copy.\n\n" +
+              content
+            );
+          }
+          return content;
+        }
         return `${readNote(name, view)}\n\n${content}`;
       } finally {
         await handle.close();
@@ -651,6 +712,13 @@ export interface SavedToolsPreamble {
   preamble: string;
   /** Tool names in the preamble, in load order. */
   loaded: string[];
+  /**
+   * Size and mtime of each loaded file as this load saw it, keyed by name.
+   *
+   * The caller's tools use it to tell "still the bytes that loaded" from
+   * "rewritten since" — see {@link PreambleStatus.identity}.
+   */
+  loadedIdentity: ReadonlyMap<string, PreambleFileIdentity>;
   /**
    * Tool names present on disk but left out because a limit was reached.
    *
@@ -790,11 +858,19 @@ export async function loadSavedTools(
 
   const names = await savedToolNames({ root, toolsDir });
   if (names.length === 0)
-    return { preamble: "", loaded: [], skipped: [], unreadable: [], refused: [] };
+    return {
+      preamble: "",
+      loaded: [],
+      loadedIdentity: new Map(),
+      skipped: [],
+      unreadable: [],
+      refused: [],
+    };
 
   const reservedNames = new Set(options.hostToolNames ?? []);
 
   const loaded: string[] = [];
+  const loadedIdentity = new Map<string, PreambleFileIdentity>();
   const skipped: string[] = [];
   const refused: RefusedTool[] = [];
   const unreadable: UnreadableTool[] = [];
@@ -867,6 +943,7 @@ export async function loadSavedTools(
 
     bytes += size;
     loaded.push(name);
+    loadedIdentity.set(name, { size: entry.size, mtimeMs: entry.mtimeMs });
     sources.push(content);
   }
 
@@ -877,9 +954,18 @@ export async function loadSavedTools(
   // unreadable entries from the same pass ride along: "nothing loaded" is the
   // whole truth either way. `skipped` stays `[]` by the #54 decision — the
   // limits are never evaluated when a preamble is refused.
-  if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], unreadable, refused };
+  if (refused.length > 0)
+    return {
+      preamble: "",
+      loaded: [],
+      loadedIdentity: new Map(),
+      skipped: [],
+      unreadable,
+      refused,
+    };
 
-  if (loaded.length === 0) return { preamble: "", loaded: [], skipped, unreadable, refused };
+  if (loaded.length === 0)
+    return { preamble: "", loaded: [], loadedIdentity: new Map(), skipped, unreadable, refused };
 
   const header = [
     "# ── Loaded tools ──",
@@ -893,6 +979,7 @@ export async function loadSavedTools(
   return {
     preamble: [...header, ...sources.flatMap((s) => [s, ""])].join("\n"),
     loaded,
+    loadedIdentity,
     skipped,
     unreadable,
     refused,
