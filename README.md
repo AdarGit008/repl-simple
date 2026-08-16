@@ -59,6 +59,13 @@ Trusted or not, the preamble is capped at 32 files and 64 KiB, and revoking trus
 running rather than waiting for the next session.
 See [docs/project-trust.md](docs/project-trust.md).
 
+The four management tools resolve inside `repl` in every session, and they tell the truth about what
+**this session** actually loaded: `list_saved_tools` annotates every name that is not running
+(`[not loaded: …]`), `read_tool` refuses to read an untrusted project's files and labels source the
+session did not load, `delete_tool` removes a tool so **new sessions** stop running it, and
+`save_tool` asks for approval because what it writes executes automatically at the start of every
+future session.
+
 ### Approvals
 
 `bash`, `edit` and `write` ask before they run, and an approval covers **one execution**. The same

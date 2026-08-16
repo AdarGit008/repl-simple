@@ -34,7 +34,7 @@ It is the VS Code Workspace Trust model, chosen there for the same reason, and p
 | Project | Preamble | The model is told |
 |---|---|---|
 | Trusted | Loaded, up to the limits below | Only if a limit dropped something |
-| Untrusted | **Not read at all** | `[preamble withheld]`, naming every tool |
+| Untrusted | **Not read at all** | `[preamble withheld]`, naming every tool; `list_saved_tools` annotates each as not loaded, `read_tool` refuses to read |
 
 In an untrusted project the files are never opened. `ReplRunner` reads the *directory listing* —
 names only — because the names are what the notice needs, and listing a directory is not executing
@@ -44,8 +44,9 @@ what is in it.
 
 ### The model is told, once
 
-Silence would trade one bug for another. The tools are still on disk and `list_saved_tools` still
-lists them, so a model that is not told calls one and gets a bare `NameError` it cannot explain. The
+Silence would trade one bug for another. The tools are still on disk — `list_saved_tools` lists
+them with a `[not loaded: project not trusted]` annotation, and `read_tool` refuses to read them —
+so a model that calls one gets a `NameError` it can explain only if the notice names them. The
 notice names the missing tools and says what calling one will do.
 
 It is delivered on the result of the run that created the session, and not repeated. A line printed
@@ -103,10 +104,12 @@ whose code the user has agreed to run. `savedToolNames` is the half that is safe
 
 ## What this does not cover
 
-- **`save_tool` itself is still ungated** — an agent can write a file that a later trusted session
-  executes. That is [#56].
-- **`list_saved_tools` reports names in an untrusted project without saying they will not load.** The
-  toolstore tools have no view of the trust decision; the run-level notice is what closes the gap.
+- **A deletion does not stop the running session.** `delete_tool` removes the file, and new sessions
+  stop running it; the current session keeps the copy it loaded, and the tool says so. Removing
+  code from a transcript that already prepends it would need session surgery no tool should attempt.
+- **`read_tool` refuses whole untrusted projects**, even for a tool the model saved itself
+  mid-session: it cannot tell a friendly save from a hostile one apart, and "never even read" is the
+  point of the gate. Trusting the project is the answer.
 - **`.pi/` is now in this repository's `.gitignore`** so these files do not travel from here. That
   protects other people from us; project trust is what protects us from them.
 
