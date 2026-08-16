@@ -1,6 +1,15 @@
-import { lstat, mkdir, open, readdir, rm, writeFile, type FileHandle } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { constants, type Stats } from "node:fs";
-import { join, resolve, extname } from "node:path";
+import { join, resolve, extname, dirname, basename, sep } from "node:path";
 import { requireString } from "./registry.js";
 import { HostToolError } from "./types.js";
 import type { HostTool } from "./types.js";
@@ -161,6 +170,52 @@ function renderName(name: string): string {
 /** Resolve a tool file path from a name. */
 function toolPath(toolsDir: string, name: string): string {
   return join(toolsDir, `${name}.py`);
+}
+
+/**
+ * The tools directory, canonicalised and refused when it escapes the root.
+ *
+ * The per-entry checks bind only the **final** path component. A `.pi` or
+ * `.pi/code-tools` that is itself a symlink would silently redirect every
+ * tool — an ungated `delete_tool` deleting outside the project, a gated
+ * `save_tool` planting self-executing code in a sibling project — so each
+ * call resolves the real directory first and refuses it outside the real
+ * root, with the nearest-existing-ancestor walk `pathjail.ts` uses so a
+ * directory that does not exist yet is checked by what it would be created
+ * under (#57).
+ */
+async function containedToolsDir(toolsDir: string, root: string): Promise<string> {
+  const realRoot = await realpath(root);
+  const outside = (): HostToolError =>
+    new HostToolError(
+      "PermissionError",
+      `refusing to touch saved tools: '${toolsDir}' resolves outside the project root`,
+    );
+
+  // realpath the deepest ancestor that exists, then rejoin the missing tail
+  // — a path that does not exist has no realpath, and a symlinked parent
+  // would go unchecked.
+  let probe = toolsDir;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      let dir = await realpath(probe);
+      for (const part of [...missing].reverse()) dir = join(dir, part);
+      if (dir !== realRoot && !dir.startsWith(realRoot + sep)) throw outside();
+      return dir;
+    } catch (err) {
+      if (err instanceof HostToolError) throw err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw new HostToolError("OSError", (err as Error).message);
+      }
+      const parent = dirname(probe);
+      // The filesystem root always exists, so this terminates before it.
+      if (parent === probe) throw new HostToolError("OSError", `cannot resolve '${toolsDir}'`);
+      missing.push(basename(probe));
+      probe = parent;
+    }
+  }
 }
 
 // ── Shadowing detection ────────────────────────────────────────
@@ -343,8 +398,8 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   // the session lives, and the tools must follow it (see ToolStoreOptions).
   const isTrustedNow = options.isTrusted ?? (() => options.preambleStatus?.trusted ?? true);
 
-  const ensureDir = async () => {
-    await mkdir(toolsDir, { recursive: true });
+  const ensureDir = async (dir: string) => {
+    await mkdir(dir, { recursive: true });
   };
 
   // ── save_tool ──────────────────────────────────────────────
@@ -384,6 +439,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       const name = validateToolName(args.name);
       const code = requireString(args.code, "code");
       const description = requireString(args.description, "description");
+      const dir = await containedToolsDir(toolsDir, root);
 
       // Refuse to persist a tool that would shadow a host tool, rather than
       // letting it bind the name on every later run (#54, #56).
@@ -396,7 +452,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         );
       }
 
-      await ensureDir();
+      await ensureDir(dir);
 
       // Wrap with docstring comment
       const docComment = description
@@ -412,7 +468,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         "",
       ].join("\n");
 
-      await writeFile(toolPath(toolsDir, name), content, "utf-8");
+      await writeFile(toolPath(dir, name), content, "utf-8");
       return (
         `Tool '${name}' saved. It loads in new sessions — ` +
         `the current session's preamble is unchanged.`
@@ -441,7 +497,8 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     returns: "str",
     async execute(args) {
       const name = validateToolName(args.name);
-      const path = toolPath(toolsDir, name);
+      const dir = await containedToolsDir(toolsDir, root);
+      const path = toolPath(dir, name);
 
       try {
         await rm(path, { force: false });
@@ -471,7 +528,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
    * load whose file has since been deleted: it still runs here and is gone
    * from new sessions, and the line says both.
    */
-  function annotate(name: string, onDisk: boolean, view: PreambleStatus): Promise<string> {
+  function annotate(
+    name: string,
+    onDisk: boolean,
+    view: PreambleStatus,
+    dir: string,
+  ): Promise<string> {
     const shown = renderName(name);
     if (!view.loaded.has(name)) {
       return Promise.resolve(`${shown} [not loaded: ${notLoadedReason(name, view)}]`);
@@ -481,7 +543,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         `${shown} [loaded in this session — file deleted; gone from new sessions]`,
       );
     }
-    return identityStatus(name, shown, view);
+    return identityStatus(name, shown, view, dir);
   }
 
   /**
@@ -497,11 +559,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     name: string,
     shown: string,
     view: PreambleStatus,
+    dir: string,
   ): Promise<string> {
     const identity = view.identity?.get(name);
     if (!identity) return shown;
     try {
-      const st = await lstat(toolPath(toolsDir, name));
+      const st = await lstat(toolPath(dir, name));
       if (st.size !== identity.size || st.mtimeMs !== identity.mtimeMs) {
         return `${shown} [loaded in this session — file changed since; the session runs the earlier copy]`;
       }
@@ -533,11 +596,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     params: [],
     returns: "str",
     async execute(_args) {
-      await ensureDir();
+      const dir = await containedToolsDir(toolsDir, root);
+      await ensureDir(dir);
 
       let entries: string[];
       try {
-        entries = await readdir(toolsDir);
+        entries = await readdir(dir);
       } catch {
         entries = [];
       }
@@ -554,7 +618,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       // executes in this one, and hiding it would claim it stopped.
       const all = [...new Set([...disk, ...view.loaded])].sort();
       if (all.length === 0) return "(no saved tools)";
-      return (await Promise.all(all.map((name) => annotate(name, disk.has(name), view)))).join(
+      return (await Promise.all(all.map((name) => annotate(name, disk.has(name), view, dir)))).join(
         "\n",
       );
     },
@@ -603,7 +667,8 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     returns: "str",
     async execute(args) {
       const name = validateToolName(args.name);
-      const path = toolPath(toolsDir, name);
+      const dir = await containedToolsDir(toolsDir, root);
+      const path = toolPath(dir, name);
 
       // The untrusted refusal comes first, before any filesystem contact: an
       // untrusted session learns nothing about what is (or is not) on disk.

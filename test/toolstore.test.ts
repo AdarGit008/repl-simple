@@ -1961,3 +1961,75 @@ describe("loaded tools whose file changed after the session started (#57)", () =
     }
   });
 });
+
+// ── A symlinked tools dir cannot escape the root (#57) ──────────
+
+describe("toolstore tools refuse a tools dir that escapes the root (#57)", () => {
+  /** Root with `.pi/code-tools` → symlink to `outside`; a victim file lives there. */
+  function symlinkedSetup(): { root: string; outside: string } {
+    const root = makeTempDir();
+    const outside = mkdtempSync(join(tmpdir(), "repl-outside-"));
+    writeFileSync(join(outside, "victim.py"), "def victim(): pass\n");
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    symlinkSync(outside, join(root, ".pi", "code-tools"));
+    return { root, outside };
+  }
+
+  function viewedTools(root: string): HostTool[] {
+    return createToolStoreTools({ root, preambleStatus: status({}) });
+  }
+
+  it("save_tool refuses to write through it", async () => {
+    const { root } = symlinkedSetup();
+    try {
+      const tools = viewedTools(root);
+      await assert.rejects(async () => {
+        await findTool(tools, "save_tool").execute({
+          name: "sneaky",
+          code: "def sneaky(): pass",
+          description: "escape",
+        });
+      }, /outside the project root/);
+      assert.ok(!existsSync(join(root, ".pi", "code-tools", "sneaky.py")));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("delete_tool refuses to delete through it", async () => {
+    const { root, outside } = symlinkedSetup();
+    try {
+      const tools = viewedTools(root);
+      await assert.rejects(async () => {
+        await findTool(tools, "delete_tool").execute({ name: "victim" });
+      }, /outside the project root/);
+      assert.ok(existsSync(join(outside, "victim.py")), "the victim file was deleted");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("list_saved_tools refuses to list through it", async () => {
+    const { root } = symlinkedSetup();
+    try {
+      const tools = viewedTools(root);
+      await assert.rejects(async () => {
+        await findTool(tools, "list_saved_tools").execute({});
+      }, /outside the project root/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("read_tool refuses to read through it", async () => {
+    const { root } = symlinkedSetup();
+    try {
+      const tools = viewedTools(root);
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "victim" });
+      }, /outside the project root/);
+    } finally {
+      cleanup();
+    }
+  });
+});
