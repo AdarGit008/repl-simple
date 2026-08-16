@@ -365,7 +365,7 @@ function limitNotice(skipped: string[]): string {
  */
 function refusalNotice(refused: RefusedTool[]): string {
   const offenders = refused
-    .map((r) => `${escapeNoticeName(r.file)} defines ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
+    .map((r) => `${escapeNoticeName(r.file)} binds ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
     .join("; ");
   return (
     `[preamble refused] No saved tools were loaded: ${offenders} — those names are host tools, ` +

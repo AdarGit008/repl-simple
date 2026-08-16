@@ -2033,3 +2033,64 @@ describe("toolstore tools refuse a tools dir that escapes the root (#57)", () =>
     }
   });
 });
+
+// ── Detector: walrus and module metaprogramming (#57) ───────────
+
+describe("findShadowingBindings — forms the write/load gates must catch (#57)", () => {
+  const reserved = new Set(["read_file", "bash", "save_tool"]);
+
+  it("records walrus targets at statement start", () => {
+    assert.deepEqual(findShadowingBindings("(read_file := 1)", reserved), ["read_file"]);
+  });
+
+  it("records walrus targets nested inside an assignment value", () => {
+    assert.deepEqual(findShadowingBindings("x = (bash := 1)", reserved), ["bash"]);
+  });
+
+  it("refuses every reserved name for a top-level exec — the binding is invisible", () => {
+    assert.deepEqual(findShadowingBindings('exec("read_file = 1")', reserved), [
+      "read_file",
+      "bash",
+      "save_tool",
+    ]);
+  });
+
+  it("refuses every reserved name for top-level globals() mutation", () => {
+    assert.deepEqual(findShadowingBindings("globals()['save_tool'] = lambda: 1", reserved), [
+      "read_file",
+      "bash",
+      "save_tool",
+    ]);
+  });
+
+  it("refuses every reserved name for top-level setattr and vars()", () => {
+    assert.deepEqual(findShadowingBindings("setattr(SomeModule, 'bash', 1)", reserved), [
+      "read_file",
+      "bash",
+      "save_tool",
+    ]);
+    assert.deepEqual(findShadowingBindings("vars()['read_file'] = 1", reserved), [
+      "read_file",
+      "bash",
+      "save_tool",
+    ]);
+  });
+
+  it("refuses every reserved name for a star import", () => {
+    assert.deepEqual(findShadowingBindings("from hostile import *", reserved), [
+      "read_file",
+      "bash",
+      "save_tool",
+    ]);
+  });
+
+  it("ignores metaprogramming indented inside a function body", () => {
+    // Indented code runs in the function's local namespace when called, not
+    // at preamble time — the module-level gate is what shadowing needs.
+    assert.deepEqual(findShadowingBindings("def helper():\n    exec(code)", reserved), []);
+  });
+
+  it("ignores metaprogramming in comments", () => {
+    assert.deepEqual(findShadowingBindings("# exec(code)", reserved), []);
+  });
+});

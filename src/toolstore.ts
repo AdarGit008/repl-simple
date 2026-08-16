@@ -254,16 +254,20 @@ function assignmentEquals(s: string): number[] {
  *
  * Detects the binding forms a saved tool could use to shadow a host tool:
  * `def`/`async def`, `class`, assignment (plain, annotated, tuple, chained),
- * `for … in`, `with/except … as`, `import … as`, and `from … import …`.
+ * walrus, `for … in`, `with/except … as`, `import … as`, `from … import …`,
+ * and — because the binding is invisible to a name scan — top-level
+ * `exec`/`eval`, `globals()`/`vars()`, `__dict__[…]`, `setattr(…)` and
+ * `import *`, which refuse **every** reserved name rather than guessing one.
  *
  * A **best-effort scan, not a parser** (#54 lists the forms; the write-time
  * gate is #56). It is conservative on false *positives* — a match refuses
  * even inside a triple-quoted string, which is the safe direction — but it
- * has false *negatives*: `exec(...)`, `globals()["name"] = …`, `setattr`,
- * walrus (`:=`), `del name`, `match`/`case` captures, and a plain
- * `import mod` (no alias) are not caught. Those are the load-time check's
- * job (#54), which runs over every `.py` in `.pi/code-tools` and is the
- * authoritative control; this write-time check only refuses what it can see.
+ * has false *negatives*: `del name`, `match`/`case` captures, `setattr` with
+ * a first argument that reaches the module namespace by an alias
+ * (`sys.modules[__name__]`), and metaprogramming indented inside a function
+ * body are not caught. **Both gates run this same scan** — the load-time
+ * check (#54) is authoritative only in that it runs over every `.py` in
+ * `.pi/code-tools` regardless of how it got there, not in what it can see.
  * Comment lines are excluded for free — a binding form must start the line,
  * and `# def read_file` starts with `#`.
  *
@@ -336,6 +340,28 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         continue;
       }
 
+      // Module-level metaprogramming: the binding is invisible to this scan.
+      // `exec`/`eval` run arbitrary code in the current namespace, `globals()`
+      // and `vars()` hand it over by name, `__dict__[…]` and `setattr` mutate
+      // it, and `import *` binds an unknown set. A refusal cannot name the
+      // symbol, so every reserved name is recorded — the safe over-refusal,
+      // and the honest one, since the message says "binds" rather than
+      // "defines". Top-level (column 0) only: indented code belongs to a
+      // function body and runs in its locals when called, not at preamble
+      // time. Single-line `def f(): exec(…)` reaches the def branch above
+      // instead — correct, because that exec does not run at load time.
+      if (!/^[ \t]/.test(raw)) {
+        const code = s.split("#")[0];
+        if (
+          /\b(?:exec|eval)\s*\(|\bglobals\s*\(\s*\)|\bvars\s*\(\s*\)|\b__dict__\s*\[|\bsetattr\s*\(|import\s+\*/.test(
+            code,
+          )
+        ) {
+          for (const reservedName of reserved) record(reservedName);
+          continue;
+        }
+      }
+
       const from = /^from\s+[\w.]+\s+import\s+(.*)$/.exec(s);
       if (from) {
         // `from m import f as read_file` binds the alias; `from m import read_file`
@@ -353,6 +379,11 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         }
         continue;
       }
+
+      // Walrus targets — `(read_file := …)` at statement start, or nested in
+      // an assignment value. Recorded additively, before the assignment
+      // branch, so `x = (bash := 1)` records `bash` as well as `x`.
+      for (const m of s.matchAll(/[A-Za-z_]\w*\s*:=/g)) record(m[0].replace(/\s*:=$/, ""));
 
       // Assignment. The statement must *begin* with a target expression — an
       // identifier, or one wrapped in parens/brackets or star-unpacked — so a
@@ -442,12 +473,14 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       const dir = await containedToolsDir(toolsDir, root);
 
       // Refuse to persist a tool that would shadow a host tool, rather than
-      // letting it bind the name on every later run (#54, #56).
+      // letting it bind the name on every later run (#54, #56). "binds", not
+      // "defines": the detector also refuses invisible bindings (exec, walrus),
+      // where "defines" would overstate what the scan can see.
       const shadowing = findShadowingBindings(code, reservedNames);
       if (shadowing.length > 0) {
         throw new HostToolError(
           "ValueError",
-          `cannot save tool '${name}': its code defines ${shadowing.map((n) => `'${n}'`).join(", ")}, ` +
+          `cannot save tool '${name}': its code binds ${shadowing.map((n) => `'${n}'`).join(", ")}, ` +
             `which would shadow a host tool`,
         );
       }
