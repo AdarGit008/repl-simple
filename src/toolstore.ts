@@ -14,11 +14,14 @@ export interface ToolStoreOptions {
   /**
    * Names a saved tool's code must not bind — the session's host-tool names.
    *
-   * `save_tool` refuses code that defines one of these, because the preamble
-   * runs before host tools resolve and would silently replace them (#54, #56).
-   * Caller-supplied so the list derives from the live registry rather than a
-   * hardcoded set that drifts. Omitted (or `[]`) means no write-time check;
-   * the load-time refusal (#54) is the backstop in that case.
+   * One list, two gates. `save_tool` refuses code that defines one of these
+   * at write time (#56), and `loadSavedTools` refuses a preamble containing
+   * such a file at load time (#54) — because the preamble runs before host
+   * tools resolve and would silently replace them. Caller-supplied so the
+   * list derives from the live registry rather than a hardcoded set that
+   * drifts. Omitted (or `[]`) means no check: for a standalone caller that
+   * cannot name the registry, `loadSavedTools` still loads, and the caller
+   * owns the security decision.
    */
   hostToolNames?: readonly string[];
 }
@@ -418,6 +421,30 @@ export interface SavedToolsPreamble {
    * `NameError` the model has no way to explain.
    */
   skipped: string[];
+  /**
+   * Files whose code binds a host-tool name, refused at load time (#54).
+   *
+   * Non-empty means **nothing** was loaded — `preamble` is `""`, `loaded` and
+   * `skipped` are `[]` — and the caller must tell the model which file and
+   * symbol to fix. Partial injection would produce a session whose behaviour
+   * nobody can predict from the source, so one offender refuses the whole
+   * preamble rather than the offending file.
+   */
+  refused: RefusedTool[];
+}
+
+/**
+ * One saved tool the preamble must not run: its code shadows a host tool.
+ *
+ * A preamble definition **silently replaces** a host tool — host tools resolve
+ * only for names Python has not already bound, and the preamble runs first,
+ * so binding the name wins for the whole session (#54).
+ */
+export interface RefusedTool {
+  /** The `.py` file whose code binds a host-tool name. */
+  file: string;
+  /** The host-tool names the file binds, in first-appearance order. */
+  symbols: string[];
 }
 
 // ── savedToolNames ────────────────────────────────────────────────
@@ -460,6 +487,11 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
  * only for a project whose code the user has agreed to run — see
  * `docs/project-trust.md`. `savedToolNames` is the safe half of this function
  * for callers that only need to know what is there.
+ *
+ * When `options.hostToolNames` is set, every file is scanned with
+ * {@link findShadowingBindings} before anything is returned: a file that binds
+ * a host-tool name refuses the **whole** preamble (#54), reported in `refused`
+ * with the offending file and symbols and nothing loaded.
  */
 export async function loadSavedTools(
   options: ToolStoreOptions,
@@ -469,24 +501,35 @@ export async function loadSavedTools(
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
   const names = await savedToolNames({ root, toolsDir });
-  if (names.length === 0) return { preamble: "", loaded: [], skipped: [] };
+  if (names.length === 0) return { preamble: "", loaded: [], skipped: [], refused: [] };
+
+  const reservedNames = new Set(options.hostToolNames ?? []);
 
   const loaded: string[] = [];
   const skipped: string[] = [];
+  const refused: RefusedTool[] = [];
   const sources: string[] = [];
   let bytes = 0;
 
   for (const name of names) {
+    const content = await readFile(join(toolsDir, `${name}.py`), "utf-8");
+
+    // Read every file even after an offender: all of them are collected in
+    // one pass, so the developer fixes once rather than one refusal per fix.
+    const shadowing = findShadowingBindings(content, reservedNames);
+    if (shadowing.length > 0) {
+      refused.push({ file: `${name}.py`, symbols: shadowing });
+      continue;
+    }
+
     if (loaded.length >= limits.maxFiles) {
       skipped.push(name);
       continue;
     }
 
-    const content = await readFile(join(toolsDir, `${name}.py`), "utf-8");
-    const size = Buffer.byteLength(content, "utf-8");
-
     // Skipped whole, never truncated: half a Python file is a SyntaxError,
     // and a SyntaxError in the preamble takes every later tool down with it.
+    const size = Buffer.byteLength(content, "utf-8");
     if (bytes + size > limits.maxBytes) {
       skipped.push(name);
       continue;
@@ -497,7 +540,13 @@ export async function loadSavedTools(
     sources.push(content);
   }
 
-  if (loaded.length === 0) return { preamble: "", loaded: [], skipped };
+  // One offender refuses everything. Partial injection — the benign siblings
+  // without the hostile file — produces a session whose behaviour nobody can
+  // predict from the source, and the issue forbids both that and doing
+  // nothing silently. The caller must turn `refused` into a notice.
+  if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], refused };
+
+  if (loaded.length === 0) return { preamble: "", loaded: [], skipped, refused };
 
   const header = [
     "# ── Loaded tools ──",
@@ -512,5 +561,6 @@ export async function loadSavedTools(
     preamble: [...header, ...sources.flatMap((s) => [s, ""])].join("\n"),
     loaded,
     skipped,
+    refused,
   };
 }
