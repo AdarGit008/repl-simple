@@ -72,6 +72,20 @@ export interface ToolStoreOptions {
    * and `read_tool` answers (#57). Omitted, the tools report disk state only.
    */
   preambleStatus?: PreambleStatus;
+  /**
+   * The live trust decision, read at every call.
+   *
+   * The snapshot above records what the session loaded at creation; this is
+   * the decision in force **now**. They differ exactly when a trust flip
+   * kept the session — `ReplRunner` does not rebuild a session whose preamble
+   * would not change, and the tools must follow the live decision anyway or
+   * `read_tool` would read a project that is no longer trusted (#57).
+   *
+   * Consulted by `read_tool`'s refusal and by the list's "project not
+   * trusted" bucket. Absent, the tools fall back to `preambleStatus.trusted`,
+   * and a standalone caller with neither gets today's ungated behavior.
+   */
+  isTrusted?: () => boolean;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -269,6 +283,9 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
   const reservedNames = new Set(options.hostToolNames ?? []);
+  // Live where the snapshot is frozen: the trust decision can change while
+  // the session lives, and the tools must follow it (see ToolStoreOptions).
+  const isTrustedNow = options.isTrusted ?? (() => options.preambleStatus?.trusted ?? true);
 
   const ensureDir = async () => {
     await mkdir(toolsDir, { recursive: true });
@@ -413,7 +430,9 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     if (view.refused.has(name)) return "preamble refused — shadows a host tool";
     if (view.unreadable.has(name)) return "unreadable file";
     if (view.skipped.has(name)) return "preamble limit reached";
-    if (!view.trusted || view.withheld.has(name)) return "project not trusted";
+    // The live decision, not the snapshot: a tool that appears after an inert
+    // untrust flip is "not trusted", not "saved after this session started".
+    if (!isTrustedNow() || view.withheld.has(name)) return "project not trusted";
     // Trusted and in no category: either a benign sibling of a refused
     // preamble (the loader refuses the whole batch, #54) or a tool saved
     // after this session started. The loader's invariant — `loaded` is
@@ -466,8 +485,10 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
    */
   function readNote(name: string, view: PreambleStatus): string {
     if (view.refused.has(name)) {
-      return "# NOTE: not loaded in this session — the preamble was refused because this code " +
-        "shadows a host tool";
+      return (
+        "# NOTE: not loaded in this session — the preamble was refused because this code " +
+        "shadows a host tool"
+      );
     }
     if (view.unreadable.has(name)) {
       return "# NOTE: not loaded in this session — the file could not be read when the session started";
@@ -514,9 +535,11 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       }
 
       // An untrusted project's files are never even read (#53) — a registered
-      // read tool that read them would silently repeal the gate.
+      // read tool that read them would silently repeal the gate. The live
+      // decision decides, not the snapshot: a trust flip that kept the
+      // session (nothing to lose) must still close the gate.
       const view = options.preambleStatus;
-      if (view && !view.trusted) {
+      if (!isTrustedNow()) {
         throw new HostToolError(
           "PermissionError",
           `tool '${name}' was not loaded — this project is not trusted, so its files are not read. ` +

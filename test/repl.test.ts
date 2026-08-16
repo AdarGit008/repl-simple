@@ -1389,3 +1389,75 @@ describe("ReplRunner — save_tool stays gated inside repl (#57)", () => {
     }
   });
 });
+
+// ── Tools follow inert trust flips (#57, post-review) ───────────
+//
+// trustChangeDiscards keeps the session when a trust flip "changes nothing",
+// but the tools must follow the live decision anyway — a frozen snapshot
+// would read files from a project that is no longer trusted, or keep lying
+// about a project that now is.
+
+describe("ReplRunner — tools follow inert trust flips (#57)", () => {
+  it("read_tool refuses once trust is revoked with no preamble to lose", async () => {
+    const cwd = makeTempDir();
+    let trusted = true;
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+
+    try {
+      await runner.run("1 + 1", "flip"); // session created trusted, no preamble
+      saveToolFile(cwd, "late", "def late():\n    return 1\n"); // tool appears later
+      trusted = false; // no discard: the session never had a preamble
+
+      const read = await runner.run("read_tool('late')", "flip");
+      assert.match(read, /project is not trusted/, `an untrusted project's file was read: ${read}`);
+      assert.match(
+        await runner.run("list_saved_tools()", "flip"),
+        /late \[not loaded: project not trusted\]/,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("read_tool stops refusing once trust is granted with no preamble to gain", async () => {
+    const cwd = makeTempDir();
+    let trusted = false;
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+
+    try {
+      await runner.run("1 + 1", "flip"); // session created untrusted, nothing on disk
+      trusted = true;
+      await runner.run(
+        "save_tool('late', 'def late(): return 1', 'saved after the flip')",
+        "flip",
+        approve,
+      );
+
+      const read = await runner.run("read_tool('late')", "flip");
+      assert.match(read, /def late/, `a trusted project's file was refused: ${read}`);
+      assert.match(
+        await runner.run("list_saved_tools()", "flip"),
+        /late \[not loaded: saved after this session started\]/,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a rebuilt session's tools follow the new decision", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "adder", "def add_two(a, b):\n    return a + b\n");
+    let trusted = true;
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+
+    try {
+      await runner.run("1 + 1", "flip"); // trusted session, preamble loaded
+      trusted = false; // discards and rebuilds: the preamble would change
+
+      const out = await runner.run("read_tool('adder')", "flip");
+      assert.match(out, /project is not trusted/, `the rebuilt session still reads: ${out}`);
+    } finally {
+      cleanup();
+    }
+  });
+});

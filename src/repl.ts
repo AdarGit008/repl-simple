@@ -2,7 +2,12 @@ import { Session, type GrantSummary } from "./session.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
-import { loadSavedTools, savedToolNames, createToolStoreTools, TOOLSTORE_TOOL_NAMES } from "./toolstore.js";
+import {
+  loadSavedTools,
+  savedToolNames,
+  createToolStoreTools,
+  TOOLSTORE_TOOL_NAMES,
+} from "./toolstore.js";
 import type { RefusedTool, UnreadableTool, PreambleStatus } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
@@ -245,10 +250,7 @@ export class ReplRunner {
     // the session will have — including the toolstore's own, which are not in
     // the registry yet: a preamble `def save_tool` would shadow the registered
     // tool exactly like a bridge or builtin name (#57).
-    const hostToolNames = [
-      ...registry.list().map((tool) => tool.name),
-      ...TOOLSTORE_TOOL_NAMES,
-    ];
+    const hostToolNames = [...registry.list().map((tool) => tool.name), ...TOOLSTORE_TOOL_NAMES];
 
     let preamble = "";
     let preambleStatus: PreambleStatus;
@@ -294,8 +296,14 @@ export class ReplRunner {
     // Registered in every session, trusted or untrusted (#57): the tools
     // answer from the status above — listing what actually loaded, refusing
     // reads the project never trusted — and the write-time shadowing check
-    // (#56) finally sees the live registry's names.
-    for (const tool of createToolStoreTools({ root: this.cwd, hostToolNames, preambleStatus })) {
+    // (#56) finally sees the live registry's names. The live trust callback
+    // keeps the read gate honest across trust flips that keep the session.
+    for (const tool of createToolStoreTools({
+      root: this.cwd,
+      hostToolNames,
+      preambleStatus,
+      isTrusted: this.isProjectTrusted,
+    })) {
       registry.add(tool);
     }
 

@@ -638,10 +638,7 @@ describe("list_saved_tools with preambleStatus (#57)", () => {
       const { tools, opts } = makeViewedTools(root, status({ loaded: ["z_tool", "a_tool"] }));
       await writeTool(root, "z_tool");
       await writeTool(root, "a_tool");
-      assert.equal(
-        await findTool(tools, "list_saved_tools").execute({}),
-        "a_tool\nz_tool",
-      );
+      assert.equal(await findTool(tools, "list_saved_tools").execute({}), "a_tool\nz_tool");
       void opts;
     } finally {
       cleanup();
@@ -738,10 +735,7 @@ describe("list_saved_tools with preambleStatus (#57)", () => {
       const view = status({ loaded: ["gone"] });
       const { tools } = makeViewedTools(root, view);
       const out = await findTool(tools, "list_saved_tools").execute({});
-      assert.equal(
-        out,
-        "gone [loaded in this session — file deleted; gone from new sessions]",
-      );
+      assert.equal(out, "gone [loaded in this session — file deleted; gone from new sessions]");
     } finally {
       cleanup();
     }
