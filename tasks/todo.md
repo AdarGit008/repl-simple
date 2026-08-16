@@ -22,3 +22,14 @@
     green; `npm run check` clean; `npm run lint` clean; each increment committed; tree clean.
   - Verify: `npm test && npm run check && npm run lint`; `gh issue view 40 --comments`.
   - Files: none (verification + GitHub comment only)
+
+- [x] Task 4: review remediation (code-reviewer, security-auditor, test-engineer findings)
+  - Acceptance: the HIGH universal-newline bypass is closed (detector splits on `\r`/`\r\n` and
+    joins backslash continuations); for-tuple and parenthesized/starred targets are caught;
+    reads beyond `maxFiles` are gone (no unreadable-entry regression, no unbounded I/O); notice
+    filenames are control-character-escaped and the recovery wording is truthful; trust-change
+    after refusal and fix-then-new-session paths are pinned by tests; SPEC/todo record the
+    remediation.
+  - Verify: `npm test && npm run check && npm run lint && npm run build`.
+  - Files: `src/toolstore.ts`, `src/repl.ts`, `test/toolstore.test.ts`, `test/repl.test.ts`,
+    `SPEC.md`, `tasks/todo.md`

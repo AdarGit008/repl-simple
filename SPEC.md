@@ -46,16 +46,30 @@ resolving; the model is told exactly which file and symbol to fix.
   one detector, two gates (write-time #56, load-time #54). The reserved names arrive through the
   existing `ToolStoreOptions.hostToolNames` (#56 added it for the write gate; this issue widens
   its contract to both gates and updates its JSDoc).
-- **Whole-preamble refusal.** If *any* file shadows, `preamble === ""`, `loaded === []`, limits
-  are not evaluated, and `refused` names the offenders. Partial injection produces a session
-  nobody can predict from the source; the issue forbids it.
-- **All offenders are collected in one pass.** Reading stops for nothing: the notice lists every
-  shadowing file at once, so the developer fixes once rather than rinse-and-repeat.
+- **Whole-preamble refusal.** If *any* file that would load shadows, `preamble === ""`,
+  `loaded === []`, limits are not evaluated, and `refused` names the offenders. Partial injection
+  produces a session nobody can predict from the source; the issue forbids it.
+- **Only code that would load is read and scanned.** Files beyond `maxFiles` are never read —
+  code that never loads cannot shadow, and reading it anyway would be unbounded host-side I/O
+  (review finding). A capped-out shadow is refused the first session in which it *would* load,
+  because session creation re-runs the loader. All offenders within the scanned set are still
+  collected in one pass, so the developer fixes once rather than rinse-and-repeat.
+- **The scanner is tokenizer-faithful where a line break could hide a binding.** The source is
+  split on universal newlines (`\r`, `\r\n`, `\n`) and backslash continuations are joined first,
+  exactly as CPython/Monty tokenize — otherwise `# comment\rdef bash(...)` executes as a `def`
+  that a `\n`-only split would read as one comment line (security-audit finding, verified end to
+  end against the real sandbox). For-heads record every target identifier, and parenthesized /
+  starred assignment targets are covered. The audit's `match`/`case` capture remains a documented
+  miss (the sandbox rejects `match` statements loudly today; see residual risks).
 - **Refusal applies only where a preamble would be injected** — the trusted path. The untrusted
   path (#53) never loads anything, so there is nothing to scan.
 - **The reserved list is the live registry.** `ReplRunner.createSession` passes
   `registry.list().map(t => t.name)` (bridge + builtins today; toolstore tools join it when #57
   registers them, and then shadow them too). No hardcoded list to drift (test 5).
+- **The refusal notice is truthful and inert.** Filenames interpolated into the notice are
+  control-character-escaped (they come from the directory listing); the notice tells the model to
+  fix the file and **start a new session** — the running session's preamble is fixed at creation
+  and never re-verified, so "loads in the next session" would have been a lie (audit finding).
 - **The namespace question is recorded on #40.** The durable answer — registering host tools in a
   namespace Python cannot rebind — is sandbox-level and migration-dependent; per the issue, a
   comment is added to #40 so the question survives the migration spike.
@@ -144,9 +158,13 @@ All five issue tests pass end-to-end, plus: full suite green, `npm run check` cl
 5. **`read_file` is a registered builtin today** (bridge: `read, grep, find, ls, bash, edit,
    write`; builtins: `read_file, list_files, http_get`) — the reproduction in the issue body is
    therefore live against the current registry.
-6. **Detector false negatives inherit from #56** (exec, setattr, walrus, bare `import`). This is
-   accepted: the load-time scan is a UX/security guard, not a parser, and the namespace fix (#40)
-   is the structural answer.
+6. **Detector false negatives inherit from #56** (exec, setattr, walrus, bare `import`, `del`,
+   `match`/`case`). This is accepted: the load-time scan is a UX/security guard, not a parser, and
+   the namespace fix (#40) is the structural answer.
+7. **Unreadable entries and oversized single files remain #55's problem.** A file that throws on
+   read (directory named `x.py`, dangling symlink) or a single file far larger than `maxBytes`
+   still aborts the load; this predates the change (reads are bounded to the `maxFiles` set) and
+   is fixed in #55, which owns the read loop's error handling and size caps.
 
 ## Open Questions
 
@@ -154,13 +172,37 @@ None blocking. #55 (unreadable entries) and #57 (registration) remain open and o
 
 ## Residual risks (recorded for the ship report)
 
-- **The detector is best-effort.** The binding scan (#56) has false negatives; code that binds a
-  host name through `exec`, `globals()`, `setattr`, walrus or a bare `import` slips past the
-  write-time *and* load-time checks. The structural fix — a namespace Python cannot rebind — is
-  recorded on #40 and remains the authoritative answer.
+- **The detector is best-effort.** The binding scan (#56) has false negatives: code that binds a
+  host name through `exec`, `globals()`, `setattr`, walrus, a bare `import`, `del`, or
+  `match`/`case` captures slips past both gates. The audit verified that today those forms tend
+  to fail loudly (the checker validates against the tool stubs) rather than shadow silently —
+  but that depends on stub types never degrading to `Any`. The structural fix — a namespace
+  Python cannot rebind — is recorded on #40 and remains the authoritative answer.
 - **Recovery is host-side until #57.** The refusal notice tells the model what to fix, but
   `delete_tool` is not registered inside `repl` yet, so the offending file must be removed or
-  rewritten from the host side. The notice is worded accordingly (no lie about `delete_tool`).
+  rewritten from the host side. The notice says to start a new session after fixing — the honest
+  instruction, pinned by a test.
 - **A refusal costs the innocent tools too.** Whole-preamble refusal means benign siblings of the
   offending file do not load either. That is the issue's explicit demand ("refuse the whole
   preamble"), and the notice says so.
+- **One oversized or unreadable entry still aborts the load.** Reads are bounded to the
+  `maxFiles` set (no beyond-caps reads — review finding), but a single giant file within the caps
+  is still read in full, and a directory named `x.py` still throws out of session creation.
+  Both predate this change; #55 owns the fix.
+
+## Review remediation (post-build, reviewer-driven)
+
+- **HIGH (security audit): universal-newline bypass** — fixed: the detector splits on `\r`/`\r\n`
+  and joins backslash continuations, with unit and loader-level regression tests. The same
+  detector backs the #56 write gate, so both gates are hardened by one change.
+- **MEDIUM (security audit): undocumented target-form misses** — fixed for for-tuples and
+  parenthesized/starred targets; `match`/`case` documented as a miss (sandbox rejects `match`
+  loudly today).
+- **REQUIRED (code review) / MEDIUM (audit): reads beyond the caps** — fixed: files the caps
+  drop are neither read nor scanned; the unreadable-entry regression and the unbounded-I/O
+  concern both disappear. Pinned by a test.
+- **LOW (audit): notice wording and filename interpolation** — fixed: filenames are
+  control-character-escaped in the refusal notice; the false "next session" promise is reworded
+  and the recovery path pinned by a test.
+- **Test-engineer must-haves** — the scan-bounds interplay and the trust-change-after-refusal
+  behaviour are now pinned; multi-offender notice rendering is pinned at runner level.
