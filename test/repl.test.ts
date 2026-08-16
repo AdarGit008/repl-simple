@@ -701,6 +701,10 @@ describe("ReplRunner — a shadowing preamble is refused whole (#54)", () => {
     assert.match(first, /shadow\.py/, "the notice must name the file");
     assert.match(first, /'read_file'/, "the notice must name the symbol");
     assert.match(first, /No saved tools were loaded/);
+    // #57 registered the tools: the notice must point at the now-working
+    // in-repl recovery path instead of leaving the model to edit files.
+    assert.match(first, /read_tool\(\)/, "the notice must offer to read the offender");
+    assert.match(first, /delete_tool\(\)/, "the notice must offer to delete the offender");
 
     // News, not a banner — the same one-shot contract as the other notices.
     const second = await runner.run("2 + 2", "told");
@@ -983,6 +987,10 @@ describe("ReplRunner — an untrusted project's preamble does not run (#53)", ()
     assert.match(first, /^\[preamble withheld\]/);
     assert.match(first, /hostile/, "the notice must name what is missing");
     assert.match(first, /NameError/, "the notice must say what calling one will do");
+    // #57 registered the tools: the notice must say which management tool
+    // shows the truth and which one refuses, in an untrusted project.
+    assert.match(first, /list_saved_tools\(\)/, "the notice must point at the list tool");
+    assert.match(first, /read_tool\(\) refuses/, "the notice must say read_tool refuses");
 
     // News, not a banner: repeating it on every result would train the model
     // to skip the line that matters.

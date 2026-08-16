@@ -320,7 +320,8 @@ function untrustedNotice(withheld: string[]): string {
     `[preamble withheld] ${withheld.length} saved tool(s) in .pi/code-tools were not loaded ` +
     `because this project is not trusted: ${withheld.join(", ")}. ` +
     `They are not defined in this session — calling one raises NameError. ` +
-    `Trust the project in pi to load them, or paste the code you need.`
+    `list_saved_tools() shows what is on disk, and read_tool() refuses while the project ` +
+    `is untrusted. Trust the project in pi to load them, or paste the code you need.`
   );
 }
 
@@ -369,7 +370,7 @@ function refusalNotice(refused: RefusedTool[]): string {
     `[preamble refused] No saved tools were loaded: ${offenders} — those names are host tools, ` +
     `and a preamble that shadows one is refused whole, never run in part. ` +
     `Calling a saved tool raises NameError in this session. ` +
-    `Rewrite or delete the offending file(s) under .pi/code-tools, ` +
+    `Rewrite the offending file(s) — read_tool() shows the code, delete_tool() removes one — ` +
     `then start a new session to load the preamble.`
   );
 }
