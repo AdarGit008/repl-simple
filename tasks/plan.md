@@ -1,70 +1,110 @@
-# Implementation Plan: One unreadable entry must not break `repl` (#55)
+# Implementation Plan: Register the toolstore tools (#57)
 
 ## Overview
 
-Stop a single unreadable or non-regular `.py` entry under `.pi/code-tools` from bricking every
-`repl` call in the project. Two code changes, both small and additive: (1) `loadSavedTools`
-gates each entry with `lstat` (regular files only) and wraps the per-entry read, reporting
-failures in a new `unreadable` field instead of throwing; (2) `ReplRunner` renders a
-`[preamble unreadable]` notice from that field, alongside the existing `limitNotice` and
-`refusalNotice`. The session is then always created — recoverable by deleting the bad entry
-and starting a new session, no restart.
+Register `createToolStoreTools` in `ReplRunner.createSession` so the model can inspect and remove
+the preamble that auto-executes before its code. Make `list_saved_tools` / `read_tool` honest about
+what the session actually loaded (withheld #53, refused #54, skipped/unreadable #55), and wire the
+live registry's names into the #54/#56 shadowing gates. Source of truth: `SPEC.md`.
 
 ## Architecture Decisions
 
-- **`unreadable: UnreadableTool[]` on `SavedToolsPreamble`** — `{ file, reason }` per entry:
-  `"not a regular file"` for anything `lstat` reports non-regular (directory, FIFO, socket,
-  symlink — working or broken), the error message for `lstat`/`readFile` failures (TOCTOU,
-  permissions). Additive field; the two existing full-object `deepEqual` assertions in
-  `test/toolstore.test.ts` gain `unreadable: []`.
-- **`lstat` decides, not exceptions** — the "skip anything that is not a regular file" the
-  issue demands is enforced up front. Symlinks never load: a preamble is auto-executed code,
-  and a link can point outside the project root. Working symlinks are refused too — one rule.
-- **Per-entry `readFile` guard** — TOCTOU (deleted/swapped between `readdir` and `readFile`)
-  and permission errors become `unreadable` entries, never throws.
-- **Caps and scanning interplay** — unreadable entries consume no `maxFiles` slot, add no
-  bytes, and are never scanned (code that cannot load cannot shadow). Entries beyond
-  `maxFiles` are neither stat'd nor read — the #54 invariant extends to `lstat`.
-- **Refusal (#54) still wins, but reports everything** — an unreadable entry alone never
-  refuses the batch; when a shadowing file refuses it, the refusal result still carries the
-  `unreadable` entries from the same pass, and the notices compose.
-- **`savedToolNames` untouched** — name-only contract (#53); the stat gate lives in the loader.
-- **Notice** `[preamble unreadable]` — one-shot via `LiveSession.notice`, names
-  control-character-escaped (`escapeNoticeName`), says files are not defined → `NameError`,
-  fix/remove + **new session** (a live session's preamble is fixed at creation).
+- **Order in `createSession`:** build bridge+builtin registry → compute `hostToolNames` (live
+  registry + `TOOLSTORE_TOOL_NAMES`) → load preamble (trusted) or read names (untrusted) → build
+  `PreambleStatus` from the outcome → create toolstore tools with `hostToolNames` + `preambleStatus`
+  → add to registry. The toolstore's own names must be in the load-time list *before* the tools
+  exist (a preamble `def save_tool` would shadow the registered tool).
+- **Static snapshot, honest messages.** `PreambleStatus` is a per-session snapshot (5 sets +
+  `trusted` flag). The tools derive every answer from it plus the current disk state; nothing
+  mutable is tracked, and the save/delete messages carry the "new sessions" semantics.
+- **Additive, back-compatible.** `preambleStatus?` on `ToolStoreOptions`; absent → today's behavior.
+  Existing tests must pass untouched.
 
 ## Task List
 
-### Phase 1: Loader resilience
-- [x] Task 1: `loadSavedTools` skips unreadable entries + loader tests
-  (toolstore.ts, index.ts, toolstore.test.ts)
+### Phase 1: Toolstore foundation (unit-tested)
 
-### Checkpoint: Loader
-- [x] `npx tsx --test test/toolstore.test.ts` green; `npm run check` clean
+- [ ] Task 1: `TOOLSTORE_TOOL_NAMES` + `PreambleStatus` type + `preambleStatus` option
+  - Acceptance: const exported and equal to the four names `createToolStoreTools` returns (pinned by
+    test); `ToolStoreOptions.preambleStatus?: PreambleStatus`; type exported from `src/index.ts`.
+  - Verify: `npx tsx --test test/toolstore.test.ts`; `npm run check`.
+  - Files: `src/toolstore.ts`, `src/index.ts`, `test/toolstore.test.ts`
 
-### Phase 2: Runner wiring
-- [x] Task 2: `ReplRunner` renders the unreadable notice + runner tests
-  (repl.ts, repl.test.ts)
+- [ ] Task 2: `list_saved_tools` reports loaded state
+  - Acceptance: with `preambleStatus`, output is the sorted union of disk + loaded names, plain for
+    loaded, `[not loaded: …]` per category (withheld / limit / refused / refused-whole / unreadable /
+    saved-after-start), `[loaded in this session — file deleted; gone from new sessions]` for
+    deleted-but-loaded; `(no saved tools)` when empty; without the option, output unchanged.
+  - Verify: new unit tests red→green; `npx tsx --test test/toolstore.test.ts`; `npm run check`.
+  - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
 
-### Checkpoint: Runner
-- [x] `npx tsx --test test/repl.test.ts` green; `npm run check` clean
+- [ ] Task 3: `read_tool` honesty + non-regular-file refusal
+  - Acceptance: `lstat` first — non-regular file → `OSError` refusal (never a read); untrusted →
+    `PermissionError` refusal with no read; refused/skipped/unreadable → source with
+    `# NOTE: not loaded in this session …` header; loaded/plain/missing unchanged.
+  - Verify: new unit tests red→green; `npx tsx --test test/toolstore.test.ts`; `npm run check`.
+  - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
 
-### Phase 3: Verify and record
-- [x] Task 3: full suite + check + lint + build; commit
+- [ ] Task 4: `save_tool` / `delete_tool` honest messages
+  - Acceptance: save → "loads in new sessions — the current session's preamble is unchanged";
+    delete → "gone from new sessions; the current session keeps any copy it loaded". Existing
+    `includes`-based assertions keep passing.
+  - Verify: updated unit tests red→green; focused test; `npm run check`.
+  - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
+
+### Checkpoint: Foundation
+- [ ] `npx tsx --test test/toolstore.test.ts` green; `npm run check` clean
+
+### Phase 2: ReplRunner wiring (integration-tested)
+
+- [ ] Task 5: register the tools in `createSession` with live `hostToolNames` + `PreambleStatus`
+  - Acceptance: all four tools resolve inside `repl` in a trusted session (list/read/delete/save
+    work); load-time `hostToolNames` includes bridge+builtin+toolstore names; `PreambleStatus` built
+    from the load outcome (or from `savedToolNames` when untrusted).
+  - Verify: new integration tests red→green; `npx tsx --test test/repl.test.ts`; `npm run check`.
+  - Files: `src/repl.ts`, `test/repl.test.ts`
+
+- [ ] Task 6: notice text updates (untrusted / refusal)
+  - Acceptance: `[preamble withheld]` notice keeps the NameError sentence and gains
+    `list_saved_tools()`/`read_tool()` guidance; `[preamble refused]` notice points at
+    `read_tool()`/`delete_tool()`; existing `/^\[preamble (withheld|refused)\]` and `/NameError/`
+    assertions still pass.
+  - Verify: updated notice assertions; `npx tsx --test test/repl.test.ts`; `npm run check`.
+  - Files: `src/repl.ts`, `test/repl.test.ts`
+
+- [ ] Task 7: end-to-end integration tests — list honesty, delete→new session, save_tool gate
+  - Acceptance: `list_saved_tools()` inside `repl` annotates withheld/refused/unreadable exactly as
+    executed; delete→list→read→new-session flow demonstrated; `save_tool` denies with no file
+    written and refuses shadowing code against live host names.
+  - Verify: new integration tests red→green; `npx tsx --test test/repl.test.ts`; `npm run check`.
+  - Files: `test/repl.test.ts`
+
+### Checkpoint: Wiring
+- [ ] `npx tsx --test test/repl.test.ts` green; `npm run check` clean
+
+### Phase 3: Docs
+
+- [ ] Task 8: README + docs/project-trust.md
+  - Acceptance: README toolstore section states the tools resolve in every session, lists load
+    honesty, save_tool gating; project-trust.md "What this does not cover" no longer claims
+    `save_tool` is ungated or that `list_saved_tools` misleads in untrusted projects.
+  - Verify: read-through; `npm run lint`.
+  - Files: `README.md`, `docs/project-trust.md`
 
 ### Checkpoint: Complete
-- [x] `npm test && npm run check && npm run lint && npm run build` all green; tree clean
+- [ ] `npm test` green; `npm run check` clean; `npm run lint` clean
+- [ ] All five issue tests exist and pass; README accurate
+- [ ] Ready for review (Phase 5)
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Platform variance (FIFO/symlink/`chmod 000` tests) | Med | Skip guards: win32 for symlink+FIFO, `getuid()===0` for permissions — matches existing repo patterns |
-| TOCTOU between stat and read | Med | Both `lstat` and `readFile` wrapped; a swapped entry becomes `unreadable`, never a throw |
-| Symlink policy change surprises a real workflow | Low | Recorded in spec assumptions; `save_tool` only writes regular files, so the loader's own tools are unaffected |
-| `deepEqual` churn from the new field | Low | Grep-driven: every full-object `SavedToolsPreamble` assertion updated in Task 1's RED step |
-| Notice wording lies about a reason | Med | "could not be read" is true for every reason; reasons stay on the struct |
+| Notice text changes break extension/repl tests | Med | Existing tests assert prefixes and `/NameError/` only — verified by grep before editing; full suite after Task 6 |
+| `read_tool` exposes the FIFO-hang / symlink-escape hazards | High | `lstat` refusal before any read (Task 3), unit-tested |
+| Registering tools changes type-stub surface inside `repl` | Low | Stubs render from the same `ToolRegistry`; existing sandbox tests cover stub rendering |
+| List format drift between spec and implementation | Med | Format pinned by unit tests per category |
 
 ## Open Questions
 
-None. Scope boundary with #57 (toolstore registration) and #40 (namespace) recorded in the spec.
+None blocking — see SPEC.md "Assumptions".
