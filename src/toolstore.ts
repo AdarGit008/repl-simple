@@ -32,6 +32,87 @@ function toolPath(toolsDir: string, name: string): string {
   return join(toolsDir, `${name}.py`);
 }
 
+// ── Shadowing detection ────────────────────────────────────────
+
+/**
+ * Names from `reserved` that `source` binds, in first-appearance order.
+ *
+ * Detects the binding forms a saved tool could use to shadow a host tool —
+ * `def`/`async def`, `class`, plain assignment, `import … as`, and
+ * `from … import … [as …]` (#54 lists these; the write-time gate is #56).
+ *
+ * Line-anchored regexes, deliberately conservative: a match refuses even
+ * when it sits inside a triple-quoted string, because a false refusal is a
+ * failed save and a false pass is a session whose host tools are silently
+ * replaced. Comment lines are excluded for free — a binding form must start
+ * the line, and `# def read_file` starts with `#`. This is not a Python
+ * parser; tuple unpacking (`read_file, x = …`) and annotated assignment
+ * (`read_file: int = …`) are not caught here, and the load-time check (#54)
+ * is the backstop for those harder shapes.
+ */
+export function findShadowingBindings(
+  source: string,
+  reserved: ReadonlySet<string>,
+): string[] {
+  if (reserved.size === 0) return [];
+
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const record = (name: string): void => {
+    if (reserved.has(name) && !seen.has(name)) {
+      seen.add(name);
+      found.push(name);
+    }
+  };
+
+  for (const line of source.split("\n")) {
+    const def = /^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/.exec(line);
+    if (def) {
+      record(def[1]);
+      continue;
+    }
+
+    const cls = /^\s*class\s+([A-Za-z_]\w*)/.exec(line);
+    if (cls) {
+      record(cls[1]);
+      continue;
+    }
+
+    const assign = /^\s*([A-Za-z_]\w*)\s*=(?!=)/.exec(line);
+    if (assign) {
+      record(assign[1]);
+      continue;
+    }
+
+    if (/^\s*import\s/.test(line)) {
+      // `import x as read_file`; also `import a, b as read_file`. A plain
+      // `import read_file` binds a module name, but no stdlib module shares a
+      // host-tool name, so only the alias form is a shadow here (#54's list).
+      for (const m of line.split("#")[0].matchAll(/\bas\s+([A-Za-z_]\w*)/g)) {
+        record(m[1]);
+      }
+      continue;
+    }
+
+    const from = /^\s*from\s+[\w.]+\s+import\s+(.*)$/.exec(line);
+    if (from) {
+      // `from m import f as read_file` binds the alias; `from m import read_file`
+      // binds the name itself. `import *` binds no single reserved name.
+      for (const item of from[1].split("#")[0].split(",")) {
+        const as = /\bas\s+([A-Za-z_]\w*)\s*$/.exec(item.trim());
+        if (as) {
+          record(as[1]);
+        } else {
+          const plain = /^([A-Za-z_]\w*)/.exec(item.trim());
+          if (plain && plain[1] !== "*") record(plain[1]);
+        }
+      }
+    }
+  }
+
+  return found;
+}
+
 // ── createToolStoreTools ────────────────────────────────────────
 
 /**

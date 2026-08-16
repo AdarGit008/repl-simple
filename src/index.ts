@@ -92,6 +92,7 @@ export {
   createToolStoreTools,
   loadSavedTools,
   savedToolNames,
+  findShadowingBindings,
   DEFAULT_PREAMBLE_LIMITS,
   type PreambleLimits,
   type SavedToolsPreamble,

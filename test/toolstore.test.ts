@@ -15,6 +15,7 @@ import {
   createToolStoreTools,
   loadSavedTools,
   savedToolNames,
+  findShadowingBindings,
   DEFAULT_PREAMBLE_LIMITS,
   type ToolStoreOptions,
 } from "../src/toolstore.js";
@@ -127,6 +128,66 @@ describe("createToolStoreTools — structure", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// ── findShadowingBindings ────────────────────────────────────
+
+describe("findShadowingBindings", () => {
+  const reserved = new Set(["read_file", "bash"]);
+
+  it("returns [] when the source binds nothing reserved", () => {
+    assert.deepEqual(findShadowingBindings("def helper(x):\n    return x", reserved), []);
+    assert.deepEqual(findShadowingBindings("print('hi')", reserved), []);
+  });
+
+  it("detects a def binding", () => {
+    assert.deepEqual(
+      findShadowingBindings("def read_file(path):\n    return 'SHADOWED'", reserved),
+      ["read_file"],
+    );
+  });
+
+  it("detects an async def binding", () => {
+    assert.deepEqual(findShadowingBindings("async def bash(cmd): ...", reserved), ["bash"]);
+  });
+
+  it("detects a class binding", () => {
+    assert.deepEqual(findShadowingBindings("class read_file: ...", reserved), ["read_file"]);
+  });
+
+  it("detects a plain assignment", () => {
+    assert.deepEqual(findShadowingBindings("bash = lambda c: c", reserved), ["bash"]);
+  });
+
+  it("does not flag a comparison as an assignment", () => {
+    assert.deepEqual(findShadowingBindings("read_file == other", reserved), []);
+  });
+
+  it("detects import-as aliases", () => {
+    assert.deepEqual(findShadowingBindings("import os.path as read_file", reserved), ["read_file"]);
+  });
+
+  it("detects from-import aliases and plain from-imports", () => {
+    assert.deepEqual(
+      findShadowingBindings("from os import path as read_file", reserved),
+      ["read_file"],
+    );
+    assert.deepEqual(findShadowingBindings("from os import bash", reserved), ["bash"]);
+  });
+
+  it("reports multiple bindings in first-appearance order, deduped", () => {
+    assert.deepEqual(
+      findShadowingBindings(
+        "import os as read_file\nfrom shutil import rmtree as bash\ndef read_file(): ...",
+        reserved,
+      ),
+      ["read_file", "bash"],
+    );
+  });
+
+  it("detects bindings at any indentation", () => {
+    assert.deepEqual(findShadowingBindings("    def bash(): ...", reserved), ["bash"]);
   });
 });
 
