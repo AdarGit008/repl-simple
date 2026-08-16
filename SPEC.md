@@ -203,3 +203,17 @@ following; each is fixed in a follow-up increment with tests:
    verified after every increment from now on.
 8. **Notice wording**: "start a new session" was ambiguous (`repl_reset` does not reload). Now
    "run `repl` with a new `sessionId`"; save/delete messages say "sessions created after this one".
+
+### Residual risks after the fixes (recorded for the ship report)
+
+- **savedToolNames/loadSavedTools still follow a symlinked toolsDir.** The four *tools* now refuse
+  an escaping directory; the loader and the name-listing path (pre-existing, and execution there is
+  trusted-only) do not. A hostile repo can still have its names listed through a symlink in an
+  untrusted session. Filed as a follow-up, out of #57's tool-registration scope.
+- **The containment check and the operation behind it race** (check → swap dir → act). Same class
+  as the fd-open race now closed for reads; a local attacker with write access to the project tree
+  could exploit the window. Narrow, documented, not closed here.
+- **`validateToolName` accepts Windows device names** (`con`, `nul`, …) — pre-existing, Nit-level.
+- **Two commits share a message** (the tsc-fix and the test commit) — cosmetic, history kept.
+- **Detector remains a scan, not a parser** — indented metaprogramming and `sys.modules[__name__]`
+  aliases are documented false negatives; both gates share them.

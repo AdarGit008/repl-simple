@@ -40,42 +40,42 @@
   - Verify: read-through; `npm run lint`.
   - Files: `README.md`, `docs/project-trust.md`
 
-- [ ] Task 9: live trust callback — tools follow inert trust flips
+- [x] Task 9: live trust callback — tools follow inert trust flips
   - Acceptance: `ToolStoreOptions.isTrusted` consulted by `read_tool` refusal and the list's withheld bucket; trusted→untrusted (no preamble) refuses reads, untrusted→trusted stops refusing; rebuild path pinned.
   - Verify: integration tests red→green; `npx tsx --test test/repl.test.ts`; `npm run check`; `npm run lint` (exit code).
   - Files: `src/toolstore.ts`, `src/repl.ts`, `test/repl.test.ts`, `test/toolstore.test.ts`
 
-- [ ] Task 10: filename escaping — no forged annotations
+- [x] Task 10: filename escaping — no forged annotations
   - Acceptance: `escapeNoticeName` exported from toolstore (C0/DEL/C1/bidi); applied to list names, untrusted/limit notices; non-identifier names rendered quoted.
   - Verify: unit tests red→green; focused test; check; lint.
   - Files: `src/toolstore.ts`, `src/repl.ts`, `test/toolstore.test.ts`, `test/repl.test.ts`
 
-- [ ] Task 11: read_tool fd-open — close the TOCTOU
+- [x] Task 11: read_tool fd-open — close the TOCTOU
   - Acceptance: single open with `O_NOFOLLOW|O_NONBLOCK`, `fstat` on fd, trust refusal before open; FIFO/symlink/dir refused without a read; loader read uses the same fd pattern.
   - Verify: unit tests red→green (FIFO refusal, symlink refusal); focused test; check; lint.
   - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
 
-- [ ] Task 12: content identity — a changed file is not "loaded"
+- [x] Task 12: content identity — a changed file is not "loaded"
   - Acceptance: loader records size+mtime per loaded file; `read_tool`/`list_saved_tools` annotate changed-but-loaded files (`the session runs the earlier copy`).
   - Verify: unit tests red→green; focused test; check; lint.
   - Files: `src/toolstore.ts`, `src/repl.ts`, `test/toolstore.test.ts`
 
-- [ ] Task 13: toolsDir containment — refuse a symlinked tools dir
+- [x] Task 13: toolsDir containment — refuse a symlinked tools dir
   - Acceptance: save/delete/list/read resolve the real tools dir and throw PermissionError when it escapes the real root; normal dirs unaffected.
   - Verify: unit tests red→green (symlinked dir for each tool); focused test; check; lint.
   - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
 
-- [ ] Task 14: shadowing detector — walrus + module metaprogramming
+- [x] Task 14: shadowing detector — walrus + module metaprogramming
   - Acceptance: walrus targets recorded; top-level `exec`/`eval`/`globals()`/`vars()`/`__dict__[`/`setattr(`/`import *` refuse all reserved names; consumer wording "defines" → "binds"; JSDoc corrected.
   - Verify: unit + load-time integration tests red→green; focused test; check; lint.
   - Files: `src/toolstore.ts`, `src/repl.ts`, `test/toolstore.test.ts`, `test/repl.test.ts`
 
-- [ ] Task 15: wording — "new sessionId", sessions-created-after
+- [x] Task 15: wording — "new sessionId", sessions-created-after
   - Acceptance: notices say `repl` with a new `sessionId`; save/delete messages say "sessions created after this one"; a doc note that tool results are cached snapshots.
   - Verify: updated assertions; focused tests; check; lint.
   - Files: `src/repl.ts`, `src/toolstore.ts`, `test/repl.test.ts`, `test/toolstore.test.ts`
 
-- [ ] Task 16: remaining integration gaps + full verification
+- [x] Task 16: remaining integration gaps + full verification
   - Acceptance: limits-skip integration test; untrusted read-refusal + delete via repl; `npm test`, `npm run check`, `npm run build`, `npm run lint` all clean (exit codes verified).
   - Verify: full suite; check; build; lint.
   - Files: `test/repl.test.ts`
