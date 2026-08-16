@@ -185,7 +185,7 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
       // identifier, or one wrapped in parens/brackets or star-unpacked — so a
       // call with keyword args (`foo(x = 1)`) or a comparison (`x == y`) is
       // not mistaken for a binding.
-      const start = /^[\[(]*\s*(?:\*\s*)?([A-Za-z_]\w*)/.exec(s);
+      const start = /^[([]*\s*(?:\*\s*)?([A-Za-z_]\w*)/.exec(s);
       if (start) {
         const after = s.slice(start[0].length);
         if (/^[\])]*\s*(?::[^=;\n]*)?\s*(?:=(?!=)|,)/.test(after)) {

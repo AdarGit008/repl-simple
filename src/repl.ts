@@ -304,7 +304,14 @@ function limitNotice(skipped: string[]): string {
  * terminal sequences. Control characters become `\u{..}` escapes.
  */
 function escapeNoticeName(name: string): string {
-  return name.replace(/[\x00-\x1f\x7f]/g, (c) => `\\u{${c.charCodeAt(0).toString(16)}}`);
+  // No regex here: biome forbids control characters in regex literals
+  // (noControlCharactersInRegex), and the loop form is clearer anyway.
+  let out = "";
+  for (const c of name) {
+    const code = c.charCodeAt(0);
+    out += code < 0x20 || code === 0x7f ? `\\u{${code.toString(16)}}` : c;
+  }
+  return out;
 }
 
 /**
