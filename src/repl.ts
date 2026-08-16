@@ -7,6 +7,7 @@ import {
   savedToolNames,
   createToolStoreTools,
   TOOLSTORE_TOOL_NAMES,
+  escapeNoticeName,
 } from "./toolstore.js";
 import type { RefusedTool, UnreadableTool, PreambleStatus } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
@@ -324,9 +325,11 @@ export class ReplRunner {
 
 /** What the model is told when project trust withheld the saved tools. */
 function untrustedNotice(withheld: string[]): string {
+  // Names come from readdir — escape before rendering, as every notice does.
+  const names = withheld.map(escapeNoticeName).join(", ");
   return (
     `[preamble withheld] ${withheld.length} saved tool(s) in .pi/code-tools were not loaded ` +
-    `because this project is not trusted: ${withheld.join(", ")}. ` +
+    `because this project is not trusted: ${names}. ` +
     `They are not defined in this session — calling one raises NameError. ` +
     `list_saved_tools() shows what is on disk, and read_tool() refuses while the project ` +
     `is untrusted. Trust the project in pi to load them, or paste the code you need.`
@@ -335,9 +338,10 @@ function untrustedNotice(withheld: string[]): string {
 
 /** What the model is told when the preamble limits dropped some tools. */
 function limitNotice(skipped: string[]): string {
+  const names = skipped.map(escapeNoticeName).join(", ");
   return (
     `[preamble truncated] ${skipped.length} saved tool(s) were not loaded because the ` +
-    `preamble size limit was reached: ${skipped.join(", ")}. ` +
+    `preamble size limit was reached: ${names}. ` +
     `They are not defined in this session — calling one raises NameError. ` +
     `Delete tools you no longer need with delete_tool.`
   );
@@ -346,21 +350,9 @@ function limitNotice(skipped: string[]): string {
 /**
  * Render a filename inside a model-facing notice.
  *
- * Filenames come from the directory listing and may contain newlines and
- * ANSI escapes — unescaped, a crafted name could forge notice lines or
- * terminal sequences. Control characters become `\u{..}` escapes.
+ * The shared escaper lives in `toolstore.ts` — `escapeNoticeName` — so the
+ * tools and every notice render attacker-controlled filenames the same way.
  */
-function escapeNoticeName(name: string): string {
-  // No regex here: biome forbids control characters in regex literals
-  // (noControlCharactersInRegex), and the loop form is clearer anyway.
-  let out = "";
-  for (const c of name) {
-    const code = c.charCodeAt(0);
-    out += code < 0x20 || code === 0x7f ? `\\u{${code.toString(16)}}` : c;
-  }
-  return out;
-}
-
 /**
  * What the model is told when the preamble was refused for shadowing (#54).
  *

@@ -102,6 +102,45 @@ function validateToolName(name: unknown): string {
   return s;
 }
 
+/**
+ * Render a name from the tools directory for model-facing text.
+ *
+ * Filenames come from the directory listing and may contain newlines, ANSI
+ * escapes and bidi overrides — unescaped, a crafted name could forge notice
+ * lines or terminal sequences. Control characters become `\u{..}` escapes.
+ * C1 controls and Unicode bidi controls are escaped too: they render as
+ * nothing in most terminals while still reordering or hiding what follows.
+ */
+export function escapeNoticeName(name: string): string {
+  // No regex here: biome forbids control characters in regex literals
+  // (noControlCharactersInRegex), and the loop form is clearer anyway.
+  let out = "";
+  for (const c of name) {
+    const code = c.charCodeAt(0);
+    const escaped =
+      code < 0x20 ||
+      code === 0x7f ||
+      (code >= 0x80 && code <= 0x9f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069);
+    out += escaped ? `\\u{${code.toString(16)}}` : c;
+  }
+  return out;
+}
+
+/**
+ * Render a disk name for a list line: plain for a valid identifier, quoted
+ * and escaped otherwise.
+ *
+ * A crafted name like `helper [not loaded: …]` would read as an annotation
+ * while its file is actually loaded — quoting names the toolstore could not
+ * have written itself keeps the two apart, and the quotes are also a cue
+ * that `save_tool`/`delete_tool` would refuse the name.
+ */
+function renderName(name: string): string {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name) ? name : `"${escapeNoticeName(name)}"`;
+}
+
 /** Resolve a tool file path from a name. */
 function toolPath(toolsDir: string, name: string): string {
   return join(toolsDir, `${name}.py`);
@@ -416,13 +455,14 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
    * from new sessions, and the line says both.
    */
   function annotate(name: string, onDisk: boolean, view: PreambleStatus): string {
+    const shown = renderName(name);
     if (view.loaded.has(name)) {
       return onDisk
-        ? name
-        : `${name} [loaded in this session — file deleted; gone from new sessions]`;
+        ? shown
+        : `${shown} [loaded in this session — file deleted; gone from new sessions]`;
     }
     const reason = notLoadedReason(name, view);
-    return `${name} [not loaded: ${reason}]`;
+    return `${shown} [not loaded: ${reason}]`;
   }
 
   /** Why `name` did not load, derived from the session view and its invariants. */
