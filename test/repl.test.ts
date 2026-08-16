@@ -823,6 +823,67 @@ describe("ReplRunner — refusal keeps its promises (#54)", () => {
   });
 });
 
+// ── An unreadable entry is skipped, not fatal (#55) ─────────────
+
+/**
+ * The issue's exact failure: a directory named `dir.py` passed the `.py` name
+ * filter and threw `EISDIR` out of `loadSavedTools`, out of session creation,
+ * and out of every `repl` call — unrecoverably, because the session was never
+ * cached and `repl_reset` had nothing to reset. One unreadable entry now
+ * skips that entry, not the batch, and the model is told which file it was.
+ */
+describe("ReplRunner — an unreadable entry is skipped, not fatal (#55)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    saveToolFile(cwd, "good", "def good():\n    return 'good-loaded'\n");
+    mkdirSync(join(cwd, ".pi", "code-tools", "dir.py"));
+  });
+
+  after(cleanup);
+
+  it("runs the exact reproduction: a directory named dir.py does not break repl", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const out = await runner.run("1 + 1", "repro", approve);
+
+    assert.match(out, /\[result\]\n2/, "the unreadable entry broke the call");
+    assert.doesNotMatch(out, /EISDIR/, "the raw filesystem error reached the model");
+  });
+
+  it("loads the good tools beside the bad entry, and says what was skipped, once", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const first = await runner.run("good()", "told", approve);
+    assert.match(first, /^\[preamble unreadable\]/);
+    assert.match(first, /dir\.py/, "the notice must name the file that was not loaded");
+    assert.match(first, /NameError/, "the notice must say what calling it will do");
+    assert.match(first, /good-loaded/, "the good tool did not load beside the bad entry");
+
+    const second = await runner.run("good()", "told");
+    assert.doesNotMatch(second, /preamble unreadable/, "the skip is news, not a banner");
+    assert.match(second, /good-loaded/, "the cached session lost its preamble");
+  });
+
+  it("recovers without a restart: remove the bad entry and a new session loads normally", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const beforeFix = await runner.run("1 + 1", "s1", approve);
+    assert.match(beforeFix, /^\[preamble unreadable\]/);
+
+    rmSync(join(cwd, ".pi", "code-tools", "dir.py"), { recursive: true });
+
+    const afterFix = await runner.run("good()", "s2", approve);
+    assert.doesNotMatch(afterFix, /preamble unreadable/, "the removed entry is still reported");
+    assert.match(afterFix, /good-loaded/, "the fixed project did not load normally");
+
+    // The session that skipped the entry keeps working with what it loaded.
+    const sameSession = await runner.run("good()", "s1");
+    assert.match(sameSession, /good-loaded/);
+  });
+});
+
 // ── The preamble is gated on project trust (#53) ─────────────────
 
 /**

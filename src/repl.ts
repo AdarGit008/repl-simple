@@ -3,7 +3,7 @@ import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
 import { loadSavedTools, savedToolNames } from "./toolstore.js";
-import type { RefusedTool } from "./toolstore.js";
+import type { RefusedTool, UnreadableTool } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
 
@@ -252,6 +252,7 @@ export class ReplRunner {
       });
       preamble = load.preamble;
       if (load.refused.length > 0) notices.push(refusalNotice(load.refused));
+      if (load.unreadable.length > 0) notices.push(unreadableNotice(load.unreadable));
       if (load.skipped.length > 0) notices.push(limitNotice(load.skipped));
     } else {
       // Names only. Reading the listing is not reading the files, and the
@@ -332,6 +333,25 @@ function refusalNotice(refused: RefusedTool[]): string {
     `and a preamble that shadows one is refused whole, never run in part. ` +
     `Calling a saved tool raises NameError in this session. ` +
     `Rewrite or delete the offending file(s) under .pi/code-tools, ` +
+    `then start a new session to load the preamble.`
+  );
+}
+
+/**
+ * What the model is told when an entry in `.pi/code-tools` could not be read
+ * and was left out of the preamble (#55).
+ *
+ * One bad entry skips that entry, not the batch — the other saved tools did
+ * load, so this notice never says "no tools". Naming the file is what lets
+ * the developer fix it; "could not be read" is true for every reason — a
+ * directory, a FIFO, a symlink, a permissions error.
+ */
+function unreadableNotice(unreadable: UnreadableTool[]): string {
+  const files = unreadable.map((u) => escapeNoticeName(u.file)).join(", ");
+  return (
+    `[preamble unreadable] ${unreadable.length} saved tool file(s) could not be read and were ` +
+    `not loaded: ${files}. They are not defined in this session — calling one raises ` +
+    `NameError. Fix or remove the file(s) under .pi/code-tools, ` +
     `then start a new session to load the preamble.`
   );
 }
