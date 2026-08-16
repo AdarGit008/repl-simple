@@ -1,14 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   mkdtempSync,
   rmSync,
   statSync,
   readFileSync,
   existsSync,
+  symlinkSync,
   writeFileSync,
   mkdirSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -600,6 +603,7 @@ describe("loadSavedTools", () => {
         preamble: "",
         loaded: [],
         skipped: [],
+        unreadable: [],
         refused: [],
       });
     } finally {
@@ -615,6 +619,7 @@ describe("loadSavedTools", () => {
         preamble: "",
         loaded: [],
         skipped: [],
+        unreadable: [],
         refused: [],
       });
     } finally {
@@ -745,6 +750,187 @@ describe("loadSavedTools — preamble limits", () => {
 
       assert.equal(loaded.length, DEFAULT_PREAMBLE_LIMITS.maxFiles);
       assert.deepEqual(skipped, [`t${String(DEFAULT_PREAMBLE_LIMITS.maxFiles).padStart(3, "0")}`]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── loadSavedTools — unreadable entries (#55) ──────────────────
+
+/**
+ * The issue's exact failure: a directory named `dir.py` passed the `.py` name
+ * filter and threw `EISDIR` out of `readFile`, out of `loadSavedTools`, and
+ * out of session creation — so the session was never cached and every later
+ * `repl` call threw again, unrecoverably by `repl_reset`.
+ *
+ * One unreadable entry now skips that entry, not the batch: the good tools
+ * load, and the caller learns exactly which file was not loaded.
+ */
+describe("loadSavedTools — unreadable entries are skipped, not fatal (#55)", () => {
+  it("a directory named dir.py is skipped, and other entries still load", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "good", "def good():\n    return 'ok'\n");
+      mkdirSync(join(toolsDirOf(opts), "dir.py"));
+
+      const { preamble, loaded, unreadable } = await loadSavedTools(opts);
+
+      assert.deepEqual(loaded, ["good"], "skipping one entry must not become load nothing");
+      assert.deepEqual(unreadable, [{ file: "dir.py", reason: "not a regular file" }]);
+      assert.ok(preamble.includes("def good():"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a symlink is skipped whether its target exists or not", async (t) => {
+    if (process.platform === "win32") return t.skip("symlinks need privileges on Windows");
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      // A working symlink whose target is a real file *outside* the tools
+      // directory: following it would execute code outside the project, so
+      // the link itself is skipped — one rule for every symlink.
+      const dir = toolsDirOf(opts);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(root, "outside.py"), "def sneaky():\n    return 'loaded'\n");
+      symlinkSync(join(root, "outside.py"), join(dir, "link.py"));
+      symlinkSync(join(root, "no-such-target"), join(dir, "dangle.py"));
+
+      const { preamble, loaded, unreadable } = await loadSavedTools(opts);
+
+      assert.deepEqual(loaded, []);
+      assert.deepEqual(unreadable, [
+        { file: "dangle.py", reason: "not a regular file" },
+        { file: "link.py", reason: "not a regular file" },
+      ]);
+      assert.equal(preamble, "", "a symlinked file's code was executed");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a FIFO is skipped, not fatal", async (t) => {
+    if (process.platform === "win32") return t.skip("no FIFOs on Windows");
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "good", "def good():\n    return 'ok'\n");
+      // Node has no mkfifo; the platform utility does. Skipped on win32
+      // above, present on the CI legs (ubuntu, macOS).
+      execFileSync("mkfifo", [join(toolsDirOf(opts), "pipe.py")]);
+
+      const { loaded, unreadable } = await loadSavedTools(opts);
+
+      assert.deepEqual(loaded, ["good"]);
+      assert.deepEqual(unreadable, [{ file: "pipe.py", reason: "not a regular file" }]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a file the process cannot read is skipped with the error message as reason", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores file permissions");
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "good", "def good():\n    return 'ok'\n");
+      const locked = join(toolsDirOf(opts), "locked.py");
+      writeFileSync(locked, "def locked():\n    return 1\n");
+      chmodSync(locked, 0o000);
+
+      const { loaded, unreadable } = await loadSavedTools(opts);
+
+      assert.deepEqual(loaded, ["good"]);
+      assert.equal(unreadable.length, 1);
+      assert.equal(unreadable[0].file, "locked.py");
+      assert.match(unreadable[0].reason, /EACCES/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("an unreadable entry does not consume a maxFiles slot", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "a_good", "def a():\n    return 'a'\n");
+      mkdirSync(join(toolsDirOf(opts), "b_dir.py"));
+      writeSavedTool(opts, "c_good", "def c():\n    return 'c'\n");
+
+      const { preamble, loaded, skipped, unreadable } = await loadSavedTools(opts, {
+        maxFiles: 2,
+        maxBytes: 1024 * 1024,
+      });
+
+      // b_dir.py was examined and skipped, so the cap's two slots went to the
+      // two loadable files — a skipped entry must not eat the slot of code
+      // that would have run.
+      assert.deepEqual(loaded, ["a_good", "c_good"]);
+      assert.deepEqual(skipped, []);
+      assert.deepEqual(unreadable, [{ file: "b_dir.py", reason: "not a regular file" }]);
+      assert.ok(preamble.includes("def c():"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("entries beyond maxFiles are neither stat'd nor read — they stay skipped", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "a_good", "def a():\n    return 'a'\n");
+      mkdirSync(join(toolsDirOf(opts), "z_dir.py"));
+
+      const { loaded, skipped, unreadable } = await loadSavedTools(opts, {
+        maxFiles: 1,
+        maxBytes: 1024 * 1024,
+      });
+
+      assert.deepEqual(loaded, ["a_good"]);
+      assert.deepEqual(skipped, ["z_dir"], "a capped-out entry was examined and misreported");
+      assert.deepEqual(unreadable, [], "a capped-out entry was stat'd or read");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a refusal still reports the unreadable entries from the same pass", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root, hostToolNames: ["read_file"] };
+      writeSavedTool(opts, "shadow", "def read_file(path):\n    return 'x'\n");
+      mkdirSync(join(toolsDirOf(opts), "dir.py"));
+
+      const result = await loadSavedTools(opts);
+
+      assert.deepEqual(result.refused, [{ file: "shadow.py", symbols: ["read_file"] }]);
+      assert.deepEqual(result.unreadable, [{ file: "dir.py", reason: "not a regular file" }]);
+      assert.equal(result.preamble, "");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("removing the bad entry makes the next load normal — recovery without a restart", async () => {
+    const root = makeTempDir();
+    try {
+      const { opts } = makeTools(root);
+      writeSavedTool(opts, "good", "def good():\n    return 'ok'\n");
+      mkdirSync(join(toolsDirOf(opts), "dir.py"));
+
+      const first = await loadSavedTools(opts);
+      assert.deepEqual(first.unreadable, [{ file: "dir.py", reason: "not a regular file" }]);
+      assert.deepEqual(first.loaded, ["good"]);
+
+      rmSync(join(toolsDirOf(opts), "dir.py"), { recursive: true });
+
+      const second = await loadSavedTools(opts);
+      assert.deepEqual(second.unreadable, []);
+      assert.deepEqual(second.loaded, ["good"]);
     } finally {
       cleanup();
     }
