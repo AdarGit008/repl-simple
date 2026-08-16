@@ -1,5 +1,5 @@
-import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import { lstat, mkdir, open, readdir, rm, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
 import { join, resolve, extname } from "node:path";
 import { requireString } from "./registry.js";
 import { HostToolError } from "./types.js";
@@ -557,27 +557,10 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       const name = validateToolName(args.name);
       const path = toolPath(toolsDir, name);
 
-      // lstat first, before any read. A FIFO named `x.py` would hang the
-      // readFile below, and a symlink whose target leaves the project root
-      // would read outside it — the loader refuses both at load time (#55),
-      // and a registered read tool must refuse them at read time too.
-      let entry: Stats;
-      try {
-        entry = await lstat(path);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
-        }
-        throw new HostToolError("OSError", (err as Error).message);
-      }
-      if (!entry.isFile()) {
-        throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
-      }
-
-      // An untrusted project's files are never even read (#53) — a registered
-      // read tool that read them would silently repeal the gate. The live
-      // decision decides, not the snapshot: a trust flip that kept the
-      // session (nothing to lose) must still close the gate.
+      // The untrusted refusal comes first, before any filesystem contact: an
+      // untrusted session learns nothing about what is (or is not) on disk.
+      // The live decision decides, not the snapshot: a trust flip that kept
+      // the session (nothing to lose) must still close the gate.
       const view = options.preambleStatus;
       if (!isTrustedNow()) {
         throw new HostToolError(
@@ -587,18 +570,41 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         );
       }
 
-      let content: string;
+      // One open, no name reuse after it: O_NOFOLLOW refuses a symlink (a
+      // target that leaves the project root would read outside it) and
+      // O_NONBLOCK turns a FIFO open into an immediate error instead of a
+      // hang — a swap between an lstat and a later readFile cannot race the
+      // fd, because the fd is what is read. The loader's lstat-first check
+      // would not have protected the read itself (#55 refused the static
+      // case; this closes the window).
+      let handle;
       try {
-        content = await readFile(path, "utf-8");
+        handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
           throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
         }
+        // ELOOP: the final component is a symlink. ENXIO/EISDIR: a FIFO or
+        // directory. All are "not a regular file" to the model.
+        if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+          throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
+        }
         throw new HostToolError("OSError", (err as Error).message);
       }
 
-      if (!view || view.loaded.has(name)) return content;
-      return `${readNote(name, view)}\n\n${content}`;
+      try {
+        // fstat, not lstat: the check must describe what the fd actually is,
+        // not what the path was a moment ago.
+        const st = await handle.stat();
+        if (!st.isFile()) {
+          throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
+        }
+        const content = await handle.readFile("utf-8");
+        if (!view || view.loaded.has(name)) return content;
+        return `${readNote(name, view)}\n\n${content}`;
+      } finally {
+        await handle.close();
+      }
     },
   };
 
@@ -821,9 +827,22 @@ export async function loadSavedTools(
     // The read can still fail — the entry may be deleted or swapped between
     // readdir and readFile, or be unreadable by permission. One bad entry
     // skips that entry, not the batch: the session must still be created.
+    // The read itself opens the fd with O_NOFOLLOW | O_NONBLOCK — a swap to
+    // a symlink or FIFO after the lstat above errors here instead of reading
+    // outside the root or hanging.
     let content: string;
     try {
-      content = await readFile(path, "utf-8");
+      const handle = await open(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      try {
+        const st = await handle.stat();
+        if (!st.isFile()) throw new Error("not a regular file");
+        content = await handle.readFile("utf-8");
+      } finally {
+        await handle.close();
+      }
     } catch (err) {
       unreadable.push({ file: `${name}.py`, reason: (err as Error).message });
       continue;

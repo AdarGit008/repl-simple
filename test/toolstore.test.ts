@@ -1833,3 +1833,38 @@ describe("escapeNoticeName", () => {
     assert.equal(escapeNoticeName("plain"), "plain");
   });
 });
+
+// ── read_tool refusal ordering and non-regular files (#57) ──────
+
+describe("read_tool refusal ordering (#57)", () => {
+  it("refuses an untrusted project before touching the filesystem", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ trusted: false });
+      const opts: ToolStoreOptions = { root, preambleStatus: view };
+      const tools = createToolStoreTools(opts);
+      // The name does not exist: the untrusted refusal must win, so an
+      // untrusted session learns nothing about what is on disk.
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "missing" });
+      }, /project is not trusted/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses a FIFO named like a tool without hanging", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root, preambleStatus: status({}) };
+      const tools = createToolStoreTools(opts);
+      mkdirSync(join(root, ".pi", "code-tools"), { recursive: true });
+      execFileSync("mkfifo", [join(root, ".pi", "code-tools", "fifo.py")]);
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "fifo" });
+      }, /not a regular file/);
+    } finally {
+      cleanup();
+    }
+  });
+});
