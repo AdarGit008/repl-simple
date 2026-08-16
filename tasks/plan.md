@@ -1,70 +1,63 @@
-# Implementation Plan: One unreadable entry must not break `repl` (#55)
+# Implementation Plan: Restore the unconditional `context` input (#72)
 
 ## Overview
 
-Stop a single unreadable or non-regular `.py` entry under `.pi/code-tools` from bricking every
-`repl` call in the project. Two code changes, both small and additive: (1) `loadSavedTools`
-gates each entry with `lstat` (regular files only) and wraps the per-entry read, reporting
-failures in a new `unreadable` field instead of throwing; (2) `ReplRunner` renders a
-`[preamble unreadable]` notice from that field, alongside the existing `limitNotice` and
-`refusalNotice`. The session is then always created — recoverable by deleting the bad entry
-and starting a new session, no restart.
+Two small, additive changes to `src/rlm.ts`, each driven by its own RED→GREEN pair in
+`test/rlm.test.ts`: (1) `runRlm` always builds a merged inputs map whose `context` defaults to
+`""`, so the shipped `repl_server.py` preamble type-checks with no caller inputs; (2)
+`buildInitialPrompt` announces every input key instead of only `context`. The five issue tests
+plus a preview-truncation pin land first (RED), then the two fixes (GREEN), in four commits.
 
 ## Architecture Decisions
 
-- **`unreadable: UnreadableTool[]` on `SavedToolsPreamble`** — `{ file, reason }` per entry:
-  `"not a regular file"` for anything `lstat` reports non-regular (directory, FIFO, socket,
-  symlink — working or broken), the error message for `lstat`/`readFile` failures (TOCTOU,
-  permissions). Additive field; the two existing full-object `deepEqual` assertions in
-  `test/toolstore.test.ts` gain `unreadable: []`.
-- **`lstat` decides, not exceptions** — the "skip anything that is not a regular file" the
-  issue demands is enforced up front. Symlinks never load: a preamble is auto-executed code,
-  and a link can point outside the project root. Working symlinks are refused too — one rule.
-- **Per-entry `readFile` guard** — TOCTOU (deleted/swapped between `readdir` and `readFile`)
-  and permission errors become `unreadable` entries, never throws.
-- **Caps and scanning interplay** — unreadable entries consume no `maxFiles` slot, add no
-  bytes, and are never scanned (code that cannot load cannot shadow). Entries beyond
-  `maxFiles` are neither stat'd nor read — the #54 invariant extends to `lstat`.
-- **Refusal (#54) still wins, but reports everything** — an unreadable entry alone never
-  refuses the batch; when a shadowing file refuses it, the refusal result still carries the
-  `unreadable` entries from the same pass, and the notices compose.
-- **`savedToolNames` untouched** — name-only contract (#53); the stat gate lives in the loader.
-- **Notice** `[preamble unreadable]` — one-shot via `LiveSession.notice`, names
-  control-character-escaped (`escapeNoticeName`), says files are not defined → `NameError`,
-  fix/remove + **new session** (a live session's preamble is fixed at creation).
+- **Merge site in `runRlm`** — `{ ...runOptions.inputs, ...options.inputs }`, then
+  `context = merged.context ?? ""`. Today's precedence survives; the declaration path
+  (`buildTypeCheckStubs` → input names, `feedStart` → values) is already correct and untouched.
+- **`buildInitialPrompt(question, inputs)`** — signature change from `(question, context?)`;
+  private, so no API surface moves. Iterates the merged map: `context` keeps its legacy header
+  and the 5000-char head/tail preview; other keys use `# Input (available as \`name\`)` with
+  the same preview treatment; empty values are header-only.
+- **Tests are medium, real-sandbox** — the mutation M4 cuts exactly the inputs-forwarding line,
+  so only tests that read inputs in a real worker kill it; canned-LLM mocks keep determinism.
+- **`REPL_SERVER` load** — `readFileSync` against `repl/repl_server.py`, mirroring
+  `test/repl_server.test.ts`, used by the headline integration test.
 
 ## Task List
 
-### Phase 1: Loader resilience
-- [x] Task 1: `loadSavedTools` skips unreadable entries + loader tests
-  (toolstore.ts, index.ts, toolstore.test.ts)
+### Phase 1: Input plumbing
+- [ ] Task 1: RED — load REPL_SERVER + tests 1, 2, 3, 5
+  (test/rlm.test.ts)
+- [ ] Task 2: GREEN — always declare `context` in `runRlm`
+  (src/rlm.ts)
 
-### Checkpoint: Loader
-- [x] `npx tsx --test test/toolstore.test.ts` green; `npm run check` clean
+### Checkpoint: Plumbing
+- [ ] `npx tsx --test test/rlm.test.ts` green; `npm run check` clean
 
-### Phase 2: Runner wiring
-- [x] Task 2: `ReplRunner` renders the unreadable notice + runner tests
-  (repl.ts, repl.test.ts)
+### Phase 2: Prompt announcement
+- [ ] Task 3: RED — test 4 (every key named) + preview-truncation pin
+  (test/rlm.test.ts)
+- [ ] Task 4: GREEN — announce every input key in `buildInitialPrompt`
+  (src/rlm.ts)
 
-### Checkpoint: Runner
-- [x] `npx tsx --test test/repl.test.ts` green; `npm run check` clean
+### Checkpoint: Announcement
+- [ ] `npx tsx --test test/rlm.test.ts` green; `npm run check` clean
 
 ### Phase 3: Verify and record
-- [x] Task 3: full suite + check + lint + build; commit
+- [ ] Task 5: full suite + check + lint + build + coverage + mutation; commit, push, PR
 
 ### Checkpoint: Complete
-- [x] `npm test && npm run check && npm run lint && npm run build` all green; tree clean
+- [ ] All six gates green; branch pushed; PR opened; ship report written
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Platform variance (FIFO/symlink/`chmod 000` tests) | Med | Skip guards: win32 for symlink+FIFO, `getuid()===0` for permissions — matches existing repo patterns |
-| TOCTOU between stat and read | Med | Both `lstat` and `readFile` wrapped; a swapped entry becomes `unreadable`, never a throw |
-| Symlink policy change surprises a real workflow | Low | Recorded in spec assumptions; `save_tool` only writes regular files, so the loader's own tools are unaffected |
-| `deepEqual` churn from the new field | Low | Grep-driven: every full-object `SavedToolsPreamble` assertion updated in Task 1's RED step |
-| Notice wording lies about a reason | Med | "could not be read" is true for every reason; reasons stay on the struct |
+| M4 not actually killed (tests bypass the site) | Med | Tests deliberately use **no preamble** so the sandbox value can only arrive via `runOpts.inputs`; verified under the mutation run |
+| Coverage floors drop (new branches in `rlm.ts`) | Med | Every new branch has a test: default, caller context, non-context key, empty-value header-only, >5000-char preview |
+| Mutation harness cannot run in this environment (systemd scope) | Low | Fall back to a plain `stryker run`; record in the ship report |
+| Merge collision with the #57 session owning `main` | Low | Branch-only push + PR; no merge into `main` |
+| Prompt change breaks an existing test asserting exact prompt text | Low | Grep shows no test asserts the initial prompt shape; suite re-run confirms |
 
 ## Open Questions
 
-None. Scope boundary with #57 (toolstore registration) and #40 (namespace) recorded in the spec.
+None.
