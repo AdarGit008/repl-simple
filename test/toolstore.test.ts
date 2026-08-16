@@ -370,7 +370,7 @@ describe("save_tool", () => {
       });
       assert.equal(
         result,
-        "Tool 'later' saved. It loads in new sessions — the current session's preamble is unchanged.",
+        "Tool 'later' saved. It loads in sessions created after this one — the current session's preamble is unchanged.",
       );
     } finally {
       cleanup();
@@ -507,7 +507,7 @@ describe("delete_tool", () => {
       const result = await del.execute({ name: "kept" });
       assert.equal(
         result,
-        "Tool 'kept' deleted. It is gone from new sessions; the current session keeps any copy it loaded.",
+        "Tool 'kept' deleted. It is gone from sessions created after this one; the current session keeps any copy it loaded.",
       );
     } finally {
       cleanup();

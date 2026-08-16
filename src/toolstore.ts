@@ -420,6 +420,10 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
  * Tools are stored as `.py` files in the configured tools directory
  * (default: `<root>/.pi/code-tools`). Agents use these to persist
  * reusable Python functions across sessions.
+ *
+ * Results are **snapshots**, and the session caches tool results for replay:
+ * a list taken before a save or delete stays what it was. Act on a fresh
+ * `list_saved_tools()` when the answer matters.
  */
 export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   const root = resolve(options.root);
@@ -503,7 +507,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
 
       await writeFile(toolPath(dir, name), content, "utf-8");
       return (
-        `Tool '${name}' saved. It loads in new sessions — ` +
+        `Tool '${name}' saved. It loads in sessions created after this one — ` +
         `the current session's preamble is unchanged.`
       );
     },
@@ -543,7 +547,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       }
 
       return (
-        `Tool '${name}' deleted. It is gone from new sessions; ` +
+        `Tool '${name}' deleted. It is gone from sessions created after this one; ` +
         `the current session keeps any copy it loaded.`
       );
     },
@@ -712,7 +716,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         throw new HostToolError(
           "PermissionError",
           `tool '${name}' was not loaded — this project is not trusted, so its files are not read. ` +
-            `Trust the project in pi to load saved tools, then start a new session.`,
+            "Trust the project in pi, then run `repl` with a new `sessionId` to load them.",
         );
       }
 

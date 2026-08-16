@@ -372,7 +372,7 @@ function refusalNotice(refused: RefusedTool[]): string {
     `and a preamble that shadows one is refused whole, never run in part. ` +
     `Calling a saved tool raises NameError in this session. ` +
     `Rewrite the offending file(s) — read_tool() shows the code, delete_tool() removes one — ` +
-    `then start a new session to load the preamble.`
+    "then run `repl` with a new `sessionId` to load the preamble."
   );
 }
 
@@ -391,7 +391,7 @@ function unreadableNotice(unreadable: UnreadableTool[]): string {
     `[preamble unreadable] ${unreadable.length} saved tool file(s) could not be read and were ` +
     `not loaded: ${files}. They are not defined in this session — calling one raises ` +
     `NameError. Fix or remove the file(s) under .pi/code-tools, ` +
-    `then start a new session to load the preamble.`
+    "then run `repl` with a new `sessionId` to load the preamble."
   );
 }
 
