@@ -570,6 +570,64 @@ describe("runRlm() — context input", () => {
     assert.ok(prompt.includes("`other_data`"), `prompt does not name other_data:\n${prompt}`);
     assert.ok(prompt.includes("ctx-value"), `prompt omits the context value:\n${prompt}`);
     assert.ok(prompt.includes("od-value"), `prompt omits the other_data value:\n${prompt}`);
+    // The two recorded rendering contracts: `context` keeps its legacy
+    // header, every other key gets the parallel `# Input` header.
+    assert.ok(
+      prompt.includes("# Context (available as `context` variable)"),
+      `context lost its legacy header:\n${prompt}`,
+    );
+    assert.ok(
+      prompt.includes("# Input (available as `other_data` variable)"),
+      `other_data lost the # Input header:\n${prompt}`,
+    );
+  });
+
+  it("9.2.7 renders the default empty context header-only", async () => {
+    // The default `context: ""` is announced (the preamble ships context_*
+    // helpers) but must not render an empty code fence.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(prompt.includes("# Context (available as `context` variable)"));
+    assert.ok(!prompt.includes("```\n\n```"), `empty value rendered an empty fence:\n${prompt}`);
+  });
+
+  it("9.2.8 forwards runOptions.inputs when options.inputs is absent", async () => {
+    // The recorded deviation from RLMLoop.run: runOptions.inputs.context
+    // survives when options.inputs has no context.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+
+    const result = await runRlm("how long?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      runOptions: { inputs: { context: "from-run" } },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "8");
+  });
+
+  it("9.2.9 options.inputs wins over runOptions.inputs for the same key", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+
+    const result = await runRlm("how long?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "winner" },
+      runOptions: { inputs: { context: "loser" } },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "6");
   });
 
   it("9.2.6 previews a long context head-and-tail, not the middle", async () => {
@@ -589,6 +647,20 @@ describe("runRlm() — context input", () => {
     assert.ok(prompt.includes(head), "prompt should include the head");
     assert.ok(prompt.includes(tail), "prompt should include the tail");
     assert.ok(!prompt.includes("MIDDLE"), "prompt should elide the middle");
+
+    // Boundary pin: exactly 5000 chars is not elided (only > 5000 is).
+    const boundary = "B".repeat(5000);
+    const { llm: llm2 } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const result2 = await runRlm("q", {
+      llmClient: llm2,
+      registry: rlmRegistry(),
+      inputs: { context: boundary },
+      maxIterations: 5,
+    });
+    assert.equal(result2.status, "ok");
+    const prompt2 = llm2.calls()[0].messages[0].content;
+    assert.ok(prompt2.includes(boundary), "a 5000-char value must render whole");
+    assert.ok(!prompt2.includes("..."), `5000-char value was elided:\n${prompt2.slice(0, 200)}`);
   });
 });
 

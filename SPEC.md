@@ -113,9 +113,11 @@ sandboxRunOpts.inputs = { ...inputs, context: inputs.context ?? "" };
 `node:test` + `assert/strict`, same file and helpers (`mockLlmCodeGen`) as the existing RLM
 tests. The five new tests are **medium** (real Monty workers, deterministic canned LLM):
 sandbox-visible behaviour is asserted through run results, prompt behaviour through
-`llm.calls()[0]` message content. RED first: each new test must fail against HEAD for the right
-reason (typing error for 1/2/3/5, missing key for 4) before its fix lands. No new dependencies;
-no mocking of `runInSandbox` — the whole point is that inputs survive into a real worker.
+`llm.calls()[0]` message content. RED first, where applicable: 9.2.1, 9.2.2 and 9.2.5 failed
+against HEAD for the documented reason (typing error / missing key); 9.2.3, 9.2.4 and 9.2.6
+were green guards and pins — their job is to fail under the M4 mutant and the wrong fix, not
+under HEAD. No new dependencies; no mocking of `runInSandbox` — the whole point is that inputs
+survive into a real worker.
 
 ## Boundaries
 
@@ -149,3 +151,73 @@ no mocking of `runInSandbox` — the whole point is that inputs survive into a r
 ## Open Questions
 
 None. Scope boundaries with #74 (message growth) and #78 (convergence) recorded above.
+
+## Review remediation (post-build, five-axis self-review)
+
+### Correctness — no required changes
+
+- `src/rlm.ts:213-218` merge order matches the spec decision: `runOptions.inputs` first, then
+  `options.inputs` (today's precedence), then `context` defaulted to `""` — set last, so the
+  default can never override a caller's value.
+- `src/rlm.ts:85` the `if (value)` header-only path is exercised by 9.2.1/9.2.2 (default
+  `context: ""`), the >5000 preview path by 9.2.6 — every new branch has a test.
+- `src/rlm.ts:230` `sandboxRunOpts.inputs ?? {}` is defensive only; the assignment above is
+  unconditional.
+
+### Readability — no required changes
+
+- The merge comment explains *why* (undeclared input = deterministic type-check failure), not
+  what. JSDoc on `buildInitialPrompt` matches behaviour.
+
+### Architecture — no required changes
+
+- All changes stay in `src/rlm.ts`, the owning layer; `rlm_loop.ts` untouched as #78's
+  reference; no new abstractions; no API surface change (`buildInitialPrompt` is private).
+
+### Security — FYI (no action)
+
+- `src/rlm.ts:83-91` input values are interpolated into the LLM prompt; the change extends the
+  existing `context` inlining to every input key. Not a new class: the RLM loop hands the
+  model the same data through the sandbox anyway, and inputs come from the extension's own
+  invoker, not remote users. Recorded, not fixed.
+
+### Performance — no required changes
+
+- One extra header line per input key; previews per key are capped by the same 5000-char
+  policy. The single-context case is byte-identical to before. Growth concerns belong to #74.
+
+## Review remediation round 2 (code-reviewer + security-auditor + test-engineer fan-out)
+
+### Addressed
+
+- **Rendering contracts pinned** (code-reviewer Required 1, test-engineer Low): 9.2.5 now
+  asserts the exact `# Context` / `# Input` headers; new 9.2.7 asserts the default empty
+  `context` renders header-only with no empty fence.
+- **Precedence deviation pinned** (code-reviewer Optional 2, test-engineer Medium): new 9.2.8
+  (`runOptions.inputs` survives when `options.inputs` is absent) and 9.2.9 (`options.inputs`
+  wins on the same key).
+- **Dead defensiveness removed** (code-reviewer Nit 4, security-auditor Nit): the
+  `sandboxRunOpts.inputs ?? {}` fallback is gone — `runInputs` is built once, defaulted once,
+  and passed to both the sandbox and the prompt.
+- **LLM-disclosure contract documented** (security-auditor Required 1):
+  `RlmOptions.inputs` JSDoc (`src/types.ts`) and the README's RLM section now state that every
+  input key and value is rendered into the LLM prompt and must never carry secrets.
+- **RED trail corrected** (test-engineer Low): SPEC testing-strategy wording and `tasks/todo.md`
+  Task 1 acceptance now say "red where applicable" with the actual red/green split; the first
+  test commit message amended to match.
+- **5000-char boundary pinned** (test-engineer Low): 9.2.6 now also asserts an exactly-5000-char
+  value renders whole and un-elided.
+
+### Deferred (recorded, not fixed)
+
+- **Aggregate prompt cap** (security-auditor Required 2): the 5000-char cap is per value; N
+  large inputs make an N×~5 KB initial prompt. This is #74's exact territory (message growth
+  across the whole loop) and gets a note on #74 rather than a bespoke cap here. The per-value
+  preview cap is pinned by 9.2.6.
+- **Input-name validation** (security-auditor Optional, code-reviewer Optional 3): names are
+  interpolated unescaped into the prompt header and the type-check stub. A
+  `/^[A-Za-z_][A-Za-z0-9_]*$/` check at the merge site would harden both paths; noted for the
+  next RLM change (#78 touches this area).
+- **Registry-scoping documentation** (security-auditor Optional): `RlmOptions.registry` should
+  warn that the RLM sub-model is an injection-exposed trust domain and only the three RLM
+  tools belong there. Doc-only; noted.
