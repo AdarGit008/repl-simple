@@ -1,10 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
 import type { LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
 import { runRlm, extractPythonCode, buildFeedback } from "../src/rlm.js";
+
+// ── Load repl_server.py — the shipped RLM preamble ──────────────
+
+const replServerPath = join(fileURLToPath(import.meta.url), "..", "..", "repl", "repl_server.py");
+const REPL_SERVER = readFileSync(replServerPath, "utf-8");
 
 // ── Section 5.2: extractPythonCode() — unit tests ────────────────
 
@@ -464,6 +472,84 @@ describe("runRlm() edge cases", () => {
     );
     assert.ok(submitCall);
     assert.equal(submitCall.ok, true);
+  });
+});
+
+// ── The advertised context configuration (#72) ─────────────────
+
+describe("runRlm() — context input", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("9.2.1 succeeds with the shipped repl_server.py preamble and no inputs", async () => {
+    // The documented production configuration: preamble + no `inputs`.
+    // The preamble's helpers reference the bare name `context`, which only
+    // type-checks when it is declared as a sandbox input.
+    const { llm } = mockLlmCodeGen([
+      '```python\nprint(context_summary())\nSUBMIT(str(context_length()))\n```',
+    ]);
+
+    const result = await runRlm("how much context is there?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "0");
+    assert.equal(result.iterations.length, 1);
+  });
+
+  it("9.2.2 declares context as an empty string when no inputs are passed", async () => {
+    // No preamble: `context` resolves only if the sandbox input is declared.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+
+    const result = await runRlm("how long is the context?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "0");
+  });
+
+  it("9.2.3 forwards a caller-supplied context into the sandbox", async () => {
+    // Guards M4 ("never forward inputs to the sandbox"): the value can only
+    // arrive through runOpts.inputs, and it must win over the "" default.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+
+    const result = await runRlm("how long?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "hello world" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "11");
+  });
+
+  it("9.2.4 declares and forwards a non-context input", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(other_data)\n```']);
+
+    const result = await runRlm("what is the payload?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { other_data: "the payload" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "the payload");
   });
 });
 
