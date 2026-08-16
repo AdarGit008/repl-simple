@@ -20,6 +20,7 @@ import {
   savedToolNames,
   findShadowingBindings,
   DEFAULT_PREAMBLE_LIMITS,
+  TOOLSTORE_TOOL_NAMES,
   type ToolStoreOptions,
 } from "../src/toolstore.js";
 import { HostToolError } from "../src/types.js";
@@ -91,6 +92,23 @@ describe("createToolStoreTools — structure", () => {
       assert.equal(tools[1].name, "delete_tool");
       assert.equal(tools[2].name, "list_saved_tools");
       assert.equal(tools[3].name, "read_tool");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("TOOLSTORE_TOOL_NAMES pins the names createToolStoreTools returns (#57)", () => {
+    // ReplRunner must include the toolstore's own names in the load-time
+    // shadowing gate *before* the tools are registered, so the constant and
+    // the tools cannot be allowed to drift.
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      assert.deepEqual(
+        tools.map((t) => t.name),
+        [...TOOLSTORE_TOOL_NAMES],
+        "TOOLSTORE_TOOL_NAMES and createToolStoreTools disagree",
+      );
     } finally {
       cleanup();
     }

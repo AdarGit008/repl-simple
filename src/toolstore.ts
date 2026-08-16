@@ -7,6 +7,48 @@ import type { HostTool } from "./types.js";
 
 // ── Options ──────────────────────────────────────────────────────
 
+/** The names `createToolStoreTools` returns, in registration order.
+ *
+ * `ReplRunner` must include these in the load-time shadowing gate **before**
+ * the tools exist in the registry — a preamble `def save_tool` would shadow
+ * the registered host tool exactly like any other — so the list lives here,
+ * next to the tools, and a unit test pins it to what `createToolStoreTools`
+ * actually returns (#57).
+ */
+export const TOOLSTORE_TOOL_NAMES = [
+  "save_tool",
+  "delete_tool",
+  "list_saved_tools",
+  "read_tool",
+] as const;
+
+/**
+ * What a session's preamble actually loaded, per tool name.
+ *
+ * The toolstore tools answer from this snapshot plus the current disk state,
+ * so `list_saved_tools` and `read_tool` never claim a file is running when
+ * the session is not running it (#57): withheld (#53), refused (#54),
+ * skipped or unreadable (#55) names are all visible to the model.
+ *
+ * Omitted from {@link ToolStoreOptions}, the tools behave as they did before
+ * #57: the list is the disk list and reads are raw — the honest reporting
+ * only exists when a caller supplies the session's view.
+ */
+export interface PreambleStatus {
+  /** Whether the preamble was eligible to load (project trusted at session creation). */
+  trusted: boolean;
+  /** Names actually loaded and executing in this session. */
+  loaded: ReadonlySet<string>;
+  /** Names on disk but withheld — the project was not trusted (#53). */
+  withheld: ReadonlySet<string>;
+  /** Names on disk but left out — preamble limits reached. */
+  skipped: ReadonlySet<string>;
+  /** Names on disk whose code shadows a host tool — the whole preamble was refused (#54). */
+  refused: ReadonlySet<string>;
+  /** Names on disk whose files could not be loaded (#55). */
+  unreadable: ReadonlySet<string>;
+}
+
 export interface ToolStoreOptions {
   /** Workspace root. Defaults to '.' if not set. */
   root: string;
@@ -25,6 +67,11 @@ export interface ToolStoreOptions {
    * owns the security decision.
    */
   hostToolNames?: readonly string[];
+  /**
+   * What the session's preamble actually loaded, for honest `list_saved_tools`
+   * and `read_tool` answers (#57). Omitted, the tools report disk state only.
+   */
+  preambleStatus?: PreambleStatus;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
