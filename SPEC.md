@@ -227,11 +227,15 @@ None. Scope boundaries with #74 (message growth) and #78 (convergence) recorded 
 ### Go decision
 
 **GO — approved by code-reviewer (after Required 1, addressed), security-auditor (after
-Required 1-2, addressed/deferred), test-engineer (conditions met pending the mutation
-report).** Gates: 772/772 tests, tsc strict clean, biome clean, build clean, coverage floors
-met ×3 (one transient floor dip observed only under full-mutation load; the flake band is
-documented in README, filed as #113), targeted mutation on `src/rlm.ts` running at report
-time. The change is additive, no API surface change, no new dependencies, no I/O surface.
+Required 1-2, addressed/deferred), test-engineer (conditions met — M4 confirmed killed by the
+targeted mutation run below).** Gates: 772/772 tests, tsc strict clean, biome clean, build clean,
+coverage floors met ×3 (one transient floor dip observed only under full-mutation load; the flake
+band is documented in README, filed as #113). Targeted mutation on `src/rlm.ts` (248 mutants,
+86m53s, zero harness deaths): **61.29%** killed vs the 30.58% baseline — improved — and **M4 is
+killed**: both inputs-merge mutants (`src/rlm.ts:217,218`) and the `?? ""` default mutant
+(`:220`) are Killed. Survivors in the changed regions are cosmetic string/template literals
+(prompt wording, the `"user"` role) and pre-existing conditionals. The change is additive, no
+API surface change, no new dependencies, no I/O surface.
 
 ### Rollback plan
 
@@ -253,8 +257,7 @@ time. The change is additive, no API surface change, no new dependencies, no I/O
    deferred, noted on #74.
 4. **Aggregate mutation floor not re-measured** — the full 3738-mutant run is ~46 h on this
    host and mutation is not a CI gate; the targeted `src/rlm.ts` run covers the changed file
-   (M4 kill is the issue's DoD item). If the targeted run shows rlm.ts below its 30.58%
-   baseline, re-assess before merge.
+   (M4 kill is the issue's DoD item).
 5. **Merge ordering with #57** — another session owns `main`; this branch is pushed and PR'd,
    not merged. Rebase on the post-#57 `main` before merge (expected clean — disjoint files:
    #57 touches toolstore/repl/README toolstore sections; this touches rlm/types/RREADME RLM
