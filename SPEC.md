@@ -221,3 +221,41 @@ None. Scope boundaries with #74 (message growth) and #78 (convergence) recorded 
 - **Registry-scoping documentation** (security-auditor Optional): `RlmOptions.registry` should
   warn that the RLM sub-model is an injection-exposed trust domain and only the three RLM
   tools belong there. Doc-only; noted.
+
+## Ship report (phase 6 — go/no-go)
+
+### Go decision
+
+**GO — approved by code-reviewer (after Required 1, addressed), security-auditor (after
+Required 1-2, addressed/deferred), test-engineer (conditions met pending the mutation
+report).** Gates: 772/772 tests, tsc strict clean, biome clean, build clean, coverage floors
+met ×3 (one transient floor dip observed only under full-mutation load; the flake band is
+documented in README, filed as #113), targeted mutation on `src/rlm.ts` running at report
+time. The change is additive, no API surface change, no new dependencies, no I/O surface.
+
+### Rollback plan
+
+- **Trigger:** regression in RLM prompts or sandbox inputs reported after merge (e.g. #78
+  work sees divergent prompt shape; a caller's `runOptions.inputs` flow behaves differently).
+- **Step 1:** `git revert` the merge commit on `main` — the change is self-contained
+  (`src/rlm.ts` + `src/types.ts` docs + `README.md` + tests), reverts cleanly against #57's
+  preceding commits (no shared lines).
+- **Step 2:** verify `npm test` + `npm run check` on the revert.
+- **Time to rollback:** < 5 minutes (single commit, no data, no migration).
+
+### Residual risks (recorded)
+
+1. **Prompt shape delta for all callers** — every `runRlm` prompt now carries the `# Context`
+   header (default `""` context announced). Intentional, pinned by 9.2.7.
+2. **Aggregate prompt growth** — per-value caps only; deferred to #74 (note posted on the
+   issue, comment 5309340038).
+3. **Unescaped input names** — prompt header + type-check stub interpolation; validation
+   deferred, noted on #74.
+4. **Aggregate mutation floor not re-measured** — the full 3738-mutant run is ~46 h on this
+   host and mutation is not a CI gate; the targeted `src/rlm.ts` run covers the changed file
+   (M4 kill is the issue's DoD item). If the targeted run shows rlm.ts below its 30.58%
+   baseline, re-assess before merge.
+5. **Merge ordering with #57** — another session owns `main`; this branch is pushed and PR'd,
+   not merged. Rebase on the post-#57 `main` before merge (expected clean — disjoint files:
+   #57 touches toolstore/repl/README toolstore sections; this touches rlm/types/RREADME RLM
+   section only).
