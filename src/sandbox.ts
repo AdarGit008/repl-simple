@@ -501,7 +501,9 @@ function buildApprovalRequest(
     tool: tool.name,
     args,
     kwargs,
-    description: `${tool.name}(${paramParts.join(", ")})`,
+    description:
+      `${tool.name}(${paramParts.join(", ")})` +
+      (tool.approvalNote ? ` — ${tool.approvalNote}` : ""),
   };
 }
 

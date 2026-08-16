@@ -11,6 +11,16 @@ export interface ToolStoreOptions {
   root: string;
   /** Directory for saved tools. Defaults to '<root>/.pi/code-tools'. */
   toolsDir?: string;
+  /**
+   * Names a saved tool's code must not bind — the session's host-tool names.
+   *
+   * `save_tool` refuses code that defines one of these, because the preamble
+   * runs before host tools resolve and would silently replace them (#54, #56).
+   * Caller-supplied so the list derives from the live registry rather than a
+   * hardcoded set that drifts. Omitted (or `[]`) means no write-time check;
+   * the load-time refusal (#54) is the backstop in that case.
+   */
+  hostToolNames?: readonly string[];
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -32,6 +42,152 @@ function toolPath(toolsDir: string, name: string): string {
   return join(toolsDir, `${name}.py`);
 }
 
+// ── Shadowing detection ────────────────────────────────────────
+
+/** Index of every `=` that assigns (as opposed to `==`, `!=`, `:=`, `+=`, …). */
+function assignmentEquals(s: string): number[] {
+  const eqs: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== "=") continue;
+    if (s[i + 1] === "=") {
+      i++; // `==`
+      continue;
+    }
+    const prev = s[i - 1];
+    if (
+      prev === "!" ||
+      prev === "<" ||
+      prev === ">" ||
+      prev === ":" ||
+      prev === "+" ||
+      prev === "-" ||
+      prev === "*" ||
+      prev === "/" ||
+      prev === "%" ||
+      prev === "@"
+    ) {
+      continue; // `!=` `<=` `>=` `:=` `+=` `-=` `*=` `/=` `%=` `@=`
+    }
+    eqs.push(i);
+  }
+  return eqs;
+}
+
+/**
+ * Names from `reserved` that `source` binds, in first-appearance order.
+ *
+ * Detects the binding forms a saved tool could use to shadow a host tool:
+ * `def`/`async def`, `class`, assignment (plain, annotated, tuple, chained),
+ * `for … in`, `with/except … as`, `import … as`, and `from … import …`.
+ *
+ * A **best-effort scan, not a parser** (#54 lists the forms; the write-time
+ * gate is #56). It is conservative on false *positives* — a match refuses
+ * even inside a triple-quoted string, which is the safe direction — but it
+ * has false *negatives*: `exec(...)`, `globals()["name"] = …`, `setattr`,
+ * walrus (`:=`), and a plain `import mod` (no alias) are not caught. Those
+ * are the load-time check's job (#54), which runs over every `.py` in
+ * `.pi/code-tools` and is the authoritative control; this write-time check
+ * only refuses what it can see. Comment lines are excluded for free — a
+ * binding form must start the line, and `# def read_file` starts with `#`.
+ */
+export function findShadowingBindings(source: string, reserved: ReadonlySet<string>): string[] {
+  if (reserved.size === 0) return [];
+
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const record = (name: string): void => {
+    if (reserved.has(name) && !seen.has(name)) {
+      seen.add(name);
+      found.push(name);
+    }
+  };
+
+  // Split into logical statements on newlines and `;`. A `;` inside a string
+  // over-splits, which only ever over-refuses — the safe direction.
+  for (const line of source.split("\n")) {
+    for (const raw of line.split(";")) {
+      const s = raw.trim();
+      if (s === "") continue;
+
+      const def = /^(?:async\s+)?def\s+([A-Za-z_]\w*)/.exec(s);
+      if (def) {
+        record(def[1]);
+        continue;
+      }
+
+      const cls = /^class\s+([A-Za-z_]\w*)/.exec(s);
+      if (cls) {
+        record(cls[1]);
+        continue;
+      }
+
+      const forTarget = /^for\s+([A-Za-z_]\w*)/.exec(s);
+      if (forTarget) {
+        record(forTarget[1]);
+        continue;
+      }
+
+      // `with open(p) as f` and `except X as e` bind the `as` name. (Python 3
+      // unbinds an `except … as` name after the block, but over-refusing here
+      // is the safe side, and Monty's behaviour is not worth betting on.)
+      if (/^(?:(?:async\s+)?with|except)\b/.test(s)) {
+        for (const m of s.split("#")[0].matchAll(/\bas\s+([A-Za-z_]\w*)/g)) record(m[1]);
+        continue;
+      }
+
+      if (/^import\s/.test(s)) {
+        // `import x as read_file`; also `import a, b as read_file`. A plain
+        // `import read_file` binds a module name, but no stdlib module shares a
+        // host-tool name, so only the alias form is a shadow here (#54's list).
+        for (const m of s.split("#")[0].matchAll(/\bas\s+([A-Za-z_]\w*)/g)) record(m[1]);
+        continue;
+      }
+
+      const from = /^from\s+[\w.]+\s+import\s+(.*)$/.exec(s);
+      if (from) {
+        // `from m import f as read_file` binds the alias; `from m import read_file`
+        // binds the name itself. Parens wrap multi-name imports. `import *`
+        // binds no single reserved name.
+        const clause = from[1].split("#")[0].replace(/^\(|\)$/g, "");
+        for (const item of clause.split(",")) {
+          const as = /\bas\s+([A-Za-z_]\w*)\s*$/.exec(item.trim());
+          if (as) {
+            record(as[1]);
+          } else {
+            const plain = /^([A-Za-z_]\w*)/.exec(item.trim());
+            if (plain) record(plain[1]);
+          }
+        }
+        continue;
+      }
+
+      // Assignment. The statement must *begin* with a target identifier, so a
+      // call with keyword args (`foo(x = 1)`) or a comparison (`x == y`) is
+      // not mistaken for a binding.
+      const start = /^([A-Za-z_]\w*)/.exec(s);
+      if (start) {
+        const after = s.slice(start[0].length);
+        if (/^(?:\s*:[^=;\n]*)?\s*(?:=(?!=)|,)/.test(after)) {
+          const eqs = assignmentEquals(s);
+          // Every identifier before the first `=` is a target (tuple targets
+          // split on commas); in a chain (`a = b = c`) the identifier between
+          // each `=` is a target too. The value after the last `=` is not.
+          for (const target of s.slice(0, eqs[0]).split(",")) {
+            const tm = /^([A-Za-z_]\w*)/.exec(target.trim());
+            if (tm) record(tm[1]);
+          }
+          for (let k = 1; k < eqs.length; k++) {
+            const tm = /^([A-Za-z_]\w*)/.exec(s.slice(eqs[k - 1] + 1, eqs[k]).trim());
+            if (tm) record(tm[1]);
+          }
+        }
+      }
+    }
+  }
+
+  return found;
+}
+
 // ── createToolStoreTools ────────────────────────────────────────
 
 /**
@@ -44,6 +200,7 @@ function toolPath(toolsDir: string, name: string): string {
 export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
+  const reservedNames = new Set(options.hostToolNames ?? []);
 
   const ensureDir = async () => {
     await mkdir(toolsDir, { recursive: true });
@@ -75,10 +232,28 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       },
     ],
     returns: "str",
+    // This is the write primitive the bridge already gates (`write`,
+    // `edit`) — but the file it writes does not just sit there, it executes
+    // at the start of every future session. Ungated, `save_tool` would be a
+    // self-persisting write with auto-execution, strictly worse than `write`
+    // (#56).
+    requiresApproval: true,
+    approvalNote: "the saved code executes automatically at the start of every future session",
     async execute(args) {
       const name = validateToolName(args.name);
       const code = requireString(args.code, "code");
       const description = requireString(args.description, "description");
+
+      // Refuse to persist a tool that would shadow a host tool, rather than
+      // letting it bind the name on every later run (#54, #56).
+      const shadowing = findShadowingBindings(code, reservedNames);
+      if (shadowing.length > 0) {
+        throw new HostToolError(
+          "ValueError",
+          `cannot save tool '${name}': its code defines ${shadowing.map((n) => `'${n}'`).join(", ")}, ` +
+            `which would shadow a host tool`,
+        );
+      }
 
       await ensureDir();
 
@@ -103,6 +278,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
 
   // ── delete_tool ────────────────────────────────────────────
 
+  // Deliberately NOT gated (#56). Deletion is destructive, but its blast
+  // radius is one `.py` file under `.pi/code-tools` — it cannot execute code,
+  // write files, or reach the network — and it is the primary recovery path
+  // for a bad tool, which must be removable without an extra dialog.
+  // `validateToolName` bounds it to deleting one named file, so it cannot wipe
+  // arbitrary paths. Gating it would be net-negative.
   const deleteTool: HostTool = {
     name: "delete_tool",
     description: "Remove a saved tool.",

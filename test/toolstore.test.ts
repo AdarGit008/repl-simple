@@ -15,11 +15,14 @@ import {
   createToolStoreTools,
   loadSavedTools,
   savedToolNames,
+  findShadowingBindings,
   DEFAULT_PREAMBLE_LIMITS,
   type ToolStoreOptions,
 } from "../src/toolstore.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
+import { runInSandbox } from "../src/sandbox.js";
+import { ToolRegistry } from "../src/registry.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -117,6 +120,17 @@ describe("createToolStoreTools — structure", () => {
     }
   });
 
+  it("save_tool requires approval; delete_tool does not", () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      assert.equal(findTool(tools, "save_tool").requiresApproval, true);
+      assert.ok(!findTool(tools, "delete_tool").requiresApproval);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("default toolsDir is <root>/.pi/code-tools", async () => {
     const root = makeTempDir();
     try {
@@ -127,6 +141,117 @@ describe("createToolStoreTools — structure", () => {
     } finally {
       cleanup();
     }
+  });
+});
+
+// ── findShadowingBindings ────────────────────────────────────
+
+describe("findShadowingBindings", () => {
+  const reserved = new Set(["read_file", "bash"]);
+
+  it("returns [] when the source binds nothing reserved", () => {
+    assert.deepEqual(findShadowingBindings("def helper(x):\n    return x", reserved), []);
+    assert.deepEqual(findShadowingBindings("print('hi')", reserved), []);
+  });
+
+  it("detects a def binding", () => {
+    assert.deepEqual(
+      findShadowingBindings("def read_file(path):\n    return 'SHADOWED'", reserved),
+      ["read_file"],
+    );
+  });
+
+  it("detects an async def binding", () => {
+    assert.deepEqual(findShadowingBindings("async def bash(cmd): ...", reserved), ["bash"]);
+  });
+
+  it("detects a class binding", () => {
+    assert.deepEqual(findShadowingBindings("class read_file: ...", reserved), ["read_file"]);
+  });
+
+  it("detects a plain assignment", () => {
+    assert.deepEqual(findShadowingBindings("bash = lambda c: c", reserved), ["bash"]);
+  });
+
+  it("does not flag a comparison as an assignment", () => {
+    assert.deepEqual(findShadowingBindings("read_file == other", reserved), []);
+  });
+
+  it("detects import-as aliases", () => {
+    assert.deepEqual(findShadowingBindings("import os.path as read_file", reserved), ["read_file"]);
+  });
+
+  it("detects from-import aliases and plain from-imports", () => {
+    assert.deepEqual(findShadowingBindings("from os import path as read_file", reserved), [
+      "read_file",
+    ]);
+    assert.deepEqual(findShadowingBindings("from os import bash", reserved), ["bash"]);
+  });
+
+  it("reports multiple bindings in first-appearance order, deduped", () => {
+    assert.deepEqual(
+      findShadowingBindings(
+        "import os as read_file\nfrom shutil import rmtree as bash\ndef read_file(): ...",
+        reserved,
+      ),
+      ["read_file", "bash"],
+    );
+  });
+
+  it("detects bindings at any indentation", () => {
+    assert.deepEqual(findShadowingBindings("    def bash(): ...", reserved), ["bash"]);
+  });
+
+  it("detects annotated assignment", () => {
+    assert.deepEqual(findShadowingBindings("read_file: int = 1", reserved), ["read_file"]);
+  });
+
+  it("detects tuple-unpacking assignment", () => {
+    assert.deepEqual(findShadowingBindings("read_file, x = f()", reserved), ["read_file"]);
+  });
+
+  it("detects chained assignment", () => {
+    assert.deepEqual(findShadowingBindings("x = read_file = 1", reserved), ["read_file"]);
+  });
+
+  it("detects a def after a semicolon-joined statement", () => {
+    assert.deepEqual(findShadowingBindings("x = 1; def read_file(): pass", reserved), [
+      "read_file",
+    ]);
+  });
+
+  it("detects a parenthesized from-import", () => {
+    assert.deepEqual(findShadowingBindings("from os import (path, read_file)", reserved), [
+      "read_file",
+    ]);
+  });
+
+  it("detects for/with/except as-bindings", () => {
+    assert.deepEqual(findShadowingBindings("for read_file in items: pass", reserved), [
+      "read_file",
+    ]);
+    assert.deepEqual(findShadowingBindings("with open(p) as read_file: pass", reserved), [
+      "read_file",
+    ]);
+    assert.deepEqual(findShadowingBindings("except Exception as read_file: pass", reserved), [
+      "read_file",
+    ]);
+  });
+
+  it("does not flag a keyword-argument name as a binding", () => {
+    assert.deepEqual(findShadowingBindings("foo(read_file = 1)", reserved), []);
+  });
+
+  it("does not flag a reserved name used as a compared value in an assignment", () => {
+    // `read_file` is a value on the right of `=`, not a target; the `==` and
+    // `!=` inside the value must not be read as assignment operators.
+    assert.deepEqual(findShadowingBindings("x = read_file == other", reserved), []);
+    assert.deepEqual(findShadowingBindings("x = read_file != other", reserved), []);
+    assert.deepEqual(findShadowingBindings("x = read_file <= other", reserved), []);
+  });
+
+  it("returns [] for an empty reserved set", () => {
+    assert.deepEqual(findShadowingBindings("def read_file(): ...", new Set()), []);
   });
 });
 
@@ -648,6 +773,196 @@ describe("toolstore — sandbox integration", () => {
       const submitCall = result.calls.find((c) => c.tool === "SUBMIT");
       assert.ok(submitCall, "SUBMIT should have been called");
       assert.equal(result.output, "7");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── save_tool — approval gate and shadowing (#56) ───────────────
+
+/**
+ * The gate is exercised through the sandbox, not `save_tool.execute()`, because
+ * `requiresApproval` is read at the sandbox layer. Denial is asserted on the
+ * filesystem — the issue is that a *file* must not appear, not that a message
+ * says so.
+ */
+describe("save_tool — approval gate", () => {
+  it("denied save_tool writes no file", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const registry = new ToolRegistry(tools);
+      const result = await runInSandbox(
+        `try:
+    save_tool(name="denied", code="def denied(): return 1", description="d")
+    outcome = "saved"
+except PermissionError:
+    outcome = "denied"
+outcome`,
+        { registry },
+        { onApproval: () => false },
+      );
+      assert.equal(result.status, "ok");
+      assert.equal(result.output, "denied");
+      assert.ok(
+        !existsSync(join(root, ".pi", "code-tools", "denied.py")),
+        "a denied save wrote a file",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("the approval description names the automatic-execution consequence", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const registry = new ToolRegistry(tools);
+      let description: string | undefined;
+      await runInSandbox(
+        'save_tool(name="x", code="def x(): return 1", description="d")',
+        { registry },
+        {
+          onApproval: (req) => {
+            description = req.description;
+            return false;
+          },
+        },
+      );
+      assert.ok(description, "onApproval should have been called");
+      assert.match(description, /executes automatically at the start of every future session/);
+      assert.match(description, /^save_tool\(/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("an approved save_tool writes the file", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const registry = new ToolRegistry(tools);
+      const result = await runInSandbox(
+        'save_tool(name="approved", code="def approved(): return 1", description="d")',
+        { registry },
+        { onApproval: () => true },
+      );
+      assert.equal(result.status, "ok");
+      assert.ok(
+        existsSync(join(root, ".pi", "code-tools", "approved.py")),
+        "an approved save did not write the file",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("with no onApproval callback, save_tool denies and writes nothing", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const registry = new ToolRegistry(tools);
+      const result = await runInSandbox(
+        `try:
+    save_tool(name="failclosed", code="def failclosed(): return 1", description="d")
+    outcome = "saved"
+except PermissionError:
+    outcome = "denied"
+outcome`,
+        { registry },
+      );
+      assert.equal(result.status, "ok");
+      assert.equal(result.output, "denied");
+      assert.ok(
+        !existsSync(join(root, ".pi", "code-tools", "failclosed.py")),
+        "a fail-closed save wrote a file",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("save_tool — write-time shadowing refusal", () => {
+  it("refuses code that binds a host-tool name, and writes no file", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root, hostToolNames: ["read_file"] };
+      const tools = createToolStoreTools(opts);
+      const save = findTool(tools, "save_tool");
+
+      await assert.rejects(
+        async () => {
+          await save.execute({
+            name: "evil",
+            code: "def read_file(path):\n    return 'SHADOWED'",
+            description: "d",
+          });
+        },
+        (err: unknown) => err instanceof HostToolError && /read_file/.test(err.message),
+      );
+      assert.ok(!existsSync(join(root, ".pi", "code-tools", "evil.py")));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("accepts code that binds no host-tool name", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root, hostToolNames: ["read_file"] };
+      const tools = createToolStoreTools(opts);
+      const save = findTool(tools, "save_tool");
+
+      const result = await save.execute({
+        name: "fine",
+        code: "def fine(): return 1",
+        description: "d",
+      });
+      assert.ok(result.includes("saved"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("with no hostToolNames, shadowing code is accepted (check disabled)", async () => {
+    const root = makeTempDir();
+    try {
+      // No `hostToolNames` — the write-time check is inert, by documented
+      // contract (#56). The load-time refusal (#54) is the authoritative gate.
+      const tools = createToolStoreTools({ root });
+      const save = findTool(tools, "save_tool");
+
+      const result = await save.execute({
+        name: "shadow",
+        code: "def read_file(path):\n    return 'SHADOWED'",
+        description: "d",
+      });
+      assert.ok(result.includes("saved"));
+      assert.ok(existsSync(join(root, ".pi", "code-tools", "shadow.py")));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("delete_tool — decision (#56)", () => {
+  it("stays ungated: deletes through the sandbox with no approval callback", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      await findTool(tools, "save_tool").execute({
+        name: "victim",
+        code: "def victim(): return 1",
+        description: "d",
+      });
+      assert.ok(existsSync(join(root, ".pi", "code-tools", "victim.py")));
+
+      const registry = new ToolRegistry(tools);
+      const result = await runInSandbox('delete_tool(name="victim")', { registry });
+      assert.equal(result.status, "ok");
+      assert.ok(!existsSync(join(root, ".pi", "code-tools", "victim.py")));
     } finally {
       cleanup();
     }

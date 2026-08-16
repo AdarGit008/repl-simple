@@ -16,6 +16,14 @@ export interface HostTool {
   returns: "str" | "void";
   execute(args: Record<string, unknown>): string | Promise<string>;
   requiresApproval?: boolean;
+  /**
+   * Consequence text appended to the approval dialog description.
+   *
+   * Present for gated tools whose effect outlives the call — `save_tool` is
+   * the canonical case: approving it runs code at the start of every future
+   * session, which "save a tool" understates. Omitted for the ordinary case.
+   */
+  approvalNote?: string;
 }
 
 /** Approval request from a gated tool call */

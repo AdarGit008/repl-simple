@@ -336,6 +336,29 @@ result
     assert.deepEqual(result.suspendedCall.args, ["data"]);
   });
 
+  it("approvalNote is appended to the dialog description", async () => {
+    const notedTool: HostTool = {
+      ...gatedTool,
+      approvalNote: "this runs automatically later",
+    };
+    const registry = new ToolRegistry([notedTool]);
+    let description: string | undefined;
+    const result = await runInSandbox(
+      'sensitive("data")',
+      { registry },
+      {
+        onApproval: (req) => {
+          description = req.description;
+          return false;
+        },
+      },
+    );
+    assert.equal(result.status, "error");
+    assert.ok(description, "onApproval should have been called");
+    assert.match(description, /this runs automatically later/);
+    assert.match(description, /^sensitive\(x="data"\)/);
+  });
+
   it("no onApproval callback → denied", async () => {
     const registry = new ToolRegistry([gatedTool]);
     const result = await runInSandbox(
