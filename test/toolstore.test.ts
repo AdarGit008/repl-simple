@@ -22,6 +22,7 @@ import {
   DEFAULT_PREAMBLE_LIMITS,
   TOOLSTORE_TOOL_NAMES,
   type ToolStoreOptions,
+  type PreambleStatus,
 } from "../src/toolstore.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
@@ -51,6 +52,27 @@ function makeTools(root: string): { tools: HostTool[]; opts: ToolStoreOptions } 
   const opts: ToolStoreOptions = { root };
   const tools = createToolStoreTools(opts);
   return { tools, opts };
+}
+
+/** A session preamble view with only the categories a test cares about. */
+function status(
+  partial: {
+    trusted?: boolean;
+    loaded?: readonly string[];
+    withheld?: readonly string[];
+    skipped?: readonly string[];
+    refused?: readonly string[];
+    unreadable?: readonly string[];
+  } = {},
+): PreambleStatus {
+  return {
+    trusted: partial.trusted ?? true,
+    loaded: new Set(partial.loaded ?? []),
+    withheld: new Set(partial.withheld ?? []),
+    skipped: new Set(partial.skipped ?? []),
+    refused: new Set(partial.refused ?? []),
+    unreadable: new Set(partial.unreadable ?? []),
+  };
 }
 
 /** Where `opts` puts saved tools — the default the loader also computes. */
@@ -537,6 +559,156 @@ describe("list_saved_tools", () => {
 
       const result = await list.execute({});
       assert.equal(result, "real_tool"); // Only the .py file
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── list_saved_tools with a session view (#57) ─────────────────
+//
+// With `preambleStatus` supplied, the list answers "what did this session
+// actually load?" — disk names are annotated with their load status rather
+// than silently listed as if they were running.
+
+describe("list_saved_tools with preambleStatus (#57)", () => {
+  /** Tools built with `view`, plus the default tools dir under `root`. */
+  function makeViewedTools(root: string, view: PreambleStatus) {
+    const opts: ToolStoreOptions = { root, preambleStatus: view };
+    return { tools: createToolStoreTools(opts), opts };
+  }
+
+  /** Write a tool file the way `save_tool` would, then return its name. */
+  async function writeTool(root: string, name: string): Promise<string> {
+    const { tools, opts } = makeTools(root);
+    await findTool(tools, "save_tool").execute({
+      name,
+      code: `def ${name}(): pass`,
+      description: "test tool",
+    });
+    return toolsDirOf(opts);
+  }
+
+  it("lists loaded names plain, in sorted order", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools, opts } = makeViewedTools(root, status({ loaded: ["z_tool", "a_tool"] }));
+      await writeTool(root, "z_tool");
+      await writeTool(root, "a_tool");
+      assert.equal(
+        await findTool(tools, "list_saved_tools").execute({}),
+        "a_tool\nz_tool",
+      );
+      void opts;
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates names withheld from an untrusted project", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ trusted: false, withheld: ["hostile"] });
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "hostile");
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(out, "hostile [not loaded: project not trusted]");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates a tool saved mid-session in an untrusted project as not loaded", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ trusted: false }); // nothing on disk at creation
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "late");
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(out, "late [not loaded: project not trusted]");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates names skipped by the preamble limits", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ skipped: ["big_tool"] });
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "big_tool");
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(out, "big_tool [not loaded: preamble limit reached]");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates a shadowing file as refused, and its siblings as nothing-loaded", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ refused: ["bad"] }); // loaded is empty: whole batch refused
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "bad");
+      await writeTool(root, "good");
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(
+        out,
+        "bad [not loaded: preamble refused — shadows a host tool]\n" +
+          "good [not loaded: preamble refused — nothing loaded]",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates an unreadable entry", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ unreadable: ["dir"] });
+      const { tools } = makeViewedTools(root, view);
+      // The unreadable entry is a directory that happens to end in .py.
+      mkdirSync(join(root, ".pi", "code-tools", "dir.py"), { recursive: true });
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(out, "dir [not loaded: unreadable file]");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates a tool saved after the session started", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({}); // trusted, nothing loaded at creation
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "new_tool");
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(out, "new_tool [not loaded: saved after this session started]");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reports a loaded tool whose file was deleted mid-session", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ loaded: ["gone"] });
+      const { tools } = makeViewedTools(root, view);
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(
+        out,
+        "gone [loaded in this session — file deleted; gone from new sessions]",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns '(no saved tools)' when disk and view are both empty", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({}));
+      assert.equal(await findTool(tools, "list_saved_tools").execute({}), "(no saved tools)");
     } finally {
       cleanup();
     }

@@ -382,6 +382,40 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
 
   // ── list_saved_tools ───────────────────────────────────────
 
+  /**
+   * One list line for `name`: the name, and — when a session view exists —
+   * its load status, so a model never reads a plain list as "loaded" when
+   * the session is not running the file (#57).
+   *
+   * A plain, unannotated name means **loaded**. Everything else carries a
+   * `[not loaded: …]` suffix. The one exception is a tool the session did
+   * load whose file has since been deleted: it still runs here and is gone
+   * from new sessions, and the line says both.
+   */
+  function annotate(name: string, onDisk: boolean, view: PreambleStatus): string {
+    if (view.loaded.has(name)) {
+      return onDisk
+        ? name
+        : `${name} [loaded in this session — file deleted; gone from new sessions]`;
+    }
+    const reason = notLoadedReason(name, view);
+    return `${name} [not loaded: ${reason}]`;
+  }
+
+  /** Why `name` did not load, derived from the session view and its invariants. */
+  function notLoadedReason(name: string, view: PreambleStatus): string {
+    if (view.refused.has(name)) return "preamble refused — shadows a host tool";
+    if (view.unreadable.has(name)) return "unreadable file";
+    if (view.skipped.has(name)) return "preamble limit reached";
+    if (!view.trusted || view.withheld.has(name)) return "project not trusted";
+    // Trusted and in no category: either a benign sibling of a refused
+    // preamble (the loader refuses the whole batch, #54) or a tool saved
+    // after this session started. The loader's invariant — `loaded` is
+    // empty whenever `refused` is not — tells them apart.
+    if (view.loaded.size === 0 && view.refused.size > 0) return "preamble refused — nothing loaded";
+    return "saved after this session started";
+  }
+
   const listSavedTools: HostTool = {
     name: "list_saved_tools",
     description: "List all saved tools.",
@@ -394,16 +428,22 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       try {
         entries = await readdir(toolsDir);
       } catch {
-        return "(no saved tools)";
+        entries = [];
+      }
+      const disk = new Set(entries.filter((e) => extname(e) === ".py").map((e) => e.slice(0, -3)));
+
+      const view = options.preambleStatus;
+      if (!view) {
+        const names = [...disk].sort();
+        if (names.length === 0) return "(no saved tools)";
+        return names.join("\n");
       }
 
-      const names = entries
-        .filter((e) => extname(e) === ".py")
-        .map((e) => e.slice(0, -3)) // strip .py
-        .sort();
-
-      if (names.length === 0) return "(no saved tools)";
-      return names.join("\n");
+      // The union, not just the disk: a tool deleted mid-session still
+      // executes in this one, and hiding it would claim it stopped.
+      const all = [...new Set([...disk, ...view.loaded])].sort();
+      if (all.length === 0) return "(no saved tools)";
+      return all.map((name) => annotate(name, disk.has(name), view)).join("\n");
     },
   };
 
