@@ -25,25 +25,25 @@ plus a preview-truncation pin land first (RED), then the two fixes (GREEN), in f
 ## Task List
 
 ### Phase 1: Input plumbing
-- [ ] Task 1: RED — load REPL_SERVER + tests 1, 2, 3, 5
+- [x] Task 1: RED — load REPL_SERVER + tests 1, 2, 3, 5
   (test/rlm.test.ts)
-- [ ] Task 2: GREEN — always declare `context` in `runRlm`
+- [x] Task 2: GREEN — always declare `context` in `runRlm`
   (src/rlm.ts)
 
 ### Checkpoint: Plumbing
 - [ ] `npx tsx --test test/rlm.test.ts` green; `npm run check` clean
 
 ### Phase 2: Prompt announcement
-- [ ] Task 3: RED — test 4 (every key named) + preview-truncation pin
+- [x] Task 3: RED — test 4 (every key named) + preview-truncation pin
   (test/rlm.test.ts)
-- [ ] Task 4: GREEN — announce every input key in `buildInitialPrompt`
+- [x] Task 4: GREEN — announce every input key in `buildInitialPrompt`
   (src/rlm.ts)
 
 ### Checkpoint: Announcement
 - [ ] `npx tsx --test test/rlm.test.ts` green; `npm run check` clean
 
 ### Phase 3: Verify and record
-- [ ] Task 5: full suite + check + lint + build + coverage + mutation; commit, push, PR
+- [x] Task 5: full suite + check + lint + build + coverage + mutation; commit, push, PR
 
 ### Checkpoint: Complete
 - [ ] All six gates green; branch pushed; PR opened; ship report written
