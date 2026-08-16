@@ -493,7 +493,7 @@ describe("runRlm() — context input", () => {
     // The preamble's helpers reference the bare name `context`, which only
     // type-checks when it is declared as a sandbox input.
     const { llm } = mockLlmCodeGen([
-      '```python\nprint(context_summary())\nSUBMIT(str(context_length()))\n```',
+      "```python\nprint(context_summary())\nSUBMIT(str(context_length()))\n```",
     ]);
 
     const result = await runRlm("how much context is there?", {
@@ -510,7 +510,7 @@ describe("runRlm() — context input", () => {
 
   it("9.2.2 declares context as an empty string when no inputs are passed", async () => {
     // No preamble: `context` resolves only if the sandbox input is declared.
-    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
 
     const result = await runRlm("how long is the context?", {
       llmClient: llm,
@@ -525,7 +525,7 @@ describe("runRlm() — context input", () => {
   it("9.2.3 forwards a caller-supplied context into the sandbox", async () => {
     // Guards M4 ("never forward inputs to the sandbox"): the value can only
     // arrive through runOpts.inputs, and it must win over the "" default.
-    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
 
     const result = await runRlm("how long?", {
       llmClient: llm,
@@ -539,7 +539,7 @@ describe("runRlm() — context input", () => {
   });
 
   it("9.2.4 declares and forwards a non-context input", async () => {
-    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(other_data)\n```']);
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(other_data)\n```"]);
 
     const result = await runRlm("what is the payload?", {
       llmClient: llm,
