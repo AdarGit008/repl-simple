@@ -297,6 +297,17 @@ function limitNotice(skipped: string[]): string {
 }
 
 /**
+ * Render a filename inside a model-facing notice.
+ *
+ * Filenames come from the directory listing and may contain newlines and
+ * ANSI escapes — unescaped, a crafted name could forge notice lines or
+ * terminal sequences. Control characters become `\u{..}` escapes.
+ */
+function escapeNoticeName(name: string): string {
+  return name.replace(/[\x00-\x1f\x7f]/g, (c) => `\\u{${c.charCodeAt(0).toString(16)}}`);
+}
+
+/**
  * What the model is told when the preamble was refused for shadowing (#54).
  *
  * A preamble definition silently replaces a host tool — host tools resolve
@@ -307,14 +318,14 @@ function limitNotice(skipped: string[]): string {
  */
 function refusalNotice(refused: RefusedTool[]): string {
   const offenders = refused
-    .map((r) => `${r.file} defines ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
+    .map((r) => `${escapeNoticeName(r.file)} defines ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
     .join("; ");
   return (
-    `[preamble refused] No saved tools were loaded: ${offenders} — that name is a host tool, ` +
+    `[preamble refused] No saved tools were loaded: ${offenders} — those names are host tools, ` +
     `and a preamble that shadows one is refused whole, never run in part. ` +
     `Calling a saved tool raises NameError in this session. ` +
-    `Rewrite or delete the offending file(s) under .pi/code-tools; ` +
-    `the preamble loads in the next session.`
+    `Rewrite or delete the offending file(s) under .pi/code-tools, ` +
+    `then start a new session to load the preamble.`
   );
 }
 

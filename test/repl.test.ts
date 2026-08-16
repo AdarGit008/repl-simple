@@ -739,6 +739,71 @@ describe("ReplRunner — a shadowing preamble is refused whole (#54)", () => {
       rmSync(cleanCwd, { recursive: true, force: true });
     }
   });
+
+  it("names every offender, not just the first", async () => {
+    const multiCwd = mkdtempSync(join(tmpdir(), "repl-test-shadow-multi-"));
+    try {
+      saveToolFile(multiCwd, "a_shadow", "def read_file(p):\n    return 'x'\n");
+      saveToolFile(multiCwd, "b_shadow", "def bash(c):\n    return 'x'\n");
+      const runner = new ReplRunner(multiCwd, { isProjectTrusted: () => true });
+
+      const out = await runner.run("1 + 1", "multi", approve);
+
+      assert.match(out, /^\[preamble refused\]/);
+      assert.match(out, /a_shadow\.py/);
+      assert.match(out, /b_shadow\.py/);
+      assert.match(out, /'read_file'/);
+      assert.match(out, /'bash'/);
+    } finally {
+      rmSync(multiCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Refusal keeps its promises (#54) ────────────────────────────
+
+/**
+ * Pins the two behaviours the refusal's design implies: a refused session
+ * never ran anything, so a trust change costs it nothing; and the notice's
+ * recovery instruction — fix the file, start a new session — actually works.
+ */
+describe("ReplRunner — refusal keeps its promises (#54)", () => {
+  it("revoking trust after a refusal costs nothing — nothing ever ran", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-test-shadow-revoke-"));
+    try {
+      saveToolFile(cwd, "shadow", "def read_file(path):\n    return 'SHADOWED'\n");
+      let trusted = true;
+      const runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+
+      await runner.run("v = 41", "refused-revoke");
+      trusted = false;
+      const out = await runner.run("v + 1", "refused-revoke");
+
+      assert.doesNotMatch(out, /trust changed/, "a wipe with no security in it");
+      assert.match(out, /\[result\]\n42/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("the next session loads once the offending file is fixed", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-test-shadow-fix-"));
+    try {
+      saveToolFile(cwd, "shadow", "def read_file(path):\n    return 'SHADOWED'\n");
+      const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+      const refused = await runner.run("1 + 1", "refused");
+      assert.match(refused, /^\[preamble refused\]/);
+
+      // Fix the file host-side, as the notice instructs.
+      saveToolFile(cwd, "shadow", "def legit():\n    return 'fixed'\n");
+
+      const out = await runner.run("legit()", "after-fix", approve);
+      assert.doesNotMatch(out, /preamble refused/, "the refusal was cached across sessions");
+      assert.match(out, /\[result\]\nfixed/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── The preamble is gated on project trust (#53) ─────────────────
