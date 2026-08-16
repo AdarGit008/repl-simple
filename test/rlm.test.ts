@@ -551,6 +551,45 @@ describe("runRlm() — context input", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "the payload");
   });
+
+  it("9.2.5 names every input key in the initial prompt", async () => {
+    // Assert on prompt content, not message count: data present in the
+    // sandbox but unnamed in the instructions is invisible to the model.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("question?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "ctx-value", other_data: "od-value" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(prompt.includes("`context`"), `prompt does not name context:\n${prompt}`);
+    assert.ok(prompt.includes("`other_data`"), `prompt does not name other_data:\n${prompt}`);
+    assert.ok(prompt.includes("ctx-value"), `prompt omits the context value:\n${prompt}`);
+    assert.ok(prompt.includes("od-value"), `prompt omits the other_data value:\n${prompt}`);
+  });
+
+  it("9.2.6 previews a long context head-and-tail, not the middle", async () => {
+    const head = "H".repeat(2500);
+    const tail = "T".repeat(2500);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: `${head}MIDDLE${tail}` },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(prompt.includes(head), "prompt should include the head");
+    assert.ok(prompt.includes(tail), "prompt should include the tail");
+    assert.ok(!prompt.includes("MIDDLE"), "prompt should elide the middle");
+  });
 });
 
 // ── Feedback for a lost sandbox ─────────────────────────────────
