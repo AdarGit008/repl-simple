@@ -11,6 +11,16 @@ export interface ToolStoreOptions {
   root: string;
   /** Directory for saved tools. Defaults to '<root>/.pi/code-tools'. */
   toolsDir?: string;
+  /**
+   * Names a saved tool's code must not bind — the session's host-tool names.
+   *
+   * `save_tool` refuses code that defines one of these, because the preamble
+   * runs before host tools resolve and would silently replace them (#54, #56).
+   * Caller-supplied so the list derives from the live registry rather than a
+   * hardcoded set that drifts. Omitted (or `[]`) means no write-time check;
+   * the load-time refusal (#54) is the backstop in that case.
+   */
+  hostToolNames?: readonly string[];
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -50,10 +60,7 @@ function toolPath(toolsDir: string, name: string): string {
  * (`read_file: int = …`) are not caught here, and the load-time check (#54)
  * is the backstop for those harder shapes.
  */
-export function findShadowingBindings(
-  source: string,
-  reserved: ReadonlySet<string>,
-): string[] {
+export function findShadowingBindings(source: string, reserved: ReadonlySet<string>): string[] {
   if (reserved.size === 0) return [];
 
   const found: string[] = [];
@@ -125,6 +132,7 @@ export function findShadowingBindings(
 export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
+  const reservedNames = new Set(options.hostToolNames ?? []);
 
   const ensureDir = async () => {
     await mkdir(toolsDir, { recursive: true });
@@ -156,10 +164,28 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       },
     ],
     returns: "str",
+    // This is the write primitive the bridge already gates (`write`,
+    // `edit`) — but the file it writes does not just sit there, it executes
+    // at the start of every future session. Ungated, `save_tool` would be a
+    // self-persisting write with auto-execution, strictly worse than `write`
+    // (#56).
+    requiresApproval: true,
+    approvalNote: "the saved code executes automatically at the start of every future session",
     async execute(args) {
       const name = validateToolName(args.name);
       const code = requireString(args.code, "code");
       const description = requireString(args.description, "description");
+
+      // Refuse to persist a tool that would shadow a host tool, rather than
+      // letting it bind the name on every later run (#54, #56).
+      const shadowing = findShadowingBindings(code, reservedNames);
+      if (shadowing.length > 0) {
+        throw new HostToolError(
+          "ValueError",
+          `cannot save tool '${name}': its code defines ${shadowing.map((n) => `'${n}'`).join(", ")}, ` +
+            `which would shadow a host tool`,
+        );
+      }
 
       await ensureDir();
 
@@ -184,6 +210,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
 
   // ── delete_tool ────────────────────────────────────────────
 
+  // Deliberately NOT gated (#56). Deletion is destructive, but its blast
+  // radius is one `.py` file under `.pi/code-tools` — it cannot execute code,
+  // write files, or reach the network — and it is the primary recovery path
+  // for a bad tool, which must be removable without an extra dialog.
+  // `validateToolName` bounds it to deleting one named file, so it cannot wipe
+  // arbitrary paths. Gating it would be net-negative.
   const deleteTool: HostTool = {
     name: "delete_tool",
     description: "Remove a saved tool.",
