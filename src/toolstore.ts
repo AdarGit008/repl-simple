@@ -340,7 +340,10 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       ].join("\n");
 
       await writeFile(toolPath(toolsDir, name), content, "utf-8");
-      return `Tool '${name}' saved.`;
+      return (
+        `Tool '${name}' saved. It loads in new sessions — ` +
+        `the current session's preamble is unchanged.`
+      );
     },
   };
 
@@ -376,7 +379,10 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         throw new HostToolError("OSError", (err as Error).message);
       }
 
-      return `Tool '${name}' deleted.`;
+      return (
+        `Tool '${name}' deleted. It is gone from new sessions; ` +
+        `the current session keeps any copy it loaded.`
+      );
     },
   };
 

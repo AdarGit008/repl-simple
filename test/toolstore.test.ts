@@ -354,6 +354,26 @@ describe("save_tool", () => {
     }
   });
 
+  it("tells the model the tool loads in new sessions, not this one (#57)", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const save = findTool(tools, "save_tool");
+
+      const result = await save.execute({
+        name: "later",
+        code: "def later(): return 1",
+        description: "Saved mid-session",
+      });
+      assert.equal(
+        result,
+        "Tool 'later' saved. It loads in new sessions — the current session's preamble is unchanged.",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
   it("overwrites existing tool", async () => {
     const root = makeTempDir();
     try {
@@ -463,6 +483,29 @@ describe("delete_tool", () => {
 
       // Verify file is gone
       assert.ok(!existsSync(join(root, ".pi", "code-tools", "to_delete.py")));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("tells the model the current session keeps any copy it loaded (#57)", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const save = findTool(tools, "save_tool");
+      const del = findTool(tools, "delete_tool");
+
+      await save.execute({
+        name: "kept",
+        code: "def kept(): pass",
+        description: "loaded by a session",
+      });
+
+      const result = await del.execute({ name: "kept" });
+      assert.equal(
+        result,
+        "Tool 'kept' deleted. It is gone from new sessions; the current session keeps any copy it loaded.",
+      );
     } finally {
       cleanup();
     }
