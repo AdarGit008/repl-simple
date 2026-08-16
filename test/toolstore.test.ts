@@ -242,6 +242,14 @@ describe("findShadowingBindings", () => {
     assert.deepEqual(findShadowingBindings("foo(read_file = 1)", reserved), []);
   });
 
+  it("does not flag a reserved name used as a compared value in an assignment", () => {
+    // `read_file` is a value on the right of `=`, not a target; the `==` and
+    // `!=` inside the value must not be read as assignment operators.
+    assert.deepEqual(findShadowingBindings("x = read_file == other", reserved), []);
+    assert.deepEqual(findShadowingBindings("x = read_file != other", reserved), []);
+    assert.deepEqual(findShadowingBindings("x = read_file <= other", reserved), []);
+  });
+
   it("returns [] for an empty reserved set", () => {
     assert.deepEqual(findShadowingBindings("def read_file(): ...", new Set()), []);
   });
