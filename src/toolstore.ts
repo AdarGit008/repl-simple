@@ -44,21 +44,51 @@ function toolPath(toolsDir: string, name: string): string {
 
 // ── Shadowing detection ────────────────────────────────────────
 
+/** Index of every `=` that assigns (as opposed to `==`, `!=`, `:=`, `+=`, …). */
+function assignmentEquals(s: string): number[] {
+  const eqs: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== "=") continue;
+    if (s[i + 1] === "=") {
+      i++; // `==`
+      continue;
+    }
+    const prev = s[i - 1];
+    if (
+      prev === "!" ||
+      prev === "<" ||
+      prev === ">" ||
+      prev === ":" ||
+      prev === "+" ||
+      prev === "-" ||
+      prev === "*" ||
+      prev === "/" ||
+      prev === "%" ||
+      prev === "@"
+    ) {
+      continue; // `!=` `<=` `>=` `:=` `+=` `-=` `*=` `/=` `%=` `@=`
+    }
+    eqs.push(i);
+  }
+  return eqs;
+}
+
 /**
  * Names from `reserved` that `source` binds, in first-appearance order.
  *
- * Detects the binding forms a saved tool could use to shadow a host tool —
- * `def`/`async def`, `class`, plain assignment, `import … as`, and
- * `from … import … [as …]` (#54 lists these; the write-time gate is #56).
+ * Detects the binding forms a saved tool could use to shadow a host tool:
+ * `def`/`async def`, `class`, assignment (plain, annotated, tuple, chained),
+ * `for … in`, `with/except … as`, `import … as`, and `from … import …`.
  *
- * Line-anchored regexes, deliberately conservative: a match refuses even
- * when it sits inside a triple-quoted string, because a false refusal is a
- * failed save and a false pass is a session whose host tools are silently
- * replaced. Comment lines are excluded for free — a binding form must start
- * the line, and `# def read_file` starts with `#`. This is not a Python
- * parser; tuple unpacking (`read_file, x = …`) and annotated assignment
- * (`read_file: int = …`) are not caught here, and the load-time check (#54)
- * is the backstop for those harder shapes.
+ * A **best-effort scan, not a parser** (#54 lists the forms; the write-time
+ * gate is #56). It is conservative on false *positives* — a match refuses
+ * even inside a triple-quoted string, which is the safe direction — but it
+ * has false *negatives*: `exec(...)`, `globals()["name"] = …`, `setattr`,
+ * walrus (`:=`), and a plain `import mod` (no alias) are not caught. Those
+ * are the load-time check's job (#54), which runs over every `.py` in
+ * `.pi/code-tools` and is the authoritative control; this write-time check
+ * only refuses what it can see. Comment lines are excluded for free — a
+ * binding form must start the line, and `# def read_file` starts with `#`.
  */
 export function findShadowingBindings(source: string, reserved: ReadonlySet<string>): string[] {
   if (reserved.size === 0) return [];
@@ -72,46 +102,84 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
     }
   };
 
+  // Split into logical statements on newlines and `;`. A `;` inside a string
+  // over-splits, which only ever over-refuses — the safe direction.
   for (const line of source.split("\n")) {
-    const def = /^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/.exec(line);
-    if (def) {
-      record(def[1]);
-      continue;
-    }
+    for (const raw of line.split(";")) {
+      const s = raw.trim();
+      if (s === "") continue;
 
-    const cls = /^\s*class\s+([A-Za-z_]\w*)/.exec(line);
-    if (cls) {
-      record(cls[1]);
-      continue;
-    }
-
-    const assign = /^\s*([A-Za-z_]\w*)\s*=(?!=)/.exec(line);
-    if (assign) {
-      record(assign[1]);
-      continue;
-    }
-
-    if (/^\s*import\s/.test(line)) {
-      // `import x as read_file`; also `import a, b as read_file`. A plain
-      // `import read_file` binds a module name, but no stdlib module shares a
-      // host-tool name, so only the alias form is a shadow here (#54's list).
-      for (const m of line.split("#")[0].matchAll(/\bas\s+([A-Za-z_]\w*)/g)) {
-        record(m[1]);
+      const def = /^(?:async\s+)?def\s+([A-Za-z_]\w*)/.exec(s);
+      if (def) {
+        record(def[1]);
+        continue;
       }
-      continue;
-    }
 
-    const from = /^\s*from\s+[\w.]+\s+import\s+(.*)$/.exec(line);
-    if (from) {
-      // `from m import f as read_file` binds the alias; `from m import read_file`
-      // binds the name itself. `import *` binds no single reserved name.
-      for (const item of from[1].split("#")[0].split(",")) {
-        const as = /\bas\s+([A-Za-z_]\w*)\s*$/.exec(item.trim());
-        if (as) {
-          record(as[1]);
-        } else {
-          const plain = /^([A-Za-z_]\w*)/.exec(item.trim());
-          if (plain && plain[1] !== "*") record(plain[1]);
+      const cls = /^class\s+([A-Za-z_]\w*)/.exec(s);
+      if (cls) {
+        record(cls[1]);
+        continue;
+      }
+
+      const forTarget = /^for\s+([A-Za-z_]\w*)/.exec(s);
+      if (forTarget) {
+        record(forTarget[1]);
+        continue;
+      }
+
+      // `with open(p) as f` and `except X as e` bind the `as` name. (Python 3
+      // unbinds an `except … as` name after the block, but over-refusing here
+      // is the safe side, and Monty's behaviour is not worth betting on.)
+      if (/^(?:(?:async\s+)?with|except)\b/.test(s)) {
+        for (const m of s.split("#")[0].matchAll(/\bas\s+([A-Za-z_]\w*)/g)) record(m[1]);
+        continue;
+      }
+
+      if (/^import\s/.test(s)) {
+        // `import x as read_file`; also `import a, b as read_file`. A plain
+        // `import read_file` binds a module name, but no stdlib module shares a
+        // host-tool name, so only the alias form is a shadow here (#54's list).
+        for (const m of s.split("#")[0].matchAll(/\bas\s+([A-Za-z_]\w*)/g)) record(m[1]);
+        continue;
+      }
+
+      const from = /^from\s+[\w.]+\s+import\s+(.*)$/.exec(s);
+      if (from) {
+        // `from m import f as read_file` binds the alias; `from m import read_file`
+        // binds the name itself. Parens wrap multi-name imports. `import *`
+        // binds no single reserved name.
+        const clause = from[1].split("#")[0].replace(/^\(|\)$/g, "");
+        for (const item of clause.split(",")) {
+          const as = /\bas\s+([A-Za-z_]\w*)\s*$/.exec(item.trim());
+          if (as) {
+            record(as[1]);
+          } else {
+            const plain = /^([A-Za-z_]\w*)/.exec(item.trim());
+            if (plain) record(plain[1]);
+          }
+        }
+        continue;
+      }
+
+      // Assignment. The statement must *begin* with a target identifier, so a
+      // call with keyword args (`foo(x = 1)`) or a comparison (`x == y`) is
+      // not mistaken for a binding.
+      const start = /^([A-Za-z_]\w*)/.exec(s);
+      if (start) {
+        const after = s.slice(start[0].length);
+        if (/^(?:\s*:[^=;\n]*)?\s*(?:=(?!=)|,)/.test(after)) {
+          const eqs = assignmentEquals(s);
+          // Every identifier before the first `=` is a target (tuple targets
+          // split on commas); in a chain (`a = b = c`) the identifier between
+          // each `=` is a target too. The value after the last `=` is not.
+          for (const target of s.slice(0, eqs[0]).split(",")) {
+            const tm = /^([A-Za-z_]\w*)/.exec(target.trim());
+            if (tm) record(tm[1]);
+          }
+          for (let k = 1; k < eqs.length; k++) {
+            const tm = /^([A-Za-z_]\w*)/.exec(s.slice(eqs[k - 1] + 1, eqs[k]).trim());
+            if (tm) record(tm[1]);
+          }
         }
       }
     }

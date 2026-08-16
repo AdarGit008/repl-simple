@@ -201,6 +201,50 @@ describe("findShadowingBindings", () => {
   it("detects bindings at any indentation", () => {
     assert.deepEqual(findShadowingBindings("    def bash(): ...", reserved), ["bash"]);
   });
+
+  it("detects annotated assignment", () => {
+    assert.deepEqual(findShadowingBindings("read_file: int = 1", reserved), ["read_file"]);
+  });
+
+  it("detects tuple-unpacking assignment", () => {
+    assert.deepEqual(findShadowingBindings("read_file, x = f()", reserved), ["read_file"]);
+  });
+
+  it("detects chained assignment", () => {
+    assert.deepEqual(findShadowingBindings("x = read_file = 1", reserved), ["read_file"]);
+  });
+
+  it("detects a def after a semicolon-joined statement", () => {
+    assert.deepEqual(findShadowingBindings("x = 1; def read_file(): pass", reserved), [
+      "read_file",
+    ]);
+  });
+
+  it("detects a parenthesized from-import", () => {
+    assert.deepEqual(findShadowingBindings("from os import (path, read_file)", reserved), [
+      "read_file",
+    ]);
+  });
+
+  it("detects for/with/except as-bindings", () => {
+    assert.deepEqual(findShadowingBindings("for read_file in items: pass", reserved), [
+      "read_file",
+    ]);
+    assert.deepEqual(findShadowingBindings("with open(p) as read_file: pass", reserved), [
+      "read_file",
+    ]);
+    assert.deepEqual(findShadowingBindings("except Exception as read_file: pass", reserved), [
+      "read_file",
+    ]);
+  });
+
+  it("does not flag a keyword-argument name as a binding", () => {
+    assert.deepEqual(findShadowingBindings("foo(read_file = 1)", reserved), []);
+  });
+
+  it("returns [] for an empty reserved set", () => {
+    assert.deepEqual(findShadowingBindings("def read_file(): ...", new Set()), []);
+  });
 });
 
 // ── save_tool ──────────────────────────────────────────────────
@@ -779,7 +823,28 @@ outcome`,
         },
       );
       assert.ok(description, "onApproval should have been called");
-      assert.match(description, /every future session/);
+      assert.match(description, /executes automatically at the start of every future session/);
+      assert.match(description, /^save_tool\(/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("an approved save_tool writes the file", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const registry = new ToolRegistry(tools);
+      const result = await runInSandbox(
+        'save_tool(name="approved", code="def approved(): return 1", description="d")',
+        { registry },
+        { onApproval: () => true },
+      );
+      assert.equal(result.status, "ok");
+      assert.ok(
+        existsSync(join(root, ".pi", "code-tools", "approved.py")),
+        "an approved save did not write the file",
+      );
     } finally {
       cleanup();
     }
@@ -848,6 +913,26 @@ describe("save_tool — write-time shadowing refusal", () => {
         description: "d",
       });
       assert.ok(result.includes("saved"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("with no hostToolNames, shadowing code is accepted (check disabled)", async () => {
+    const root = makeTempDir();
+    try {
+      // No `hostToolNames` — the write-time check is inert, by documented
+      // contract (#56). The load-time refusal (#54) is the authoritative gate.
+      const tools = createToolStoreTools({ root });
+      const save = findTool(tools, "save_tool");
+
+      const result = await save.execute({
+        name: "shadow",
+        code: "def read_file(path):\n    return 'SHADOWED'",
+        description: "d",
+      });
+      assert.ok(result.includes("saved"));
+      assert.ok(existsSync(join(root, ".pi", "code-tools", "shadow.py")));
     } finally {
       cleanup();
     }

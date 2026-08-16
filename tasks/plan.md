@@ -42,10 +42,11 @@ the `requiresApproval` flag — to `save_tool`, and recording the `delete_tool` 
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Regex detector misses a binding form | High (silent shadow) | Cover all five forms with tests; fail-closed posture; #54 load-time check is the backstop |
-| Regex detector over-refuses (false positive) | Low (UX) | Documented; pathological only; load-time check (#54) can refine |
+| Regex detector misses a binding form | Med | Best-effort scan, not a parser; false negatives documented; #54 load-time check is the authoritative control |
+| Regex detector over-refuses (false positive) | Low (UX) | Documented; pathological only; #54 load-time check can refine |
 | `requiresApproval` regresses replay/grant flow | Med | No change to grant/replay code; existing approval tests must stay green |
 | Drift between reserved list and registry | Med | Names supplied by caller from `registry.list()`; not hardcoded |
+| Write-time check inert until #57 passes `hostToolNames` | Med | Recorded as residual risk; approval gate (fail-closed) is the live defence |
 
 ## Open Questions
 

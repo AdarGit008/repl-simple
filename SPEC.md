@@ -109,9 +109,13 @@ As in "Success criteria" above — all five items, plus: full suite green, `npm 
    ordering is: **gate (#56) before registering (#57)**. We gate here and do not register.
 2. `delete_tool` is left ungated per the decision above (DoD explicitly permits this with a
    recorded reason).
-3. Shadowing detection is regex-based and conservative (fail-closed): it may over-refuse on
-   pathological inputs (a host-tool name defined inside a triple-quoted string) but must not miss
-   a real binding. Limitations documented on the helper.
+3. Shadowing detection is regex-based and **best-effort, not a parser**: it is conservative on
+   false *positives* (it may over-refuse, e.g. a host-tool name inside a triple-quoted string),
+   but it has **false negatives** — `exec(...)`, `globals()["name"] = …`, `setattr`, walrus, and
+   a plain `import mod` (no alias) are not caught. The **load-time check (#54), which runs over
+   every `.py` in `.pi/code-tools` regardless of how it got there, is the authoritative control.**
+   The write-time check only refuses what it can see, and only when the caller supplies
+   `hostToolNames`. Limitations documented on the helper.
 4. `approvalNote` is a static string on `HostTool` (the consequence is constant for `save_tool`);
    a dynamic form is deferred until a tool needs it (YAGNI).
 5. The reserved-name list is supplied via `ToolStoreOptions.hostToolNames`; default empty means
@@ -121,3 +125,12 @@ As in "Success criteria" above — all five items, plus: full suite green, `npm 
 ## Open Questions
 
 None blocking. #54 (load-time refusal) and #57 (registration) remain open and out of scope here.
+
+## Residual risks (recorded for the ship report)
+
+- **The write-time shadowing check is best-effort and currently inert in production.** No caller
+  in `src/` passes `hostToolNames` (the REPL does not yet register the toolstore tools — that is
+  #57). Until #57 wires in the live registry's names, the *only* live defence this change ships is
+  the approval gate, which is fail-closed. The shadowing control's authoritative implementation is
+  #54 (load-time), which must land before the write-time check is relied on.
+- **The detector has false negatives** (see assumption 3). Treat it as a UX guard, not a boundary.
