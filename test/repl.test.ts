@@ -1300,7 +1300,7 @@ describe("ReplRunner — delete_tool removes a tool from new sessions (#57)", ()
 
     try {
       // Discovery: the list shows it loaded, the read shows its code.
-      const first = await runner.run("1 + 1", "cleanup");
+      await runner.run("1 + 1", "cleanup");
       assert.match(await runner.run("list_saved_tools()", "cleanup"), /^noise$/m);
       assert.match(await runner.run("read_tool('noise')", "cleanup"), /def noise/);
 
