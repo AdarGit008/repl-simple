@@ -1,16 +1,8 @@
-import {
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  realpath,
-  rm,
-  writeFile,
-  type FileHandle,
-} from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { constants, type Stats } from "node:fs";
-import { join, resolve, extname, dirname, basename, sep } from "node:path";
+import { join, resolve, extname } from "node:path";
 import { requireString } from "./registry.js";
+import { createPathJail } from "./pathjail.js";
 import { HostToolError } from "./types.js";
 import type { HostTool } from "./types.js";
 
@@ -180,41 +172,26 @@ function toolPath(toolsDir: string, name: string): string {
  * tool — an ungated `delete_tool` deleting outside the project, a gated
  * `save_tool` planting self-executing code in a sibling project — so each
  * call resolves the real directory first and refuses it outside the real
- * root, with the nearest-existing-ancestor walk `pathjail.ts` uses so a
- * directory that does not exist yet is checked by what it would be created
- * under (#57).
+ * root (#57).
+ *
+ * The containment check itself is **the** jail in `pathjail.ts` — one
+ * implementation, per the repo's rule — with `mustExist: false` so a tools
+ * dir that does not exist yet is checked by what it would be created under.
+ * Only the wording below is toolstore-specific: the jail's own message is
+ * written for readers, and these tools also write and delete.
  */
 async function containedToolsDir(toolsDir: string, root: string): Promise<string> {
-  const realRoot = await realpath(root);
-  const outside = (): HostToolError =>
-    new HostToolError(
-      "PermissionError",
-      `refusing to touch saved tools: '${toolsDir}' resolves outside the project root`,
-    );
-
-  // realpath the deepest ancestor that exists, then rejoin the missing tail
-  // — a path that does not exist has no realpath, and a symlinked parent
-  // would go unchecked.
-  let probe = toolsDir;
-  const missing: string[] = [];
-  for (;;) {
-    try {
-      let dir = await realpath(probe);
-      for (const part of [...missing].reverse()) dir = join(dir, part);
-      if (dir !== realRoot && !dir.startsWith(realRoot + sep)) throw outside();
-      return dir;
-    } catch (err) {
-      if (err instanceof HostToolError) throw err;
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTDIR") {
-        throw new HostToolError("OSError", (err as Error).message);
-      }
-      const parent = dirname(probe);
-      // The filesystem root always exists, so this terminates before it.
-      if (parent === probe) throw new HostToolError("OSError", `cannot resolve '${toolsDir}'`);
-      missing.push(basename(probe));
-      probe = parent;
+  const jail = createPathJail(root, { mustExist: false, allowAbsolute: true });
+  try {
+    return await jail.resolve(toolsDir);
+  } catch (err) {
+    if (err instanceof HostToolError && err.pythonType === "PermissionError") {
+      throw new HostToolError(
+        "PermissionError",
+        `refusing to touch saved tools: '${toolsDir}' resolves outside the project root`,
+      );
     }
+    throw err;
   }
 }
 

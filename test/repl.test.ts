@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
@@ -1506,6 +1507,67 @@ describe("ReplRunner — invisible shadowing is refused at load time (#57)", () 
       );
       assert.match(out, /would shadow a host tool/, out);
       assert.equal(existsSync(join(cwd, ".pi", "code-tools", "walrus.py")), false);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── Remaining end-to-end gaps (#57, post-review) ────────────────
+
+describe("ReplRunner — remaining toolstore end-to-end gaps (#57)", () => {
+  it("annotates the tool dropped by the preamble limits", async () => {
+    const cwd = makeTempDir();
+    // 33 tools, one past DEFAULT_PREAMBLE_LIMITS.maxFiles; sorted load order
+    // makes t32 the one that does not fit.
+    for (let i = 0; i <= 32; i++) {
+      const name = `t${String(i).padStart(2, "0")}`;
+      saveToolFile(cwd, name, `def ${name}():\n    return ${i}\n`);
+    }
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      await runner.run("1 + 1", "limits"); // session creation + truncation notice
+      const out = await runner.run("list_saved_tools()", "limits");
+      assert.match(out, /t32 \[not loaded: preamble limit reached\]/, out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("read_tool refuses and delete_tool works in an untrusted session", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "hostile", "write('pwned.txt', 'owned')\n");
+    const runner = new ReplRunner(cwd); // untrusted by default
+
+    try {
+      await runner.run("1 + 1", "untrusted");
+      const read = await runner.run("read_tool('hostile')", "untrusted");
+      assert.match(read, /project is not trusted/, `an untrusted read went through: ${read}`);
+      assert.equal(
+        existsSync(join(cwd, "pwned.txt")),
+        false,
+        "reading executed the hostile preamble",
+      );
+
+      const deleted = await runner.run("delete_tool('hostile')", "untrusted");
+      assert.match(deleted, /deleted/, deleted);
+      assert.equal(existsSync(join(cwd, ".pi", "code-tools", "hostile.py")), false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("read_tool refuses a FIFO inside repl without hanging", async () => {
+    const cwd = makeTempDir();
+    mkdirSync(join(cwd, ".pi", "code-tools"), { recursive: true });
+    execFileSync("mkfifo", [join(cwd, ".pi", "code-tools", "fifo.py")]);
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      await runner.run("1 + 1", "fifo"); // creation: unreadable notice, no hang
+      const out = await runner.run("read_tool('fifo')", "fifo");
+      assert.match(out, /not a regular file/, out);
     } finally {
       cleanup();
     }
