@@ -2,8 +2,8 @@ import { Session, type GrantSummary } from "./session.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
-import { loadSavedTools, savedToolNames } from "./toolstore.js";
-import type { RefusedTool, UnreadableTool } from "./toolstore.js";
+import { loadSavedTools, savedToolNames, createToolStoreTools, TOOLSTORE_TOOL_NAMES } from "./toolstore.js";
+import type { RefusedTool, UnreadableTool, PreambleStatus } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
 
@@ -241,16 +241,37 @@ export class ReplRunner {
     const notices: string[] = [];
     if (rebuiltId !== undefined) notices.push(trustChangedMessage(rebuiltId, false));
 
+    // The shadowing gates (#54 load, #56 write) must see every host-tool name
+    // the session will have — including the toolstore's own, which are not in
+    // the registry yet: a preamble `def save_tool` would shadow the registered
+    // tool exactly like a bridge or builtin name (#57).
+    const hostToolNames = [
+      ...registry.list().map((tool) => tool.name),
+      ...TOOLSTORE_TOOL_NAMES,
+    ];
+
     let preamble = "";
+    let preambleStatus: PreambleStatus;
     if (trusted) {
       // The reserved names are the live registry's — never a hardcoded list.
       // A file that binds one of them refuses the whole preamble (#54), and
       // the loader reports it with the offending file and symbols.
       const load = await loadSavedTools({
         root: this.cwd,
-        hostToolNames: registry.list().map((tool) => tool.name),
+        hostToolNames,
       });
       preamble = load.preamble;
+      // The tool names, for the honest tool answers: `refused`/`unreadable`
+      // carry `.py` file names, the status sets carry the names the tools and
+      // the model use.
+      preambleStatus = {
+        trusted: true,
+        loaded: new Set(load.loaded),
+        withheld: new Set(),
+        skipped: new Set(load.skipped),
+        refused: new Set(load.refused.map((r) => r.file.slice(0, -3))),
+        unreadable: new Set(load.unreadable.map((u) => u.file.slice(0, -3))),
+      };
       if (load.refused.length > 0) notices.push(refusalNotice(load.refused));
       if (load.unreadable.length > 0) notices.push(unreadableNotice(load.unreadable));
       if (load.skipped.length > 0) notices.push(limitNotice(load.skipped));
@@ -259,7 +280,23 @@ export class ReplRunner {
       // model needs the names or it will call a tool that is not defined and
       // get a NameError it cannot explain.
       const withheld = await savedToolNames({ root: this.cwd });
+      preambleStatus = {
+        trusted: false,
+        loaded: new Set(),
+        withheld: new Set(withheld),
+        skipped: new Set(),
+        refused: new Set(),
+        unreadable: new Set(),
+      };
       if (withheld.length > 0) notices.push(untrustedNotice(withheld));
+    }
+
+    // Registered in every session, trusted or untrusted (#57): the tools
+    // answer from the status above — listing what actually loaded, refusing
+    // reads the project never trusted — and the write-time shadowing check
+    // (#56) finally sees the live registry's names.
+    for (const tool of createToolStoreTools({ root: this.cwd, hostToolNames, preambleStatus })) {
+      registry.add(tool);
     }
 
     return {

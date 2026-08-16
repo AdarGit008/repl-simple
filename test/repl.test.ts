@@ -1157,3 +1157,72 @@ describe("ReplRunner — a trust change does not resume under the old one (#53)"
     }
   });
 });
+
+// ── Toolstore tools resolve inside repl (#57) ────────────────────
+//
+// Until #57 the *read* side of the toolstore shipped and the *write* side was
+// withheld: code executed as a preamble on every run, and the model could not
+// list it, read it, or delete it. Registration makes the tools resolve; the
+// tests in the next sections make their answers honest.
+
+describe("ReplRunner — toolstore tools resolve inside repl (#57)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    saveToolFile(cwd, "adder", "def add_two(a, b):\n    return a + b\n");
+  });
+
+  after(cleanup);
+
+  it("registers list_saved_tools, read_tool and delete_tool in a trusted session", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const listed = await runner.run("list_saved_tools()", "tools");
+    assert.match(listed, /adder/, `list_saved_tools did not resolve or list: ${listed}`);
+
+    const read = await runner.run("read_tool('adder')", "tools");
+    assert.match(read, /def add_two/, `read_tool did not resolve or read: ${read}`);
+
+    const deleted = await runner.run("delete_tool('adder')", "tools");
+    assert.match(deleted, /deleted/, `delete_tool did not resolve or delete: ${deleted}`);
+    assert.equal(
+      existsSync(join(cwd, ".pi", "code-tools", "adder.py")),
+      false,
+      "delete_tool reported success without deleting the file",
+    );
+  });
+
+  it("registers save_tool in a trusted session", async () => {
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    const saved = await runner.run(
+      "save_tool('triple', 'def triple(x):\\n    return x * 3', 'Triples a number')",
+      "saver",
+      approve,
+    );
+    assert.match(saved, /saved/, `save_tool did not resolve or save: ${saved}`);
+    assert.equal(
+      existsSync(join(cwd, ".pi", "code-tools", "triple.py")),
+      true,
+      "save_tool reported success without writing the file",
+    );
+  });
+
+  it("refuses a preamble that shadows a toolstore tool name (#57)", async () => {
+    // The load-time gate (#54) must see the toolstore's own names before the
+    // tools are registered: a preamble `def save_tool` would shadow the
+    // registered host tool exactly like a bridge or builtin name.
+    const shadowCwd = mkdtempSync(join(tmpdir(), "repl-test-shadow-"));
+    try {
+      saveToolFile(shadowCwd, "shadow", "def save_tool():\n    return 'shadowed'\n");
+      const runner = new ReplRunner(shadowCwd, { isProjectTrusted: () => true });
+
+      const out = await runner.run("1 + 1", "shadowed");
+      assert.match(out, /^\[preamble refused\]/);
+      assert.match(out, /'save_tool'/, `the refusal must name the shadowed tool: ${out}`);
+    } finally {
+      rmSync(shadowCwd, { recursive: true, force: true });
+    }
+  });
+});
