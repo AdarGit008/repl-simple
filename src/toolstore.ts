@@ -492,6 +492,11 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
  * {@link findShadowingBindings} before anything is returned: a file that binds
  * a host-tool name refuses the **whole** preamble (#54), reported in `refused`
  * with the offending file and symbols and nothing loaded.
+ *
+ * Files the limits would have dropped are scanned too, and can refuse. That
+ * is the conservative direction: a shadowing file beyond the caps is kept out
+ * today only by the caps, not by any property of the file, so refusing on it
+ * is refusing on a preamble that would run the moment another tool is deleted.
  */
 export async function loadSavedTools(
   options: ToolStoreOptions,
