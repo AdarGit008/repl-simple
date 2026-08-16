@@ -1,6 +1,6 @@
 # Tasks — Refuse preamble definitions that shadow a host-tool name (#54)
 
-- [ ] Task 1: `loadSavedTools` refuses shadowing preambles + loader tests
+- [x] Task 1: `loadSavedTools` refuses shadowing preambles + loader tests
   - Acceptance: `SavedToolsPreamble.refused: RefusedTool[]` exists (exported); a tool whose code
     binds a name in `hostToolNames` is refused with `{ file: "x.py", symbols: [...] }`; whole
     preamble refused (`preamble ""`, `loaded []`, `skipped []`); all five binding forms caught via
@@ -9,7 +9,7 @@
   - Verify: `npx tsx --test test/toolstore.test.ts`; `npm run check`.
   - Files: `src/toolstore.ts`, `src/index.ts`, `test/toolstore.test.ts`
 
-- [ ] Task 2: `ReplRunner` wires live registry names + refusal notice + runner tests
+- [x] Task 2: `ReplRunner` wires live registry names + refusal notice + runner tests
   - Acceptance: trusted session whose preamble shadows `read_file` injects none of it (the real
     jailed `read_file` still resolves); the one-shot notice starts `[preamble refused]`, names the
     file and symbol, and says nothing loaded; benign tools still load in a trusted project
@@ -17,7 +17,7 @@
   - Verify: `npx tsx --test test/repl.test.ts`; `npm run check`.
   - Files: `src/repl.ts`, `test/repl.test.ts`
 
-- [ ] Task 3: record the namespace question on #40; full suite + check + lint + commit
+- [x] Task 3: record the namespace question on #40; full suite + check + lint + commit
   - Acceptance: a comment on issue #40 records the namespace-isolation question; `npm test`
     green; `npm run check` clean; `npm run lint` clean; each increment committed; tree clean.
   - Verify: `npm test && npm run check && npm run lint`; `gh issue view 40 --comments`.
