@@ -170,3 +170,36 @@ open and out of scope.
 - **The current session's preamble is immutable.** `delete_tool` cannot stop a hostile preamble
   already executing in the live session; the honest message and "start a new session" guidance are
   the defence, and the session-cache semantics of #53 make new sessions cheap.
+
+---
+
+## Post-review fixes (Phase 5 findings — recorded, not reflexive)
+
+Three independent reviewers (code-reviewer, security-auditor, test-engineer) converged on the
+following; each is fixed in a follow-up increment with tests:
+
+1. **Stale trust snapshot on inert trust flips (Critical).** `trustChangeDiscards` keeps the session
+   when the flip changes nothing, but the tools' `preambleStatus.trusted` stayed frozen → fail-open
+   reads in a now-untrusted project, fail-closed lies after untrust→trust. Fix: the tools consult a
+   **live** trust callback (`ToolStoreOptions.isTrusted`), the snapshot stays load-status-only.
+2. **Attacker-controlled filenames rendered unescaped** in list lines and the withheld/limit
+   notices — a crafted name forges a "not loaded" annotation for a file that is running. Fix:
+   `escapeNoticeName` moves to `toolstore.ts`, widens to C1/bidi, and applies to every disk-derived
+   name; non-identifier names are rendered quoted so a name can never read as an annotation.
+3. **`read_tool` TOCTOU**: lstat-then-readFile lets a swap to a FIFO (hang) or symlink (root escape)
+   through. Fix: single fd-based open with `O_NOFOLLOW | O_NONBLOCK`, `fstat` on the fd, trust
+   refusal **before** the open. The loader's read gets the same fd treatment.
+4. **Content staleness**: a loaded file overwritten after session start was read/listed as if the
+   new bytes were running. Fix: the loader records size+mtime per loaded file; `read_tool` and
+   `list_saved_tools` annotate `file changed since; the session runs the earlier copy`.
+5. **toolsDir symlink escape**: `.pi/code-tools` itself a symlink let the ungated `delete_tool`
+   remove files outside the root. Fix: every tool call resolves the real tools dir and refuses
+   when it escapes the real root (pathjail technique, toolstore wording).
+6. **Shadowing detector blind spots** (walrus, `exec`/`eval`, `globals()`/`vars()`, `__dict__`,
+   top-level `setattr`, `import *`) shared by both gates — the JSDoc's "load-time is the
+   authoritative control" was wrong (same function). Fix: walrus targets recorded; top-level
+   metaprogramming refuses **all** reserved names; consumer wording "defines" → "binds".
+7. **Lint gate failure on the committed tree** (biome format) — fixed, and lint exit code is
+   verified after every increment from now on.
+8. **Notice wording**: "start a new session" was ambiguous (`repl_reset` does not reload). Now
+   "run `repl` with a new `sessionId`"; save/delete messages say "sessions created after this one".
