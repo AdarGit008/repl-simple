@@ -198,12 +198,14 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
 
   // Build sandbox RunOptions (combine RLM-level runOptions with inputs/scriptName)
   const sandboxRunOpts = options.runOptions ? { ...options.runOptions } : {};
-  if (options.inputs) {
-    sandboxRunOpts.inputs = {
-      ...(sandboxRunOpts.inputs ?? {}),
-      ...options.inputs,
-    };
-  }
+  // `context` is always declared, defaulting to "" — the shipped preamble
+  // (repl_server.py) references it from its helper bodies, and an undeclared
+  // input is a deterministic type-check failure on every iteration (#72).
+  const inputs: Record<string, string> = {
+    ...(sandboxRunOpts.inputs ?? {}),
+    ...(options.inputs ?? {}),
+  };
+  sandboxRunOpts.inputs = { ...inputs, context: inputs.context ?? "" };
   sandboxRunOpts.scriptName = sandboxRunOpts.scriptName ?? "rlm.py";
   if (options.signal) {
     sandboxRunOpts.signal = options.signal;
@@ -213,7 +215,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   const messages: Array<{ role: "user" | "assistant"; content: string }> = [
     {
       role: "user",
-      content: buildInitialPrompt(question, options.inputs?.context),
+      content: buildInitialPrompt(question, sandboxRunOpts.inputs?.context),
     },
   ];
 
