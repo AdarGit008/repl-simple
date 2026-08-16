@@ -95,6 +95,7 @@ export {
   findShadowingBindings,
   DEFAULT_PREAMBLE_LIMITS,
   type PreambleLimits,
+  type RefusedTool,
   type SavedToolsPreamble,
   type ToolStoreOptions,
 } from "./toolstore.js";

@@ -14,11 +14,14 @@ export interface ToolStoreOptions {
   /**
    * Names a saved tool's code must not bind — the session's host-tool names.
    *
-   * `save_tool` refuses code that defines one of these, because the preamble
-   * runs before host tools resolve and would silently replace them (#54, #56).
-   * Caller-supplied so the list derives from the live registry rather than a
-   * hardcoded set that drifts. Omitted (or `[]`) means no write-time check;
-   * the load-time refusal (#54) is the backstop in that case.
+   * One list, two gates. `save_tool` refuses code that defines one of these
+   * at write time (#56), and `loadSavedTools` refuses a preamble containing
+   * such a file at load time (#54) — because the preamble runs before host
+   * tools resolve and would silently replace them. Caller-supplied so the
+   * list derives from the live registry rather than a hardcoded set that
+   * drifts. Omitted (or `[]`) means no check: for a standalone caller that
+   * cannot name the registry, `loadSavedTools` still loads, and the caller
+   * owns the security decision.
    */
   hostToolNames?: readonly string[];
 }
@@ -84,11 +87,17 @@ function assignmentEquals(s: string): number[] {
  * gate is #56). It is conservative on false *positives* — a match refuses
  * even inside a triple-quoted string, which is the safe direction — but it
  * has false *negatives*: `exec(...)`, `globals()["name"] = …`, `setattr`,
- * walrus (`:=`), and a plain `import mod` (no alias) are not caught. Those
- * are the load-time check's job (#54), which runs over every `.py` in
- * `.pi/code-tools` and is the authoritative control; this write-time check
- * only refuses what it can see. Comment lines are excluded for free — a
- * binding form must start the line, and `# def read_file` starts with `#`.
+ * walrus (`:=`), `del name`, `match`/`case` captures, and a plain
+ * `import mod` (no alias) are not caught. Those are the load-time check's
+ * job (#54), which runs over every `.py` in `.pi/code-tools` and is the
+ * authoritative control; this write-time check only refuses what it can see.
+ * Comment lines are excluded for free — a binding form must start the line,
+ * and `# def read_file` starts with `#`.
+ *
+ * Two Python tokenizer rules are honoured so a line break cannot hide a
+ * binding: the source is split on **universal newlines** (`\r`, `\r\n`, `\n`)
+ * and backslash continuations are joined first, exactly as CPython/Monty
+ * tokenize them.
  */
 export function findShadowingBindings(source: string, reserved: ReadonlySet<string>): string[] {
   if (reserved.size === 0) return [];
@@ -102,9 +111,16 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
     }
   };
 
-  // Split into logical statements on newlines and `;`. A `;` inside a string
-  // over-splits, which only ever over-refuses — the safe direction.
-  for (const line of source.split("\n")) {
+  // A backslash immediately before a line break is an explicit line join in
+  // Python — the two lines are one statement, so `def \` + `read_file():`
+  // binds `read_file`. Joining can only merge statements, which cannot hide a
+  // binding (a merged line is still scanned), and a join that would produce a
+  // syntax error is one the sandbox refuses loudly anyway.
+  const joined = source.replace(/\\\r?\n/g, "");
+
+  // Split into logical statements on universal newlines and `;`. A `;` inside
+  // a string over-splits, which only ever over-refuses — the safe direction.
+  for (const line of joined.split(/\r\n|\r|\n/)) {
     for (const raw of line.split(";")) {
       const s = raw.trim();
       if (s === "") continue;
@@ -121,9 +137,13 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         continue;
       }
 
-      const forTarget = /^for\s+([A-Za-z_]\w*)/.exec(s);
-      if (forTarget) {
-        record(forTarget[1]);
+      // `for a, read_file in items` binds both — every identifier between
+      // `for` and `in` is a target, so all of them are recorded (a nested
+      // structure identifier that is merely read, not bound, over-refuses,
+      // which is the safe direction).
+      const forHead = /^for\s+(.+?)\s+in\b/.exec(s);
+      if (forHead) {
+        for (const m of forHead[1].matchAll(/[A-Za-z_]\w*/g)) record(m[0]);
         continue;
       }
 
@@ -161,21 +181,21 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         continue;
       }
 
-      // Assignment. The statement must *begin* with a target identifier, so a
+      // Assignment. The statement must *begin* with a target expression — an
+      // identifier, or one wrapped in parens/brackets or star-unpacked — so a
       // call with keyword args (`foo(x = 1)`) or a comparison (`x == y`) is
       // not mistaken for a binding.
-      const start = /^([A-Za-z_]\w*)/.exec(s);
+      const start = /^[([]*\s*(?:\*\s*)?([A-Za-z_]\w*)/.exec(s);
       if (start) {
         const after = s.slice(start[0].length);
-        if (/^(?:\s*:[^=;\n]*)?\s*(?:=(?!=)|,)/.test(after)) {
+        if (/^[\])]*\s*(?::[^=;\n]*)?\s*(?:=(?!=)|,)/.test(after)) {
           const eqs = assignmentEquals(s);
-          // Every identifier before the first `=` is a target (tuple targets
-          // split on commas); in a chain (`a = b = c`) the identifier between
-          // each `=` is a target too. The value after the last `=` is not.
-          for (const target of s.slice(0, eqs[0]).split(",")) {
-            const tm = /^([A-Za-z_]\w*)/.exec(target.trim());
-            if (tm) record(tm[1]);
-          }
+          // Every identifier before the first `=` is a target (annotated,
+          // tuple, parenthesized and starred targets included; an identifier
+          // that only appears inside an annotation over-refuses — the safe
+          // direction). In a chain (`a = b = c`) the identifier between each
+          // `=` is a target too. The value after the last `=` is not.
+          for (const m of s.slice(0, eqs[0]).matchAll(/[A-Za-z_]\w*/g)) record(m[0]);
           for (let k = 1; k < eqs.length; k++) {
             const tm = /^([A-Za-z_]\w*)/.exec(s.slice(eqs[k - 1] + 1, eqs[k]).trim());
             if (tm) record(tm[1]);
@@ -418,6 +438,30 @@ export interface SavedToolsPreamble {
    * `NameError` the model has no way to explain.
    */
   skipped: string[];
+  /**
+   * Files whose code binds a host-tool name, refused at load time (#54).
+   *
+   * Non-empty means **nothing** was loaded — `preamble` is `""`, `loaded` and
+   * `skipped` are `[]` — and the caller must tell the model which file and
+   * symbol to fix. Partial injection would produce a session whose behaviour
+   * nobody can predict from the source, so one offender refuses the whole
+   * preamble rather than the offending file.
+   */
+  refused: RefusedTool[];
+}
+
+/**
+ * One saved tool the preamble must not run: its code shadows a host tool.
+ *
+ * A preamble definition **silently replaces** a host tool — host tools resolve
+ * only for names Python has not already bound, and the preamble runs first,
+ * so binding the name wins for the whole session (#54).
+ */
+export interface RefusedTool {
+  /** The `.py` file whose code binds a host-tool name. */
+  file: string;
+  /** The host-tool names the file binds, in first-appearance order. */
+  symbols: string[];
 }
 
 // ── savedToolNames ────────────────────────────────────────────────
@@ -460,6 +504,17 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
  * only for a project whose code the user has agreed to run — see
  * `docs/project-trust.md`. `savedToolNames` is the safe half of this function
  * for callers that only need to know what is there.
+ *
+ * When `options.hostToolNames` is set, every file that could load is scanned
+ * with {@link findShadowingBindings} before anything is returned: a file that
+ * binds a host-tool name refuses the **whole** preamble (#54), reported in
+ * `refused` with the offending file and symbols and nothing loaded.
+ *
+ * Files the caps drop are neither read nor scanned — code that never loads
+ * cannot shadow, and reading it anyway would be unbounded I/O the caps exist
+ * to prevent. The scan still refuses a capped-out shadow the moment it *would*
+ * load: session creation re-runs the loader, so the first session in which the
+ * file fits is the first session that refuses it.
  */
 export async function loadSavedTools(
   options: ToolStoreOptions,
@@ -469,10 +524,13 @@ export async function loadSavedTools(
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
   const names = await savedToolNames({ root, toolsDir });
-  if (names.length === 0) return { preamble: "", loaded: [], skipped: [] };
+  if (names.length === 0) return { preamble: "", loaded: [], skipped: [], refused: [] };
+
+  const reservedNames = new Set(options.hostToolNames ?? []);
 
   const loaded: string[] = [];
   const skipped: string[] = [];
+  const refused: RefusedTool[] = [];
   const sources: string[] = [];
   let bytes = 0;
 
@@ -483,10 +541,19 @@ export async function loadSavedTools(
     }
 
     const content = await readFile(join(toolsDir, `${name}.py`), "utf-8");
-    const size = Buffer.byteLength(content, "utf-8");
+
+    // Read on after an offender: all of them are collected in one pass, so
+    // the developer fixes once rather than one refusal per fix. Files beyond
+    // `maxFiles` are never read — code that cannot load cannot shadow.
+    const shadowing = findShadowingBindings(content, reservedNames);
+    if (shadowing.length > 0) {
+      refused.push({ file: `${name}.py`, symbols: shadowing });
+      continue;
+    }
 
     // Skipped whole, never truncated: half a Python file is a SyntaxError,
     // and a SyntaxError in the preamble takes every later tool down with it.
+    const size = Buffer.byteLength(content, "utf-8");
     if (bytes + size > limits.maxBytes) {
       skipped.push(name);
       continue;
@@ -497,7 +564,13 @@ export async function loadSavedTools(
     sources.push(content);
   }
 
-  if (loaded.length === 0) return { preamble: "", loaded: [], skipped };
+  // One offender refuses everything. Partial injection — the benign siblings
+  // without the hostile file — produces a session whose behaviour nobody can
+  // predict from the source, and the issue forbids both that and doing
+  // nothing silently. The caller must turn `refused` into a notice.
+  if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], refused };
+
+  if (loaded.length === 0) return { preamble: "", loaded: [], skipped, refused };
 
   const header = [
     "# ── Loaded tools ──",
@@ -512,5 +585,6 @@ export async function loadSavedTools(
     preamble: [...header, ...sources.flatMap((s) => [s, ""])].join("\n"),
     loaded,
     skipped,
+    refused,
   };
 }
