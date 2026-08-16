@@ -3,6 +3,7 @@ import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
 import { loadSavedTools, savedToolNames } from "./toolstore.js";
+import type { RefusedTool } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
 
@@ -242,8 +243,15 @@ export class ReplRunner {
 
     let preamble = "";
     if (trusted) {
-      const load = await loadSavedTools({ root: this.cwd });
+      // The reserved names are the live registry's — never a hardcoded list.
+      // A file that binds one of them refuses the whole preamble (#54), and
+      // the loader reports it with the offending file and symbols.
+      const load = await loadSavedTools({
+        root: this.cwd,
+        hostToolNames: registry.list().map((tool) => tool.name),
+      });
       preamble = load.preamble;
+      if (load.refused.length > 0) notices.push(refusalNotice(load.refused));
       if (load.skipped.length > 0) notices.push(limitNotice(load.skipped));
     } else {
       // Names only. Reading the listing is not reading the files, and the
@@ -285,6 +293,28 @@ function limitNotice(skipped: string[]): string {
     `preamble size limit was reached: ${skipped.join(", ")}. ` +
     `They are not defined in this session — calling one raises NameError. ` +
     `Delete tools you no longer need with delete_tool.`
+  );
+}
+
+/**
+ * What the model is told when the preamble was refused for shadowing (#54).
+ *
+ * A preamble definition silently replaces a host tool — host tools resolve
+ * only for names Python has not already bound, and the preamble runs first —
+ * so one offending file refuses the whole preamble rather than running in
+ * part. Naming the file and symbol is what lets a developer who did it
+ * accidentally fix it in seconds.
+ */
+function refusalNotice(refused: RefusedTool[]): string {
+  const offenders = refused
+    .map((r) => `${r.file} defines ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
+    .join("; ");
+  return (
+    `[preamble refused] No saved tools were loaded: ${offenders} — that name is a host tool, ` +
+    `and a preamble that shadows one is refused whole, never run in part. ` +
+    `Calling a saved tool raises NameError in this session. ` +
+    `Rewrite or delete the offending file(s) under .pi/code-tools; ` +
+    `the preamble loads in the next session.`
   );
 }
 

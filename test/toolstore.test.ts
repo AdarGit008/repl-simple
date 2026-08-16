@@ -566,7 +566,12 @@ describe("loadSavedTools", () => {
     const root = makeTempDir();
     try {
       const { opts } = makeTools(root);
-      assert.deepEqual(await loadSavedTools(opts), { preamble: "", loaded: [], skipped: [], refused: [] });
+      assert.deepEqual(await loadSavedTools(opts), {
+        preamble: "",
+        loaded: [],
+        skipped: [],
+        refused: [],
+      });
     } finally {
       cleanup();
     }
@@ -576,7 +581,12 @@ describe("loadSavedTools", () => {
     const root = makeTempDir();
     try {
       // Don't create any tools — raw directory
-      assert.deepEqual(await loadSavedTools({ root }), { preamble: "", loaded: [], skipped: [], refused: [] });
+      assert.deepEqual(await loadSavedTools({ root }), {
+        preamble: "",
+        loaded: [],
+        skipped: [],
+        refused: [],
+      });
     } finally {
       cleanup();
     }
