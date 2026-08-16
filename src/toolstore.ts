@@ -1,4 +1,5 @@
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { join, resolve, extname } from "node:path";
 import { requireString } from "./registry.js";
 import { HostToolError } from "./types.js";
@@ -448,6 +449,18 @@ export interface SavedToolsPreamble {
    * preamble rather than the offending file.
    */
   refused: RefusedTool[];
+  /**
+   * Tool files present on disk but left out because they could not be loaded:
+   * not a regular file (directory, FIFO, socket, symlink), or the stat/read
+   * failed (permissions, deleted between `readdir` and `readFile`).
+   *
+   * Non-empty means the caller **must tell the model**: a tool that is on
+   * disk, listed by `list_saved_tools` and absent from the interpreter is a
+   * `NameError` the model has no way to explain. Unlike `refused`, an
+   * unreadable entry never empties the preamble — one bad entry skips that
+   * entry, not the batch (#55).
+   */
+  unreadable: UnreadableTool[];
 }
 
 /**
@@ -462,6 +475,28 @@ export interface RefusedTool {
   file: string;
   /** The host-tool names the file binds, in first-appearance order. */
   symbols: string[];
+}
+
+/**
+ * One saved tool the preamble could not include: its file was not a regular
+ * file, or could not be read.
+ *
+ * Reported rather than thrown (#55): a directory named `x.py`, a FIFO, or a
+ * dangling symlink used to throw out of `loadSavedTools`, out of session
+ * creation, and out of every `repl` call — unrecoverably, because the session
+ * was never cached and `repl_reset` had nothing to reset.
+ */
+export interface UnreadableTool {
+  /** The `.py` file that was not loaded. */
+  file: string;
+  /**
+   * Why: `not a regular file` (lstat), or the stat/read error's message.
+   *
+   * For humans and tests. Raw errno text, attacker-influenced through the
+   * filename — escape before rendering into any model-facing or terminal
+   * text.
+   */
+  reason: string;
 }
 
 // ── savedToolNames ────────────────────────────────────────────────
@@ -515,6 +550,16 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
  * to prevent. The scan still refuses a capped-out shadow the moment it *would*
  * load: session creation re-runs the loader, so the first session in which the
  * file fits is the first session that refuses it.
+ *
+ * Every entry the caps admit is `lstat`'d first: only regular files load.
+ * Anything else — directory, FIFO, socket, symlink, working or broken — is
+ * reported in `unreadable` and skipped. A preamble is auto-executed code with
+ * full host-tool access, so a symlink that can point outside the project root
+ * is refused here rather than followed. The read itself is guarded too: an
+ * entry deleted or swapped between `readdir` and `readFile`, or unreadable by
+ * permission, is one `unreadable` entry, not a throw out of session creation.
+ * One bad entry therefore skips that entry, not the batch (#55) — the failure
+ * that used to kill every `repl` call unrecoverably is now loud and local.
  */
 export async function loadSavedTools(
   options: ToolStoreOptions,
@@ -524,13 +569,15 @@ export async function loadSavedTools(
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
   const names = await savedToolNames({ root, toolsDir });
-  if (names.length === 0) return { preamble: "", loaded: [], skipped: [], refused: [] };
+  if (names.length === 0)
+    return { preamble: "", loaded: [], skipped: [], unreadable: [], refused: [] };
 
   const reservedNames = new Set(options.hostToolNames ?? []);
 
   const loaded: string[] = [];
   const skipped: string[] = [];
   const refused: RefusedTool[] = [];
+  const unreadable: UnreadableTool[] = [];
   const sources: string[] = [];
   let bytes = 0;
 
@@ -540,7 +587,33 @@ export async function loadSavedTools(
       continue;
     }
 
-    const content = await readFile(join(toolsDir, `${name}.py`), "utf-8");
+    const path = join(toolsDir, `${name}.py`);
+
+    // Only regular files load, decided by lstat rather than discovered as an
+    // EISDIR or a hang: a directory and a FIFO both pass the `.py` name
+    // filter, and reading a FIFO with no writer blocks forever (#55).
+    let entry: Stats;
+    try {
+      entry = await lstat(path);
+    } catch (err) {
+      unreadable.push({ file: `${name}.py`, reason: (err as Error).message });
+      continue;
+    }
+    if (!entry.isFile()) {
+      unreadable.push({ file: `${name}.py`, reason: "not a regular file" });
+      continue;
+    }
+
+    // The read can still fail — the entry may be deleted or swapped between
+    // readdir and readFile, or be unreadable by permission. One bad entry
+    // skips that entry, not the batch: the session must still be created.
+    let content: string;
+    try {
+      content = await readFile(path, "utf-8");
+    } catch (err) {
+      unreadable.push({ file: `${name}.py`, reason: (err as Error).message });
+      continue;
+    }
 
     // Read on after an offender: all of them are collected in one pass, so
     // the developer fixes once rather than one refusal per fix. Files beyond
@@ -567,10 +640,13 @@ export async function loadSavedTools(
   // One offender refuses everything. Partial injection — the benign siblings
   // without the hostile file — produces a session whose behaviour nobody can
   // predict from the source, and the issue forbids both that and doing
-  // nothing silently. The caller must turn `refused` into a notice.
-  if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], refused };
+  // nothing silently. The caller must turn `refused` into a notice. The
+  // unreadable entries from the same pass ride along: "nothing loaded" is the
+  // whole truth either way. `skipped` stays `[]` by the #54 decision — the
+  // limits are never evaluated when a preamble is refused.
+  if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], unreadable, refused };
 
-  if (loaded.length === 0) return { preamble: "", loaded: [], skipped, refused };
+  if (loaded.length === 0) return { preamble: "", loaded: [], skipped, unreadable, refused };
 
   const header = [
     "# ── Loaded tools ──",
@@ -585,6 +661,7 @@ export async function loadSavedTools(
     preamble: [...header, ...sources.flatMap((s) => [s, ""])].join("\n"),
     loaded,
     skipped,
+    unreadable,
     refused,
   };
 }

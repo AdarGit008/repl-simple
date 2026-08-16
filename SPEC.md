@@ -1,78 +1,93 @@
-# Spec: Refuse preamble definitions that shadow a host-tool name — issue #54
+# Spec: One unreadable entry must not break `repl` — issue #55
 
-> 6.2 — "Refuse preamble definitions that shadow a host-tool name"
-> Parent: #52 (Bucket 6 — preamble supply chain) · Labels: `security`, `bucket-6`
+> 6.3 — "One unreadable entry breaks every repl call, unrecoverably"
+> Parent: #52 (Bucket 6 — preamble supply chain) · Labels: `bug`, `bucket-6`
 
 ## Objective
 
-A preamble definition **silently replaces** a host tool: a file containing
-`def read_file(path): return "SHADOWED"` replaces the jailed builtin for the whole session,
-permanently and silently — host tools resolve only for names Python has not already bound
-(`sandbox.ts:205-227`), and the preamble runs first. #53 stops an *untrusted* project's preamble
-from running at all, but a **trusted** project can still shadow `read_file`, `bash` or `http_get`
-by accident or by intent, and every bucket-4 security control is bypassed for that session.
-Trust is not a licence to impersonate the host.
+`loadSavedTools` guards the directory **listing** but not the per-entry **reads**
+(`src/toolstore.ts`, the loop's bare `readFile`). A **directory** named `dir.py` under
+`.pi/code-tools` passes the `.py` name filter, throws `EISDIR` out of `loadSavedTools`, out of
+`ReplRunner.createSession`, and out of **every** `repl` call — and `repl_reset` cannot fix it:
+the throw happens during session creation, so the session is never created and never cached,
+and the next call re-runs `createSession` and throws again. The tool is dead for that project
+until a human deletes the file by hand, and nothing tells them (or the model) what happened.
+A broken symlink, a FIFO, a permissions error, or a file deleted between `readdir` and
+`readFile` does the same.
 
-The fix: before injecting a preamble, scan it for definitions that bind a **registered host-tool
-name**, and **refuse** — naming the offending file and symbol, so a developer who did it
-accidentally can fix it in seconds.
+The fix: **one bad entry skips that entry, not the batch** — the session is created, the good
+tools load, and the model is told exactly which file was not loaded, so the failure is loud,
+specific, and recoverable without restarting Pi.
 
-**User:** a pi user who runs `repl` in a trusted project whose `.pi/code-tools` contains a
-shadowing file. **Success:** no part of such a preamble is injected; the real host tool keeps
-resolving; the model is told exactly which file and symbol to fix.
+**User:** a pi user who runs `repl` in a trusted project whose `.pi/code-tools` contains an
+unreadable or non-regular `.py` entry. **Success:** `repl` works; the other saved tools are
+defined and callable; the model is told which file was not loaded and why it is not defined;
+removing the bad entry makes the next **new** session load normally with no restart.
 
-### Success criteria (the issue's five tests)
+### Success criteria (the issue's six tests)
 
-1. A preamble defining `read_file` is refused, and the refusal names the file and the symbol.
-2. Each binding form is caught: `def`, plain assignment, `class`, `import as`, `from … import … as`.
-3. A preamble defining a name that is **not** a host tool loads normally. A check that rejects
-   legitimate tools would be turned off.
-4. When a preamble is refused, **no part of it is injected** — asserted on the session's actual
-   definitions, not merely on an error string.
-5. The check runs against the **registered** tool names for that session, not a hardcoded list,
-   so it cannot drift as the registry changes.
+1. A directory named `dir.py` does not break `repl` — the call succeeds and the entry is skipped.
+2. Other entries still load when one is bad. Skipping must not become "load nothing".
+3. The skip is reported to the model.
+4. Recovery works: remove the bad entry, and the next call loads normally with no restart.
+5. A non-regular file — symlink to nowhere, FIFO — is skipped, not fatal.
+6. The size and count caps are enforced, and the truncation is reported rather than silent.
 
 ### Explicit decisions (recorded, not reflexive)
 
-- **Refusal = withhold the whole preamble + a loud one-shot notice. Not a throw at session
-  creation.** A throw would brick every `repl` call for the project — the exact "unrecoverable"
-  failure mode #55 is filed for — and would leave no session to assert test 4 against. The
-  withhold-plus-notice design matches the shipped #53 pattern (untrusted path), keeps `repl`
-  usable, and satisfies "refuse the whole preamble rather than the offending file" with nothing
-  injected. The notice names every offending file and its shadowed symbols, states that **no**
-  saved tools were loaded, and says what must be fixed.
-- **The scan lives in `loadSavedTools`** (toolstore.ts), which reads each file and can therefore
-  attribute a shadow to its file. The detector is the existing `findShadowingBindings` (#56) —
-  one detector, two gates (write-time #56, load-time #54). The reserved names arrive through the
-  existing `ToolStoreOptions.hostToolNames` (#56 added it for the write gate; this issue widens
-  its contract to both gates and updates its JSDoc).
-- **Whole-preamble refusal.** If *any* file that would load shadows, `preamble === ""`,
-  `loaded === []`, limits are not evaluated, and `refused` names the offenders. Partial injection
-  produces a session nobody can predict from the source; the issue forbids it.
-- **Only code that would load is read and scanned.** Files beyond `maxFiles` are never read —
-  code that never loads cannot shadow, and reading it anyway would be unbounded host-side I/O
-  (review finding). A capped-out shadow is refused the first session in which it *would* load,
-  because session creation re-runs the loader. All offenders within the scanned set are still
-  collected in one pass, so the developer fixes once rather than rinse-and-repeat.
-- **The scanner is tokenizer-faithful where a line break could hide a binding.** The source is
-  split on universal newlines (`\r`, `\r\n`, `\n`) and backslash continuations are joined first,
-  exactly as CPython/Monty tokenize — otherwise `# comment\rdef bash(...)` executes as a `def`
-  that a `\n`-only split would read as one comment line (security-audit finding, verified end to
-  end against the real sandbox). For-heads record every target identifier, and parenthesized /
-  starred assignment targets are covered. The audit's `match`/`case` capture remains a documented
-  miss (the sandbox rejects `match` statements loudly today; see residual risks).
-- **Refusal applies only where a preamble would be injected** — the trusted path. The untrusted
-  path (#53) never loads anything, so there is nothing to scan.
-- **The reserved list is the live registry.** `ReplRunner.createSession` passes
-  `registry.list().map(t => t.name)` (bridge + builtins today; toolstore tools join it when #57
-  registers them, and then shadow them too). No hardcoded list to drift (test 5).
-- **The refusal notice is truthful and inert.** Filenames interpolated into the notice are
-  control-character-escaped (they come from the directory listing); the notice tells the model to
-  fix the file and **start a new session** — the running session's preamble is fixed at creation
-  and never re-verified, so "loads in the next session" would have been a lie (audit finding).
-- **The namespace question is recorded on #40.** The durable answer — registering host tools in a
-  namespace Python cannot rebind — is sandbox-level and migration-dependent; per the issue, a
-  comment is added to #40 so the question survives the migration spike.
+- **Skip + report, never throw.** A bad entry produces an `unreadable` entry on the loader
+  result and the load continues. Nothing in the load path throws on an entry that cannot be
+  read — that is the whole bug. (The only remaining throws in `loadSavedTools` are programmer
+  errors, and there are none: `savedToolNames` catches its own `readdir`.)
+- **A new field, not a reuse of `skipped`.** `SavedToolsPreamble.unreadable: UnreadableTool[]`
+  carries `{ file, reason }` per entry. `skipped` keeps its exact meaning — "the caps dropped
+  it" — because the limit notice's wording ("preamble size limit was reached") would be a lie
+  for a directory, and #57 will reuse both fields for read-side honesty. Additive, exactly as
+  `refused` was in #54; the two existing full-object `deepEqual` assertions gain `unreadable: []`.
+- **Only regular files load — decided by `lstat`, not by exception.** Anything whose `lstat`
+  reports non-regular (directory, FIFO, socket, symlink — to nowhere **or** to anywhere) is
+  skipped with reason `"not a regular file"`. A preamble is auto-executed code with full
+  host-tool access, and a symlink **entry** inside `.pi/code-tools` can point outside the
+  project root; following one would be an escape the path jail exists to prevent. Working
+  symlinks do not load either — one rule, no special cases, and `save_tool` only ever writes
+  regular files anyway. This is the "skip anything that is not a regular file" the issue
+  demands, decided up front rather than discovered as `EISDIR`. **Scope of the gate:** it
+  refuses symlinks at the *entry* level. A symlinked `.pi` or `.pi/code-tools` *directory* is
+  still followed — that content is part of the trusted project's own tree (the project
+  authored the link), so project trust, not a path jail, is the boundary there (audit
+  finding, recorded as a residual). Hard links are regular files by `lstat` and pass; they
+  also require write access to the directory, which in a trusted project is already the
+  stronger primitive.
+- **The read itself is wrapped.** `lstat` and `readFile` each get their own try/catch: a file
+  deleted or swapped between `readdir` and `readFile` (TOCTOU), or unreadable by permission,
+  becomes `{ file, reason: <error message> }`. The reason is kept on the struct for humans and
+  tests; the model-facing notice names files only (same as #54 assumption 4).
+- **Unreadable entries consume nothing and are never scanned.** They do not count against
+  `maxFiles`, do not add bytes, and are never passed to `findShadowingBindings` — code that
+  cannot load cannot shadow. Files **beyond** `maxFiles` are neither stat'd nor read (the #54
+  invariant "no I/O beyond the caps" now covers `lstat` too) — they stay `skipped`.
+- **Unreadable entries do not trigger whole-preamble refusal.** Only shadowing (#54) refuses
+  everything. A directory named `dir.py` is not an attack, it is an accident; the benign
+  siblings keep running. But when a refusal *does* happen, the refusal result still carries
+  the `unreadable` entries discovered in the same pass — "nothing loaded" is the whole truth
+  either way.
+- **`savedToolNames` stays name-only.** Its contract is "names without reading" (#53); the
+  stat filter lives in the loader. Cosmetic consequence: an untrusted project's withheld
+  notice may list a non-regular name — the statement "it was not loaded" is true for it too.
+- **The notice joins the `[preamble …]` family.** `[preamble unreadable]` — one-shot through
+  `LiveSession.notice`, filenames control-character-escaped via the existing
+  `escapeNoticeName` (#54), wording truthful for both reasons: the files were not read and are
+  not defined, calling one raises `NameError`, fix or remove them under `.pi/code-tools`, then
+  **start a new session** — the honest instruction, since a live session's preamble is fixed
+  at creation (the #54 audit finding applies here too).
+- **Recovery means the next new session.** Sessions are cached per `sessionId` by design, so
+  "the next call loads normally" can only be true of a session that re-runs the loader — a new
+  `sessionId`, or a trust-change rebuild. The test pins both directions: the session that
+  skipped the entry keeps working with the tools it did load, and a fresh session after the
+  fix loads cleanly with no notice.
+- **`read_tool` / `list_saved_tools` honesty stays #57's job.** #55 makes the **loader**
+  resilient; #57 remains the owner of reporting what actually executed to the model through
+  the registered tools. Recorded so the scope boundary is explicit.
 
 ## Tech Stack
 
@@ -94,20 +109,21 @@ Lint:             npm run lint         # biome check --error-on-warnings
 
 ```
 src/types.ts        (unchanged)
-src/toolstore.ts    loadSavedTools — scan each file, RefusedTool, refused field, whole-refusal
-src/repl.ts         createSession — pass registry.list() names; refusal notice
-src/index.ts        export RefusedTool type
-test/toolstore.test.ts  loader-level refusal tests (issue tests 1-3, 5 at loader level)
-test/repl.test.ts       runner-level tests (issue tests 1, 4, 5 end to end)
+src/toolstore.ts    loadSavedTools — lstat gate, per-entry read guard, UnreadableTool,
+                    unreadable field on SavedToolsPreamble
+src/repl.ts         createSession — unreadableNotice wired alongside limitNotice/refusalNotice
+src/index.ts        export UnreadableTool type
+test/toolstore.test.ts  loader-level tests (issue tests 1, 2, 5, 6 at loader level; recovery)
+test/repl.test.ts       runner-level tests (issue tests 1, 3, 4 end to end)
 ```
 
 ## Code Style
 
 Match existing conventions: JSDoc on every exported symbol, section-divider comment bars
-(`// ── Name ───`), biome double quotes, 2-space indent, 100-col line width. `HostToolError` is
-**not** used here — refusal is a withheld result, not a Python-facing failure. Notices follow the
-existing `[preamble …]` family (`untrustedNotice`, `limitNotice`), one-shot through
-`LiveSession.notice`. Example (existing):
+(`// ── Name ───`), biome double quotes, 2-space indent, 100-col line width. `HostToolError`
+is **not** used here — a skipped entry is a withheld result, not a Python-facing failure.
+Notices follow the existing `[preamble …]` family, one-shot through `LiveSession.notice`.
+Example (existing):
 
 ```ts
 function limitNotice(skipped: string[]): string {
@@ -123,86 +139,144 @@ function limitNotice(skipped: string[]): string {
 ## Testing Strategy
 
 `node:test` + `node:assert/strict`, TDD (RED → GREEN). Loader-level tests in
-`test/toolstore.test.ts` drive `loadSavedTools` with real files in a temp dir (the
-`writeSavedTool` helper). Runner-level tests in `test/repl.test.ts` use the `saveToolFile` helper
-and a real `ReplRunner` with `isProjectTrusted: () => true`, asserting on **observable behavior**
-— the real host tool still resolves — not merely on a message, mirroring the #53 hostile-preamble
-pattern. Existing tests that `deepEqual` the full `SavedToolsPreamble` object are updated for the
-new `refused` field (additive change).
+`test/toolstore.test.ts` drive `loadSavedTools` with real files in a temp dir — real
+directories, real `symlinkSync`, real `mkfifoSync`, real `chmodSync 0o000` — never mocks of
+the filesystem. Runner-level tests in `test/repl.test.ts` use `saveToolFile` and a real
+`ReplRunner` with `isProjectTrusted: () => true`, asserting on **observable behavior** —
+`[result]\n2` still comes back and the good tool still resolves — not merely on a message.
+
+Platform guards, following the existing repo pattern
+(`test/extension-loader.test.ts` skips the symlink test on win32):
+- `symlinkSync` tests skip on `win32` (symlinks need privileges there).
+- `mkfifoSync` tests skip on `win32` (no FIFOs).
+- The `chmod 0o000` read-failure test skips when `process.getuid?.() === 0` (root ignores
+  permissions; CI and dev run unprivileged).
+CI runs ubuntu + macOS (Node 22/24), where all three are live.
 
 ## Boundaries
 
 - **Always:** TDD (RED→GREEN), run `npm test` and `npm run check` after each increment, commit
-  per increment, fail closed — a refusal must inject nothing.
-- **Never (out of scope):** register the toolstore tools into `ReplRunner` (#57); fix unreadable
-  entries in the load loop (#55); change the Monty sandbox or its namespace (#40); a hardcoded
-  reserved-name list; a throw at session creation (see decisions); hard throw semantics anywhere
-  in the load path.
+  per increment, fail closed — an unreadable entry must never abort a session.
+- **Never (out of scope):** register the toolstore tools into `ReplRunner` (#57); refuse the
+  whole preamble for an unreadable entry (only #54 shadowing refuses); follow a symlink; a
+  throw at session creation for any entry the loader can name; read or stat files beyond
+  `maxFiles`; change `savedToolNames`'s name-only contract; change the Monty sandbox (#40);
+  a hardcoded list of "bad" filenames.
 
 ## Success Criteria
 
-All five issue tests pass end-to-end, plus: full suite green, `npm run check` clean,
-`npm run lint` clean, namespace question recorded on #40, change committed.
+All six issue tests pass end-to-end, plus: full suite green, `npm run check` clean,
+`npm run lint` clean, `npm run build` clean, every increment committed, tree clean.
 
 ## Assumptions (recorded; no human asked)
 
-1. **Withhold + notice, not throw** — decided above under "Explicit decisions"; assumed to be the
-   intended reading of "refuse" given test 4 asserts a *session* without the definitions.
-2. **`hostToolNames` reuse.** One option, two gates. Callers who never set it get no load-time
-   check either (same contract as #56's write gate); `ReplRunner` always sets it from the live
-   registry, so the shipped path is always checked.
-3. **Limits are not evaluated when the preamble is refused.** A refused preamble loads nothing,
-   so `skipped` is `[]` alongside `refused`; the two fields never mix.
-4. **The notice names offenders only.** The model can enumerate the directory with the bridged
-   `ls`/`read`; the actionable content is the offending file + symbol.
-5. **`read_file` is a registered builtin today** (bridge: `read, grep, find, ls, bash, edit,
-   write`; builtins: `read_file, list_files, http_get`) — the reproduction in the issue body is
-   therefore live against the current registry.
-6. **Detector false negatives inherit from #56** (exec, setattr, walrus, bare `import`, `del`,
-   `match`/`case`). This is accepted: the load-time scan is a UX/security guard, not a parser, and
-   the namespace fix (#40) is the structural answer.
-7. **Unreadable entries and oversized single files remain #55's problem.** A file that throws on
-   read (directory named `x.py`, dangling symlink) or a single file far larger than `maxBytes`
-   still aborts the load; this predates the change (reads are bounded to the `maxFiles` set) and
-   is fixed in #55, which owns the read loop's error handling and size caps.
+1. **"Skip and report" means a new `unreadable` field, not `skipped` reuse** — decided above;
+   `skipped`'s limit-only meaning is asserted in existing tests and its notice wording.
+2. **Symlinks never load, even working ones** — the lstat gate refuses the link itself. The
+   issue names only "symlink to nowhere", but a working symlink in auto-executed position can
+   point outside the project root; the one-rule version is both simpler and safer. If a
+   legitimate workflow relies on symlinked tools, that is a future issue with a future test.
+3. **The notice names files, not reasons** — the actionable content is which file to fix or
+   remove; the reason stays on the result struct for humans and tests.
+4. **Unreadable entries don't consume `maxFiles` slots** — a cap is about how much code runs,
+   and skipped code doesn't run.
+5. **The refusal result carries `unreadable` too** — discovered in the same pass, reported in
+   the same result; the notices compose (refusal + unreadable) via the existing
+   `notices.join("\n\n")`.
+6. **Issue test 6 (caps + truncation reporting) is already satisfied** by the shipped #53
+   limit work (`skipped` + `[preamble truncated]` + header line, all pinned by tests). This
+   change keeps those tests green and adds the two cap-interaction pins (no stat beyond
+   `maxFiles`; unreadable entries don't consume slots) so the new loop cannot regress them.
+7. **Pre-existing limit-header interpolation of `skipped` names is untouched** — a control
+   character in a capped file's name could break out of the preamble's `#` header comment
+   (pre-dates this issue; the model-facing notice path is escaped). Recorded as a residual
+   risk rather than silently widened; the unreadable names go through the **escaped** notice
+   path only and are not interpolated into the preamble.
 
 ## Open Questions
 
-None blocking. #55 (unreadable entries) and #57 (registration) remain open and out of scope here.
-
-## Residual risks (recorded for the ship report)
-
-- **The detector is best-effort.** The binding scan (#56) has false negatives: code that binds a
-  host name through `exec`, `globals()`, `setattr`, walrus, a bare `import`, `del`, or
-  `match`/`case` captures slips past both gates. The audit verified that today those forms tend
-  to fail loudly (the checker validates against the tool stubs) rather than shadow silently —
-  but that depends on stub types never degrading to `Any`. The structural fix — a namespace
-  Python cannot rebind — is recorded on #40 and remains the authoritative answer.
-- **Recovery is host-side until #57.** The refusal notice tells the model what to fix, but
-  `delete_tool` is not registered inside `repl` yet, so the offending file must be removed or
-  rewritten from the host side. The notice says to start a new session after fixing — the honest
-  instruction, pinned by a test.
-- **A refusal costs the innocent tools too.** Whole-preamble refusal means benign siblings of the
-  offending file do not load either. That is the issue's explicit demand ("refuse the whole
-  preamble"), and the notice says so.
-- **One oversized or unreadable entry still aborts the load.** Reads are bounded to the
-  `maxFiles` set (no beyond-caps reads — review finding), but a single giant file within the caps
-  is still read in full, and a directory named `x.py` still throws out of session creation.
-  Both predate this change; #55 owns the fix.
+None blocking. #57 (toolstore registration) and #40 (namespace) remain open and out of scope.
 
 ## Review remediation (post-build, reviewer-driven)
 
-- **HIGH (security audit): universal-newline bypass** — fixed: the detector splits on `\r`/`\r\n`
-  and joins backslash continuations, with unit and loader-level regression tests. The same
-  detector backs the #56 write gate, so both gates are hardened by one change.
-- **MEDIUM (security audit): undocumented target-form misses** — fixed for for-tuples and
-  parenthesized/starred targets; `match`/`case` documented as a miss (sandbox rejects `match`
-  loudly today).
-- **REQUIRED (code review) / MEDIUM (audit): reads beyond the caps** — fixed: files the caps
-  drop are neither read nor scanned; the unreadable-entry regression and the unbounded-I/O
-  concern both disappear. Pinned by a test.
-- **LOW (audit): notice wording and filename interpolation** — fixed: filenames are
-  control-character-escaped in the refusal notice; the false "next session" promise is reworded
-  and the recovery path pinned by a test.
-- **Test-engineer must-haves** — the scan-bounds interplay and the trust-change-after-refusal
-  behaviour are now pinned; multi-offender notice rendering is pinned at runner level.
+Five-axis review (correctness, readability, architecture, security, performance) of the
+branch's four commits, plus an independent file-by-file pass. Findings:
+
+- **No required or blocking findings.** The loader loop has no unguarded I/O left: `lstat`,
+  the regular-file gate, and the read are each failure-contained, and the only other throw
+  sources (`savedToolNames`'s `readdir`) were already guarded.
+- **Verified:** the notice names are control-character-escaped (`escapeNoticeName`, reused
+  from #54); the reason strings (raw errno messages) never reach the model-facing notice;
+  the `trustChangedMessage` function is byte-identical to the pre-branch version (an edit
+  mishap during Task 2 was repaired before commit, diff-verified); the FIFO test's
+  `mkfifoSync` was replaced with `execFileSync("mkfifo", …)` because Node ships no `mkfifo`.
+- **LOW (residual, accepted):** a TOCTOU swap between `lstat` and `readFile` — an attacker
+  with **write access to a trusted project's `.pi/code-tools`** could swap a checked entry
+  for a symlink (read follows it) or a FIFO (read blocks). That capability already implies
+  the stronger primitive (write a hostile regular file, which the trust model explicitly
+  allows), so it adds no marginal risk; recorded rather than engineered around.
+- **Nit (recorded, unchanged):** `savedToolNames` is name-only, so a non-regular `.py`
+  entry still appears in the untrusted path's withheld list. The claim ("not loaded") is
+  true for it too; #57 may tighten this when it makes `list_saved_tools` honest.
+
+## Review remediation round 2 (code-reviewer + security-auditor + test-engineer fan-out)
+
+All three agents returned **zero Critical and zero Required** findings. Remediated here:
+
+- **Test isolation (code-reviewer):** the three runner tests shared one temp dir and the
+  recovery test mutated it (`rmSync` of `dir.py`) — order-dependent. Each test now owns its
+  `makeCwd()` + `try/finally cleanup()`.
+- **FIFO regression would hang CI (test-engineer):** `npm test` has no per-test timeout, so
+  a loader that regresses on the lstat gate blocks the FIFO test forever. The FIFO test now
+  declares `{ timeout: 5000 }` — a hung read is a failing test, not a hung job.
+- **Escape path unpinned (test-engineer):** a runner-level test now pins that the unreadable
+  notice escapes control characters in filenames (`dir\nesc.py` → `dir\u{a}esc.py`), the
+  same rule the #54 refusal notice is pinned against.
+- **Chmod test under-pinned (test-engineer nit):** the skipped-entry assertion is now a
+  `deepEqual` over the file list (a double-report would fail it), with the `/EACCES/`
+  reason pin kept.
+- **`reason` is attacker-influenced (security-auditor):** `UnreadableTool.reason` JSDoc now
+  says "for humans and tests — escape before rendering into model-facing or terminal text".
+- **Refusal branch asymmetry (code-reviewer):** the refusal return now comments why
+  `skipped` stays `[]` there (the #54 decision: limits are never evaluated when a preamble
+  is refused).
+- **Artifact drift (code-reviewer nit):** `tasks/plan.md` checkboxes now match
+  `tasks/todo.md`.
+- **Spec wording corrected (security-auditor):** the lstat gate's scope is now stated
+  precisely — entry-level symlink refusal; a symlinked *directory* component is followed
+  and is covered by project trust, not the gate (residual below).
+
+Not remediated (recorded as accepted residuals below, none exploitable): directory-component
+symlinks, hard links, bidi controls in `escapeNoticeName` and the unescaped sibling notices
+(`untrustedNotice`, `limitNotice` — pre-existing #53/#54 text), and unbounded notice length
+(pre-existing pattern across the whole notice family).
+
+## Residual risks (recorded for the ship report)
+
+- **An unreadable entry is skipped forever, silently after the first call.** The notice is
+  one-shot (the family pattern); a later call in the same session gets no reminder that
+  `dir.py` is missing. That is the intended trade — a repeating banner trains the model to
+  skip the line — and #57's read-side honesty is the durable answer.
+- **`savedToolNames` still lists non-regular names.** The untrusted withheld notice and
+  `trustChangeDiscards` count a `dir.py` as a tool name. Harmless (the claim "not loaded" is
+  true), recorded above.
+- **Limit-header interpolation of `skipped` names is unescaped** (pre-existing, assumption 7).
+- **Recovery needs a new session** — by design (sessions cache their preamble); the notice
+  says exactly that, pinned by a test.
+- **A symlinked `.pi` or `.pi/code-tools` directory is followed** (audit finding, accepted).
+  The lstat gate refuses symlink *entries*; directory components resolve normally. The
+  content a symlinked directory loads is part of the trusted project's own tree — the
+  project authored the link — so project trust, not a path jail, is the boundary. A
+  `realpath` containment check would make the claim literal if the trust model ever
+  narrows.
+- **Hard links pass the regular-file gate** (audit finding, accepted). `lstat` reports a
+  hard link as a regular file, and creating one requires write access to
+  `.pi/code-tools` — which in a trusted project is already arbitrary auto-executed code.
+  No marginal risk.
+- **`escapeNoticeName` does not neutralize bidi controls, and the sibling notices
+  (`untrustedNotice`, `limitNotice`) do not escape at all** (audit finding, pre-existing
+  from #53/#54, not widened here). A crafted filename can visually reorder notice text.
+  Candidate for the #57 sweep.
+- **Notice length is unbounded** (audit finding, pre-existing pattern across the whole
+  notice family): thousands of junk `.py`-named entries produce a megabyte-scale notice.
+  A name-count cap belongs to the family, not to this issue.
