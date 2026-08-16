@@ -191,6 +191,28 @@ All six issue tests pass end-to-end, plus: full suite green, `npm run check` cle
 
 None blocking. #57 (toolstore registration) and #40 (namespace) remain open and out of scope.
 
+## Review remediation (post-build, reviewer-driven)
+
+Five-axis review (correctness, readability, architecture, security, performance) of the
+branch's four commits, plus an independent file-by-file pass. Findings:
+
+- **No required or blocking findings.** The loader loop has no unguarded I/O left: `lstat`,
+  the regular-file gate, and the read are each failure-contained, and the only other throw
+  sources (`savedToolNames`'s `readdir`) were already guarded.
+- **Verified:** the notice names are control-character-escaped (`escapeNoticeName`, reused
+  from #54); the reason strings (raw errno messages) never reach the model-facing notice;
+  the `trustChangedMessage` function is byte-identical to the pre-branch version (an edit
+  mishap during Task 2 was repaired before commit, diff-verified); the FIFO test's
+  `mkfifoSync` was replaced with `execFileSync("mkfifo", …)` because Node ships no `mkfifo`.
+- **LOW (residual, accepted):** a TOCTOU swap between `lstat` and `readFile` — an attacker
+  with **write access to a trusted project's `.pi/code-tools`** could swap a checked entry
+  for a symlink (read follows it) or a FIFO (read blocks). That capability already implies
+  the stronger primitive (write a hostile regular file, which the trust model explicitly
+  allows), so it adds no marginal risk; recorded rather than engineered around.
+- **Nit (recorded, unchanged):** `savedToolNames` is name-only, so a non-regular `.py`
+  entry still appears in the untrusted path's withheld list. The claim ("not loaded") is
+  true for it too; #57 may tighten this when it makes `list_saved_tools` honest.
+
 ## Residual risks (recorded for the ship report)
 
 - **An unreadable entry is skipped forever, silently after the first call.** The notice is
