@@ -449,6 +449,32 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
 
   // ── read_tool ──────────────────────────────────────────────
 
+  /**
+   * The `# NOTE` header prepended to a source the session did not load.
+   *
+   * Returned rather than thrown: the model needs the code to fix it (a
+   * refused shadow, a skipped tool). Only the two reads that must not happen
+   * refuse — an untrusted project's files (never even read, #53) and a file
+   * that is not a regular file (a FIFO would hang the call, a symlink could
+   * leave the root, #55).
+   */
+  function readNote(name: string, view: PreambleStatus): string {
+    if (view.refused.has(name)) {
+      return "# NOTE: not loaded in this session — the preamble was refused because this code " +
+        "shadows a host tool";
+    }
+    if (view.unreadable.has(name)) {
+      return "# NOTE: not loaded in this session — the file could not be read when the session started";
+    }
+    if (view.skipped.has(name)) {
+      return "# NOTE: not loaded in this session — the preamble limit was reached";
+    }
+    if (view.loaded.size === 0 && view.refused.size > 0) {
+      return "# NOTE: not loaded in this session — the preamble was refused and nothing was loaded";
+    }
+    return "# NOTE: not loaded in this session — it was saved after this session started";
+  }
+
   const readTool: HostTool = {
     name: "read_tool",
     description: "Read a saved tool's source code.",
@@ -464,14 +490,46 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       const name = validateToolName(args.name);
       const path = toolPath(toolsDir, name);
 
+      // lstat first, before any read. A FIFO named `x.py` would hang the
+      // readFile below, and a symlink whose target leaves the project root
+      // would read outside it — the loader refuses both at load time (#55),
+      // and a registered read tool must refuse them at read time too.
+      let entry: Stats;
       try {
-        return await readFile(path, "utf-8");
+        entry = await lstat(path);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
           throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
         }
         throw new HostToolError("OSError", (err as Error).message);
       }
+      if (!entry.isFile()) {
+        throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
+      }
+
+      // An untrusted project's files are never even read (#53) — a registered
+      // read tool that read them would silently repeal the gate.
+      const view = options.preambleStatus;
+      if (view && !view.trusted) {
+        throw new HostToolError(
+          "PermissionError",
+          `tool '${name}' was not loaded — this project is not trusted, so its files are not read. ` +
+            `Trust the project in pi to load saved tools, then start a new session.`,
+        );
+      }
+
+      let content: string;
+      try {
+        content = await readFile(path, "utf-8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
+        }
+        throw new HostToolError("OSError", (err as Error).message);
+      }
+
+      if (!view || view.loaded.has(name)) return content;
+      return `${readNote(name, view)}\n\n${content}`;
     },
   };
 

@@ -717,6 +717,182 @@ describe("list_saved_tools with preambleStatus (#57)", () => {
 
 // ── read_tool ──────────────────────────────────────────────────
 
+describe("read_tool with preambleStatus (#57)", () => {
+  function makeViewedTools(root: string, view: PreambleStatus) {
+    const opts: ToolStoreOptions = { root, preambleStatus: view };
+    return { tools: createToolStoreTools(opts), opts };
+  }
+
+  async function writeTool(root: string, name: string): Promise<string> {
+    const { tools, opts } = makeTools(root);
+    await findTool(tools, "save_tool").execute({
+      name,
+      code: `def ${name}(): return 1`,
+      description: "test tool",
+    });
+    return toolsDirOf(opts);
+  }
+
+  it("refuses to read a directory named like a tool", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ unreadable: ["dir"] }));
+      mkdirSync(join(root, ".pi", "code-tools", "dir.py"), { recursive: true });
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "dir" });
+      }, /not a regular file/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses to read a symlink, even one to a real file", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ unreadable: ["link"] }));
+      const target = join(root, "real.txt");
+      writeFileSync(target, "def link(): return 1");
+      mkdirSync(join(root, ".pi", "code-tools"), { recursive: true });
+      symlinkSync(target, join(root, ".pi", "code-tools", "link.py"));
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "link" });
+      }, /not a regular file/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses to read withheld files in an untrusted project", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ trusted: false, withheld: ["hostile"] });
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "hostile");
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "hostile" });
+      }, /project is not trusted/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses to read a tool saved mid-session in an untrusted project", async () => {
+    const root = makeTempDir();
+    try {
+      const view = status({ trusted: false }); // disk was empty at creation
+      const { tools } = makeViewedTools(root, view);
+      await writeTool(root, "late");
+      await assert.rejects(async () => {
+        await findTool(tools, "read_tool").execute({ name: "late" });
+      }, /project is not trusted/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates the source of a refused file", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ refused: ["bad"] }));
+      await writeTool(root, "bad");
+      const out = await findTool(tools, "read_tool").execute({ name: "bad" });
+      assert.ok(
+        out.includes(
+          "# NOTE: not loaded in this session — the preamble was refused because this code " +
+            "shadows a host tool",
+        ),
+        out,
+      );
+      assert.ok(out.includes("def bad()"), out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates the source of a sibling of a refused preamble", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ refused: ["bad"] }));
+      await writeTool(root, "good");
+      const out = await findTool(tools, "read_tool").execute({ name: "good" });
+      assert.ok(
+        out.includes(
+          "# NOTE: not loaded in this session — the preamble was refused and nothing was loaded",
+        ),
+        out,
+      );
+      assert.ok(out.includes("def good()"), out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates the source of a tool skipped by the preamble limits", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ skipped: ["big"] }));
+      await writeTool(root, "big");
+      const out = await findTool(tools, "read_tool").execute({ name: "big" });
+      assert.ok(
+        out.includes("# NOTE: not loaded in this session — the preamble limit was reached"),
+        out,
+      );
+      assert.ok(out.includes("def big()"), out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates the source of a file that was unreadable at session start", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ unreadable: ["flaky"] }));
+      await writeTool(root, "flaky");
+      const out = await findTool(tools, "read_tool").execute({ name: "flaky" });
+      assert.ok(
+        out.includes(
+          "# NOTE: not loaded in this session — the file could not be read when the session started",
+        ),
+        out,
+      );
+      assert.ok(out.includes("def flaky()"), out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("annotates the source of a tool saved after the session started", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({}));
+      await writeTool(root, "new_tool");
+      const out = await findTool(tools, "read_tool").execute({ name: "new_tool" });
+      assert.ok(
+        out.includes(
+          "# NOTE: not loaded in this session — it was saved after this session started",
+        ),
+        out,
+      );
+      assert.ok(out.includes("def new_tool()"), out);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns plain source for a tool the session loaded", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeViewedTools(root, status({ loaded: ["ok"] }));
+      await writeTool(root, "ok");
+      const out = await findTool(tools, "read_tool").execute({ name: "ok" });
+      assert.ok(out.includes("def ok()"), out);
+      assert.doesNotMatch(out, /NOTE: not loaded/, "a loaded tool's source carries a refusal note");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("read_tool", () => {
   it("reads a saved tool's source code", async () => {
     const root = makeTempDir();
