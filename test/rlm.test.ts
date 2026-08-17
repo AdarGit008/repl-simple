@@ -602,7 +602,7 @@ describe("runRlm() — context input", () => {
   it("9.2.8 forwards runOptions.inputs when options.inputs is absent", async () => {
     // The recorded deviation from RLMLoop.run: runOptions.inputs.context
     // survives when options.inputs has no context.
-    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
 
     const result = await runRlm("how long?", {
       llmClient: llm,
@@ -616,7 +616,7 @@ describe("runRlm() — context input", () => {
   });
 
   it("9.2.9 options.inputs wins over runOptions.inputs for the same key", async () => {
-    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(str(len(context)))\n```']);
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
 
     const result = await runRlm("how long?", {
       llmClient: llm,
