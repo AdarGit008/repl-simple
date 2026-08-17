@@ -126,8 +126,10 @@ hand-edited), the question-as-input follow-up (D24).
     `assert.equal(last.messages.at(-1)?.role, "user")` (Assumption 7 — both, not the issue's
     "or").
   - Extract the count via `/… (\d+) earlier turns dropped/` from the marker and assert it equals
-    the number of `TURN_i_` labels absent from the final query's messages (self-consistent, no
-    hardcoded count).
+    the number of `TURN_i_` labels of **completed turns only** (labels 0 … last-completed-turn)
+    absent from the final query's messages (self-consistent, no hardcoded count). The final query
+    is composed *for* the pending newest turn — its label is absent by construction and must not
+    be counted (build-corrected: the original all-10-labels scope was unsatisfiable, see SPEC D16).
 
   **Guard — GREEN immediately.** Current code cannot produce a dangling assistant and the marker
   count is consistent today.

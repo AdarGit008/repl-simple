@@ -172,10 +172,16 @@ the current flat cut.
 
 Cosmetic-strength: test 5 currently pins ceiling + marker presence only. Add: extract the count via
 `/… (\d+) earlier turns dropped/` from the marker, and assert it equals the number of `TURN_i_` labels
-(0–9) absent from the final query's messages (each retained turn's assistant reply carries its label;
-dropped turns vanish entirely). Self-consistent — no need to predict the exact count for the 10 ×
-300 KB-labelled-print scenario. **Prove-it guard — GREEN immediately** (the marker count is consistent
-today). The head/tail-ratio half of item 7's complaint is pinned by tests 20/21 (D21, both-ends
+**of completed turns only** (labels 0 … last-completed-turn) absent from the final query's messages
+each retained turn's assistant reply carries its label; dropped turns vanish entirely). The final
+query is composed *for* the pending newest turn, whose label is absent by construction and must NOT
+be counted — counting all 10 labels makes the assertion unsatisfiable (verified in BUILD: absent
+labels {0,1,9} = 3 vs. marker count 2; completed-turns scope gives {0,1} = 2 == 2).
+Self-consistent — no need to predict the exact count for the 10 × 300 KB-labelled-print scenario.
+**Prove-it guard — GREEN immediately** with completed-turns scope (the marker count is consistent
+today). **(Build-correction note: the original D16 wording counted labels 0–9 and was unsatisfiable
+at HEAD — amended to completed-turns scope, recorded 2026-08-17.)** The head/tail-ratio half of
+item 7's complaint is pinned by tests 20/21 (D21, both-ends assertions) rather than here. The head/tail-ratio half of item 7's complaint is pinned by tests 20/21 (D21, both-ends
 assertions) rather than here.
 
 ### D17 — Absorbed 1: sentinel-delimited truncation markers + system-prompt note (no `truncate.ts` edit)
