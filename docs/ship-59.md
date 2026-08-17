@@ -88,4 +88,4 @@ is documented in README + SPEC. Residual risks above are recorded and none block
 
 - [x] Targeted mutation green; temp dirs removed
 - [x] `tasks/todo.md` checkpoint complete
-- [x] `git push origin main`
+- [ ] `git push origin main` — **BLOCKED**: protected branch, direct pushes declined (`protected branch hook declined`). The 11 commits are complete on local `main`, untouched. Unblock options: (a) push a branch holding the same commits and open a PR, or (b) the maintainer adjusts branch protection / pipeline instructions (planned for a later session). Nothing was reworked without a decision.
