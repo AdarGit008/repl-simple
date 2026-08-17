@@ -823,14 +823,20 @@ describe("runRlm() — context input", () => {
   });
 
   it("9.2.6 previews a long context head-and-tail, not the middle", async () => {
-    const head = "H".repeat(2500);
-    const tail = "T".repeat(2500);
+    // D15: per-value previews go through the shared truncator at 5 KiB, so
+    // the elision threshold moved from ">5000 chars" to ">5120 bytes" and
+    // the marker is a full magnitude+recovery marker. Size the head and tail
+    // runs under the kept budgets and the middle large enough to be fully
+    // elided (this test moved with the D15 code — SPEC risk-table rule).
+    const head = "H".repeat(2000);
+    const tail = "T".repeat(2000);
+    const middle = "M".repeat(5000);
     const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
 
     const result = await runRlm("q", {
       llmClient: llm,
       registry: rlmRegistry(),
-      inputs: { context: `${head}MIDDLE${tail}` },
+      inputs: { context: `${head}${middle}${tail}` },
       maxIterations: 5,
     });
 
@@ -838,10 +844,12 @@ describe("runRlm() — context input", () => {
     const prompt = llm.calls()[0].messages[0].content;
     assert.ok(prompt.includes(head), "prompt should include the head");
     assert.ok(prompt.includes(tail), "prompt should include the tail");
-    assert.ok(!prompt.includes("MIDDLE"), "prompt should elide the middle");
+    assert.ok(!prompt.includes(middle), "prompt should elide the middle");
+    assert.match(prompt, /elided/, "the per-value preview must carry the truncation marker");
 
-    // Boundary pin: exactly 5000 chars is not elided (only > 5000 is).
-    const boundary = "B".repeat(5000);
+    // Boundary pin: exactly 5120 bytes (the 5 KiB budget) is not elided —
+    // the spill is strictly > (the shared truncator's threshold).
+    const boundary = "B".repeat(5120);
     const { llm: llm2 } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
     const result2 = await runRlm("q", {
       llmClient: llm2,
@@ -851,8 +859,8 @@ describe("runRlm() — context input", () => {
     });
     assert.equal(result2.status, "ok");
     const prompt2 = llm2.calls()[0].messages[0].content;
-    assert.ok(prompt2.includes(boundary), "a 5000-char value must render whole");
-    assert.ok(!prompt2.includes("..."), `5000-char value was elided:\n${prompt2.slice(0, 200)}`);
+    assert.ok(prompt2.includes(boundary), "a 5120-byte value must render whole");
+    assert.ok(!prompt2.includes("..."), `5120-byte value was elided:\n${prompt2.slice(0, 200)}`);
   });
 });
 
@@ -1576,6 +1584,72 @@ describe("runRlm() — aggregate input preview cap", () => {
     );
     assert.match(inputSection, /elided/, "the truncation marker must state what went");
     assert.match(inputSection, /slice it in Python/, "the recovery clause must name the input");
+  });
+
+  it("keeps every fence and header whole under the aggregate cut (test 14)", async () => {
+    // D15: the flat D6 head+tail cut of the joined preview can split a ```
+    // fence or an `# Input` header. Under test 7's 8 × 50 KiB scenario it
+    // leaves data_3's fence split around the elision marker — the open fence
+    // sits at the end of the head, the marker, then the close fence at the
+    // start of the tail (an even fence count, but a broken pair). The
+    // aggregate cut must elide whole input blocks instead: the aggregate
+    // marker sits between blocks, never inside a fence pair.
+    const large = "L".repeat(50 * 1024);
+    const inputs: Record<string, string> = {};
+    for (let i = 0; i < 8; i++) inputs[`data_${i}`] = large;
+
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const result = await runRlm("what do these inputs contain?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs,
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    const inputStart = prompt.indexOf("# Input (available as `data_0` variable)");
+    const inputEnd = prompt.indexOf("\n\nWrite Python code to answer the question.");
+    assert.ok(inputStart >= 0, `input section missing:\n${prompt.slice(0, 300)}`);
+    assert.ok(inputEnd > inputStart, "input section end not found");
+    const inputSection = prompt.slice(inputStart, inputEnd);
+
+    // Every fence must close within the section: the ``` count is even, and
+    // — the part an even count cannot see — the aggregate elision marker must
+    // not sit between a fence open and its close (the flat cut split data_3's
+    // fence pair exactly there).
+    const fenceCount = (inputSection.match(/```/g) ?? []).length;
+    assert.equal(fenceCount % 2, 0, "no fence may be left open by the cut");
+    const markerLine = inputSection.split("\n").find((line) => /inputs elided/.test(line));
+    assert.ok(markerLine, "the aggregate elision marker must state the block count");
+    assert.match(markerLine, /elided/, "the truncation marker must state what went");
+    assert.match(markerLine, /slice it in Python/, "the recovery clause must name the input");
+    let insideFence = false;
+    let markerInsideFence = false;
+    for (const line of inputSection.split("\n")) {
+      if (line.trim() === "```") {
+        insideFence = !insideFence;
+      } else if (line === markerLine) {
+        markerInsideFence = insideFence;
+      }
+    }
+    assert.equal(markerInsideFence, false, "the aggregate marker must not split a fence pair");
+
+    // Every `# Input` header line must be complete — no mid-header cut.
+    for (const line of inputSection.split("\n")) {
+      if (line.startsWith("# Input")) {
+        assert.match(
+          line,
+          /^# Input \(available as `[^`\n]+` variable\)$/,
+          `split header: ${line}`,
+        );
+      }
+    }
+
+    assert.ok(
+      Buffer.byteLength(inputSection, "utf8") <= 32 * 1024,
+      `input section is ${Buffer.byteLength(inputSection, "utf8")} bytes`,
+    );
   });
 });
 

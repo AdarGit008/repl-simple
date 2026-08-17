@@ -383,7 +383,7 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `buildFeedback` `stdout` | 32 KiB | 25/75 head+tail | #74 |
 | `buildFeedback` `output` | 16 KiB | 50/50 head+tail | #74 |
 | `runRlm` conversation (`messages`) | 256 KiB | keep first + last N, drop oldest whole pairs | #74 |
-| `buildInitialPrompt` input preview | 32 KiB aggregate | 50/50 head+tail | #74 |
+| `buildInitialPrompt` input preview | 32 KiB aggregate; 5 KiB per value | per-value 50/50 head+tail; aggregate whole-block elision | #74, #145 |
 | `buildFeedback` `error` | 16 KiB | 50/50 head+tail | #144 |
 | `buildInitialPrompt` `question` | 64 KiB | 50/50 head+tail | #144 |
 

@@ -47,12 +47,18 @@ const MAX_CONVERSATION_BYTES = 256 * 1024;
 
 // ── Initial-prompt aggregate cap ───────────────────────────────
 //
-// Each input renders a bounded ~5 KB head/tail preview, but the aggregate
-// still scales with the input count. The assembled input section is re-cut as
-// one flat head+tail so the initial message cannot grow with N (#74, D6).
+// Each input renders a whole block: a header plus a fenced per-value preview,
+// bounded at 5 KiB by the shared truncator. The aggregate still scales with
+// the input count, so the assembled section is elided block-level — whole
+// blocks kept from head and tail, middle blocks dropped wholesale — so the
+// initial message cannot grow with N and no cut can split a fence or a
+// header (#74 D6, #145 D15).
 
 /** Byte ceiling on the rendered input-preview section of the initial prompt. */
 const INPUT_PREVIEW_MAX_BYTES = 32 * 1024;
+
+/** Byte ceiling for each per-value input preview (5 KiB, value shape). */
+const INPUT_PREVIEW_VALUE_MAX_BYTES = 5 * 1024;
 
 /**
  * Route to an elided input: each input is already declared as a named sandbox
@@ -83,6 +89,68 @@ const textEncoder = new TextEncoder();
 
 function contentBytes(text: string): number {
   return textEncoder.encode(text).length;
+}
+
+/**
+ * Marker for whole-block input elision. The recovery clause stays true at any
+ * block count: every input — shown or elided — is a named sandbox variable,
+ * so the model can slice the variable to see the whole value.
+ */
+function aggregateInputMarker(elided: number, total: number): string {
+  return `[… ${elided} of ${total} inputs elided. ${INPUT_PREVIEW_RECOVERY} …]`;
+}
+
+/**
+ * Bound the assembled input-preview section to `INPUT_PREVIEW_MAX_BYTES` by
+ * eliding whole input blocks (#145, D15).
+ *
+ * Unlike a flat `truncateText` cut of the joined section, nothing here is cut
+ * mid-text: whole blocks are kept from the head while they fit the 50% head
+ * budget and whole blocks from the tail while they fit the remainder, and the
+ * middle blocks are elided wholesale. The marker is budgeted via the existing
+ * `contentBytes` helper, so the ceiling holds with the marker included — the
+ * same reserve-at-widest trick the shared truncator uses.
+ */
+function elideInputBlocks(blocks: string[]): string {
+  if (blocks.length === 0) return "";
+  const totalBytes =
+    blocks.reduce((sum, block) => sum + contentBytes(block), 0) + (blocks.length - 1);
+  if (totalBytes <= INPUT_PREVIEW_MAX_BYTES) return blocks.join("\n");
+
+  // Reserve the marker at its widest: every count in it is at its maximum
+  // here, so the marker computed after selection can only be shorter and the
+  // ceiling holds without a second selection pass.
+  const reserve = contentBytes(`\n${aggregateInputMarker(blocks.length, blocks.length)}\n`);
+  const payload = INPUT_PREVIEW_MAX_BYTES - reserve;
+  if (payload <= 0) return "";
+
+  const headBudget = Math.floor(payload * VALUE_HEAD_RATIO);
+  let headCount = 0;
+  let headBytes = 0;
+  while (headCount < blocks.length) {
+    const next = headBytes + contentBytes(blocks[headCount]) + (headCount > 0 ? 1 : 0);
+    if (next > headBudget) break;
+    headBytes = next;
+    headCount++;
+  }
+
+  const tailBudget = payload - headBytes;
+  let tailCount = 0;
+  let tailBytes = 0;
+  while (tailCount < blocks.length - headCount) {
+    const block = blocks[blocks.length - 1 - tailCount];
+    const next = tailBytes + contentBytes(block) + (tailCount > 0 ? 1 : 0);
+    if (next > tailBudget) break;
+    tailBytes = next;
+    tailCount++;
+  }
+
+  const elided = blocks.length - headCount - tailCount;
+  if (elided <= 0) return blocks.join("\n");
+
+  const head = blocks.slice(0, headCount).join("\n");
+  const tail = blocks.slice(blocks.length - tailCount).join("\n");
+  return `${head}\n${aggregateInputMarker(elided, blocks.length)}\n${tail}`;
 }
 
 // ── System prompt ────────────────────────────────────────────────
@@ -272,29 +340,35 @@ async function raceAgainstSignal<T>(promise: Promise<T>, signal?: AbortSignal): 
  * Announces every sandbox input by name so the model knows it exists: data
  * present in the sandbox but unnamed in the instructions is invisible (#72).
  * `context` keeps its legacy header; other keys get the parallel `# Input`
- * header. Values render as preview blocks — head-and-tail beyond 5000 chars —
- * and empty values render header-only, never an empty fence.
+ * header. Values render as fenced preview blocks — truncated to a 5 KiB
+ * head/tail with an elision marker beyond that — and empty values render
+ * header-only, never an empty fence.
  */
 function buildInitialPrompt(question: string, inputs: Record<string, string>): string {
-  const inputParts: string[] = [];
+  // One whole block per input: a header plus a fenced per-value preview. Each
+  // value goes through the shared truncator at 5 KiB, so a single block is
+  // bounded and marker-complete — fences always close within a preview.
+  const inputBlocks: string[] = [];
   for (const [name, value] of Object.entries(inputs)) {
     const header = name === "context" ? "# Context" : "# Input";
-    inputParts.push(`${header} (available as \`${name}\` variable)`);
+    const headerLine = `${header} (available as \`${name}\` variable)`;
     if (value) {
-      const preview =
-        value.length > 5000 ? `${value.slice(0, 2500)}\n...\n${value.slice(-2500)}` : value;
-      inputParts.push(`\`\`\`\n${preview}\n\`\`\``);
+      const { text: preview } = truncateText(value, {
+        maxBytes: INPUT_PREVIEW_VALUE_MAX_BYTES,
+        headRatio: VALUE_HEAD_RATIO,
+        recovery: INPUT_PREVIEW_RECOVERY,
+      });
+      inputBlocks.push(`${headerLine}\n\`\`\`\n${preview}\n\`\`\``);
+    } else {
+      inputBlocks.push(headerLine);
     }
   }
 
-  // Per-value previews bound each input, but not their sum. Cut the assembled
-  // section as one flat head+tail so N inputs cannot scale the initial prompt
-  // past this budget (#74, D6).
-  const { text: inputSection } = truncateText(inputParts.join("\n"), {
-    maxBytes: INPUT_PREVIEW_MAX_BYTES,
-    headRatio: VALUE_HEAD_RATIO,
-    recovery: INPUT_PREVIEW_RECOVERY,
-  });
+  // Per-value previews bound each input, but not their sum. Elide the
+  // assembled section block-level — whole blocks from head and tail, middle
+  // blocks dropped wholesale — so N inputs cannot scale the initial prompt
+  // past this budget and no cut can split a fence or a header (#145, D15).
+  const inputSection = elideInputBlocks(inputBlocks);
 
   // The question is never dropped from `messages[0]`, so its budget bounds the
   // worst case while leaving every realistic question untouched (#144, D8).

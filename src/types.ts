@@ -256,9 +256,10 @@ export interface RlmOptions {
   onIteration?: (iteration: RlmIteration) => void;
   /**
    * Inputs declared in the sandbox and **announced to the LLM**: every key
-   * and value is rendered into the initial prompt (head/tail preview beyond
-   * 5000 chars per value). Never pass secrets or data the model must not
-   * see — the model reads these values from the prompt and from sandbox code.
+   * and value is rendered into the initial prompt (5 KiB head/tail preview
+   * per value with an elision marker beyond that). Never pass secrets or
+   * data the model must not see — the model reads these values from the
+   * prompt and from sandbox code.
    * `context` is always declared and defaults to `""` when absent.
    */
   inputs?: Record<string, string>;
