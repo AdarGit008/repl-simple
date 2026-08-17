@@ -15,7 +15,7 @@
   - Verify: `npm test` (focused sandbox tests green, full suite green), `npm run check`
   - Files: `src/sandbox.ts`, `test/sandbox.test.ts`
 
-- [ ] Task 3: RLM passes `lineOffset` (actual preamble line count) — issue tests 1+2
+- [x] Task 3: RLM passes `lineOffset` (actual preamble line count) — issue tests 1+2
   - Acceptance: `runInSandbox` call in `rlm.ts` passes `lineOffset` computed from the preamble
     string actually used (never hardcoded); syntax error on the model's line 1 is reported as
     line 1; fed-back diagnostic contains no known preamble token; #144's 16 KiB error cap still

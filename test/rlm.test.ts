@@ -856,6 +856,111 @@ describe("runRlm() — context input", () => {
   });
 });
 
+// ── lineOffset wiring: the RLM preamble is the prefix (#77) ──────
+//
+// The loop assembles `preamble + "\n" + code`, so the sandbox numbers every
+// diagnostic from the top of the preamble. The loop must tell the sandbox how
+// many lines it prepended (`RunOptions.lineOffset`), computed from the
+// preamble string actually used — the model's line 1 is line 1, and preamble
+// source never reaches it.
+
+describe("runRlm() — preamble lineOffset wiring", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  /** The feedback for iteration 1 — the last message of the second LLM call. */
+  function lastMessage(call: { messages: Array<{ role: string; content: string }> }): string {
+    return call.messages[call.messages.length - 1].content;
+  }
+
+  /** Reply set: iteration 1 fails, iteration 2 terminates cleanly. */
+  const FAIL_THEN_SUBMIT = ["```python\n1 +\n```", '```python\nSUBMIT("done")\n```'];
+
+  it("reports a syntax error on the model's line 1 as line 1 (issue test 1)", async () => {
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.iterations.length, 2);
+    const feedback = lastMessage(llm.calls()[1]);
+    assert.match(feedback, / --> rlm\.py:1:/, "the diagnostic location is the model's line 1");
+    assert.match(feedback, /^\s*1 \| 1 \+$/m, "the excerpt line is the model's line 1");
+  });
+
+  it("feeds back no preamble source (issue test 2)", async () => {
+    // The preamble's final source line sits directly above the model's code in
+    // the assembled script, so it is the first thing a diagnostic excerpt
+    // leaks when the offset is missing — a number-only fix leaves it in.
+    // Derived from the shipped preamble, not a literal, so the pin survives
+    // preamble edits.
+    const preambleLines = REPL_SERVER.split("\n");
+    const lastSourceLine = preambleLines[preambleLines.length - 2];
+    const token = lastSourceLine.trim();
+    assert.ok(token.length > 0, "the preamble must end with a non-empty source line");
+
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = lastMessage(llm.calls()[1]);
+    assert.ok(!feedback.includes(token), "preamble source must not reach the model");
+  });
+
+  it("still caps corrected error text at 16 KiB (test 8 re-assert on the corrected path)", async () => {
+    // #144's 16 KiB cap must hold on the *corrected* text: the correction
+    // happens upstream of buildFeedback, and the huge raise the model sent
+    // still arrives capped — with the offset-corrected frame intact.
+    const { llm } = mockLlmCodeGen([
+      "```python\nraise ValueError('X' * 100000)\n```",
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = lastMessage(llm.calls()[1]);
+    const prefix = "Error: ";
+    assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
+    const rest = feedback.slice(prefix.length);
+    const stdoutIdx = rest.indexOf("\nstdout:");
+    assert.ok(stdoutIdx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const errorSection = rest.slice(0, stdoutIdx);
+    assert.ok(
+      Buffer.byteLength(errorSection, "utf8") <= 16 * 1024,
+      `Error section is ${Buffer.byteLength(errorSection, "utf8")} bytes`,
+    );
+    assert.match(
+      errorSection,
+      /File "<python-input-0>", line 1, in <module>/,
+      "the offset-corrected frame survives the cap",
+    );
+  });
+});
+
 // ── Direct answers and the raw fall-through (#73) ────────────────
 
 describe("runRlm() — direct answers and the raw fall-through", () => {
