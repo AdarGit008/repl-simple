@@ -1,169 +1,223 @@
-# Spec: coverage:update writes floors the instrument's variance can't turn red — issue #113
+# Spec: Serialize session creation and bound the session pool — issue #59
 
-> "coverage:update writes floors that the instrument's own variance can turn red"
-> Labels: `infra`, `test`, `chore` · Not filed under bucket 1 (the floors are correct as of #112; this
-> is about keeping them correct automatically).
+Issue: https://github.com/AdarGit008/repl-simple/issues/59 (Bucket 7, step 1 — parent #58, blocked-by #18, closed).
 
 ## Objective
 
-`scripts/coverage.mjs --update` measures coverage **once** and writes that observation as the floor.
-Per-file coverage varies between identical runs of the same tree — V8's per-function range count is
-lost when coverage from several test processes is merged — so a floor written from a lucky high run
-fails later on an unrelated PR with no signal pointing at the cause. This has already cost one red
-build (`src/pool.ts` at `021b5af`, 97.51% vs 100.00%).
+Two defects in `ReplRunner` (`src/repl.ts`), both reproduced at HEAD:
 
-**The fix is a mechanism, not a convention.** #105's by-hand rule ("a file that varies gets its floor
-set at the low observation") is unenforced and machine-dependent. The script must own the floor:
+1. **The creation race.** `getOrCreateSession` does `get` → `await createSession()` (disk I/O:
+   `loadSavedTools` / `savedToolNames`) → `set`. Two concurrent `run`s on one `sessionId` each
+   build a session; the second `set` wins and the first — with everything in it — is silently
+   dropped. Both calls report success, so the model reasons from state that does not exist:
+   `Promise.all([run("x = 1","s"), run("y = 2","s")])` → both report `[result]\nNone`, then
+   `print(x)` → `TypeError: Name 'x' used when not defined`.
+2. **The unbounded pool.** `sessions` is a `Map` keyed by a model-supplied string, with no cap and
+   no eviction. Each live session retains every snippet it ever ran plus its full `callCache`.
+   `reset()` clears the `Session`'s fields but leaves the entry in the map.
 
-1. `--update` measures **N times** and writes the **per-file minimum**.
-2. `--update` **refuses to write** when a file's spread exceeds a threshold — blind `min` would bake
-   a badly slack floor into the baseline if a whole process's data were ever lost. Wide variance is
-   a thing to look at, not to average away.
-3. The **measured spread is printed**, so a file that starts varying becomes visible.
-4. The plain `coverage` gate gains a **one-line tolerance** so it only bites on drops the instrument
-   can actually resolve (the #132 correction to the original proposal's arithmetic).
-5. The README's by-hand rule is replaced by a description of what the script does.
+Success is the issue's Definition of Done, restated as testable criteria in **Success Criteria**
+below. The sharpest sub-problem is the suspension one: eviction must never silently discard a call
+the user was asked to approve.
 
-**User:** anyone landing a change in this repo. **Success:** `coverage:update` followed by any number
-of plain `coverage` runs is green on the same tree, with no hand-tuned numbers anywhere.
+## Scope
 
-## Explicit decisions (recorded, not reflexive)
+`src/repl.ts` (the pool) + `test/repl.test.ts` (six issue tests + two updated tests) + `README.md`
+(policy documentation). No changes to `session.ts`, the sandbox, or the extension's tool
+descriptions. No new dependencies.
 
-- **N = 3.** The issue proposes 3 ("the low showed up once in six"); three full runs (~45 s each) is
-  an acceptable update cost and samples the known-variant files on most machines.
-- **Per-file minimum across N runs, global = minimum of the N per-run globals.** The global is
-  "reported, not a gate"; min-of-N keeps it consistent with the per-file philosophy.
-- **Refusal threshold = max(1.00 pp, one line).** One line of a file is `100/found` pp. The issue's
-  "~1 pp" is the term for big files; on a 42-line file the same benign instrument defect is 2.38 pp,
-  and refusing there would be a false positive. A spread **above** `max(1.00, 100/found)` pp refuses
-  the update with the file and its measured range named, exit 1. Exactly one line of spread always
-  passes; more than a line is "look at it, don't average it away".
-- **One-line compare tolerance, applied at gate time only.** A measured file fails only when it is
-  **more than one line** (`100/found` pp) below its floor. This is #132's alternative to the refusal
-  threshold, and both are kept: the threshold keeps floors honest, the tolerance makes the gate
-  resolve what the instrument can resolve — a one-line tail below the min-of-3 cannot go red, and
-  the hand-pinned 99.74 stops mattering even if this machine's min-of-3 lands on 100.00.
-- **The tolerance is for percentage comparisons only.** The manifest checks — a floored file absent
-  from the report, a source file with no floor — are structural, not measurements, and stay exact.
-- **A file present in some but not all N update runs refuses the update.** A file that loads
-  unstably is the instrument at its worst; writing a floor for it would be guessing.
-- **Decision logic lives in a typed, unit-tested module.** `scripts/coverage-core.ts` holds the pure
-  functions (`pct`, `combineRuns`, thresholds, `belowFloor`). `scripts/coverage.mjs` becomes thin
-  orchestration importing it, and `npm run coverage` / `coverage:update` run the script via `tsx`
-  (plain `node` cannot import `.ts`). CI already invokes `npm run coverage`, so it is unaffected.
-  `tsconfig.json` does not include `scripts/`, but tsc follows imports — the core gets strictly
-  checked. **Correction (2026-08-17, review):** `npm run build` also follows that import and emits
-  `dist/scripts/coverage-core.js` + `.d.ts`. Harmless — `dist/` is gitignored, the package is
-  `private`, and pi loads the extension from source — but the claim below that the build is
-  untouched was wrong; #80's dist restructure will absorb the file.
-- **`found` for threshold/tolerance purposes = the maximum LF across the N runs.** On an unchanged
-  tree LF is constant; max is the conservative choice if it ever is not.
-- **`scripts/` files are printed but never floored.** `scripts/coverage-core.ts` loads in the unit
-  tests and lands in the report; its line coverage (62.8%) tracks *comment* density — V8 counts
-  comment lines of tsx-transformed files as uncovered (measured: branch coverage 100%, the missing
-  37% is JSDoc) — so a floor on it would break CI on comment edits. The update floors only the
-  tracked `src/` + `extensions/` universe (`keepFloorable`), and the gate prints the row as
-  UNMEASURED without failing. Recorded 2026-08-17 after the first empirical update run surfaced it.
+## Explicit decisions
 
-## Tech Stack
+### D1 — Single-flight creation via an `inflight` map
 
-Node ≥ 22.19 ESM, `node:test` via `tsx` (the suite runner), Node's `--experimental-test-coverage`
-with the lcov reporter, biome 2.5.8, tsc strict. No new dependencies.
+`private inflight = new Map<string, Promise<LiveSession>>()`. `getOrCreateSession` stores the
+creation promise **before** awaiting anything, so a concurrent caller joins the same creation
+instead of starting a second. On success the promise inserts the session into `sessions` and removes
+itself from `inflight`; on rejection it removes itself and rethrows — a single failed creation can
+never poison the id (the same contract `src/pool.ts` already pins for the worker pool:
+`getSandboxPool`).
+
+### D2 — Trust-change rebuilds share the flight
+
+`trustChangeDiscards` deletes a session whose trust decision changed; the rebuild then routes
+through the same `inflight` path, so two concurrent rebuilders of one id create **one** session.
+
+### D3 — Stale-reference revalidation
+
+`getOrCreateSession` awaits `trustChangeDiscards`, during which the entry may be rebuilt or evicted
+by another caller. After the await it returns `existing` only if `sessions.get(sessionId) ===
+existing`; otherwise it loops (re-get or join the inflight creation). No session object that the
+map no longer holds is ever handed out.
+
+### D4 — LRU by Map insertion order
+
+`Map` iteration order is insertion order. "Use" = `delete` + `set` (touch) on **every** retrieval
+of a live session — `run`, `resume`, and `abandon` all touch. `reset` does not touch: it removes.
+
+### D5 — The cap
+
+`DEFAULT_MAX_SESSIONS = 32` per `ReplRunner` (per cwd — each runner owns its own pool).
+Precedence: explicit `ReplRunnerOptions.maxSessions` > `REPL_MAX_SESSIONS` env (positive integer,
+read at construction) > default. Non-positive values fall back to the default, matching the
+`envInt` pattern in `src/pool.ts`. Rationale for 32: the preamble's `DEFAULT_PREAMBLE_LIMITS.maxFiles`
+precedent, and a session is strictly heavier than a preamble file.
+
+### D6 — Eviction policy (the recorded suspension decision)
+
+On insert past the cap: evict the **least-recently-used session that is not suspended**, skipping
+suspended ones and never evicting the id just inserted. If **every** other session is suspended,
+exceed the cap temporarily rather than discard a pending approval. **Decision: refuse to evict a
+suspended session** (never report-and-drop — a dropped suspension loses a call the user was asked
+to approve, and the model is never told). The over-cap state is self-limiting: every suspension
+demands user attention, and an abandoned/resumed/overwritten session loses its protection on the
+next insert.
+
+### D7 — `reset()` evicts
+
+`reset(id)` calls `session.reset()` (to obtain the revoked-grant report), then deletes the map
+entry. Deliberate, model-visible consequence: `repl_resume` after `repl_reset` now answers
+`No session 'X' exists. Run some code first.` instead of `…has nothing waiting for approval.` The
+extension's `repl_reset` wording is unchanged (it describes the reset, not the entry's afterlife).
+The two existing tests that pinned the old contract are updated, not deleted.
+
+### D8 — Reset racing an in-flight creation
+
+`reset` sees no entry and reports `{ existed: false, revoked: [] }`; the in-flight creation lands
+afterward. No cancellation token — out of scope, and coherent from the model's seat (the reset
+happened before the session existed). `executionMode: "sequential"` (#49) already makes
+intra-message races impossible; cross-turn ordering is the only kind left.
+
+### D9 — Diagnostics
+
+New public method `ReplRunner.liveSessionCount(): number` — the number of entries in `sessions`
+(in-flight creations that have not landed are not counted). The issue's DoD says "assert the map
+size, not just behaviour", and a map size that cannot be observed cannot be asserted. Documented
+as a host/test diagnostic, not a model-facing API.
+
+### D10 — Test seams
+
+Test 2 demands a `createSession` call counter. TypeScript `private` methods are ordinary prototype
+methods at runtime, so the tests patch `createSession` with an own-property wrapper that counts
+and delegates — **no production test hooks**. Tests 1, 4, 5, 6 are pure behaviour tests through the
+real `ReplRunner`.
+
+## Assumptions (recorded — fire-and-forget run, no human asked)
+
+1. Default cap 32 (D5) — no issue guidance; sized against the preamble precedent.
+2. Env var name `REPL_MAX_SESSIONS` (D5).
+3. "Touch" covers `run`/`resume`/`abandon`; `reset` removes (D4).
+4. The suspension decision is **refuse to evict**, not "report it" (D6) — silent loss is the one
+   outcome the issue forbids.
+5. The cap is per `ReplRunner` instance (per cwd), not process-wide — `getRunner` caches one runner
+   per extension instance, and a process-wide pool would be a different object (#60's territory).
+
+## Tech stack
+
+TypeScript 5.9 (strict), `node:test` + `node:assert/strict` via `tsx --test`, Biome 2.5.8 for lint
+and format, Stryker 9.6.1 (mutation, incremental), `tsc -p tsconfig.build.json` for the build.
+Node >= 22.19.0. No new dependencies.
 
 ## Commands
 
 ```
-Gate:      npm run coverage              # measure once, compare against floors + tolerance
-Update:    npm run coverage:update       # measure 3×, write per-file minima or refuse
-Test:      npm test                      # full suite incl. new unit tests
-Focused:   npx tsx --test test/coverage-core.test.ts
-Check:     npm run check                 # tsc --noEmit (follows imports into scripts/)
-Lint:      npm run lint                  # biome check --error-on-warnings
-Build:     npm run build
+Test (focused):  npx tsx --test test/repl.test.ts
+Test (full):     npm test
+Type-check:      npm run check
+Build:           npm run build
+Lint:            npm run lint
+Coverage gate:   npm run coverage
+Mutation:        npm run mutation        (quality gate; incremental)
 ```
 
-## Project Structure
+## Project structure
 
 ```
-scripts/coverage.mjs        → orchestration: measure loop, baseline read/write, refusal, reporting
-scripts/coverage-core.ts    → pure decision logic (NEW): pct, combineRuns, spreadLimit, belowFloor
-test/coverage-core.test.ts  → unit tests for the core (NEW)
-coverage-baseline.json      → { global, files: { path: pct } } — shape unchanged
-README.md                   → "Coverage floors" section rewritten to describe the mechanism
+src/repl.ts              → the change: inflight map, LRU pool, eviction, reset-evict, diagnostic
+test/repl.test.ts        → six issue tests (new describe block) + two updated contract tests
+README.md                → "Approvals"/tool docs section: documented cap + eviction policy (DoD)
+SPEC.md, tasks/plan.md,
+tasks/todo.md            → this spec, the plan, the task checklist
 ```
 
-## Code Style
+## Code style
 
-The script is plain ESM with jsdoc block comments explaining *why* (the existing file is the model).
-The core module follows `src/` style: named exports, no default exports, strict types. Example:
+Follow the file's existing voice: sentence-style model messages, JSDoc on every decision, issue
+references in comments, no `any`. The core of the new code:
 
 ```ts
-/** Line percentage, floored to 2dp so a baseline never sits above what was measured. */
-export function pct({ hit, found }: Counts): number {
-  if (!found) return 100;
-  return Math.floor((hit / found) * 10000) / 100;
+/** The pool. Insertion order is recency: oldest = eviction candidate. */
+private sessions = new Map<string, LiveSession>();
+/** Creations in flight, stored before awaiting so concurrent callers join one. */
+private inflight = new Map<string, Promise<LiveSession>>();
+
+private getOrCreateSession(sessionId: string): Promise<LiveSession> {
+  for (;;) {
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      this.touch(sessionId, existing);
+      if (!(await this.trustChangeDiscards(sessionId, existing))) {
+        if (this.sessions.get(sessionId) === existing) return existing; // D3
+        continue; // evicted or rebuilt while the trust check ran
+      }
+    }
+    return this.joinOrStartCreation(sessionId, existing !== undefined);
+  }
 }
 ```
 
-## Testing Strategy
+## Testing strategy
 
-- **Unit tests** (`test/coverage-core.test.ts`, runs under `npm test`) cover the decision logic:
-  `pct` flooring; `combineRuns` minima/spread/global-min and the missing-in-some-runs flag;
-  `spreadLimit` = max(1.00, 100/found); `belowFloor` boundaries — the exact known cases from the
-  issue (floor 100.00, measured 99.74, found 384 → pass; two lines down → fail).
-- **Empirical verification of the script** (not in the unit suite — it spawns the whole suite):
-  run `coverage:update`, then three consecutive plain `coverage` runs, all green; the update
-  prints the spread table and the written floor for `src/truncate.ts` is script-owned.
-- The core is deliberately pure so the threshold/refusal arithmetic is pinned without needing to
-  *force* V8 variance in a fixture — that is not deterministic.
+`node:test`, behaviour-first, through the real `ReplRunner` against real Monty — the suite's
+existing style. The six issue tests, numbered as in the issue:
+
+1. **The reproduction**: a *trusted* project (preamble files widen the creation window so the
+   race is reliably red), `Promise.all` of `x = 1` and `y = 2` on one id, then assert both `x` and
+   `y` resolve — asserted on **state**, never on the reported statuses (both already claim success).
+2. **One creation**: own-property counter wrapper around `createSession` (D10); concurrent runs →
+   counter is 1.
+3. **No poisoned id**: wrapper rejects once; the run fails; the wrapper is restored; the next run
+   on the same id succeeds and its state persists.
+4. **LRU eviction**: `maxSessions: 2`; create `a`, `b` (touch `a`), create `c` → `b` evicted;
+   assert `liveSessionCount() === 2` (the map size, per DoD) and that `b`'s state is gone
+   (re-running on `b` gives a fresh session).
+5. **`reset` removes the entry**: after `reset`, `liveSessionCount()` drops and `resume` answers
+   "No session 'X' exists".
+6. **Suspended sessions are never evicted**: `maxSessions: 1`; session `a` suspends; creating `b`
+   exceeds the cap (count 2, `a`'s approval still pending and still resumable); abandoning `a`
+   removes its protection and creating `c` evicts it (count back at 1).
+
+Two existing tests updated to the D7 contract: "reset clears a suspension too…" now asserts the
+no-session sentence after reset; "clears session state on reset" passes unchanged (a recreated
+session has no variables either way).
+
+RED → GREEN per task; regression = full `npm test` after every task; `npm run check` + `npm run
+build` + `npm run lint` before every commit.
 
 ## Boundaries
 
-- **Always:** run `npm test` and `npm run coverage` before committing; never hand-edit a floor in
-  `coverage-baseline.json` (the script owns it now); explain any deliberate floor change in the
-  commit message.
-- **Ask first:** (n/a this run — autonomous) changing N or the threshold values.
-- **Never:** lower a floor without running `coverage:update`; remove a failing test to make a floor
-  pass; add a file to `UNMEASURED_SOURCE_FILES` without its reason in the comment.
+- **Always:** tests before the fix, full suite before each commit, biome lint, issue-referenced
+  commit messages, mark the task in `tasks/todo.md` as it completes.
+- **Ask first (record instead — fire-and-forget):** nothing in this change is high-risk or
+  irreversible; any surprise is recorded in the ship report rather than pausing.
+- **Never:** delete a failing test without replacing it, hand-edit `coverage-baseline.json`, skip
+  the mutation guard, change the extension's tool descriptions or `session.ts` (out of scope).
 
-## Success criteria (testable)
+## Success criteria
 
-1. `coverage:update` completes and writes `coverage-baseline.json` from min-of-3; the spread report
-   prints every file whose measurements differed, with its range.
-2. A file whose spread exceeds `max(1.00, 100/found)` pp fails the update with its measured range
-   named — pinned by unit tests on the core (the script path is exercised by feeding the core
-   synthetic data; V8 variance cannot be forced deterministically).
-3. Three consecutive plain `npm run coverage` runs on the same tree pass after the update —
-   verified by running them, not assumed.
-4. `src/truncate.ts`'s floor is written by the script (99.74 if the machine samples the low, 100.00
-   if it does not — either is safe under the one-line tolerance), and the README's by-hand rule
-   paragraph is removed and replaced with the mechanism description.
-5. The manifest checks keep their exact behavior: floor-without-report, no-floor, and UNMEASURED
-   handling all fail exactly as today (existing behavior, re-verified by running the gate).
-6. `npm test`, `npm run check`, `npm run build`, `npm run lint` all clean (exit codes verified).
+1. All six issue tests exist and pass; tests 1–5 are red before their fix, green after.
+2. The issue's reproduction passes end to end.
+3. Concurrent creation calls `createSession` exactly once (counter asserted).
+4. A failed creation does not poison the id — the next call retries and succeeds.
+5. The LRU cap evicts; eviction is asserted on the map size via `liveSessionCount()`.
+6. `reset()` removes the entry rather than leaving a hollow one.
+7. A pending suspension survives every eviction attempt; the refusal decision is recorded in code
+   comments **and** in the README (DoD: "recorded, not implicit").
+8. The cap and eviction policy are documented in the README; `maxSessions` is a documented
+   `ReplRunnerOptions` field.
+9. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` all exit 0;
+   mutation score does not regress.
 
-## Assumptions (recorded; no human asked — autonomous run)
+## Open questions
 
-1. N = 3 and threshold = max(1.00 pp, one line) are the reasonable readings of the issue's "~1 pp"
-   and "3 is probably enough"; both are single constants in the core and trivial to retune.
-2. Adopting **both** #132's alternatives (refusal threshold *and* one-line compare tolerance) is
-   intended: they protect different moments (writing vs. gating) and the comment presents them as
-   the two real options, not as mutually exclusive.
-3. Switching `npm run coverage`/`coverage:update` from `node` to `tsx` is in scope; the script's
-   behavior is unchanged, and CI (which calls `npm run coverage`) needs no edit.
-4. "Reproduced by the script" (DoD 3) means the script owns the number going forward; whether this
-   machine's min-of-3 samples the 99.74 low or the 100.00 high for `truncate.ts`, no hand pinning
-   remains.
-5. `bashenv.ts`'s floor (84.21) is treated as a real measurement, not variance — its spread is a
-   documented separate question on the issue; if the update observes it varying beyond threshold,
-   the refusal fires and the run records it rather than silently writing.
-
-## Open Questions
-
-None blocking. Whether the #132 evidence should also be re-tested on the pool/bashenv files after
-this lands is a follow-up, not part of this change.
-
-## Not in scope
-
-Fixing the V8/Node coverage-merge behavior itself (upstream defect); touching #109's mutant flake;
-changing the mutation-score gate; the CI matrix (floors stay a single Node 24/ubuntu job).
+None blocking. The five assumptions above are the recorded answers to everything the issue left
+open (cap size, env name, touch semantics, suspension policy shape, pooling scope).
