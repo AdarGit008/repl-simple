@@ -184,7 +184,7 @@ describe("extractPythonCode()", () => {
     },
     {
       name: "9.3.6 wrappers strip to a fixpoint",
-      reply: "The answer is **\"hi\"**.",
+      reply: 'The answer is **"hi"**.',
       expected: ANSWER("hi"),
     },
     {
@@ -244,7 +244,7 @@ describe("extractDirectAnswer()", () => {
     // A reply of repeated anchors with no valid tail used to backtrack
     // quadratically (measured ~2.2s at 30 KB). The linear last-anchor scan
     // must return the final anchor's tail as the answer.
-    const reply = "The answer is ".repeat(5000) + "x";
+    const reply = `${"The answer is ".repeat(5000)}x`;
     assert.equal(extractDirectAnswer(reply), "x");
   });
 
