@@ -55,6 +55,12 @@ mutable expressions. That is correct, not a coverage gap.
 
 `rlm.ts` being last is consistent with #24's hand campaign, which scored it **0/9**.
 
+> **Calibration (2026-08-17, #110 sweep):** the per-file mutant counts in the table above are
+> stale post-#48/#59. A single-file `--mutate src/repl.ts` sweep that day took **~2h15m for
+> 287 mutants** (concurrency 2, ~55–60 s per mutant pair, plus 34 × 60 s timeouts) — not
+> 30–60 min/59 mutants. Before budgeting any sweep, count mutants from a dry run; do not size
+> from this table.
+
 ### This supersedes the 58.28% baseline, which was inflated
 
 The first baseline read **58.28%** — 1235 of 2119 at `e556a70`. It was measured with a harness that
@@ -183,6 +189,23 @@ For pull requests, use `--incremental` (the config writes `.stryker-incremental.
 `--since`. A full run belongs on a schedule or on demand. **A mutation gate nobody can afford to
 run is not a gate.**
 
+Never assert "sweep exits 0" when the sweep is launched through a pipe
+(`contained.mjs … | tail -60`): bash returns the tail's status, and an orphaned run loses the
+transcript entirely. Run long sweeps with output tee'd to a log (`nohup … | tee sweep.log` or
+equivalent) so an agent death does not strand or silence the run, and read the verdict only from
+`node scripts/mutation-guard.mjs --report` plus machine-read statuses in
+`reports/mutation/mutation.json` — never the terminal. (Observed live on the #110 flight,
+2026-08-17: the launching agent died mid-sweep; the verdicts were recoverable only because they
+are file-based.)
+
+### Reading the report (freshness first)
+
+The JSON reporter overwrites `reports/mutation/mutation.json` **only when the run finishes**.
+During a sweep the previous run's JSON stays on disk. Before extracting any evidence, assert
+freshness: mtime must postdate the sweep start **and** `list(json['files'].keys())` must
+contain exactly the file(s) mutated. A `files` map with only `src/rlm.ts` while you sweep
+`src/repl.ts` is the previous run, not yours (observed live on the #110 flight, 2026-08-17).
+
 ### `REQUIRE_BRIDGE_TOOLS=1` is not optional
 
 The test command sets it. Without `fd` and `rg` present, `test/support/bridge-tools.ts` **silently
@@ -305,6 +328,17 @@ shows the suite would stay green.
 Severity is lower than M22's: `src/session.ts:257` resolves a missing callback to `decision = false`
 — it fails closed. This breaks the resume feature rather than opening an approval bypass.
 **[judgement]**
+
+**Closed 2026-08-17 (PR #147):** a targeted `--mutate src/repl.ts` sweep proved the mutant Killed
+on the current tree — the `ObjectLiteral` is now at `src/repl.ts:235` and the `!session` guard at
+`:210` (the `:62` cite above is stale since the #48/#59 rewrite); the killing test is
+`test/repl.test.ts:517`. Evidence in `docs/verify-110.md`. That sweep also surfaced two **new**
+resume-method survivors, tracked under #47:
+
+- `src/repl.ts:230` — `StringLiteral` (the "nothing waiting for approval" message) — Survived.
+- `src/repl.ts:233` — `UpdateOperator` (`live.busy--`) — Survived.
+
+The #110 closure verified only `:210` and `:235`; these two are untracked elsewhere.
 
 Three more equivalent-mutant notes, so nobody re-investigates them:
 
