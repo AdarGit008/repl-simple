@@ -1118,6 +1118,96 @@ describe("buildFeedback() — feedback byte caps", () => {
   });
 });
 
+// ── Conversation bound (D2/D3) ──────────────────────────────────
+
+describe("runRlm() — conversation bound", () => {
+  /** Total UTF-8 bytes of a recorded call's message contents. */
+  function conversationBytes(messages: Array<{ role: string; content: string }>): number {
+    return messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0);
+  }
+
+  /** A large, labelled print so a dropped turn can be identified by label. */
+  const labelledPrint = (i: number): string =>
+    `\`\`\`python\nprint('TURN_${i}_' + 'x' * 300000)\n\`\`\``;
+
+  it("keeps the 4×300 KB reproduction under 256 KiB (test 1)", async () => {
+    // The issue's reproduction, re-budgeted: four iterations each printing
+    // 300 KB. The sandbox caps stdout at 32 KiB and output at 16 KiB per run,
+    // and the feedback re-caps at the same budgets, so the historical
+    // [119, 262403, 524687, 786971] growth cannot recur.
+    const { llm } = mockLlmCodeGen([0, 1, 2, 3].map(labelledPrint));
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 4 });
+
+    assert.equal(result.status, "max_iterations");
+    for (const call of llm.calls()) {
+      const total = conversationBytes(call.messages);
+      assert.ok(total <= 256 * 1024, `conversation exceeded 256 KiB: ${total} bytes`);
+    }
+  });
+
+  it("drops the oldest middle turns in whole pairs at the boundary (test 4)", async () => {
+    // Ten iterations each add ~32 KiB of capped feedback, crossing the 256 KiB
+    // budget around turn eight, so the oldest turns must be dropped.
+    const { llm } = mockLlmCodeGen(Array.from({ length: 10 }, (_, i) => labelledPrint(i)));
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
+
+    const calls = llm.calls();
+    for (const call of calls) {
+      const total = conversationBytes(call.messages);
+      assert.ok(total <= 256 * 1024, `conversation exceeded 256 KiB: ${total} bytes`);
+    }
+
+    // The final query reflects the bound applied after the previous turn.
+    const last = calls[calls.length - 1];
+    // The initial message is never dropped.
+    assert.equal(last.messages[0].role, "user");
+    assert.match(last.messages[0].content, /# Question/);
+    // The newest queried turn survives...
+    assert.ok(
+      last.messages.some((m) => m.content.includes("TURN_8_")),
+      "the newest turn must be kept",
+    );
+    // ...and the oldest turn was dropped.
+    assert.ok(
+      !last.messages.some((m) => m.content.includes("TURN_0_")),
+      "the oldest turn must be dropped",
+    );
+  });
+
+  it("emits a history-dropped marker and never leaves a dangling feedback (test 5)", async () => {
+    const { llm } = mockLlmCodeGen(Array.from({ length: 10 }, (_, i) => labelledPrint(i)));
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
+
+    const last = llm.calls()[llm.calls().length - 1];
+    // The initial message is followed by the drop marker (user role, D3).
+    assert.equal(last.messages[0].role, "user");
+    assert.equal(last.messages[1].role, "user");
+    assert.match(last.messages[1].content, /earlier turns dropped/);
+    assert.match(last.messages[1].content, /conversation bounded at 256KB/);
+
+    // Pairs are dropped whole: after the marker the retained messages
+    // alternate assistant → user, so no feedback dangles without its
+    // assistant message.
+    for (let i = 2; i < last.messages.length; i++) {
+      const expected = (i - 2) % 2 === 0 ? "assistant" : "user";
+      assert.equal(
+        last.messages[i].role,
+        expected,
+        `messages[${i}] should be ${expected}, got ${last.messages[i].role}`,
+      );
+    }
+  });
+});
+
 // ── A SUBMIT that never resolved ────────────────────────────────
 
 describe("runRlm() — a SUBMIT call that failed to resolve", () => {

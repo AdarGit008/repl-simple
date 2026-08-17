@@ -24,6 +24,27 @@ const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
 /** Byte ceiling for `output` in a feedback message. */
 const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
 
+// ── Conversation budget ─────────────────────────────────────────
+//
+// The feedback caps bound each turn, but the conversation as a whole grows by
+// two messages per iteration with no ceiling of its own. The cumulative budget
+// below is the backstop: when the whole conversation exceeds it, the oldest
+// middle turns are dropped in whole assistant+feedback pairs (#74, D2).
+
+/** Byte ceiling on the whole RLM conversation, over every message's content. */
+const MAX_CONVERSATION_BYTES = 256 * 1024;
+
+/**
+ * UTF-8 length of a message's content — the unit the conversation budget is
+ * measured in. `TextEncoder` yields the same count without reintroducing
+ * byte-level measurement here (the shared truncator owns that, #74 invariant 4).
+ */
+const textEncoder = new TextEncoder();
+
+function contentBytes(text: string): number {
+  return textEncoder.encode(text).length;
+}
+
 // ── System prompt ────────────────────────────────────────────────
 
 export const DEFAULT_RLM_SYSTEM_PROMPT = `\
@@ -338,6 +359,68 @@ export function buildFeedback(result: RunResult): string {
 const RAW_FALLBACK_NOTICE = "Note: no code block found — treating the whole reply as Python code.";
 
 /**
+ * The D3 notice emitted when oldest-middle turns are dropped. User role,
+ * pi-style ellipsis vocabulary, consistent with the truncation markers: the
+ * model must know the history it sees is partial, not assume completeness.
+ */
+function historyDropMarker(droppedTurns: number): string {
+  return `[… ${droppedTurns} earlier turns dropped — conversation bounded at 256KB. The most recent context follows. …]`;
+}
+
+/**
+ * Bound the conversation to `MAX_CONVERSATION_BYTES` (D2).
+ *
+ * Drops the oldest middle turns in whole assistant+feedback pairs — the
+ * initial user message and the newest pair are never dropped — so a feedback
+ * never dangles without its assistant message. When anything is dropped, a
+ * user-role marker (D3) is inserted right after the initial message and
+ * counts toward the budget. A single over-budget message (an LLM reply the
+ * loop cannot truncate without summarising) is kept and may exceed the budget
+ * transiently until it ages out (#74, Assumption 4).
+ *
+ * `droppedTurns` is the cumulative count across iterations; the function
+ * returns the updated count.
+ */
+function boundConversation(
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  droppedTurns: number,
+): number {
+  // A prior marker always sits at index 1, right after the initial message,
+  // and is the only user-role message that can occupy that slot (a feedback
+  // never appears there while pairs are whole). Strip it before dropping so
+  // `splice(1, 2)` always removes a whole assistant+feedback pair, then
+  // re-insert a fresh marker with the cumulative count below.
+  if (messages.length >= 2 && messages[1].role === "user") {
+    messages.splice(1, 1);
+  }
+
+  const totalBytes = () =>
+    messages.reduce((sum, message) => sum + contentBytes(message.content), 0);
+
+  // Drop the oldest pairs while over budget. A droppable pair is the oldest
+  // assistant+feedback pair after the initial message; dropping needs at least
+  // two pairs — one to drop and the newest to keep — i.e. five messages.
+  while (totalBytes() > MAX_CONVERSATION_BYTES && messages.length >= 5) {
+    messages.splice(1, 2);
+    droppedTurns++;
+  }
+
+  if (droppedTurns === 0) return 0;
+
+  // The marker counts toward the budget; if it would push the conversation
+  // back over, drop more oldest pairs first.
+  let marker = historyDropMarker(droppedTurns);
+  while (totalBytes() + contentBytes(marker) > MAX_CONVERSATION_BYTES && messages.length >= 5) {
+    messages.splice(1, 2);
+    droppedTurns++;
+    marker = historyDropMarker(droppedTurns);
+  }
+
+  messages.splice(1, 0, { role: "user", content: marker });
+  return droppedTurns;
+}
+
+/**
  * Run the Repeated LLM → Monty loop.
  *
  * Takes a question, iteratively generates Python code via the LLM,
@@ -386,6 +469,9 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       content: buildInitialPrompt(question, runInputs),
     },
   ];
+
+  // Cumulative number of whole turns dropped by the conversation bound (D3).
+  let droppedTurns = 0;
 
   for (let i = 0; i < maxIterations; i++) {
     // Abort check between iterations
@@ -454,6 +540,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         ? `${RAW_FALLBACK_NOTICE}\n\n`
         : "") + buildFeedback(result);
     messages.push({ role: "user", content: feedback });
+
+    // 9. Bound the conversation: drop the oldest middle turns in whole pairs
+    // and tell the model when history was dropped (#74, D2/D3).
+    droppedTurns = boundConversation(messages, droppedTurns);
   }
 
   // Max iterations exhausted
