@@ -1,134 +1,164 @@
-# Spec: Serialize session creation and bound the session pool — issue #59
+# Spec: Bound message growth in the RLM feedback loop — issue #74
 
-Issue: https://github.com/AdarGit008/repl-simple/issues/59 (Bucket 7, step 1 — parent #58, blocked-by #18, closed).
+Issue: https://github.com/AdarGit008/repl-simple/issues/74 (Bucket 9, step 4 — parent #70, blocked-by #18/#30).
 
 ## Objective
 
-Two defects in `ReplRunner` (`src/repl.ts`), both reproduced at HEAD:
+`runRlm` (`src/rlm.ts`) accumulates a conversation of `messages` that grows by two entries per
+iteration with **no total ceiling**. The issue reproduces it as a 300 KB print per iteration driving
+prompt sizes `[119, 262403, 524687, 786971]` bytes → 1.57 MB across 4 iterations (~390 K tokens).
 
-1. **The creation race.** `getOrCreateSession` does `get` → `await createSession()` (disk I/O:
-   `loadSavedTools` / `savedToolNames`) → `set`. Two concurrent `run`s on one `sessionId` each
-   build a session; the second `set` wins and the first — with everything in it — is silently
-   dropped. Both calls report success, so the model reasons from state that does not exist:
-   `Promise.all([run("x = 1","s"), run("y = 2","s")])` → both report `[result]\nNone`, then
-   `print(x)` → `TypeError: Name 'x' used when not defined`.
-2. **The unbounded pool.** `sessions` is a `Map` keyed by a model-supplied string, with no cap and
-   no eviction. Each live session retains every snippet it ever ran plus its full `callCache`.
-   `reset()` clears the `Session`'s fields but leaves the entry in the map.
+The issue names three uncapped paths. Verified against HEAD (not the issue's stale line numbers) the
+three stand as follows:
 
-Success is the issue's Definition of Done, restated as testable criteria in **Success Criteria**
-below. The sharpest sub-problem is the suspension one: eviction must never silently discard a call
-the user was asked to approve.
+1. **`buildFeedback` stdout interpolation.** `buildFeedback` (`src/rlm.ts:234`) interpolates
+   `result.stdout` raw, on both the error path (`Error: ${result.error}\nstdout: ${result.stdout}`)
+   and the ok path (`\nstdout:\n${result.stdout}`). The issue's "256 KiB per-iteration sandbox cap"
+   is **stale**: `stdout` is now capped per run at **32 KiB** by `src/sandbox.ts` (the
+   `DispatchAccumulators` `Truncator`, `DEFAULT_MAX_STDOUT = STDOUT_MAX_BYTES`). What is still true:
+   there is no feedback-specific budget, and a caller may raise the sandbox cap via
+   `runOptions.maxStdoutBytes`, so `buildFeedback` inherits an arbitrary ceiling.
+2. **`result.output` interpolation.** The issue's "no cap at all" is **stale**: #34 landed
+   (commit `e556a70`) and, per its Exception 2, caps `output` at **16 KiB** where the `RunOk` is
+   built — `capOutput` at `src/sandbox.ts:475`, applied at every `RunOk` site (`:793`, `:964`,
+   `:1250`) precisely so the RLM loop's bare-`context` case (A23) is covered too. What is still
+   true: `buildFeedback` (`Output: ${output}`, `src/rlm.ts:292`) re-interpolates it with no cap of
+   its own and no feedback budget.
+3. **The message array.** `messages` (`src/rlm.ts:347`) starts with one initial user message and
+   then `messages.push` appends the assistant reply (`:413`) and the feedback user message (`:420`)
+   every iteration. It never drops or summarises anything. **This is the live headline defect**:
+   even with per-run caps in place, cumulative growth is unbounded — 10 iterations × (≤32 KiB stdout
+   + ≤16 KiB output) ≈ 480 KiB of feedback alone, plus every LLM reply.
+
+**The compounded-by-#72 diagnostic is resolved at HEAD.** #72 (commit `3e74313`) fixed the
+deterministic ~4 KB, 12-error `unresolved-reference` diagnostic by always declaring `context`
+(`src/rlm.ts:339`, `runInputs.context = runInputs.context ?? ""`). It is not a live path and is out
+of scope here. #72 **did** leave a live deferral recorded on #74: `buildInitialPrompt`
+(`src/rlm.ts:195`) renders every input with a per-value 5000-char head/tail preview but **no
+aggregate cap** — N large inputs ≈ N×~5 KB of initial prompt. The aggregate policy belongs here
+(D6).
 
 ## Scope
 
-`src/repl.ts` (the pool) + `test/repl.test.ts` (six issue tests + two updated tests) + `README.md`
-(policy documentation). No changes to `session.ts`, the sandbox, or the extension's tool
-descriptions. No new dependencies.
+**In scope** (exact files expected to change):
+
+- `src/rlm.ts` — feedback caps (D1), conversation bound + history-drop notice (D2–D4), initial-prompt
+  aggregate cap (D6).
+- `test/rlm.test.ts` — the issue's five tests, re-expressed against HEAD (see Testing strategy).
+- `docs/truncation-policy.md` — record the RLM feedback/conversation budgets and the chosen
+  history-bounding strategy in the implementation-record table (the issue's "document which").
+
+**Out of scope** (do not touch):
+
+- `src/truncate.ts` — the helper is reused, never edited (invariant 4: one implementation).
+- `src/sandbox.ts`, `src/repl.ts`, `src/builtins.ts` — already capped by #29/#34.
+- `src/rlm_loop.ts` — the legacy loop, slated for deletion by #78.
+- `src/types.ts` — no new public option; budgets are module constants (Assumption 6).
+- Summarisation of dropped history (D4 defers it), `result.error` truncation (the policy's declared
+  non-goal), structure-aware `output` elision (#69), and input-name validation (a hardening note on
+  #74, a separate concern).
 
 ## Explicit decisions
 
-### D1 — Single-flight creation via an `inflight` map
+### D0 — The truncation policy being implemented (from #30)
 
-`private inflight = new Map<string, Promise<LiveSession>>()`. `getOrCreateSession` stores the
-creation promise **before** awaiting anything, so a concurrent caller joins the same creation
-instead of starting a second. On success the promise inserts the session into `sessions` and removes
-itself from `inflight`; on rejection it removes itself and rethrows — a single failed creation can
-never poison the id (the same contract `src/pool.ts` already pins for the worker pool:
-`getSandboxPool`).
+`docs/truncation-policy.md` is normative and already implemented by #29/#34:
 
-### D2 — Trust-change rebuilds share the flight, and the notice survives the race
+| field | shape | byte budget | marker inside budget? | magnitude? | recovery route? |
+|---|---|---|---|---|---|
+| `stdout` | head+tail, elided middle, 25/75 | 32 KiB | yes | yes | yes ("Re-run with a narrower print") |
+| `output` | head+tail, elided middle, 50/50 | 16 KiB | yes | yes | yes ("Assign the value to a name and slice it") |
 
-`trustChangeDiscards` deletes a session whose trust decision changed; the rebuild then routes
-through the same `inflight` path, so two concurrent rebuilders of one id create **one** session.
-The `[trust changed]` notice is **not** baked into the creation (an argument like `rebuilt` is
-racy: the discarder's delete lands synchronously, its rebuild decision one microtask later, and a
-joiner can start the replacement flight in between without the flag). Instead the discarder
-carries the observation and attaches the notice to whichever session lands and replaces the
-discarded one, guarded per session so two discarders deliver it once (`attachTrustChangeNotice`).
+One tool result ≤ 48 KiB, two fixed sub-budgets, **no borrowing**. Invariants: budget is a ceiling
+*including* the marker; never split a UTF-8 character; prefer not to split a line (SHOULD); one
+implementation; markers report **true** totals; truncation must not silence `onPrint`. Marker text
+uses pi's `[… N of M elided. RECOVERY …]` vocabulary.
 
-### D3 — Stale-reference revalidation
+### D1 — Reuse `truncateText` for the feedback caps (the #34 helper)
 
-`getOrCreateSession` awaits `trustChangeDiscards`, during which the entry may be rebuilt or evicted
-by another caller. After the await it returns `existing` only if `sessions.get(sessionId) ===
-existing`; otherwise it loops (re-get or join the inflight creation). No session object that the
-map no longer holds is ever handed out. `resume` has the same parity check after its trust await
-and answers the no-session sentence on mismatch, and the discard-side delete in
-`trustChangeDiscards` is identity-guarded so a stale checker cannot destroy a rebuilt session.
+`buildFeedback` caps `result.stdout` and `result.output` with its own feedback budgets, using the
+**same imported symbol** `truncateText` (`src/truncate.ts:384`, re-exported `src/index.ts:132`,
+already used by `src/sandbox.ts:479`) — not a third truncation. Budgets equal the policy budgets so
+the normal path is a no-op (the sandbox already cut at these values, so content ≤ budget and no
+second marker is emitted): `FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES` (32 KiB, `STDOUT_HEAD_RATIO`
++ `STDOUT_RECOVERY`), `FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES` (16 KiB, `VALUE_HEAD_RATIO` +
+`VALUE_RECOVERY`). This makes the feedback budget **independent** of `runOptions.maxStdoutBytes` /
+`maxOutputBytes`: a caller who raises the sandbox cap gets a feedback message still bounded at 32/16
+KiB. `result.error` stays uncapped (policy non-goal); the conversation budget (D2) is its backstop.
 
-### D4 — LRU by Map insertion order
+### D2 — Conversation bound: keep first + last N turns, byte-budgeted
 
-`Map` iteration order is insertion order. "Use" = `delete` + `set` (touch) on **every** retrieval
-of a live session — `run`, `resume`, and `abandon` all touch. `reset` does not touch: it removes.
+The `messages` array is bounded by **`MAX_CONVERSATION_BYTES = 256 * 1024`** (256 KiB) measured as
+`Buffer.byteLength` over all `messages[].content`. Strategy (chosen from the issue's menu): **keep the
+first message (initial user prompt) + the most recent turns; drop the oldest middle turns in whole
+assistant+feedback pairs.** Dropping is whole-turn so a feedback never dangles without its assistant
+message. The initial message is never dropped (it carries the question, inputs and instructions). If a
+single incoming message alone exceeds the budget (an LLM reply, which the loop cannot truncate
+without summarising), keep the initial message + that newest message and accept a temporary
+over-budget until it ages out (recorded edge, Assumption 4).
 
-### D5 — The cap
+### D3 — Tell the model when history was dropped
 
-`DEFAULT_MAX_SESSIONS = 32` per `ReplRunner` (per cwd — each runner owns its own pool).
-Precedence: explicit `ReplRunnerOptions.maxSessions` > `REPL_MAX_SESSIONS` env (positive integer,
-read at construction) > default. Non-positive values fall back to the default, matching the
-`envInt` pattern in `src/pool.ts`. Rationale for 32: the preamble's `DEFAULT_PREAMBLE_LIMITS.maxFiles`
-precedent, and a session is strictly heavier than a preamble file.
+Dropping emits a marker message (user role, pi-style ellipsis vocabulary, consistent with the
+truncation markers) stating what was dropped and why — e.g.
+`[… N earlier turns dropped — conversation bounded at 256KB. The most recent context follows. …]`.
+The marker counts toward the budget. Silent truncation is the failure the issue forbids: the model
+must know the history it sees is partial, not assume completeness.
 
-### D6 — Eviction policy (the recorded suspension decision)
+### D4 — No summarisation (decided, and why)
 
-On insert past the cap: evict the **least-recently-used session that is neither suspended nor
-mid-call** (`busy > 0`), skipping protected ones and never evicting the id just inserted. If
-**every** other session is protected, exceed the cap temporarily rather than discard a pending
-approval. **Decision: refuse to evict a suspended or busy session** (never report-and-drop — a
-dropped suspension loses a call the user was asked to approve, and the model is never told). The
-busy rule matters because a session with an approval dialog open is not `isSuspended()` yet; the
-over-cap state is self-limiting — every suspension demands user attention, and the protection ends
-the moment the session is no longer suspended or busy (resumed, abandoned, or overwritten).
+Summarising dropped turns is **out of scope**. It needs an extra LLM round-trip per compaction
+(latency, cost, a second call the injected `LlmClient` was never shaped for) and is non-deterministic,
+which the suite's mutation-resistant determinism requirement rejects. Keeping first + last N loses the
+middle detail but is deterministic, cheap and testable. Deferred; the trade-off is documented in
+`docs/truncation-policy.md`.
 
-### D7 — `reset()` evicts
+### D5 — Budget values and over-cap behaviour
 
-`reset(id)` calls `session.reset()` (to obtain the revoked-grant report), then deletes the map
-entry. Deliberate, model-visible consequence: `repl_resume` after `repl_reset` now answers
-`No session 'X' exists. Run some code first.` instead of `…has nothing waiting for approval.` The
-extension's `repl_reset` wording is unchanged (it describes the reset, not the entry's afterlife).
-The two existing tests that pinned the old contract are updated, not deleted.
+`FEEDBACK_STDOUT_MAX_BYTES = 32 KiB`, `FEEDBACK_OUTPUT_MAX_BYTES = 16 KiB`,
+`MAX_CONVERSATION_BYTES = 256 KiB`. Over-cap behaviour is **truncate for fields** (head+tail + marker,
+per D0) and **drop-oldest-turns for the conversation** (D2), never summarise and never silently drop a
+field. Justification for 256 KiB: a 6× reduction vs the issue's 1.57 MB/4-iterations, comfortably
+fits ~4–5 max-size tool results (48 KiB each) plus code before the first drop, and stays in the same
+order as the policy's 48 KiB tool-result ceiling × ~5.
 
-### D8 — Reset racing an in-flight creation
+### D6 — Initial-prompt aggregate cap (the #72 deferral)
 
-`reset` sees no entry and reports `{ existed: false, revoked: [] }`; the in-flight creation lands
-afterward. No cancellation token — out of scope, and coherent from the model's seat (the reset
-happened before the session existed). `executionMode: "sequential"` (#49) already makes
-intra-message races impossible; cross-turn ordering is the only kind left.
+`buildInitialPrompt` keeps its per-value 5000-char head/tail preview, but the **aggregate** rendered
+input section is bounded: pass the inputs section through `truncateText` with an
+`INPUT_PREVIEW_MAX_BYTES = 32 * 1024` budget (head+tail, `VALUE_HEAD_RATIO`, a recovery clause that
+names the input and says to slice it in Python). This closes the N×~5 KB gap #72 deferred to #74.
 
-### D9 — Diagnostics
+## Assumptions (recorded — fire-and-forget, no human asked)
 
-New public method `ReplRunner.liveSessionCount(): number` — the number of entries in `sessions`
-(in-flight creations that have not landed are not counted). The issue's DoD says "assert the map
-size, not just behaviour", and a map size that cannot be observed cannot be asserted. Documented
-as a host/test diagnostic, not a model-facing API.
-
-### D10 — Test seams
-
-Test 2 demands a `createSession` call counter. TypeScript `private` methods are ordinary prototype
-methods at runtime, so the tests patch `createSession` with an own-property wrapper that counts
-and delegates — **no production test hooks**. Tests 1, 4, 5, 6 are pure behaviour tests through the
-real `ReplRunner`.
-
-## Assumptions (recorded — fire-and-forget run, no human asked)
-
-1. Default cap 32 (D5) — no issue guidance; sized against the preamble precedent.
-2. Env var name `REPL_MAX_SESSIONS` (D5).
-3. "Touch" covers `run`/`resume`/`abandon`; `reset` removes (D4).
-4. The suspension decision is **refuse to evict**, not "report it" (D6) — silent loss is the one
-   outcome the issue forbids.
-5. The cap is per `ReplRunner` instance (per cwd), not process-wide — `getRunner` caches one runner
-   per extension instance, and a process-wide pool would be a different object (#60's territory).
+1. Feedback budgets equal the policy budgets (32/16 KiB) rather than a tighter value — keeps one
+   declared number per field and makes the normal path a marker-free no-op.
+2. `MAX_CONVERSATION_BYTES = 256 KiB` — the issue gives no number; sized against the 48 KiB
+   tool-result ceiling and the 1.57 MB repro.
+3. History strategy is **keep first + last N**, not summarise and not drop-oldest-only — dropping
+   oldest-only would discard the initial prompt/instructions; summarise is deferred in D4.
+4. A single over-budget LLM reply is kept and allowed to exceed the budget transiently — the loop
+   cannot truncate model output without summarising, which is out of scope.
+5. Budgets are module constants, not `RlmOptions` fields — the issue asks for no new public knob, and
+   constants keep `src/types.ts` untouched (a configurable budget is a possible follow-up).
+6. The initial-prompt aggregate cap uses a 32 KiB budget and flat head+tail — structure-aware input
+   elision is not attempted (same flat-cut rule the policy already applies to `output` until #69).
+7. `result.error` remains uncapped per-message — the policy already declares it a non-goal; D2 is the
+   backstop, and if `error` proves unbounded it is a separate issue.
+8. The "shared helper by construction" requirement (issue test 5) is verified by rlm.ts importing
+   `truncateText` from `./truncate.js` (the same module `sandbox.ts` imports) plus a source-level
+   check that no new truncation logic is defined in rlm.ts — mirroring #34's grep-based DoD.
 
 ## Tech stack
 
-TypeScript 5.9 (strict), `node:test` + `node:assert/strict` via `tsx --test`, Biome 2.5.8 for lint
-and format, Stryker 9.6.1 (mutation, incremental), `tsc -p tsconfig.build.json` for the build.
-Node >= 22.19.0. No new dependencies.
+TypeScript 5.9 (strict), `node:test` + `node:assert/strict` via `tsx --test`, Biome 2.5.8 (lint +
+format), Stryker 9.6.1 (mutation, incremental), `tsc -p tsconfig.build.json` for build. Node >=
+22.19.0. No new dependencies.
 
 ## Commands
 
 ```
-Test (focused):  npx tsx --test test/repl.test.ts
+Test (focused):  npx tsx --test test/rlm.test.ts
 Test (full):     npm test
 Type-check:      npm run check
 Build:           npm run build
@@ -140,92 +170,98 @@ Mutation:        npm run mutation        (quality gate; incremental)
 ## Project structure
 
 ```
-src/repl.ts              → the change: inflight map, LRU pool, eviction, reset-evict, diagnostic
-test/repl.test.ts        → six issue tests (new describe block) + two updated contract tests
-README.md                → "Approvals"/tool docs section: documented cap + eviction policy (DoD)
-SPEC.md, tasks/plan.md,
-tasks/todo.md            → this spec, the plan, the task checklist
+src/rlm.ts              → feedback caps (D1), conversation bound + notice (D2–D3), aggregate input cap (D6)
+test/rlm.test.ts        → the issue's five tests, re-expressed against HEAD
+docs/truncation-policy.md → implementation-record rows for the feedback/conversation budgets + strategy
+src/truncate.ts         → reused only (truncateText); never edited
 ```
 
 ## Code style
 
 Follow the file's existing voice: sentence-style model messages, JSDoc on every decision, issue
-references in comments, no `any`. The core of the new code:
+references in comments, no `any`. The feedback path reuses the existing helper rather than slicing
+bytes by hand:
 
 ```ts
-/** The pool. Insertion order is recency: oldest = eviction candidate. */
-private sessions = new Map<string, LiveSession>();
-/** Creations in flight, stored before awaiting so concurrent callers join one. */
-private inflight = new Map<string, Promise<LiveSession>>();
+import { truncateText, STDOUT_MAX_BYTES, STDOUT_HEAD_RATIO, STDOUT_RECOVERY,
+         OUTPUT_MAX_BYTES, VALUE_HEAD_RATIO, VALUE_RECOVERY } from "./truncate.js";
 
-private getOrCreateSession(sessionId: string): Promise<LiveSession> {
-  for (;;) {
-    const existing = this.sessions.get(sessionId);
-    if (existing) {
-      this.touch(sessionId, existing);
-      if (!(await this.trustChangeDiscards(sessionId, existing))) {
-        if (this.sessions.get(sessionId) === existing) return existing; // D3
-        continue; // evicted or rebuilt while the trust check ran
-      }
-    }
-    return this.joinOrStartCreation(sessionId, existing !== undefined);
-  }
-}
+const { text: stdout } = truncateText(result.stdout, {
+  maxBytes: FEEDBACK_STDOUT_MAX_BYTES,
+  headRatio: STDOUT_HEAD_RATIO,
+  recovery: STDOUT_RECOVERY,
+});
 ```
 
 ## Testing strategy
 
-`node:test`, behaviour-first, through the real `ReplRunner` against real Monty — the suite's
-existing style. The six issue tests, numbered as in the issue:
+`node:test`, behaviour-first, through the real `runRlm` with the existing `mockLlmCodeGen`
+(`test/rlm.test.ts:263`) and a real `ToolRegistry` + real Monty — the suite's existing deterministic
+style. The five issue tests, re-expressed for HEAD:
 
-1. **The reproduction**: a *trusted* project (preamble files widen the creation window so the
-   race is reliably red), `Promise.all` of `x = 1` and `y = 2` on one id, then assert both `x` and
-   `y` resolve — asserted on **state**, never on the reported statuses (both already claim success).
-2. **One creation**: own-property counter wrapper around `createSession` (D10); concurrent runs →
-   counter is 1.
-3. **No poisoned id**: wrapper rejects once; the run fails; the wrapper is restored; the next run
-   on the same id succeeds and its state persists.
-4. **LRU eviction**: `maxSessions: 2`; create `a`, `b` (touch `a`), create `c` → `b` evicted;
-   assert `liveSessionCount() === 2` (the map size, per DoD) and that `b`'s state is gone
-   (re-running on `b` gives a fresh session).
-5. **`reset` removes the entry**: after `reset`, `liveSessionCount()` drops and `resume` answers
-   "No session 'X' exists".
-6. **Suspended sessions are never evicted**: `maxSessions: 1`; session `a` suspends; creating `b`
-   exceeds the cap (count 2, `a`'s approval still pending and still resumable); abandoning `a`
-   removes its protection and creating `c` evicts it (count back at 1).
+1. **The reproduction, re-budgeted.** Four iterations each printing 300 KB (now → 32 KiB `stdout` +
+   16 KiB `output` per run under the default caps) keep the **total conversation bytes** passed to
+   `llmClient.query` under `MAX_CONVERSATION_BYTES`. The issue's `[119, 262403, 524687, 786971]`
+   prompt sizes are the historical baseline from the pre-#29/#34 tree; the regression target is that
+   no call's total messages exceed 256 KiB (and the 1.57 MB figure cannot recur).
+2. **`result.output` capped in feedback.** `buildFeedback` with a synthetic `RunResult` whose
+   `output` is huge returns a feedback string whose `Output:` section is ≤ 16 KiB and carries the
+   policy marker — asserted via `truncateText`'s already-tested behaviour (assert the marker, not
+   merely the ceiling).
+3. **`result.stdout` capped in feedback, independently of the sandbox cap.** `buildFeedback` with a
+   synthetic `RunResult` whose `stdout` is huge (or `runRlm` with `runOptions.maxStdoutBytes` raised
+   high) yields a feedback `stdout:` section ≤ 32 KiB, even though the sandbox passed more.
+4. **The conversation bound is asserted at the boundary.** Enough iterations (or large-enough
+   feedback) to cross 256 KiB → the messages sent to the LLM drop the oldest middle turns in whole
+   pairs, keep the initial message and the newest turns, and total ≤ budget.
+5. **The model is told history was dropped.** After a drop, the messages contain the history-dropped
+   marker (D3), and no dangling feedback (pairs are dropped whole).
+6. **Shared helper by construction.** `rlm.ts` imports `truncateText` from `./truncate.js` (the same
+   symbol `sandbox.ts` uses); a source-level check asserts no hand-rolled truncation exists in
+   `rlm.ts` (Assumption 8).
+7. **Aggregate input cap (D6).** `runRlm` with several large inputs produces an initial message whose
+   input-preview section is ≤ `INPUT_PREVIEW_MAX_BYTES`.
 
-Two existing tests updated to the D7 contract: "reset clears a suspension too…" now asserts the
-no-session sentence after reset; "clears session state on reset" passes unchanged (a recreated
-session has no variables either way).
-
-RED → GREEN per task; regression = full `npm test` after every task; `npm run check` + `npm run
-build` + `npm run lint` before every commit.
+Coverage note: `coverage-baseline.json` floors `src/rlm.ts` at **95.94%**. Every new branch
+(feedback caps, the drop loop, the notice, the aggregate cap) must be exercised to keep the floor
+green; do not hand-edit the baseline.
 
 ## Boundaries
 
-- **Always:** tests before the fix, full suite before each commit, biome lint, issue-referenced
-  commit messages, mark the task in `tasks/todo.md` as it completes.
-- **Ask first (record instead — fire-and-forget):** nothing in this change is high-risk or
-  irreversible; any surprise is recorded in the ship report rather than pausing.
-- **Never:** delete a failing test without replacing it, hand-edit `coverage-baseline.json`, skip
-  the mutation guard, change the extension's tool descriptions or `session.ts` (out of scope).
+- **Always:** test before fix, full `npm test` before commit, `npm run check` + `npm run build` +
+  `npm run lint`, issue-referenced commit message, mark tasks in `tasks/todo.md`.
+- **Ask first (record instead — fire-and-forget):** nothing here is high-risk; surprises are recorded
+  in the ship report.
+- **Never:** write a second truncation implementation; summarise history via the LLM; hand-edit
+  `coverage-baseline.json`; touch `src/truncate.ts`, `src/sandbox.ts`, `src/repl.ts` or
+  `src/rlm_loop.ts`.
 
 ## Success criteria
 
-1. All six issue tests exist and pass; tests 1–5 are red before their fix, green after.
-2. The issue's reproduction passes end to end.
-3. Concurrent creation calls `createSession` exactly once (counter asserted).
-4. A failed creation does not poison the id — the next call retries and succeeds.
-5. The LRU cap evicts; eviction is asserted on the map size via `liveSessionCount()`.
-6. `reset()` removes the entry rather than leaving a hollow one.
-7. A pending suspension survives every eviction attempt; the refusal decision is recorded in code
-   comments **and** in the README (DoD: "recorded, not implicit").
-8. The cap and eviction policy are documented in the README; `maxSessions` is a documented
-   `ReplRunnerOptions` field.
-9. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` all exit 0;
-   mutation score does not regress.
+1. All five issue tests (plus the D6 aggregate test) exist and pass; tests 1–5 are red before their
+   fix where applicable.
+2. The 1.57 MB reproduction stays bounded: 4 iterations of a 300 KB print never exceed 256 KiB of
+   total conversation, and 10 iterations trigger the drop, not unbounded growth.
+3. `buildFeedback` caps `stdout` ≤ 32 KiB and `output` ≤ 16 KiB via `truncateText`, independent of
+   the sandbox caps.
+4. The conversation-bounding strategy (keep first + last N, drop oldest turns whole) is asserted at
+   the boundary and documented with its trade-off in `docs/truncation-policy.md`.
+5. The model is told when history was dropped (D3 marker present).
+6. Exactly one truncation implementation is used by `rlm.ts`, `repl.ts` and `sandbox.ts`
+   (verified by construction, not by duplicated behaviour).
+7. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` exit 0; mutation
+   score does not regress.
 
-## Open questions
+## Open questions / risks
 
-None blocking. The five assumptions above are the recorded answers to everything the issue left
-open (cap size, env name, touch semantics, suspension policy shape, pooling scope).
+1. **Double-truncation totals (invariant 5).** If a caller raises the sandbox cap above the feedback
+   budget *and* the true output exceeds the sandbox cap, the feedback cap re-truncates an
+   already-truncated value, so its marker's "total" is the post-sandbox size, not the true total. Only
+   reachable via an explicit caller override; cosmetic, not a correctness failure. Recorded rather
+   than solved.
+2. **Single over-budget LLM reply.** Kept and allowed to exceed the budget transiently (Assumption 4);
+   unbounded model output remains a residual risk unless summarisation lands later.
+3. **Budget numbers are judgement, not measurement** — 256 KiB conversation / 32 KiB input-preview
+   follow the policy's prior-art range but were not evaluated against a live model.
+4. **`error` stays uncapped per-message** — policy non-goal; if a runaway `error` string appears it
+   needs its own issue.
