@@ -1208,6 +1208,52 @@ describe("runRlm() — conversation bound", () => {
   });
 });
 
+// ── Aggregate input preview cap (D6) ───────────────────────────
+
+describe("runRlm() — aggregate input preview cap", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("caps the initial prompt's input section to 32 KiB with many large inputs (test 7)", async () => {
+    // Eight large inputs render a ~5 KB head/tail preview each, so the
+    // aggregate preview (~40 KB) exceeds the 32 KiB budget without the D6
+    // cap. The cap is flat head+tail, so it must stay under 32 KiB and tell
+    // the model how to get the rest.
+    const large = "L".repeat(50 * 1024);
+    const inputs: Record<string, string> = {};
+    for (let i = 0; i < 8; i++) inputs[`data_${i}`] = large;
+
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const result = await runRlm("what do these inputs contain?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs,
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    const inputStart = prompt.indexOf("# Input (available as `data_0` variable)");
+    const inputEnd = prompt.indexOf("\n\nWrite Python code to answer the question.");
+    assert.ok(inputStart >= 0, `input section missing:\n${prompt.slice(0, 300)}`);
+    assert.ok(inputEnd > inputStart, "input section end not found");
+    const inputSection = prompt.slice(inputStart, inputEnd);
+    assert.ok(
+      Buffer.byteLength(inputSection, "utf8") <= 32 * 1024,
+      `input section is ${Buffer.byteLength(inputSection, "utf8")} bytes`,
+    );
+    assert.match(inputSection, /elided/, "the truncation marker must state what went");
+    assert.match(inputSection, /slice it in Python/, "the recovery clause must name the input");
+  });
+});
+
 // ── A SUBMIT that never resolved ────────────────────────────────
 
 describe("runRlm() — a SUBMIT call that failed to resolve", () => {

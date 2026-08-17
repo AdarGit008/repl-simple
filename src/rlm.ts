@@ -34,6 +34,23 @@ const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
 /** Byte ceiling on the whole RLM conversation, over every message's content. */
 const MAX_CONVERSATION_BYTES = 256 * 1024;
 
+// ── Initial-prompt aggregate cap ───────────────────────────────
+//
+// Each input renders a bounded ~5 KB head/tail preview, but the aggregate
+// still scales with the input count. The assembled input section is re-cut as
+// one flat head+tail so the initial message cannot grow with N (#74, D6).
+
+/** Byte ceiling on the rendered input-preview section of the initial prompt. */
+const INPUT_PREVIEW_MAX_BYTES = 32 * 1024;
+
+/**
+ * Route to an elided input: each input is already declared as a named sandbox
+ * variable, so the recovery is to slice that variable — no assignment step is
+ * needed (unlike `VALUE_RECOVERY`, where the value has no name yet).
+ */
+const INPUT_PREVIEW_RECOVERY =
+  "Each input is available as a named Python variable — slice it in Python to see more.";
+
 /**
  * UTF-8 length of a message's content — the unit the conversation budget is
  * measured in. `TextEncoder` yields the same count without reintroducing
@@ -236,16 +253,28 @@ async function raceAgainstSignal<T>(promise: Promise<T>, signal?: AbortSignal): 
  * and empty values render header-only, never an empty fence.
  */
 function buildInitialPrompt(question: string, inputs: Record<string, string>): string {
-  const parts = [`# Question\n${question}`];
+  const inputParts: string[] = [];
   for (const [name, value] of Object.entries(inputs)) {
     const header = name === "context" ? "# Context" : "# Input";
-    parts.push(`\n${header} (available as \`${name}\` variable)`);
+    inputParts.push(`${header} (available as \`${name}\` variable)`);
     if (value) {
       const preview =
         value.length > 5000 ? `${value.slice(0, 2500)}\n...\n${value.slice(-2500)}` : value;
-      parts.push(`\`\`\`\n${preview}\n\`\`\``);
+      inputParts.push(`\`\`\`\n${preview}\n\`\`\``);
     }
   }
+
+  // Per-value previews bound each input, but not their sum. Cut the assembled
+  // section as one flat head+tail so N inputs cannot scale the initial prompt
+  // past this budget (#74, D6).
+  const { text: inputSection } = truncateText(inputParts.join("\n"), {
+    maxBytes: INPUT_PREVIEW_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: INPUT_PREVIEW_RECOVERY,
+  });
+
+  const parts = [`# Question\n${question}`];
+  if (inputSection) parts.push(`\n${inputSection}`);
   parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
   return parts.join("\n");
 }
