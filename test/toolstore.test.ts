@@ -1857,7 +1857,8 @@ describe("read_tool refusal ordering (#57)", () => {
     }
   });
 
-  it("refuses a FIFO named like a tool without hanging", async () => {
+  it("refuses a FIFO named like a tool without hanging", { timeout: 5000 }, async (t) => {
+    if (process.platform === "win32") return t.skip("no FIFOs on Windows");
     const root = makeTempDir();
     try {
       const opts: ToolStoreOptions = { root, preambleStatus: status({}) };
@@ -2092,5 +2093,190 @@ describe("findShadowingBindings — forms the write/load gates must catch (#57)"
 
   it("ignores metaprogramming in comments", () => {
     assert.deepEqual(findShadowingBindings("# exec(code)", reserved), []);
+  });
+});
+
+// ── Second-pass fixes (#57) ─────────────────────────────────────
+
+describe("save_tool refuses a hostile target file (#57, pass 2)", () => {
+  function viewedTools(root: string): HostTool[] {
+    return createToolStoreTools({ root, preambleStatus: status({}) });
+  }
+
+  it("refuses to write through a file-level symlink", async () => {
+    const root = makeTempDir();
+    const outside = mkdtempSync(join(tmpdir(), "repl-outside-"));
+    try {
+      const victim = join(outside, "victim.txt");
+      writeFileSync(victim, "original");
+      mkdirSync(join(root, ".pi", "code-tools"), { recursive: true });
+      symlinkSync(victim, join(root, ".pi", "code-tools", "sneaky.py"));
+
+      const tools = viewedTools(root);
+      await assert.rejects(async () => {
+        await findTool(tools, "save_tool").execute({
+          name: "sneaky",
+          code: "def sneaky(): pass",
+          description: "escape",
+        });
+      }, /not a regular file|outside the project root/);
+      assert.equal(readFileSync(victim, "utf-8"), "original", "the symlink target was overwritten");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("refuses to write onto a FIFO without hanging", { timeout: 5000 }, async (t) => {
+    if (process.platform === "win32") return t.skip("no FIFOs on Windows");
+    const root = makeTempDir();
+    try {
+      const tools = viewedTools(root);
+      mkdirSync(join(root, ".pi", "code-tools"), { recursive: true });
+      execFileSync("mkfifo", [join(root, ".pi", "code-tools", "fifo.py")]);
+      await assert.rejects(async () => {
+        await findTool(tools, "save_tool").execute({
+          name: "fifo",
+          code: "def fifo(): pass",
+          description: "hang",
+        });
+      }, /not a regular file/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("loadSavedTools containment (#57, pass 2)", () => {
+  it("returns no tools when the tools dir escapes the root", async () => {
+    const root = makeTempDir();
+    const outside = mkdtempSync(join(tmpdir(), "repl-outside-"));
+    try {
+      writeFileSync(join(outside, "victim.py"), "def victim(): pass\n");
+      mkdirSync(join(root, ".pi"), { recursive: true });
+      symlinkSync(outside, join(root, ".pi", "code-tools"));
+
+      const load = await loadSavedTools({ root, hostToolNames: ["read_file"] });
+      assert.equal(load.preamble, "");
+      assert.deepEqual(load.loaded, []);
+
+      assert.deepEqual(await savedToolNames({ root }), [], "names leaked through the symlink");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("detector pass-2 forms (#57)", () => {
+  const reserved = new Set(["read_file", "save_tool"]);
+
+  it("records del of a reserved name", () => {
+    assert.deepEqual(findShadowingBindings("del read_file", reserved), ["read_file"]);
+  });
+
+  it("refuses metaprogramming after a semicolon on a top-level line", () => {
+    assert.deepEqual(findShadowingBindings("import os; globals()['save_tool'] = 1", reserved), [
+      "read_file",
+      "save_tool",
+    ]);
+  });
+
+  it("joins a bare-\\r continuation before scanning", () => {
+    // `def \` + `\r` + `read_file():` is one statement to CPython and Monty.
+    assert.deepEqual(findShadowingBindings("def \\\rread_file(): pass", reserved), ["read_file"]);
+  });
+});
+
+describe("save_tool message is trust-aware (#57, pass 2)", () => {
+  it("says the tool waits for trust when the project is untrusted", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = {
+        root,
+        preambleStatus: status({ trusted: false }),
+        isTrusted: () => false,
+      };
+      const tools = createToolStoreTools(opts);
+      const result = await findTool(tools, "save_tool").execute({
+        name: "later",
+        code: "def later(): pass",
+        description: "saved untrusted",
+      });
+      assert.match(result, /once this project is trusted/, result);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("escapeNoticeName pass-2 (#57)", () => {
+  it("escapes quotes and backslashes so quoting cannot be forged", () => {
+    assert.equal(escapeNoticeName('a"b'), "a\\u{22}b");
+    assert.equal(escapeNoticeName("a\\b"), "a\\u{5c}b");
+  });
+});
+
+describe("loadSavedTools skips non-identifier names (#57, pass 2)", () => {
+  it("reports them unreadable and loads the valid sibling", async () => {
+    const root = makeTempDir();
+    try {
+      const dir = join(root, ".pi", "code-tools");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "bad name.py"), "print('hostile')\n");
+      writeFileSync(join(dir, "good.py"), "def good(): return 1\n");
+
+      const load = await loadSavedTools({ root });
+      assert.deepEqual(load.loaded, ["good"], "a non-identifier name loaded and executed");
+      assert.equal(load.unreadable.length, 1);
+      assert.equal(load.unreadable[0].file, "bad name.py");
+      assert.match(load.unreadable[0].reason, /not a valid tool name/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("list_saved_tools honest about directory state (#57, pass 2)", () => {
+  it("does not create the tools dir just to list it", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root, preambleStatus: status({}) };
+      const tools = createToolStoreTools(opts);
+      assert.equal(await findTool(tools, "list_saved_tools").execute({}), "(no saved tools)");
+      assert.equal(
+        existsSync(join(root, ".pi", "code-tools")),
+        false,
+        "listing created a directory in a project",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("list_saved_tools reports an unreadable directory, not a deletion (#57, pass 2)", () => {
+  it("says it cannot list rather than '(no saved tools)'", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    try {
+      const view = status({ loaded: ["hidden"] });
+      const opts: ToolStoreOptions = { root, preambleStatus: view };
+      const tools = createToolStoreTools(opts);
+      mkdirSync(join(root, ".pi", "code-tools"), { recursive: true });
+      writeFileSync(join(root, ".pi", "code-tools", "hidden.py"), "def hidden(): pass\n");
+      chmodSync(join(root, ".pi", "code-tools"), 0o000);
+
+      const out = await findTool(tools, "list_saved_tools").execute({});
+      assert.match(out, /cannot list saved tools/, out);
+      assert.doesNotMatch(out, /file deleted/, "a permission error was reported as a deletion");
+    } finally {
+      // The test must be able to delete what it created.
+      try {
+        chmodSync(join(root, ".pi", "code-tools"), 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+    }
   });
 });

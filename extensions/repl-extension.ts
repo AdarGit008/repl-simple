@@ -204,7 +204,7 @@ export default function (pi: ReplExtensionApi) {
         // Loud on the way in, quiet on the way out: turning the gate off is
         // the half of this toggle that deserves a warning.
         ctx.ui.notify(
-          "repl approvals: yolo — bash, edit and write now run without asking. " +
+          "repl approvals: yolo — bash, edit, write and save_tool now run without asking. " +
             "Back to strict with /repl-approvals strict, or by restarting pi.",
           "warning",
         );

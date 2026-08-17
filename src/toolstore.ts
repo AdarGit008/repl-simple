@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, readdir, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rm, type FileHandle } from "node:fs/promises";
 import { constants, type Stats } from "node:fs";
 import { join, resolve, extname } from "node:path";
 import { requireString } from "./registry.js";
@@ -135,8 +135,12 @@ export function escapeNoticeName(name: string): string {
   let out = "";
   for (const c of name) {
     const code = c.charCodeAt(0);
+    // 0x22 and 0x5c: a quote or backslash inside a quoted name would break
+    // the quoting and let the rest of the name read as an annotation.
     const escaped =
       code < 0x20 ||
+      code === 0x22 ||
+      code === 0x5c ||
       code === 0x7f ||
       (code >= 0x80 && code <= 0x9f) ||
       (code >= 0x202a && code <= 0x202e) ||
@@ -239,12 +243,15 @@ function assignmentEquals(s: string): number[] {
  * A **best-effort scan, not a parser** (#54 lists the forms; the write-time
  * gate is #56). It is conservative on false *positives* — a match refuses
  * even inside a triple-quoted string, which is the safe direction — but it
- * has false *negatives*: `del name`, `match`/`case` captures, `setattr` with
- * a first argument that reaches the module namespace by an alias
- * (`sys.modules[__name__]`), and metaprogramming indented inside a function
- * body are not caught. **Both gates run this same scan** — the load-time
- * check (#54) is authoritative only in that it runs over every `.py` in
- * `.pi/code-tools` regardless of how it got there, not in what it can see.
+ * has false *negatives*: `match`/`case` captures, `setattr`/`exec` reached
+ * through an alias (`from builtins import exec as e`), and metaprogramming
+ * indented inside a function body. **Both gates run this same scan** — the
+ * load-time check (#54) is authoritative only in that it runs over every
+ * `.py` in `.pi/code-tools` regardless of how it got there, not in what it
+ * can see. Note: `exec`/`eval`/`globals`/`vars`/`setattr` are not importable
+ * in Monty 0.0.21, so the metaprogramming branch guards Python the language
+ * rather than the interpreter that runs today — the one live unbind, `del`,
+ * is caught above.
  * Comment lines are excluded for free — a binding form must start the line,
  * and `# def read_file` starts with `#`.
  *
@@ -270,11 +277,14 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
   // binds `read_file`. Joining can only merge statements, which cannot hide a
   // binding (a merged line is still scanned), and a join that would produce a
   // syntax error is one the sandbox refuses loudly anyway.
-  const joined = source.replace(/\\\r?\n/g, "");
+  const joined = source.replace(/\\[\r\n]+/g, "");
 
   // Split into logical statements on universal newlines and `;`. A `;` inside
   // a string over-splits, which only ever over-refuses — the safe direction.
   for (const line of joined.split(/\r\n|\r|\n/)) {
+    // Statements separated by `;` are all at the line's level: a top-level
+    // line's `;` pieces are top-level, and an indented line's pieces are not.
+    const topLevel = !/^[ \t]/.test(line);
     for (const raw of line.split(";")) {
       const s = raw.trim();
       if (s === "") continue;
@@ -288,6 +298,15 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
       const cls = /^class\s+([A-Za-z_]\w*)/.exec(s);
       if (cls) {
         record(cls[1]);
+        continue;
+      }
+
+      // `del read_file` unbinds the name for the whole session — the preamble
+      // runs first, and host tools resolve only for names Python has not
+      // bound, so a deleted name resolves to nothing, silently (#57 pass 2:
+      // the one live unbind in Monty 0.0.21 that nothing here caught).
+      if (/^del\s/.test(s)) {
+        for (const m of s.split("#")[0].matchAll(/[A-Za-z_]\w*/g)) record(m[0]);
         continue;
       }
 
@@ -327,7 +346,7 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
       // function body and runs in its locals when called, not at preamble
       // time. Single-line `def f(): exec(…)` reaches the def branch above
       // instead — correct, because that exec does not run at load time.
-      if (!/^[ \t]/.test(raw)) {
+      if (topLevel) {
         const code = s.split("#")[0];
         if (
           /\b(?:exec|eval)\s*\(|\bglobals\s*\(\s*\)|\bvars\s*\(\s*\)|\b__dict__\s*\[|\bsetattr\s*\(|import\s+\*/.test(
@@ -446,7 +465,8 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     // self-persisting write with auto-execution, strictly worse than `write`
     // (#56).
     requiresApproval: true,
-    approvalNote: "the saved code executes automatically at the start of every future session",
+    approvalNote:
+      "the saved code executes automatically at the start of every future session in a trusted project",
     async execute(args) {
       const name = validateToolName(args.name);
       const code = requireString(args.code, "code");
@@ -482,10 +502,49 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         "",
       ].join("\n");
 
-      await writeFile(toolPath(dir, name), content, "utf-8");
+      // The write mirrors the read: one open with O_NOFOLLOW | O_NONBLOCK, an
+      // fstat on the fd, the write on the fd. O_NOFOLLOW refuses a file-level
+      // symlink whose target leaves the root (the dir guard above does not
+      // cover the final component), O_NONBLOCK turns a FIFO target into an
+      // immediate error instead of a hang, and writing the fd — not the path —
+      // closes the check-then-write race (#57 pass 2).
+      let target: FileHandle;
+      try {
+        target = await open(
+          toolPath(dir, name),
+          constants.O_WRONLY |
+            constants.O_CREAT |
+            constants.O_TRUNC |
+            constants.O_NOFOLLOW |
+            constants.O_NONBLOCK,
+        );
+      } catch (err) {
+        // ELOOP: a symlink target. ENXIO: a FIFO with no reader (O_WRONLY).
+        // EISDIR: a directory. All are "not a regular file" to the model.
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ELOOP" || code === "ENXIO" || code === "EISDIR") {
+          throw new HostToolError("OSError", `tool '${name}' cannot be saved: not a regular file`);
+        }
+        throw new HostToolError("OSError", (err as Error).message);
+      }
+      try {
+        const st = await target.stat();
+        if (!st.isFile()) {
+          throw new HostToolError("OSError", `tool '${name}' cannot be saved: not a regular file`);
+        }
+        await target.writeFile(content, "utf-8");
+      } finally {
+        await target.close();
+      }
+
+      // Trust-aware: in an untrusted project a new session withholds the file
+      // until the project is trusted — claiming it "loads in new sessions"
+      // unconditionally would be the lie this issue exists to remove.
       return (
-        `Tool '${name}' saved. It loads in sessions created after this one — ` +
-        `the current session's preamble is unchanged.`
+        `Tool '${name}' saved.` +
+        (isTrustedNow()
+          ? " It loads in sessions created after this one — the current session's preamble is unchanged."
+          : " It will load in new sessions once this project is trusted.")
       );
     },
   };
@@ -583,8 +642,14 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         return `${shown} [loaded in this session — file changed since; the session runs the earlier copy]`;
       }
       return shown;
-    } catch {
-      return `${shown} [loaded in this session — file deleted; gone from new sessions]`;
+    } catch (err) {
+      // ENOENT means deleted; EACCES and friends mean the file is still there
+      // but its status is unreadable — "deleted" would fabricate a deletion
+      // from a permission error.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return `${shown} [loaded in this session — file deleted; gone from new sessions]`;
+      }
+      return `${shown} [loaded in this session — file status unreadable]`;
     }
   }
 
@@ -611,13 +676,17 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     returns: "str",
     async execute(_args) {
       const dir = await containedToolsDir(toolsDir, root);
-      await ensureDir(dir);
-
+      // Listing never creates the directory: a read-only tool must not write
+      // into a project — least of all one that was never trusted (#57 pass 2).
       let entries: string[];
       try {
         entries = await readdir(dir);
-      } catch {
-        entries = [];
+      } catch (err) {
+        // ENOENT is the only silent case — "no directory, no tools". Anything
+        // else (EACCES, ENOTDIR) is news: "(no saved tools)" would claim the
+        // directory is fine when the tools are merely invisible.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") entries = [];
+        else return `(cannot list saved tools: ${(err as Error).message})`;
       }
       const disk = new Set(entries.filter((e) => extname(e) === ".py").map((e) => e.slice(0, -3)));
 
@@ -681,8 +750,6 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     returns: "str",
     async execute(args) {
       const name = validateToolName(args.name);
-      const dir = await containedToolsDir(toolsDir, root);
-      const path = toolPath(dir, name);
 
       // The untrusted refusal comes first, before any filesystem contact: an
       // untrusted session learns nothing about what is (or is not) on disk.
@@ -696,6 +763,9 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
             "Trust the project in pi, then run `repl` with a new `sessionId` to load them.",
         );
       }
+
+      const dir = await containedToolsDir(toolsDir, root);
+      const path = toolPath(dir, name);
 
       // One open, no name reuse after it: O_NOFOLLOW refuses a symlink (a
       // target that leaves the project root would read outside it) and
@@ -881,9 +951,20 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
+  // The same containment as the tools: a symlinked `.pi` must not let a
+  // hostile repo list another project's tool names into the model context
+  // (#57 pass 2 — this is the untrusted-notice path, zero trust required).
+  let dir: string;
+  try {
+    dir = await containedToolsDir(toolsDir, root);
+  } catch (err) {
+    if (err instanceof HostToolError && err.pythonType === "PermissionError") return [];
+    throw err;
+  }
+
   let entries: string[];
   try {
-    entries = await readdir(toolsDir);
+    entries = await readdir(dir);
   } catch {
     return []; // Directory doesn't exist — no tools to name
   }
@@ -935,7 +1016,28 @@ export async function loadSavedTools(
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
-  const names = await savedToolNames({ root, toolsDir });
+  // Containment again, for the direct file access below: a symlinked `.pi`
+  // must not execute code from outside the project the user trusted
+  // (#57 pass 2). An escaping dir loads nothing — loud refusal is the tools'
+  // job; the loader's is to not execute what the user never trusted.
+  let dir: string;
+  try {
+    dir = await containedToolsDir(toolsDir, root);
+  } catch (err) {
+    if (err instanceof HostToolError && err.pythonType === "PermissionError") {
+      return {
+        preamble: "",
+        loaded: [],
+        loadedIdentity: new Map(),
+        skipped: [],
+        unreadable: [],
+        refused: [],
+      };
+    }
+    throw err;
+  }
+
+  const names = await savedToolNames({ root, toolsDir: dir });
   if (names.length === 0)
     return {
       preamble: "",
@@ -962,7 +1064,17 @@ export async function loadSavedTools(
       continue;
     }
 
-    const path = join(toolsDir, `${name}.py`);
+    // Only names the toolstore itself could have written load. A hostile
+    // repo can plant `bad name.py` — and if it loads, it executes while
+    // `read_tool`/`delete_tool` (which validate the name) cannot address it:
+    // the recovery promise would be a lie. Skipped here, reported as
+    // unreadable, never executed (#57 pass 2).
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+      unreadable.push({ file: `${name}.py`, reason: "not a valid tool name" });
+      continue;
+    }
+
+    const path = join(dir, `${name}.py`);
 
     // Only regular files load, decided by lstat rather than discovered as an
     // EISDIR or a hang: a directory and a FIFO both pass the `.py` name
@@ -986,6 +1098,7 @@ export async function loadSavedTools(
     // a symlink or FIFO after the lstat above errors here instead of reading
     // outside the root or hanging.
     let content: string;
+    let opened: Stats;
     try {
       const handle = await open(
         path,
@@ -995,6 +1108,10 @@ export async function loadSavedTools(
         const st = await handle.stat();
         if (!st.isFile()) throw new Error("not a regular file");
         content = await handle.readFile("utf-8");
+        // The identity must describe the bytes read through THIS fd — the
+        // pre-open lstat above describes a path that may have been swapped
+        // since (#57 pass 2).
+        opened = st;
       } finally {
         await handle.close();
       }
@@ -1022,7 +1139,7 @@ export async function loadSavedTools(
 
     bytes += size;
     loaded.push(name);
-    loadedIdentity.set(name, { size: entry.size, mtimeMs: entry.mtimeMs });
+    loadedIdentity.set(name, { size: opened.size, mtimeMs: opened.mtimeMs });
     sources.push(content);
   }
 
@@ -1048,7 +1165,7 @@ export async function loadSavedTools(
 
   const header = [
     "# ── Loaded tools ──",
-    `# ${loaded.length} tool(s) from ${toolsDir}`,
+    `# ${loaded.length} tool(s) from ${dir}`,
     ...(skipped.length > 0
       ? [`# ${skipped.length} not loaded — preamble limit reached: ${skipped.join(", ")}`]
       : []),

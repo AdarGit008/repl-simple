@@ -526,8 +526,26 @@ export class Session {
   /**
    * Restore a session from a JSON string produced by `dump()`.
    *
+   * **The dump is half a session.** The registry, the preamble and every
+   * toolstore-side view of them are not serialized — the caller must rebuild
+   * them exactly as session creation did (`ReplRunner.createSession` is the
+   * reference): a registry whose toolstore tools were built with a **fresh**
+   * `PreambleStatus` (loaded/withheld/refused/skipped/unreadable **and**
+   * `identity`, from a new `loadSavedTools`/`savedToolNames` pass), a **live**
+   * `isTrusted` callback (omitted, the tools fall back to the snapshot and a
+   * stale `true` reads files the user no longer trusts), and the preamble
+   * string re-derived through the trusted load path. A restored session
+   * whose disk changed since the dump also replays its cached tool results
+   * verbatim — treat them as the snapshots they are.
+   *
+   * `grantUses` is likewise not serialized: a restored session gets
+   * {@link DEFAULT_GRANT_USES}. Grants are excluded by design — they
+   * authorise executions in the call that is running now.
+   *
    * @param json  Serialized session state.
    * @param sandboxOptions  Sandbox configuration (ToolRegistry, etc.).
+   * @param preamble  The preamble to prepend — rebuilt by the caller, not read
+   *   from the dump.
    * @throws If the JSON version is unsupported or the format is invalid.
    */
   static load(json: string, sandboxOptions: SandboxOptions, preamble?: string): Session {
