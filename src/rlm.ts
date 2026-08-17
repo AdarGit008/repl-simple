@@ -1,6 +1,28 @@
 import type { RlmIteration, RlmOptions, RlmResult, RunResult } from "./types.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
+import {
+  truncateText,
+  STDOUT_MAX_BYTES,
+  STDOUT_HEAD_RATIO,
+  STDOUT_RECOVERY,
+  OUTPUT_MAX_BYTES,
+  VALUE_HEAD_RATIO,
+  VALUE_RECOVERY,
+} from "./truncate.js";
+
+// ── Feedback budgets ────────────────────────────────────────────
+//
+// The sandbox already caps `stdout` (32 KiB) and `output` (16 KiB), but a
+// caller may raise either ceiling via `runOptions`. The feedback must not
+// inherit that raised ceiling, so it re-caps here with the same budgets and
+// the same shared helper — the normal path is a marker-free no-op (#74, D1).
+
+/** Byte ceiling for `stdout` in a feedback message. */
+const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
+
+/** Byte ceiling for `output` in a feedback message. */
+const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
 
 // ── System prompt ────────────────────────────────────────────────
 
@@ -233,7 +255,12 @@ function extractBestAnswer(iterations: RlmIteration[]): string {
  */
 export function buildFeedback(result: RunResult): string {
   if (result.status === "error") {
-    let feedback = `Error: ${result.error}\nstdout: ${result.stdout}`;
+    const { text: stdout } = truncateText(result.stdout, {
+      maxBytes: FEEDBACK_STDOUT_MAX_BYTES,
+      headRatio: STDOUT_HEAD_RATIO,
+      recovery: STDOUT_RECOVERY,
+    });
+    let feedback = `Error: ${result.error}\nstdout: ${stdout}`;
     if (result.errorKind === "syntax") {
       feedback += "\n\nFix the syntax error in your Python code.";
     } else if (result.errorKind === "typing") {
@@ -287,9 +314,18 @@ export function buildFeedback(result: RunResult): string {
     return "Your code ran without errors and produced no output. Write more code to investigate.";
   }
 
-  const output = result.output !== "None" ? result.output : "";
-  const stdout = result.stdout ? `\nstdout:\n${result.stdout}` : "";
-  return `Output: ${output}${stdout}`;
+  const { text: output } = truncateText(result.output !== "None" ? result.output : "", {
+    maxBytes: FEEDBACK_OUTPUT_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: VALUE_RECOVERY,
+  });
+  const { text: stdout } = truncateText(result.stdout, {
+    maxBytes: FEEDBACK_STDOUT_MAX_BYTES,
+    headRatio: STDOUT_HEAD_RATIO,
+    recovery: STDOUT_RECOVERY,
+  });
+  const stdoutSection = stdout ? `\nstdout:\n${stdout}` : "";
+  return `Output: ${output}${stdoutSection}`;
 }
 
 // ── Main API ─────────────────────────────────────────────────────

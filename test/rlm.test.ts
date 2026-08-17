@@ -1039,6 +1039,85 @@ describe("runRlm() — a run that hit a limit", () => {
   });
 });
 
+// ── Feedback byte caps (D1) ─────────────────────────────────────
+
+describe("buildFeedback() — feedback byte caps", () => {
+  it("caps a huge result.output to 16 KiB with the policy marker (test 2)", () => {
+    // The sandbox already cuts `output` at 16 KiB, but a caller may raise
+    // `runOptions.maxOutputBytes`. The feedback must not inherit that raised
+    // ceiling — it re-caps here, and the model must be told what went.
+    const hugeOutput = "A".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "ok",
+      output: hugeOutput,
+      outputTruncated: false,
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const prefix = "Output: ";
+    assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
+    const outputSection = feedback.slice(prefix.length);
+    assert.ok(
+      Buffer.byteLength(outputSection, "utf8") <= 16 * 1024,
+      `Output section is ${Buffer.byteLength(outputSection, "utf8")} bytes`,
+    );
+    assert.match(outputSection, /elided/, "the truncation marker must state what went");
+    assert.match(outputSection, /Assign the value to a name and slice it/);
+  });
+
+  it("caps a huge result.stdout to 32 KiB even when the sandbox passed more (test 3)", () => {
+    // A synthetic RunResult bypasses the sandbox cap, so this proves the
+    // feedback budget is independent of `runOptions.maxStdoutBytes`.
+    const hugeStdout = "S".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "ok",
+      output: "None",
+      outputTruncated: false,
+      stdout: hugeStdout,
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const marker = "stdout:\n";
+    const idx = feedback.indexOf(marker);
+    assert.ok(idx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const stdoutSection = feedback.slice(idx + marker.length);
+    assert.ok(
+      Buffer.byteLength(stdoutSection, "utf8") <= 32 * 1024,
+      `stdout section is ${Buffer.byteLength(stdoutSection, "utf8")} bytes`,
+    );
+    assert.match(stdoutSection, /elided/, "the truncation marker must state what went");
+    assert.match(stdoutSection, /Re-run with a narrower print/);
+  });
+
+  it("uses the shared truncateText helper, not a hand-rolled truncation (test 6)", () => {
+    // Assumption 8 / invariant 4: one truncation implementation. rlm.ts must
+    // import the same symbol and module sandbox.ts uses, and must never
+    // measure bytes itself.
+    const rlmPath = join(fileURLToPath(import.meta.url), "..", "..", "src", "rlm.ts");
+    const sandboxPath = join(fileURLToPath(import.meta.url), "..", "..", "src", "sandbox.ts");
+    const rlmSource = readFileSync(rlmPath, "utf-8");
+    const sandboxSource = readFileSync(sandboxPath, "utf-8");
+
+    assert.match(rlmSource, /from "\.\/truncate\.js"/, "rlm.ts must import from ./truncate.js");
+    assert.match(
+      sandboxSource,
+      /from "\.\/truncate\.js"/,
+      "sandbox.ts must import from ./truncate.js",
+    );
+    assert.match(rlmSource, /\btruncateText\b/, "rlm.ts must reference the shared truncateText");
+    assert.match(sandboxSource, /\btruncateText\b/, "sandbox.ts must reference truncateText");
+
+    // The canonical signals of a hand-rolled byte truncator are `Buffer` and
+    // `byteLength`. rlm.ts may slice strings for unrelated reasons, but it must
+    // never measure bytes itself.
+    assert.doesNotMatch(rlmSource, /\bBuffer\b/, "rlm.ts must not hand-roll byte truncation");
+    assert.doesNotMatch(rlmSource, /\bbyteLength\b/, "rlm.ts must not measure bytes itself");
+  });
+});
+
 // ── A SUBMIT that never resolved ────────────────────────────────
 
 describe("runRlm() — a SUBMIT call that failed to resolve", () => {
