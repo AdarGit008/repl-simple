@@ -30,4 +30,4 @@
   - Verify: read-through against `src/repl.ts`; `npm run lint`.
   - Files: `README.md`
 
-- [ ] Checkpoint: Complete — `npm run coverage` green; `npm run mutation` score holds; review + ship
+- [x] Checkpoint: Complete — `npm run coverage` green (repl.ts 100.00%); targeted mutation 79.09 ≥ break 58; review closed; ship report written
