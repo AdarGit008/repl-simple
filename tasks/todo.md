@@ -1,4 +1,5 @@
-# Tasks — Prove `Repl.resume()` honours an aborted signal (#150)
+# Tasks — Cap `result.error` and the `question` in the RLM feedback loop (#144)
 
-- [X] T1 — Add the abort-propagation killing test + prove RED via the hand-applied mutant (D1, D3)
-- [X] T2 — Targeted single-file mutation sweep + freshness + harness-death check (D4)
+- [x] T1 — Cap `result.error` to 16 KiB via `truncateText` (D7) + test 8
+- [x] T2 — Cap the `question` to 64 KiB via `truncateText` (D8) + test 9
+- [x] T3 — Update `docs/truncation-policy.md` for the D7/D8 caps

@@ -339,7 +339,7 @@ Rules:
 
 - Token-based budgets. Bytes are cheap, deterministic and tokenizer-independent.
 - Structure-aware `output` elision — Q4, blocked on #69.
-- Truncating `error` / `errorKind`. Out of scope; if `error` proves unbounded it is a separate issue.
+- Truncating `errorKind`. The `error` string is now capped (16 KiB, #144); `errorKind` stays uncapped as a small bounded enum string.
 
 ---
 
@@ -384,6 +384,8 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `buildFeedback` `output` | 16 KiB | 50/50 head+tail | #74 |
 | `runRlm` conversation (`messages`) | 256 KiB | keep first + last N, drop oldest whole pairs | #74 |
 | `buildInitialPrompt` input preview | 32 KiB aggregate | 50/50 head+tail | #74 |
+| `buildFeedback` `error` | 16 KiB | 50/50 head+tail | #144 |
+| `buildInitialPrompt` `question` | 64 KiB | 50/50 head+tail | #144 |
 
 The four `#29`/`#34` rows go through one implementation, `src/truncate.ts`, per invariant 4.
 
@@ -412,6 +414,18 @@ recent context follows. …]` — that counts toward the budget, so the model is
 sees is partial. The input-preview row uses a named-variable recovery clause ("Each input is
 available as a named Python variable — slice it in Python to see more."), because inputs are already
 declared as sandbox variables and need no assignment step.
+
+**#144 (RLM feedback loop, error + question).** Two of #74's recorded non-goals are now capped. The
+`error` path reuses the value shape at the `output` budget (16 KiB, 50/50 head+tail) with a real
+recovery route — "Catch the exception and print the full traceback to see more." — because the model
+owns the Python and can re-run the failing code under `try/except` to print the whole traceback. The
+`question` path is capped at 64 KiB (50/50 head+tail), sized so that even a maxed initial prompt
+(≤64 KiB question + ≤32 KiB input preview + headers) cannot alone cross the 256 KiB conversation
+bound, and because `messages[0]` is never dropped. Its recovery clause is deliberately weaker — "The
+question was truncated. Answer from the part shown and state the assumption if ambiguous." — because
+the question is **not** sandbox-accessible: unlike `output` and inputs, the model cannot slice it in
+Python, so the marker must not advertise a route it cannot honour (policy Q3, the same rule as the
+`_` binding). Both caps go through the one shared `truncateText`.
 
 **Exception 3 — the conversation byte count uses `TextEncoder`, not `Buffer.byteLength`.** D2 writes
 the budget as `Buffer.byteLength`, but test 6 asserts `rlm.ts` never references `Buffer` or

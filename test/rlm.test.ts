@@ -1092,6 +1092,54 @@ describe("buildFeedback() — feedback byte caps", () => {
     assert.match(stdoutSection, /Re-run with a narrower print/);
   });
 
+  it("caps a huge result.error to 16 KiB with the policy marker (test 8)", () => {
+    // The sandbox does not cap `result.error` at all — a huge Python exception
+    // (e.g. `raise ValueError("A"*10**7)`) flows into one feedback message raw
+    // (#144). The feedback must re-cap it here, and the model must be told
+    // what went and how to recover the full traceback.
+    const hugeError = "E".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "error",
+      error: hugeError,
+      errorKind: "runtime",
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const prefix = "Error: ";
+    assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
+    const rest = feedback.slice(prefix.length);
+    const stdoutIdx = rest.indexOf("\nstdout:");
+    assert.ok(stdoutIdx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const errorSection = rest.slice(0, stdoutIdx);
+    assert.ok(
+      Buffer.byteLength(errorSection, "utf8") <= 16 * 1024,
+      `Error section is ${Buffer.byteLength(errorSection, "utf8")} bytes`,
+    );
+    assert.match(errorSection, /elided/, "the truncation marker must state what went");
+    assert.match(
+      errorSection,
+      /Catch the exception and print the full traceback/,
+      "the recovery clause must name the route to the rest",
+    );
+  });
+
+  it("passes a small result.error through marker-free (test 8 no-op)", () => {
+    // The normal path is a marker-free no-op: a typical exception is far under
+    // 16 KiB and must render byte-identical to the pre-change shape.
+    const feedback = buildFeedback({
+      status: "error",
+      error: "boom",
+      errorKind: "syntax",
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    });
+    assert.ok(feedback.startsWith("Error: boom\n"), `unexpected feedback: ${feedback}`);
+    assert.doesNotMatch(feedback, /elided/, "a small error must not be marked elided");
+  });
+
   it("uses the shared truncateText helper, not a hand-rolled truncation (test 6)", () => {
     // Assumption 8 / invariant 4: one truncation implementation. rlm.ts must
     // import the same symbol and module sandbox.ts uses, and must never
@@ -1251,6 +1299,73 @@ describe("runRlm() — aggregate input preview cap", () => {
     );
     assert.match(inputSection, /elided/, "the truncation marker must state what went");
     assert.match(inputSection, /slice it in Python/, "the recovery clause must name the input");
+  });
+});
+
+// ── Question cap (D8) ──────────────────────────────────────────
+
+describe("runRlm() — question cap", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("caps an oversized question to 64 KiB in messages[0] with the policy marker (test 9)", async () => {
+    // `boundConversation` never drops messages[0] (it carries the question,
+    // inputs and instructions), so an oversized question used to live in every
+    // query for the whole run (#144). The initial prompt must re-cap it here
+    // and tell the model what was lost and how to proceed.
+    const hugeQuestion = "Q".repeat(128 * 1024);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm(hugeQuestion, {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    const qHeader = "# Question\n";
+    const qHeaderIdx = prompt.indexOf(qHeader);
+    assert.ok(qHeaderIdx >= 0, `question section missing:\n${prompt.slice(0, 300)}`);
+    const qStart = qHeaderIdx + qHeader.length;
+    const qEnd = prompt.indexOf("\n\n# Context", qStart);
+    assert.ok(qEnd > qStart, "question section end not found");
+    const questionSection = prompt.slice(qStart, qEnd);
+    assert.ok(
+      Buffer.byteLength(questionSection, "utf8") <= 64 * 1024,
+      `question section is ${Buffer.byteLength(questionSection, "utf8")} bytes`,
+    );
+    assert.match(questionSection, /elided/, "the truncation marker must state what went");
+    assert.match(
+      questionSection,
+      /state the assumption/,
+      "the recovery clause must direct the model to answer from what is shown",
+    );
+  });
+
+  it("passes a normal question through marker-free (test 9 no-op)", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("what is the answer?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(
+      prompt.includes("# Question\nwhat is the answer?"),
+      `question not whole:\n${prompt.slice(0, 300)}`,
+    );
+    assert.doesNotMatch(prompt, /elided/, "a normal question must not be marked elided");
   });
 });
 

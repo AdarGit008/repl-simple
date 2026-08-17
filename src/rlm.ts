@@ -24,6 +24,16 @@ const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
 /** Byte ceiling for `output` in a feedback message. */
 const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
 
+/** Byte ceiling for `result.error` in a feedback message (16 KiB, value shape). */
+const ERROR_MAX_BYTES = 16 * 1024;
+
+/**
+ * Route to an elided error: the model owns the Python, so it can wrap the
+ * failing code in `try/except` and print the full traceback to see the whole
+ * exception the feedback truncated away (#144, D7).
+ */
+const ERROR_RECOVERY = "Catch the exception and print the full traceback to see more.";
+
 // ── Conversation budget ─────────────────────────────────────────
 //
 // The feedback caps bound each turn, but the conversation as a whole grows by
@@ -50,6 +60,18 @@ const INPUT_PREVIEW_MAX_BYTES = 32 * 1024;
  */
 const INPUT_PREVIEW_RECOVERY =
   "Each input is available as a named Python variable — slice it in Python to see more.";
+
+/** Byte ceiling for the `question` in the initial prompt (64 KiB, value shape). */
+const QUESTION_MAX_BYTES = 64 * 1024;
+
+/**
+ * Route to an elided question: the question is not a sandbox variable, so the
+ * model cannot slice it — the marker must not advertise a route it cannot
+ * honour (policy Q3). It directs the model to answer from the part shown and
+ * flag ambiguity instead (#144, D8).
+ */
+const QUESTION_RECOVERY =
+  "The question was truncated. Answer from the part shown and state the assumption if ambiguous.";
 
 /**
  * UTF-8 length of a message's content — the unit the conversation budget is
@@ -273,7 +295,15 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
     recovery: INPUT_PREVIEW_RECOVERY,
   });
 
-  const parts = [`# Question\n${question}`];
+  // The question is never dropped from `messages[0]`, so its budget bounds the
+  // worst case while leaving every realistic question untouched (#144, D8).
+  const { text: q } = truncateText(question, {
+    maxBytes: QUESTION_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: QUESTION_RECOVERY,
+  });
+
+  const parts = [`# Question\n${q}`];
   if (inputSection) parts.push(`\n${inputSection}`);
   parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
   return parts.join("\n");
@@ -310,7 +340,12 @@ export function buildFeedback(result: RunResult): string {
       headRatio: STDOUT_HEAD_RATIO,
       recovery: STDOUT_RECOVERY,
     });
-    let feedback = `Error: ${result.error}\nstdout: ${stdout}`;
+    const { text: error } = truncateText(result.error, {
+      maxBytes: ERROR_MAX_BYTES,
+      headRatio: VALUE_HEAD_RATIO,
+      recovery: ERROR_RECOVERY,
+    });
+    let feedback = `Error: ${error}\nstdout: ${stdout}`;
     if (result.errorKind === "syntax") {
       feedback += "\n\nFix the syntax error in your Python code.";
     } else if (result.errorKind === "typing") {

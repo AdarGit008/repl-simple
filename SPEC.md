@@ -1,219 +1,217 @@
-# Spec: Prove `Repl.resume()` honours an aborted signal — issue #150
+# Spec: Cap `result.error` and the `question` in the RLM feedback loop — issue #144
 
-Issue: https://github.com/AdarGit008/repl-simple/issues/150 (Bucket 5 — parent #47). Source: PR #147
-flight (SPEC Assumption 4); SHIP test-engineer follow-up.
+Issue: https://github.com/AdarGit008/repl-simple/issues/144 (Bucket 9, child of #70 — filed by the
+#74 flight, ship-report residuals 1–2). Continues #74's D1–D6; the new decisions here are D7 and D8.
 
 ## Objective
 
-`Repl.resume()` passes `signal` into `session.resume({ onApproval, signal })` (`src/repl.ts:235`),
-but no test proves abort propagation on the resume path. The #110 killing test
-(`test/repl.test.ts:517`, *"suspend → resume(approve) runs the pending call"*) drives `Repl.resume()`
-with an `approve` callback and **no signal** — it proves `onApproval` is forwarded, not `signal`.
+`runRlm` (`src/rlm.ts`) shipped four feedback/conversation caps in #74 (D1–D6), but two message
+paths the #74 flight explicitly left as a recorded non-goal (Assumption 7) remain unbounded:
 
-The gap is a single-field drop, not the whole object. Stryker 9.6.1's `ObjectLiteral` mutator yields
-**only** the empty object `{}` (verified at
-`node_modules/@stryker-mutator/instrumenter/src/mutators/object-literal-mutator.ts`:
-`yield types.objectExpression([])`), so a mutant that drops only `signal`
-(`{ onApproval, signal }` → `{ onApproval }`) is **not generated** by the mutation suite and would
-survive: the resumed call would be approved and executed with no abort observed. `signal` is the
-user's Escape / turn-cancel (#49); if the resume path silently dropped it, an already-aborted resume
-would run a gated side effect (`bash`/`write`/`edit`) the user had already cancelled.
+1. **`result.error`.** `buildFeedback` interpolates the error string raw on the `status === "error"`
+   path — `src/rlm.ts:313` `let feedback = \`Error: ${result.error}\nstdout: ${stdout}\`;`. A single
+   huge Python exception (e.g. `raise ValueError("A" * 10 ** 7)`) flows into one feedback message
+   uncapped, bypassing the 256 KiB conversation bound for that iteration and undermining the D1
+   feedback-cap guarantee.
+2. **`question`.** `buildInitialPrompt` interpolates the question raw — `src/rlm.ts:276`
+   `const parts = [\`# Question\n${question}\`];` — and `boundConversation` never drops `messages[0]`
+   (it carries the question, inputs and instructions), so an oversized question lives in **every**
+   query for the whole run, permanently.
 
-**This is a proof-of-wiring flight, not a fix flight.** The wiring is already correct: `run` and
-`resume` both thread `signal` through, and `resumeSuspended` (`src/sandbox.ts:1113`) already
-early-returns `runError("aborted", "execution aborted", acc)` when `runOpts.signal.aborted` is set,
-*before* the approval replay executes the suspended tool call. The deliverable is a killing test that
-proves the `signal` field is load-bearing on the resume path, so a future single-field drop fails the
-suite.
+Both are strings (`question: string` in `runRlm`, `error: string` on `RunResult` status `"error"`,
+`src/types.ts:164`). Both are bounded by routing through the **shared `truncateText`** (`src/truncate.ts`),
+which #74 already imports into `src/rlm.ts` — no new truncation implementation, no `src/truncate.ts` edit.
 
 ## Scope
 
 **In scope** (exact files expected to change):
 
-- `test/repl.test.ts` — one new test driving `Repl.resume()` with an already-aborted signal.
-- `SPEC.md`, `tasks/plan.md`, `tasks/todo.md` — this flight's artifacts (rotated per house convention).
-- `docs/verify-150.md`, `docs/review-150.md`, `docs/ship-150.md` — evidence + review + ship reports.
+- `src/rlm.ts` — cap `result.error` in `buildFeedback` (D7) and `question` in `buildInitialPrompt`
+  (D8), both via the already-imported `truncateText`.
+- `test/rlm.test.ts` — two new RED→GREEN tests (8, 9), each also asserting the under-budget no-op.
+- `docs/truncation-policy.md` — implementation-record rows for the two new caps, and retire the
+  "Truncating `error`" non-goal line (it is now implemented).
 
 **Out of scope** (do not touch):
 
-- `src/repl.ts`, `src/session.ts`, `src/sandbox.ts` — the wiring is already correct; the whole-object
-  `ObjectLiteral` `{}` mutant at `src/repl.ts:235` is already Killed by the #110 test. **No
-  production code change.** (The single-file sweep `--mutate src/repl.ts` is run *read-only* for
-  evidence.)
-- `extensions/*`, `src/rlm.ts`, `src/rlm_loop.ts` — unrelated.
+- `src/truncate.ts` — reused only, never edited (invariant 4: one implementation).
+- `src/sandbox.ts`, `src/repl.ts`, `src/builtins.ts`, `src/rlm_loop.ts`, `src/types.ts`,
+  `coverage-baseline.json` — untouched, as in #74.
+- No new `RlmOptions`/public option — budgets are module constants (Assumption 5, unchanged).
+- Summarisation of dropped history, structure-aware `output` elision (#69), input-name validation —
+  all still out of scope, as in #74.
 
 ## Explicit decisions
 
-### D0 — The mutant to kill is the single-field drop, proven by hand-application
+> D0–D6 are #74's decisions (`docs/truncation-policy.md` and `SPEC.md` at commit `34da5c5`) and are
+> unchanged. D7/D8 extend them.
 
-The conceptual mutant is `{ onApproval, signal }` → `{ onApproval }` (dropping only `signal`). Stryker
-cannot generate it (see Objective). It is therefore proven by the **hand-apply prove-it** technique
-already used on the #110 flight: temporarily edit `src/repl.ts:235` to `session.resume({ onApproval })`,
-run the new test, observe it fail, restore the file, observe it pass. The targeted mutation sweep is a
-*regression* check (confirm the whole-object `{}` mutant stays Killed and no new survivor appears), not
-the primary kill.
+### D7 — Cap `result.error` in `buildFeedback` (16 KiB, 50/50 head+tail)
 
-### D1 — Test shape
+The error string is a **single value** — identified by both ends, exactly like `output`: the head of
+a Python traceback names the offending frame (the model's own line), the tail names the exception
+type and message. So it reuses the value shape, not the `stdout` stream shape:
 
-Inside the existing `describe("ReplRunner — every tool answers, in every state (#48)")` block in
-`test/repl.test.ts`, immediately after the #110 test at `:517`, add one test:
+- Budget: `ERROR_MAX_BYTES = 16 * 1024` (16 KiB) — the same budget as `output`
+  (`OUTPUT_MAX_BYTES`), because both are "one value the run surfaced" and the policy already treats
+  16 KiB as the value budget.
+- Shape: `headRatio: VALUE_HEAD_RATIO` (50/50) via the shared `truncateText`.
+- Recovery: a new module constant `ERROR_RECOVERY = "Catch the exception and print the full traceback to see more."`
+  (defined in `src/rlm.ts`, alongside `INPUT_PREVIEW_RECOVERY` — the route is real: the model owns
+  the Python and can wrap the failing code in `try/except` and print `traceback.format_exc()`).
+- Application site: in `buildFeedback`, on the `status === "error"` branch, wrap `result.error`
+  before interpolation: `const { text: error } = truncateText(result.error, { maxBytes: ERROR_MAX_BYTES, headRatio: VALUE_HEAD_RATIO, recovery: ERROR_RECOVERY });` then
+  `` `Error: ${error}\nstdout: ${stdout}` ``.
+- The under-budget normal path is a **marker-free no-op** (a typical `ZeroDivisionError` is far under
+  16 KiB), so ordinary error feedback is byte-identical to today.
 
-```ts
-it("suspend → resume with an already-aborted signal does not run the pending call", async () => {
-  const suspendedOut = await runner.run("write('abort-rt.txt', 'v1')", "abort-rt", suspend);
-  assert.match(suspendedOut, /requires approval/);
-  assert.equal(existsSync(join(cwd, "abort-rt.txt")), false, "suspended means not yet run");
+### D8 — Cap `question` in `buildInitialPrompt` (64 KiB, 50/50 head+tail)
 
-  const controller = new AbortController();
-  controller.abort(); // already aborted before resume — the escape/turn-cancel case
-  const out = await runner.resume("abort-rt", approve, controller.signal);
+The question is the user's original query and is **never dropped** from `messages[0]`, so its budget
+must both bound the worst case and leave every realistic question untouched:
 
-  assert.match(out, /\[error: aborted\]/);
-  assert.equal(
-    existsSync(join(cwd, "abort-rt.txt")),
-    false,
-    "an already-aborted resume must not execute the pending gated call",
-  );
-});
-```
+- Budget: `QUESTION_MAX_BYTES = 64 * 1024` (64 KiB) — 4× the `stdout` budget and generous against any
+  genuine query (a real question is tens of bytes to a few KiB); sized so that even a maxed initial
+  prompt (≤64 KiB question + ≤32 KiB input preview + headers) cannot alone cross the 256 KiB
+  conversation bound.
+- Shape: `headRatio: VALUE_HEAD_RATIO` (50/50) — the head carries the context, the tail usually
+  carries the actual ask.
+- Recovery: `QUESTION_RECOVERY = "The question was truncated. Answer from the part shown and state the assumption if ambiguous."`
+  — recorded as a deliberate, weaker affordance than the value/input recoveries because the question
+  is **not** sandbox-accessible: unlike `output`/inputs, the model cannot slice it in Python. The
+  marker's magnitude still tells the model how much was lost.
+- Application site: in `buildInitialPrompt`, wrap `question` before the `# Question` header:
+  `const { text: q } = truncateText(question, { maxBytes: QUESTION_MAX_BYTES, headRatio: VALUE_HEAD_RATIO, recovery: QUESTION_RECOVERY });`
+  then `const parts = [\`# Question\n${q}\`];`.
+- The under-budget normal path is a **marker-free no-op** (a real question is under 64 KiB).
 
-This proves both halves of the issue's "abort behaviour": the abort is *surfaced* at the public layer,
-and the pending call is *not executed* (no disk write). It uses the existing fixtures (`runner`,
-`makeTempDir`, `suspend`, `approve`) — no new helpers.
+### D9 — The single-truncator invariant is preserved (unchanged from #74)
 
-### D2 — "AbortError" at the public layer is the `aborted` result string, not a throw
-
-`Repl.resume()` is documented "never throws" (`src/repl.ts:200`, #48) — every model-believable state
-returns a sentence. The abort therefore surfaces as `[error: aborted]\nexecution aborted` (produced by
-`formatOutcome` in `src/repl.ts:652` from `errorKind: "aborted"`). A thrown `AbortError` would only be
-observable one layer down at the `Session`/sandbox boundary, which the DoD explicitly does **not** test
-(it says drive `Repl.resume()`, not `Session.resume()`). Assert the public string, not an exception.
-
-### D3 — No production change; RED is exercised via the hand-applied mutant
-
-Because the wiring is already correct, the new test is expected to be **GREEN on first run**. That is
-the correct outcome and is recorded, not "fixed around". The RED step is exercised the only honest way:
-hand-apply the single-field mutant (D0), confirm the new test fails 1/1 with the exact "must not
-execute" assertion (the file is written, `existsSync` returns true), then restore and confirm green.
-This is the same prove-it discipline the #110 ship report records for its own mutant.
-
-### D4 — Mutation-report freshness gotcha (from `tasks/monitor-110-report.md` Item H)
-
-`reports/mutation/mutation.json` is overwritten **only when the run finishes**; during a sweep the
-previous run's JSON stays on disk (observed live on the #110 flight: mtime `00:14:59`, `files` map =
-only `src/rlm.ts`, for the whole 11:49→14:04 `src/repl.ts` sweep). Before extracting any evidence,
-assert freshness: mtime must postdate the sweep start **and** `list(json['files'].keys())` must be
-exactly `["src/repl.ts"]`. A `files` map with any other/extra key is the previous run, not this one.
+Both new caps go through the **one** imported symbol `truncateText` from `./truncate.js` — the same
+symbol `sandbox.ts` imports. No byte measurement, no `Buffer`, no `byteLength` is introduced in
+`src/rlm.ts` (test 6's source-level ban holds; byte counts in `src/rlm.ts` continue to use
+`TextEncoder`, docs Exception 3).
 
 ## Assumptions (recorded — fire-and-forget, no human asked)
 
-1. The single-field mutant is represented by hand-editing `src/repl.ts:235` to
-   `session.resume({ onApproval })` — Stryker cannot generate it (D0).
-2. The abort surface asserted is the `[error: aborted]` result string, not a thrown `AbortError` (D2).
-3. The new test lives in `test/repl.test.ts` in the #48 describe block next to the #110 test, reusing
-   the existing `runner`/`cwd`/`suspend`/`approve` fixtures — no new helpers, no new imports beyond
-   the already-imported `join`/`existsSync`.
-4. The targeted sweep is single-file `--mutate src/repl.ts` (as #110), not the full tree; it is a
-   regression check and does **not** re-baseline the tree-wide floor.
-5. The suite grows by exactly one test: 946 → 947 (baseline 946 measured at commit 162c02b;
-   the 939 → 940 figures carried over from the #110 flight SPEC were stale). The 60-Survived/34-Timeout
-   `src/repl.ts` on other lines are pre-existing, out of scope, and expected to remain unchanged.
-6. File name for the pending-call write is `abort-rt.txt` (session id `abort-rt`), matching the house
-   `approve-rt` / `deny-rt` naming.
+1. **Error budget = 16 KiB, value shape.** The issue says "an error-appropriate budget" without a
+   number. Chosen to equal `output`'s 16 KiB because an error is a single value surfaced by the run,
+   and 50/50 head+tail because a traceback is identified by both ends (first frame + exception
+   message).
+2. **Question budget = 64 KiB.** The issue says "generous". 64 KiB is far beyond any genuine query
+   while still bounding the never-dropped `messages[0]`; a smaller 32 KiB risks cutting a legitimate
+   long question, and 64 KiB keeps the initial prompt under 256 KiB even with maxed inputs.
+3. **Error recovery names a real route.** The model owns the Python and can print a full traceback;
+   unlike `output`, the error's "rest" is reachable by re-running under `try/except`.
+4. **Question recovery is a weaker affordance by necessity.** The question is not a sandbox variable,
+   so the model cannot slice it; the recovery clause directs it to answer from what is shown and flag
+   ambiguity rather than advertising an unreachable route (consistent with the policy's rule: never
+   ship a marker naming a recovery route that does not exist).
+5. **Budgets are module constants in `src/rlm.ts`, not `RlmOptions`/`types.ts`** — same as #74
+   Assumption 5; no public knob.
+6. **`error`'s budget applies only on the `status === "error"` path.** `result.error` exists only on
+   error results (`src/types.ts:163-165`), and the ok/suspended paths do not interpolate it.
 
 ## Tech stack
 
-TypeScript 5.9 (strict), `node:test` + `node:assert/strict` via `tsx --test`, Biome 2.5.8, Stryker
-9.6.1 (incremental, `ObjectLiteral` mutator verified above), `tsc -p tsconfig.build.json`. Node >=
+TypeScript 5.9 (strict), `node:test` + `node:assert/strict` via `tsx --test`, Biome 2.5.8 (lint +
+format), Stryker 9.6.1 (mutation, incremental), `tsc -p tsconfig.build.json` for build. Node >=
 22.19.0. No new dependencies.
 
 ## Commands
 
 ```
-Test (focused):  npx tsx --test test/repl.test.ts
+Test (focused):  npx tsx --test test/rlm.test.ts
 Test (full):     npm test
 Type-check:      npm run check
 Build:           npm run build
 Lint:            npm run lint
-Mutation (targeted, evidence):  node scripts/contained.mjs --limit 12G npx stryker run --mutate src/repl.ts
-Harness-death report:           node scripts/mutation-guard.mjs --report
+Coverage gate:   npm run coverage
+Mutation:        npm run mutation        (quality gate; incremental)
 ```
 
 ## Project structure
 
 ```
-test/repl.test.ts   → the one new killing test (D1)
-SPEC.md / tasks/*    → this flight's artifacts
-docs/{verify,review,ship}-150.md → evidence + review + ship reports
-src/repl.ts         → read-only; the wire under test (no edit, except the transient hand-applied mutant for RED)
+src/rlm.ts              → error cap (D7), question cap (D8), two module constants + two recovery strings
+test/rlm.test.ts        → tests 8 (error cap) and 9 (question cap)
+docs/truncation-policy.md → implementation-record rows; retire the error non-goal
+src/truncate.ts         → reused only (truncateText); never edited
 ```
 
 ## Code style
 
-Match the file's existing voice: sentence-style assertions with a trailing reason string, issue numbers
-in comments (`#150`), `describe`/`it` from `node:test`, `assert` from `node:assert/strict`. The new test
-mirrors the #110 test directly above it in the same describe block — same `write` + `suspend` +
-`existsSync` idiom, plus an `AbortController` aborted before `resume`.
+Follow the file's existing voice: sentence-style model messages, JSDoc on every decision, issue
+references in comments, no `any`. Reuse the existing `truncateText` import (already present from #74)
+and the `VALUE_HEAD_RATIO`/`VALUE_RECOVERY` shape constants; add only the two new module constants
+(`ERROR_MAX_BYTES`, `QUESTION_MAX_BYTES`) and the two recovery strings (`ERROR_RECOVERY`,
+`QUESTION_RECOVERY`), all in `src/rlm.ts` — nothing in `src/truncate.ts`:
+
+```ts
+const { text: error } = truncateText(result.error, {
+  maxBytes: ERROR_MAX_BYTES,
+  headRatio: VALUE_HEAD_RATIO,
+  recovery: ERROR_RECOVERY,
+});
+```
 
 ## Testing strategy
 
-`node:test`, behaviour-first, through the real `ReplRunner` (`test/repl.test.ts`) — the suite's existing
-deterministic style. Exactly one new test:
+`node:test`, behaviour-first, through the real `runRlm`/`buildFeedback` with the existing
+`mockLlmCodeGen` (`test/rlm.test.ts:263`) and a real `ToolRegistry` + real Monty — the suite's
+deterministic style. Two new tests (continuing #74's 1–7):
 
-1. **Abort propagation on the resume path (the kill).** Suspend a `write` pending call, abort a fresh
-   `AbortController` *before* `resume`, call `runner.resume("abort-rt", approve, controller.signal)`.
-   Assert `[error: aborted]` is surfaced **and** the file was never written. This kills the
-   single-field `{ onApproval }` mutant: without `signal`, the call approves and the write lands, so
-   the `existsSync(...) === false` assertion fails 1/1.
+8. **`result.error` capped in feedback (D7).** `buildFeedback` with a synthetic error `RunResult`
+   whose `error` is huge returns a feedback string whose `Error: ` section is ≤ 16 KiB and carries the
+   truncation marker (`/elided/`) and the error recovery clause. Assert the ceiling via
+   `Buffer.byteLength` (tests may use `Buffer`; only `src/rlm.ts` may not) and the marker, not merely
+   the ceiling. **No-op assertion:** a small `error` (e.g. `"boom"`) yields feedback byte-identical to
+   the pre-change shape — no marker, no `elided`.
+9. **`question` capped in the initial prompt (D8).** `runRlm` with a huge `question` produces an
+   initial `messages[0].content` whose `# Question` section is ≤ 64 KiB and carries the marker and the
+   question recovery clause. **No-op assertion:** a normal question (e.g. `"what is the answer?"`)
+   appears whole and marker-free in `messages[0]`.
 
-Verification sequence (executed by the BUILD/VERIFY phases, recorded here as DoD):
+Both tests must be **RED first** (the source currently interpolates both paths raw), then GREEN after
+the fix. The shared-helper invariant (test 6) already pins the single-truncator requirement; no new
+source-grep test is needed, but test 6 must keep passing.
 
-1. **GREEN (expected):** `npx tsx --test test/repl.test.ts` — the new test passes on the unmodified
-   tree.
-2. **RED (prove-it):** hand-edit `src/repl.ts:235` to `session.resume({ onApproval })`, run the focused
-   test, confirm the new test fails 1/1 at `test/repl.test.ts:539` — the first failing assertion is the
-   `[error: aborted]` match, and the output shows the write landed
-   (`'[result]\nSuccessfully wrote 2 bytes to abort-rt.txt'`), so the `existsSync` no-write assertion
-   kills independently. Restore the file, confirm green again.
-3. **Regression:** `npm test` — 947/947.
-4. **Static:** `npm run check` && `npm run build` && `npm run lint` — all exit 0.
-5. **Mutation (evidence):** `node scripts/contained.mjs --limit 12G npx stryker run --mutate src/repl.ts`;
-   then freshness-check `reports/mutation/mutation.json` (D4) and confirm the `ObjectLiteral` at
-   `src/repl.ts:235` is **Killed** (whole-object `{}` mutant — already killed by #110, must remain so)
-   and no new survivor appears at that line.
-6. **Harness-death check:** `node scripts/mutation-guard.mjs --report` → `mutation-guard: no harness
-   deaths recorded`, exit 0.
+Coverage note: `coverage-baseline.json` floors `src/rlm.ts` at **95.94%**. Each new cap's truncation
+branch (over/under budget) must be exercised to keep the floor green; do not hand-edit the baseline.
 
 ## Boundaries
 
-- **Always:** focused test before committing, full `npm test` before commit, `npm run check` + `npm run
-  build` + `npm run lint`, issue-referenced commit message (`150 — … (#150)`), mark tasks in
-  `tasks/todo.md`.
-- **Ask first (record instead — fire-and-forget):** nothing here is high-risk; surprises are recorded in
-  the ship report.
-- **Never:** edit `src/repl.ts`/`src/session.ts`/`src/sandbox.ts` as a *permanent* change (only the
-  transient hand-applied mutant for the RED step, always restored); hand-edit `coverage-baseline.json`;
-  change the mutation thresholds; treat the full-tree mutation floor as this flight's gate.
+- **Always:** test before fix (RED → GREEN), full `npm test` before commit, `npm run check` +
+  `npm run build` + `npm run lint`, issue-referenced commit message, mark tasks in `tasks/todo.md`.
+- **Ask first (record instead — fire-and-forget):** nothing here is high-risk; surprises are recorded
+  in the ship report.
+- **Never:** write a second truncation implementation; introduce `Buffer`/`byteLength` into
+  `src/rlm.ts`; change `MAX_CONVERSATION_BYTES`; hand-edit `coverage-baseline.json`; touch
+  `src/truncate.ts`, `src/sandbox.ts`, `src/repl.ts`, `src/builtins.ts`, `src/rlm_loop.ts`,
+  `src/types.ts`.
 
 ## Success criteria
 
-1. One new test exists in `test/repl.test.ts`, drives `Repl.resume()` (not `Session.resume()`), and
-   passes on the unmodified tree — proving the `signal` field is wired end-to-end.
-2. The hand-applied single-field mutant (`{ onApproval }`, dropping `signal`) makes that test fail 1/1
-   (first on the `[error: aborted]` match; the output shows the write landed, so the `existsSync`
-   no-write assertion kills independently), and is restored.
-3. The targeted `--mutate src/repl.ts` sweep keeps the `ObjectLiteral` `{}` mutant at `src/repl.ts:235`
-   Killed, with a fresh single-file report and zero harness deaths.
-4. `npm test` (947/947), `npm run check`, `npm run build`, `npm run lint` all exit 0.
-5. The evidence chain (RED/GREEN/mutation/harness-death) is recorded in `docs/verify-150.md` with the
-   mutation-report freshness check stated (D4).
+1. An oversized `result.error` cannot push any iteration's conversation over 256 KiB — the `Error: `
+   feedback section is ≤ 16 KiB via `truncateText`, and the 256 KiB conversation bound is intact.
+2. An oversized `question` cannot appear uncapped in `messages[0]` — the `# Question` section is
+   ≤ 64 KiB via `truncateText`.
+3. Both paths are RED→GREEN tested (tests 8 and 9), including the under-budget no-op (small
+   error/question pass through byte-identical, marker-free).
+4. `truncateText` remains the only truncation implementation (test 6 still passes; no
+   `Buffer`/`byteLength` in `src/rlm.ts`).
+5. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` exit 0; mutation
+   score does not regress.
 
 ## Open questions / risks
 
-1. **The sweep is slow.** A single-file `--mutate src/repl.ts` sweep took ~2h15m on the #110 flight
-   (`docs/mutation-testing.md`). The plan must budget for it and rely on incremental state
-   (`.stryker-incremental.json`) to keep it bounded. If the sweep is impractical in this flight's window,
-   the hand-applied prove-it (RED) is the primary evidence and the sweep is a confirmatory regression
-   check recorded in the ship report as pending.
-2. **60-Survived / 34-Timeout mutants elsewhere in `src/repl.ts`** are pre-existing and out of scope;
-   the ship report must not let them read as this flight's regression.
+1. **Question recovery is weaker than the other affordances.** The question's elided middle is not
+   sandbox-recoverable, so the recovery clause directs "answer from the part shown" rather than naming
+   a route to the rest. Accepted (Assumption 4); a future issue could pass the full question as an
+   input so it becomes sliceable, but that changes the input contract and is out of scope.
+2. **Budget numbers are judgement, not measurement.** 16 KiB (error) follows `output`'s prior art;
+   64 KiB (question) is sized against the 256 KiB conversation bound. Neither was evaluated against a
+   live model.
+3. **Double-truncation totals (unchanged from #74).** If a caller raises the sandbox cap above the
+   feedback budget and the true error exceeds it, the feedback marker's "total" is the post-sandbox
+   size. Only reachable via an explicit caller override; cosmetic.
