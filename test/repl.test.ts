@@ -1830,3 +1830,268 @@ describe("ReplRunner — reset removes the entry, not just its state (#59)", () 
     }
   });
 });
+
+// ── Fan-out review findings (#59) ───────────────────────────────
+//
+// The three-agent fan-out found two windows the six issue tests do not
+// cover, both in the concurrency path: a session whose run is mid-flight
+// (approval dialog open) was evictable, and joiners of an in-flight creation
+// used the creator's trust snapshot without revalidation. The tests below pin
+// the fixes, plus the lower-severity gaps the reviewers named.
+
+describe("ReplRunner — a session mid-run is never evicted (#59)", () => {
+  it("an open approval dialog survives an insert over the cap", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    let asked = false;
+    let answer!: (d: ApprovalDecision) => void;
+    const gate = new Promise<ApprovalDecision>((resolve) => {
+      answer = resolve;
+    });
+
+    try {
+      const pending = runner.run("write('p.txt', 'v1')", "a", async () => {
+        asked = true;
+        return gate;
+      });
+      await untilTrue(() => asked);
+      assert.ok(asked, "the run never reached the approval dialog");
+
+      // The only eviction candidate is mid-run, so inserting must not evict
+      // it — the pool exceeds its cap rather than orphan the dialog.
+      await runner.run("v = 1", "b");
+      assert.equal(runner.liveSessionCount(), 2, "a mid-run session was evicted");
+
+      // The user answers; the call completes against a session that still
+      // exists, and the side effect landed exactly once.
+      answer(true);
+      await pending;
+      assert.equal(readFileSync(join(cwd, "p.txt"), "utf8"), "v1");
+      assert.equal(runner.liveSessionCount(), 2, "the answered session vanished after approval");
+
+      // Idle now, it loses its protection: the next insert evicts back down
+      // to the cap (both idle sessions are older than the newcomer).
+      await runner.run("w = 1", "c");
+      assert.equal(runner.liveSessionCount(), 1, "idle sessions kept the pool over its cap");
+      assert.match(await runner.run("w", "c"), /\[result\]\n1/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("ReplRunner — joiners of an in-flight creation revalidate trust (#59)", () => {
+  it("a run joined after a trust flip never executes the withdrawn preamble", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "hostile", "write('pwned.txt', 'owned')\n");
+    let trusted = true;
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+    const counter = countCreateSessions(runner);
+
+    try {
+      const prompts: string[] = [];
+      const ask = async () => {
+        prompts.push("write");
+        return true;
+      };
+
+      const p1 = runner.run("1 + 1", "flip", ask); // snapshots trusted at creation
+      trusted = false; // the flip lands while the creation is in flight
+      const p2 = runner.run("2 + 2", "flip", ask); // joins the in-flight creation
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+
+      // Neither run executed the preamble loaded under the revoked decision.
+      assert.equal(
+        existsSync(join(cwd, "pwned.txt")),
+        false,
+        "a preamble executed after trust was revoked",
+      );
+      assert.deepEqual(prompts, [], "the withdrawn preamble reached the approval gate");
+      assert.match(r1, /\[result\]/);
+      assert.match(r2, /\[result\]/);
+
+      // Both joiners revalidated, discarded the stale session, and shared one
+      // rebuild — and the one-shot notice was delivered once.
+      assert.equal(
+        counter.calls(),
+        2,
+        "the stale creation and the rebuild were not shared as two flights",
+      );
+      const notices = [r1, r2].filter((r) => /\[trust changed\]/.test(r)).length;
+      assert.equal(notices, 1, "the trust-change notice was not one-shot");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("ReplRunner — LRU and cap edges the fan-out named (#59)", () => {
+  it("resume touches the session it answers for", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("b = 2", "b");
+      const answered = await runner.resume("a", approve); // touches a
+      assert.match(answered, /nothing waiting for approval/i);
+
+      await runner.run("c = 3", "c"); // evicts b, not a
+      assert.equal(runner.liveSessionCount(), 2);
+      assert.match(await runner.run("a", "a"), /\[result\]\n1/, "the resumed session was evicted");
+      assert.match(await runner.run("b", "b"), /used when not defined/, "b kept its state");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("abandon touches the session it answers for", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("b = 2", "b");
+      assert.equal(runner.abandon("a"), "nothing-pending"); // touches a
+
+      await runner.run("c = 3", "c"); // evicts b, not a
+      assert.match(
+        await runner.run("a", "a"),
+        /\[result\]\n1/,
+        "the abandoned session was evicted",
+      );
+      assert.match(await runner.run("b", "b"), /used when not defined/, "b kept its state");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("eviction scans past a suspended session to a later idle one", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("write('s.txt', 'v1')", "b", suspend); // b suspended
+      await runner.run("c = 3", "c"); // evicts a (idle), skips b
+      assert.match(await runner.run("a", "a"), /used when not defined/, "a kept its state");
+
+      await runner.run("d = 4", "d"); // skips b (suspended), evicts c
+      assert.equal(runner.liveSessionCount(), 2);
+      assert.match(await runner.run("c", "c"), /used when not defined/, "c kept its state");
+
+      // The suspended session survived the whole scan, approval intact.
+      const resumed = await runner.resume("b", approve);
+      assert.doesNotMatch(resumed, /PermissionError/);
+      assert.equal(readFileSync(join(cwd, "s.txt"), "utf8"), "v1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("REPL_MAX_SESSIONS sets the cap, and the explicit option wins over it", async () => {
+    const cwd = makeTempDir();
+    const previous = process.env.REPL_MAX_SESSIONS;
+    try {
+      process.env.REPL_MAX_SESSIONS = "1";
+      const fromEnv = new ReplRunner(cwd);
+      await fromEnv.run("a = 1", "a");
+      await fromEnv.run("b = 2", "b"); // evicts a: cap 1 from the env
+      assert.equal(fromEnv.liveSessionCount(), 1, "the env cap was not applied");
+
+      const explicitWins = new ReplRunner(cwd, { maxSessions: 2 });
+      await explicitWins.run("a = 1", "a");
+      await explicitWins.run("b = 2", "b");
+      assert.equal(explicitWins.liveSessionCount(), 2, "the explicit option lost to the env");
+
+      const zeroFallsBack = new ReplRunner(cwd, { maxSessions: 0 });
+      await zeroFallsBack.run("a = 1", "a");
+      await zeroFallsBack.run("b = 2", "b");
+      assert.equal(zeroFallsBack.liveSessionCount(), 1, "a non-positive option ignored the env");
+    } finally {
+      if (previous === undefined) delete process.env.REPL_MAX_SESSIONS;
+      else process.env.REPL_MAX_SESSIONS = previous;
+      cleanup();
+    }
+  });
+
+  it("concurrent joiners of a failing creation all reject, and share it", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd);
+    let calls = 0;
+    let armed = true;
+    const target = runner as unknown as {
+      createSession: (...args: unknown[]) => Promise<unknown>;
+    };
+    const original = target.createSession.bind(runner);
+    target.createSession = async (...args: unknown[]) => {
+      calls++;
+      if (armed) {
+        armed = false;
+        throw new Error("simulated creation failure");
+      }
+      return original(...args);
+    };
+
+    try {
+      const [r1, r2] = await Promise.allSettled([
+        runner.run("x = 1", "fail"),
+        runner.run("y = 2", "fail"),
+      ]);
+      assert.equal(r1.status, "rejected");
+      assert.equal(r2.status, "rejected");
+      assert.equal(calls, 1, "the joiner restarted a creation that had failed");
+
+      const out = await runner.run("x = 1", "fail");
+      assert.match(out, /\[result\]\nNone/, "the id was poisoned by the failed creation");
+      assert.match(await runner.run("x", "fail"), /\[result\]\n1/);
+    } finally {
+      target.createSession = original.bind(runner);
+      cleanup();
+    }
+  });
+
+  it("reset during an in-flight creation reports the truth, and the creation lands", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      const pending = runner.run("x = 1", "s");
+      assert.deepEqual(
+        runner.reset("s"),
+        { existed: false, revoked: [] },
+        "the reset claimed a session that does not exist yet",
+      );
+      await pending;
+      assert.equal(runner.liveSessionCount(), 1, "the reset killed the in-flight creation");
+      assert.match(await runner.run("x", "s"), /\[result\]\n1/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("liveSessionCount does not count creations still in flight", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      const pending = runner.run("x = 1", "s");
+      assert.equal(runner.liveSessionCount(), 0, "an in-flight creation was counted as live");
+      await pending;
+      assert.equal(runner.liveSessionCount(), 1);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/** Resolve once `fn` is true — bounded, so a deadlock fails instead of hanging. */
+async function untilTrue(fn: () => boolean): Promise<void> {
+  for (let i = 0; i < 2000 && !fn(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}

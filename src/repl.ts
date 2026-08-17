@@ -75,6 +75,21 @@ interface LiveSession {
   /** Whether that decision actually put saved code in front of every run. */
   hasPreamble: boolean;
   /**
+   * How many `run`/`resume` calls are executing right now.
+   *
+   * A count, not a flag, so nested calls cannot reset each other. Eviction
+   * skips busy sessions: a session whose run is mid-flight — with an approval
+   * dialog open, say — is not `isSuspended()` yet, and evicting it would
+   * orphan the answer the user was asked to give (#59).
+   */
+  busy: number;
+  /**
+   * Whether the one-shot `[trust changed]` notice has been delivered to this
+   * session. Two concurrent discarders of the same rebuilt session must not
+   * deliver it twice (#59).
+   */
+  trustChangeNoticed: boolean;
+  /**
    * A one-shot notice about the preamble, prepended to the next result.
    *
    * Cleared once delivered. It is written at the moment the environment was
@@ -164,8 +179,13 @@ export class ReplRunner {
     signal?: AbortSignal,
   ): Promise<string> {
     const live = await this.getOrCreateSession(sessionId);
-    const result = await live.session.run(code, { onApproval, signal });
-    return withNotice(live, formatResult(result, sessionId));
+    live.busy++;
+    try {
+      const result = await live.session.run(code, { onApproval, signal });
+      return withNotice(live, formatResult(result, sessionId));
+    } finally {
+      live.busy--;
+    }
   }
 
   /**
@@ -198,14 +218,25 @@ export class ReplRunner {
     if (await this.trustChangeDiscards(sessionId, live)) {
       return trustChangedMessage(sessionId, live.session.isSuspended());
     }
+    // The trust check awaited; the entry may have been evicted in the gap
+    // (D3 parity with `run`): a resumed call on a session the pool no longer
+    // holds must not report a result for it.
+    if (this.sessions.get(sessionId) !== live) {
+      return `No session '${sessionId}' exists. Run some code first.`;
+    }
     if (!live.session.isSuspended()) {
       return (
         `Session '${sessionId}' has nothing waiting for approval. ` +
         `Nothing was resumed — run code with repl to continue.`
       );
     }
-    const result = await live.session.resume({ onApproval, signal });
-    return withNotice(live, formatResult(result, sessionId));
+    live.busy++;
+    try {
+      const result = await live.session.resume({ onApproval, signal });
+      return withNotice(live, formatResult(result, sessionId));
+    } finally {
+      live.busy--;
+    }
   }
 
   /**
@@ -267,6 +298,7 @@ export class ReplRunner {
    * both directions so the rule stays one sentence rather than two.
    */
   private async getOrCreateSession(sessionId: string): Promise<LiveSession> {
+    let trustChanged = false;
     for (;;) {
       const existing = this.sessions.get(sessionId);
       if (existing) {
@@ -275,29 +307,51 @@ export class ReplRunner {
           // The trust check awaited, and awaits are where another caller
           // acts: the session may have been evicted or rebuilt in the gap.
           // Hand out only the object the map still holds.
-          if (this.sessions.get(sessionId) === existing) return existing;
-          continue;
+          if (this.sessions.get(sessionId) !== existing) continue;
+          if (trustChanged) {
+            this.attachTrustChangeNotice(sessionId, existing);
+            trustChanged = false;
+          }
+          return existing;
         }
-        // trustChangeDiscards deleted the entry — fall through to a rebuild
-        // that concurrent rebuilders share.
+        // trustChangeDiscards deleted the entry. The replacement must say so
+        // — but which session replaces it is decided by whoever lands the
+        // shared flight, so the notice is attached after landing, not baked
+        // into the creation (the `rebuilt` argument used to be, and a racy
+        // joiner could start the replacement flight without it).
+        trustChanged = true;
       }
-      return this.joinOrStartCreation(sessionId, existing !== undefined);
+      // Await the flight, then re-enter the loop: the landed entry must pass
+      // through the same trust revalidation as a pre-existing one. Returning
+      // it directly would hand a session built under a now-revoked trust
+      // decision to its first run — the stale snapshot the live callback
+      // exists to prevent. A rejected creation still propagates out.
+      await this.joinOrStartCreation(sessionId);
     }
   }
 
   /**
-   * Join the in-flight creation for `sessionId`, or start one.
+   * Deliver the one-shot `[trust changed]` notice to a rebuilt session.
    *
-   * `rebuilt` names a session that a trust change just discarded, so the
-   * replacement carries the `[trust changed]` notice. An evicted session that
-   * comes back later does not — nothing about its environment changed, only
-   * the pool forgot it.
+   * Prepended so it stays the first thing the model reads, in front of any
+   * preamble notice the rebuild produced. Guarded per session: two callers
+   * that both observed the discard deliver it once (#59).
    */
-  private joinOrStartCreation(sessionId: string, rebuilt: boolean): Promise<LiveSession> {
+  private attachTrustChangeNotice(sessionId: string, live: LiveSession): void {
+    if (live.trustChangeNoticed) return;
+    live.trustChangeNoticed = true;
+    const message = trustChangedMessage(sessionId, false);
+    live.notice = live.notice === undefined ? message : `${message}\n\n${live.notice}`;
+  }
+
+  /**
+   * Join the in-flight creation for `sessionId`, or start one.
+   */
+  private joinOrStartCreation(sessionId: string): Promise<LiveSession> {
     const pending = this.inflight.get(sessionId);
     if (pending) return pending;
 
-    const promise = this.createSession(this.isProjectTrusted(), rebuilt ? sessionId : undefined)
+    const promise = this.createSession(this.isProjectTrusted())
       .then((live) => {
         this.inflight.delete(sessionId);
         this.insert(sessionId, live);
@@ -328,15 +382,16 @@ export class ReplRunner {
   /**
    * Insert a finished creation, evicting past the cap.
    *
-   * Eviction takes the oldest session that is **not suspended**, and never
-   * the one just inserted. A suspended session is a call the user was asked
-   * to approve: evicting it would lose that call with the model never told,
+   * Eviction takes the oldest session that is **neither suspended nor
+   * mid-call**, and never the one just inserted. A suspended session is a
+   * call the user was asked to approve, and a busy one may be about to
+   * suspend — evicting either would lose a call with the model never told,
    * so the pool exceeds its cap rather than discard one. The decision is the
    * one #59 demands be recorded: refuse to evict, never report-and-drop.
    *
    * The over-cap state is self-limiting — every suspension demands user
    * attention, and the protection ends the moment the session is no longer
-   * suspended (resumed, abandoned, or overwritten).
+   * suspended or busy (resumed, abandoned, or overwritten).
    */
   private insert(sessionId: string, live: LiveSession): void {
     this.sessions.set(sessionId, live);
@@ -345,6 +400,7 @@ export class ReplRunner {
     for (const [key, entry] of this.sessions) {
       if (key === sessionId) continue;
       if (entry.session.isSuspended()) continue;
+      if (entry.busy > 0) continue;
       this.sessions.delete(key);
       if (this.sessions.size <= this.maxSessions) return;
     }
@@ -374,18 +430,20 @@ export class ReplRunner {
       return false;
     }
 
-    this.sessions.delete(sessionId);
+    // D3 parity on the delete path: a stale checker whose await resolved late
+    // must not destroy a session a concurrent caller has since rebuilt under
+    // the current decision.
+    if (this.sessions.get(sessionId) === live) this.sessions.delete(sessionId);
     return true;
   }
 
-  private async createSession(trusted: boolean, rebuiltId?: string): Promise<LiveSession> {
+  private async createSession(trusted: boolean): Promise<LiveSession> {
     const bridgeTools = createPiBridgeTools(this.cwd, { gateMutating: true });
     const builtinTools = createBuiltinTools({ root: this.cwd });
     const registry = new ToolRegistry([...bridgeTools, ...builtinTools]);
     const sandboxOpts: SandboxOptions = { registry };
 
     const notices: string[] = [];
-    if (rebuiltId !== undefined) notices.push(trustChangedMessage(rebuiltId, false));
 
     // The shadowing gates (#54 load, #56 write) must see every host-tool name
     // the session will have — including the toolstore's own, which are not in
@@ -453,6 +511,8 @@ export class ReplRunner {
       session: new Session(sandboxOpts, preamble || undefined),
       trusted,
       hasPreamble: preamble !== "",
+      busy: 0,
+      trustChangeNoticed: false,
       notice: notices.length > 0 ? notices.join("\n\n") : undefined,
     };
   }
