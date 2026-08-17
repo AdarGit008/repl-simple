@@ -115,7 +115,8 @@ exactly `["src/repl.ts"]`. A `files` map with any other/extra key is the previou
    the already-imported `join`/`existsSync`.
 4. The targeted sweep is single-file `--mutate src/repl.ts` (as #110), not the full tree; it is a
    regression check and does **not** re-baseline the tree-wide floor.
-5. The suite grows by exactly one test: 939 → 940. The 60-Survived / 34-Timeout mutants in
+5. The suite grows by exactly one test: 946 → 947 (baseline 946 measured at commit 162c02b;
+   the 939 → 940 figures carried over from the #110 flight SPEC were stale). The 60-Survived/34-Timeout
    `src/repl.ts` on other lines are pre-existing, out of scope, and expected to remain unchanged.
 6. File name for the pending-call write is `abort-rt.txt` (session id `abort-rt`), matching the house
    `approve-rt` / `deny-rt` naming.
@@ -172,7 +173,7 @@ Verification sequence (executed by the BUILD/VERIFY phases, recorded here as DoD
 2. **RED (prove-it):** hand-edit `src/repl.ts:235` to `session.resume({ onApproval })`, run the focused
    test, confirm the new test fails 1/1 with the `existsSync` assertion (file written). Restore the
    file, confirm green again.
-3. **Regression:** `npm test` — 940/940.
+3. **Regression:** `npm test` — 947/947.
 4. **Static:** `npm run check` && `npm run build` && `npm run lint` — all exit 0.
 5. **Mutation (evidence):** `node scripts/contained.mjs --limit 12G npx stryker run --mutate src/repl.ts`;
    then freshness-check `reports/mutation/mutation.json` (D4) and confirm the `ObjectLiteral` at
@@ -200,7 +201,7 @@ Verification sequence (executed by the BUILD/VERIFY phases, recorded here as DoD
    with the exact no-write assertion, and is restored.
 3. The targeted `--mutate src/repl.ts` sweep keeps the `ObjectLiteral` `{}` mutant at `src/repl.ts:235`
    Killed, with a fresh single-file report and zero harness deaths.
-4. `npm test` (940/940), `npm run check`, `npm run build`, `npm run lint` all exit 0.
+4. `npm test` (947/947), `npm run check`, `npm run build`, `npm run lint` all exit 0.
 5. The evidence chain (RED/GREEN/mutation/harness-death) is recorded in `docs/verify-150.md` with the
    mutation-report freshness check stated (D4).
 
