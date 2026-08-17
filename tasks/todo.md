@@ -7,7 +7,7 @@
 - [x] T5 — Close the fence-split (D15): per-value 5 KiB truncation + block-level aggregate elision + test 14 + src/types.ts JSDoc + docs record row
 - [x] T6 — Sentinel-delimited truncation markers + system-prompt rule (D17) + test 17
 - [x] T7 — Cap the assistant reply in the conversation (D18) + test 16
-- [ ] T8 — Quote error lines with "> " so a forged stdout line cannot pass (D19) + test 8 edits + test 18
+- [x] T8 — Quote error lines with "> " so a forged stdout line cannot pass (D19) + test 8 edits + test 18
 - [ ] T9 — Reject invalid input names before any query (D20) + test 15
 - [ ] T10 — Running byte total in boundConversation (D12) + rename ERROR_MAX_BYTES → FEEDBACK_ERROR_MAX_BYTES (D22) + convention comment
 - [ ] T11 — Reword the TextEncoder framing honestly (D14): src/rlm.ts JSDoc + docs Exception 3

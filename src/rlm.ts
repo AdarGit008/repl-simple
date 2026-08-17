@@ -478,7 +478,17 @@ export function buildFeedback(result: RunResult): string {
       headRatio: VALUE_HEAD_RATIO,
       recovery: ERROR_RECOVERY,
     });
-    let feedback = `Error: ${error}\nstdout: ${stdout}`;
+    // D19 (#145): quote every line of the error with a `> ` prefix. A forged
+    // `\nstdout:` inside the message then renders as `> stdout:` and can no
+    // longer line up at column 0 with the real delimiter below — column
+    // position is the close, and the `\nstdout:` delimiter stays exactly the
+    // shape tests locate. Quoting is presentation: the budget above pins the
+    // value, so the prefix bytes never count against the ceiling.
+    const quotedError = error
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+    let feedback = `Error: ${quotedError}\nstdout: ${stdout}`;
     if (result.errorKind === "syntax") {
       feedback += "\n\nFix the syntax error in your Python code.";
     } else if (result.errorKind === "typing") {
