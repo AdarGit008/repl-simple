@@ -55,6 +55,12 @@ of plain `coverage` runs is green on the same tree, with no hand-tuned numbers a
   checked without joining the built package (tsconfig.build.json emits only src/ + test/).
 - **`found` for threshold/tolerance purposes = the maximum LF across the N runs.** On an unchanged
   tree LF is constant; max is the conservative choice if it ever is not.
+- **`scripts/` files are printed but never floored.** `scripts/coverage-core.ts` loads in the unit
+  tests and lands in the report; its line coverage (62.8%) tracks *comment* density — V8 counts
+  comment lines of tsx-transformed files as uncovered (measured: branch coverage 100%, the missing
+  37% is JSDoc) — so a floor on it would break CI on comment edits. The update floors only the
+  tracked `src/` + `extensions/` universe (`keepFloorable`), and the gate prints the row as
+  UNMEASURED without failing. Recorded 2026-08-17 after the first empirical update run surfaced it.
 
 ## Tech Stack
 

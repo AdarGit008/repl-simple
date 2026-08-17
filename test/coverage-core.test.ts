@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   belowFloor,
   combineRuns,
+  keepFloorable,
   oneLineTolerance,
   pct,
   spreadLimit,
@@ -83,6 +84,26 @@ describe("combineRuns", () => {
 
   it("returns an empty flag list when every file appears in every run", () => {
     assert.deepEqual(combineRuns(runs).missingInSomeRuns, []);
+  });
+});
+
+// ── keepFloorable ─────────────────────────────────────────────
+
+describe("keepFloorable", () => {
+  const full = run(97.9, [
+    { file: "src/a.ts", pct: 100, found: 391 },
+    { file: "scripts/tooling.ts", pct: 62.8, found: 200 },
+  ]);
+
+  it("drops rows outside the floor universe and keeps the run global", () => {
+    const kept = keepFloorable(full, new Set(["src/a.ts"]));
+    assert.deepEqual(kept.global, 97.9);
+    assert.deepEqual(kept.rows, [{ file: "src/a.ts", pct: 100, found: 391 }]);
+  });
+
+  it("keeps every row when all are floorable", () => {
+    const kept = keepFloorable(full, new Set(["src/a.ts", "scripts/tooling.ts"]));
+    assert.equal(kept.rows.length, 2);
   });
 });
 

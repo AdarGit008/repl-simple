@@ -34,7 +34,7 @@ import { join } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { belowFloor, combineRuns, pct, spreadLimit } from "./coverage-core.js";
+import { belowFloor, combineRuns, keepFloorable, pct, spreadLimit } from "./coverage-core.js";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const BASELINE = join(REPO, "coverage-baseline.json");
@@ -73,7 +73,14 @@ const EXCLUDED_TEST_FILES = ["test/extension-loader.test.ts"];
  */
 const UNMEASURED_SOURCE_FILES = ["src/index.ts"];
 
-/** Every tracked source file expected to carry a floor. */
+/** Every tracked source file expected to carry a floor.
+ *
+ * `scripts/` is deliberately outside the universe: tooling, not package
+ * surface. Its modules can still load in tests and appear in the report —
+ * they print as UNMEASURED and are never floored, because their line counts
+ * track comment density (V8 counts comment lines of tsx-transformed files as
+ * uncovered), not behavior. See `keepFloorable` in `scripts/coverage-core.ts`.
+ */
 function sourceFiles() {
   const ls = spawnSync("git", ["ls-files", "src/*.ts", "extensions/*.ts"], {
     cwd: REPO,
@@ -189,11 +196,12 @@ if (argv.includes("--update")) {
   // would bake a badly slack floor into the baseline and call it normal — so
   // a spread wider than the known one-line defect refuses the write instead.
   const runs = [];
+  const floorable = new Set(sourceFiles());
   let measured;
   for (let i = 0; i < UPDATE_RUNS; i++) {
     console.log(`\nUpdate measurement ${i + 1}/${UPDATE_RUNS}:`);
     measured = measure(files);
-    runs.push(runResult(measured));
+    runs.push(keepFloorable(runResult(measured), floorable));
   }
   const { files: combined, missingInSomeRuns, global } = combineRuns(runs);
 

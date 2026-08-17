@@ -102,6 +102,18 @@ export function oneLineTolerance(found: number): number {
 }
 
 /**
+ * Drop rows whose file is outside the floor universe (tracked `src/` and
+ * `extensions/` sources). `scripts/` is tooling, not package surface: its
+ * modules load in tests and would otherwise earn a floor whose number tracks
+ * comment density — V8 counts comment lines of tsx-transformed files as
+ * uncovered — rather than behavior. The gate still *prints* those rows, so
+ * nothing is hidden; it just does not floor them.
+ */
+export function keepFloorable(run: MeasuredRun, floorable: ReadonlySet<string>): MeasuredRun {
+  return { global: run.global, rows: run.rows.filter((row) => floorable.has(row.file)) };
+}
+
+/**
  * Both `pct` and the stored floors are floored to 2dp. A measurement whose
  * true value is one line below the floor can report up to 0.01 below
  * `floor - oneLine` after that flooring, so the failure test allows for it.
