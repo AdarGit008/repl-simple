@@ -1,0 +1,154 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  belowFloor,
+  combineRuns,
+  oneLineTolerance,
+  pct,
+  spreadLimit,
+  type MeasuredRun,
+} from "../scripts/coverage-core.js";
+
+// ── pct ────────────────────────────────────────────────────────
+
+describe("pct", () => {
+  it("returns 100 for a file with no instrumented lines", () => {
+    assert.equal(pct({ hit: 0, found: 0 }), 100);
+  });
+
+  it("floors to 2dp so a baseline never sits above what was measured", () => {
+    assert.equal(pct({ hit: 390, found: 391 }), 99.74);
+    assert.equal(pct({ hit: 2, found: 3 }), 66.66);
+    assert.equal(pct({ hit: 999, found: 1000 }), 99.9);
+  });
+
+  it("returns exactly 100 for a fully covered file", () => {
+    assert.equal(pct({ hit: 391, found: 391 }), 100);
+  });
+});
+
+// ── combineRuns ────────────────────────────────────────────────
+
+function run(
+  global: number,
+  rows: Array<{ file: string; pct: number; found: number }>,
+): MeasuredRun {
+  return { global, rows };
+}
+
+describe("combineRuns", () => {
+  const runs = [
+    run(97.92, [
+      { file: "src/a.ts", pct: 100, found: 391 },
+      { file: "src/b.ts", pct: 99.5, found: 200 },
+      { file: "src/c.ts", pct: 98.34, found: 150 },
+    ]),
+    run(97.9, [
+      { file: "src/a.ts", pct: 99.74, found: 391 },
+      { file: "src/b.ts", pct: 100, found: 200 },
+      { file: "src/c.ts", pct: 98.34, found: 150 },
+    ]),
+    run(97.91, [
+      { file: "src/a.ts", pct: 100, found: 391 },
+      { file: "src/b.ts", pct: 100, found: 200 },
+      { file: "src/c.ts", pct: 98.34, found: 150 },
+    ]),
+  ];
+
+  it("returns the per-file minimum and maximum across runs", () => {
+    const { files } = combineRuns(runs);
+    assert.deepEqual({ ...files["src/a.ts"] }, { min: 99.74, max: 100, found: 391 });
+    assert.deepEqual({ ...files["src/b.ts"] }, { min: 99.5, max: 100, found: 200 });
+    assert.deepEqual({ ...files["src/c.ts"] }, { min: 98.34, max: 98.34, found: 150 });
+  });
+
+  it("returns the minimum global across runs", () => {
+    assert.equal(combineRuns(runs).global, 97.9);
+  });
+
+  it("takes found as the maximum across runs", () => {
+    const uneven = [
+      run(97, [{ file: "src/a.ts", pct: 99, found: 100 }]),
+      run(97, [{ file: "src/a.ts", pct: 99, found: 120 }]),
+    ];
+    assert.equal(combineRuns(uneven).files["src/a.ts"].found, 120);
+  });
+
+  it("flags files that appear in some but not all runs", () => {
+    const unstable = [run(97, [{ file: "src/a.ts", pct: 100, found: 100 }]), run(97, [])];
+    const result = combineRuns(unstable);
+    assert.deepEqual(result.missingInSomeRuns, ["src/a.ts"]);
+    assert.equal(result.files["src/a.ts"].min, 100);
+  });
+
+  it("returns an empty flag list when every file appears in every run", () => {
+    assert.deepEqual(combineRuns(runs).missingInSomeRuns, []);
+  });
+});
+
+// ── spreadLimit ────────────────────────────────────────────────
+
+describe("spreadLimit", () => {
+  it("is one percentage point for files large enough that a line is worth less", () => {
+    assert.equal(spreadLimit(391), 1);
+    assert.equal(spreadLimit(200), 1);
+    assert.equal(spreadLimit(100), 1);
+  });
+
+  it("is one line's worth when a line is worth more than a point (small files)", () => {
+    const limit = spreadLimit(42);
+    assert.ok(Math.abs(limit - 100 / 42) < 1e-9);
+  });
+
+  it("is 1 for a file with no instrumented lines", () => {
+    assert.equal(spreadLimit(0), 1);
+  });
+});
+
+// ── oneLineTolerance ───────────────────────────────────────────
+
+describe("oneLineTolerance", () => {
+  it("is one line expressed in percentage points", () => {
+    assert.equal(oneLineTolerance(200), 0.5);
+    assert.ok(Math.abs(oneLineTolerance(391) - 100 / 391) < 1e-9);
+  });
+
+  it("is 0 when there are no lines to lose", () => {
+    assert.equal(oneLineTolerance(0), 0);
+  });
+});
+
+// ── belowFloor ─────────────────────────────────────────────────
+
+describe("belowFloor", () => {
+  // The issue's exact case: truncate.ts measured 99.74 (one unhit declaration
+  // line in 391) against a floor written from a 100.00 run. One line of
+  // instrument variance must not fail the gate.
+  it("passes a measurement one line below the floor (issue's truncate.ts case)", () => {
+    assert.equal(belowFloor(99.74, 100, 391), false);
+  });
+
+  it("passes a measurement at exactly one line below the floor (boundary)", () => {
+    assert.equal(belowFloor(99, 99.5, 200), false);
+  });
+
+  it("passes a measurement above the floor", () => {
+    assert.equal(belowFloor(100, 99.74, 391), false);
+  });
+
+  it("passes a measurement at the floor", () => {
+    assert.equal(belowFloor(99.74, 99.74, 391), false);
+  });
+
+  it("fails a measurement two lines below the floor", () => {
+    assert.equal(belowFloor(99.48, 100, 391), true);
+  });
+
+  it("fails a wide drop", () => {
+    assert.equal(belowFloor(98, 99.74, 391), true);
+  });
+
+  it("fails when found is 0 and any lines are missed", () => {
+    assert.equal(belowFloor(99, 100, 0), true);
+  });
+});
