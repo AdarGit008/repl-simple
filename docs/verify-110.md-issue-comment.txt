@@ -1,4 +1,4 @@
-Verified closed by a targeted mutation sweep (`npx stryker run --mutate src/repl.ts`, run `2026-08-17`).
+Closing: verified by a targeted mutation sweep (`npx stryker run --mutate src/repl.ts`, run `2026-08-17`).
 
 The killing test already landed in `8ac0a1e` (PR #128) as `test/repl.test.ts:517` "suspend → resume(approve) runs the pending call" — it drives `Repl.resume()` and asserts the approved write reaches disk, so dropping `onApproval` from `session.resume({ onApproval, signal })` fails the test.
 
