@@ -1,6 +1,6 @@
 # Tasks — Post-ship RLM message-growth polish (#145)
 
-- [ ] T1 — Guard tests 10–13 (D13): exactly-at-256 KiB retained, single >256 KiB reply completes without hanging, just-under-budget no-drop, error-path stdout cap
+- [x] T1 — Guard tests 10–13 (D13): exactly-at-256 KiB retained, single >256 KiB reply completes without hanging, just-under-budget no-drop, error-path stdout cap
 - [ ] T2 — Tighten test 5 (D11 + D16): pair parity, last-role "user", dropped-turn count ≡ absent TURN_i_ labels
 - [ ] T3 — Guard tests 19–21 (D21): composition (huge question + inputs + prints); error boundary trio + both-ends shape; question boundary pair + shape
 - [ ] T4 — Derive the drop-marker label via formatSize (D10) + test 5 regex edit + test 6 /256KB/ grep

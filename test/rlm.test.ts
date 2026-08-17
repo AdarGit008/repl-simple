@@ -1164,6 +1164,37 @@ describe("buildFeedback() — feedback byte caps", () => {
     assert.doesNotMatch(rlmSource, /\bBuffer\b/, "rlm.ts must not hand-roll byte truncation");
     assert.doesNotMatch(rlmSource, /\bbyteLength\b/, "rlm.ts must not measure bytes itself");
   });
+
+  it("caps the error branch's stdout to 32 KiB with the policy marker (test 13)", () => {
+    // The error-path stdout cap has been live since #74 (buildFeedback,
+    // FEEDBACK_STDOUT_MAX_BYTES) but is unpinned — only the ok branch
+    // (test 3) exercises it (F-145 monitor Poll 1 Item 4). The section is
+    // located via the `\nstdout:` delimiter, which D19's quoting preserves.
+    // The kind-specific advice is appended after the stdout section; the cap
+    // budgets the stdout value, so measure the section alone.
+    const hugeStdout = "S".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "error",
+      error: "boom",
+      errorKind: "runtime",
+      stdout: hugeStdout,
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const delimiter = "\nstdout:";
+    const idx = feedback.indexOf(delimiter);
+    assert.ok(idx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const after = feedback.slice(idx + delimiter.length);
+    const sectionEnd = after.indexOf("\n\n");
+    const stdoutSection = sectionEnd >= 0 ? after.slice(0, sectionEnd) : after;
+    assert.ok(
+      Buffer.byteLength(stdoutSection, "utf8") <= 32 * 1024,
+      `stdout section is ${Buffer.byteLength(stdoutSection, "utf8")} bytes`,
+    );
+    assert.match(stdoutSection, /elided/, "the truncation marker must state what went");
+    assert.match(stdoutSection, /Re-run with a narrower print/);
+  });
 });
 
 // ── Conversation bound (D2/D3) ──────────────────────────────────
@@ -1251,6 +1282,151 @@ describe("runRlm() — conversation bound", () => {
         last.messages[i].role,
         expected,
         `messages[${i}] should be ${expected}, got ${last.messages[i].role}`,
+      );
+    }
+  });
+
+  /**
+   * A comment-padded reply whose extracted code is inert (`x = 1`): the run is
+   * silent, so its feedback is the known no-output constant. All characters
+   * are ASCII, so byte length equals string length.
+   */
+  function silentPaddedReply(targetBytes: number, label: string): string {
+    const head = `\`\`\`python\n# ${label} `;
+    const tail = "\nx = 1\n```";
+    const pad = targetBytes - head.length - tail.length;
+    assert.ok(pad >= 0, `${label}: target ${targetBytes} is too small for a padded reply`);
+    return head + "x".repeat(pad) + tail;
+  }
+
+  /**
+   * A mock whose replies make the five-message conversation at the third query
+   * total exactly `targetBytes`. Query 2 already carries the real feedback for
+   * reply 0, and reply 1 runs the same silent code, so feedback 1 is
+   * byte-identical — sizing reply 1 closes the gap exactly.
+   */
+  function exactBudgetLlm(targetBytes: number) {
+    const callRecords: Array<{
+      systemPrompt: string;
+      messages: Array<{ role: string; content: string }>;
+    }> = [];
+    const llm: LlmClient & {
+      calls(): Array<{ systemPrompt: string; messages: Array<{ role: string; content: string }> }>;
+    } = {
+      async query(systemPrompt, messages) {
+        callRecords.push({
+          systemPrompt,
+          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        });
+        if (callRecords.length === 1) {
+          return silentPaddedReply(128 * 1024, "BUDGET_FIRST");
+        }
+        if (callRecords.length === 2) {
+          const [m0, m1, m2] = callRecords[1].messages;
+          const fixed =
+            Buffer.byteLength(m0.content, "utf8") +
+            Buffer.byteLength(m1.content, "utf8") +
+            2 * Buffer.byteLength(m2.content, "utf8");
+          return silentPaddedReply(targetBytes - fixed, "BUDGET_SECOND");
+        }
+        if (callRecords.length === 3) {
+          return '```python\nSUBMIT("done")\n```';
+        }
+        return "";
+      },
+      calls() {
+        return callRecords;
+      },
+    };
+    return { llm };
+  }
+
+  it("retains an exactly-at-budget conversation — the strict > boundary (test 10)", async () => {
+    // Five messages — initial, reply 0, feedback 0, reply 1, feedback 1 —
+    // totalling exactly MAX_CONVERSATION_BYTES must all survive: the drop
+    // boundary is strict `>`, so exactly-at is retained. A `>=` boundary
+    // would drop a pair and insert the history-dropped marker instead.
+    const target = 256 * 1024;
+    const { llm } = exactBudgetLlm(target);
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const calls = llm.calls();
+    assert.equal(calls.length, 3);
+    // The query after the two exploring iterations carries all five messages.
+    const third = calls[2].messages;
+    assert.equal(third.length, 5, "exactly-at-budget turns must not be dropped");
+    assert.equal(conversationBytes(third), target, "the five messages total the budget exactly");
+    assert.deepEqual(
+      third.map((m) => m.role),
+      ["user", "assistant", "user", "assistant", "user"],
+      "no pair may be dropped at the boundary",
+    );
+    for (const call of calls) {
+      assert.doesNotMatch(
+        call.messages.map((m) => m.content).join("\n"),
+        /earlier turns dropped/,
+        "an exactly-at-budget conversation must not emit the drop marker",
+      );
+    }
+  });
+
+  it("completes when a single reply exceeds the budget — no drop, no hang (test 11)", async () => {
+    // A single > 256 KiB reply cannot be dropped: boundConversation drops only
+    // whole pairs and needs >= 5 messages, so the loop-guard must exit without
+    // hanging and the over-budget reply is kept transiently (docs Exception 4).
+    // Assert a recognisable head prefix, not the whole reply, so the test
+    // stays green after D18's reply cap (which keeps the head).
+    const hugeReply = silentPaddedReply(300 * 1024, "HUGE_REPLY_HEAD");
+    const { llm } = mockLlmCodeGen([hugeReply, '```python\nSUBMIT("done")\n```']);
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok", "the run must complete without hanging");
+    const calls = llm.calls();
+    assert.equal(calls.length, 2);
+    const second = calls[1].messages;
+    assert.equal(second.length, 3, "three messages: initial, huge reply, feedback");
+    for (const call of calls) {
+      assert.doesNotMatch(
+        call.messages.map((m) => m.content).join("\n"),
+        /earlier turns dropped/,
+        "three messages are below the five-message drop threshold — nothing may be dropped",
+      );
+    }
+    const headPrefix = hugeReply.slice(0, 120);
+    assert.ok(
+      second[1].content.startsWith(headPrefix),
+      `the huge reply's head must survive:\n${second[1].content.slice(0, 200)}`,
+    );
+  });
+
+  it("keeps a just-under-budget conversation whole and marker-free (test 12)", async () => {
+    // The complement of the strict boundary: ~100 bytes under the budget,
+    // nothing may be dropped and no marker may appear.
+    const target = 256 * 1024 - 100;
+    const { llm } = exactBudgetLlm(target);
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const calls = llm.calls();
+    assert.equal(calls.length, 3);
+    const third = calls[2].messages;
+    assert.equal(third.length, 5, "nothing may be dropped just under the budget");
+    assert.equal(conversationBytes(third), target);
+    for (const call of calls) {
+      assert.doesNotMatch(
+        call.messages.map((m) => m.content).join("\n"),
+        /earlier turns dropped/,
+        "a just-under-budget conversation must not emit the drop marker",
       );
     }
   });
