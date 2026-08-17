@@ -1,6 +1,5 @@
-# Tasks — Bound message growth in the RLM feedback loop (#74)
+# Tasks — Cap `result.error` and the `question` in the RLM feedback loop (#144)
 
-- [x] T1 — Cap `buildFeedback` `stdout`/`output` via `truncateText` (D1) + tests 2, 3, 6 — done
-- [x] T2 — Bound `messages` to 256 KiB, drop oldest whole turns, emit marker (D2–D3) + tests 1, 4, 5 — done
-- [x] T3 — Cap the initial-prompt input section to 32 KiB (D6) + test 7 — done
-- [x] T4 — Record feedback/conversation budgets + history-bounding strategy in `docs/truncation-policy.md` — done
+- [ ] T1 — Cap `result.error` to 16 KiB via `truncateText` (D7) + test 8
+- [ ] T2 — Cap the `question` to 64 KiB via `truncateText` (D8) + test 9
+- [ ] T3 — Update `docs/truncation-policy.md` for the D7/D8 caps

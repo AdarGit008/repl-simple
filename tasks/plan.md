@@ -1,161 +1,131 @@
-# Implementation Plan: Bound message growth in the RLM feedback loop (#74)
+# Implementation Plan: Cap `result.error` and the `question` in the RLM feedback loop (#144)
 
 ## Overview
 
-`runRlm` (`src/rlm.ts`) accumulates a conversation of `messages` that grows by two entries per
-iteration with no total ceiling, and `buildFeedback` re-interpolates sandbox `stdout`/`output` with
-no budget of its own. This plan orders the work in `SPEC.md` into four single-commit tasks, each a
-RED → GREEN TDD cycle, so every task lands on a green, type-checked, build-clean tree. The source of
-truth for *what* to build is `SPEC.md` decisions D0–D6; this plan only sequences them and states the
-per-task acceptance and tests.
+`runRlm` (`src/rlm.ts`) shipped four feedback/conversation caps in #74 (D1–D6), but two message
+paths remain unbounded: `buildFeedback` interpolates `result.error` raw on the `status === "error"`
+path (`src/rlm.ts:313`), and `buildInitialPrompt` interpolates the `question` raw
+(`src/rlm.ts:276`) into `messages[0]` — which `boundConversation` never drops, so a large question
+lives in every query for the whole run. Both are routed through the already-imported shared
+`truncateText` (`src/truncate.ts`) — no new truncation implementation, no `src/truncate.ts` edit.
+The source of truth for *what* to build is `SPEC.md` decisions D7 and D8; this plan only sequences
+them into three single-commit TDD tasks.
 
 Out of scope and never touched: `src/truncate.ts`, `src/sandbox.ts`, `src/repl.ts`, `src/builtins.ts`,
 `src/rlm_loop.ts`, `src/types.ts`, `coverage-baseline.json`.
 
 ## Architecture Decisions
 
-- **Reuse, don't re-implement (D1, invariant 4).** `buildFeedback` imports the existing `truncateText`
-  symbol from `./truncate.js` — the same symbol `sandbox.ts` imports — with feedback budgets equal to
-  the policy budgets (`FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES = 32 KiB`,
-  `FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES = 16 KiB`). The normal path is a marker-free no-op
-  because the sandbox already cut at these values; a raised `runOptions.maxStdoutBytes` /
-  `maxOutputBytes` no longer flows through to the model.
-- **Bound the conversation by dropping whole turns, not by summarising (D2–D4).** The `messages` array
-  is bounded at `MAX_CONVERSATION_BYTES = 256 KiB` measured with `Buffer.byteLength` over
-  `messages[].content`. Keep the initial user message plus the newest turns; drop the oldest middle
-  turns in whole assistant+feedback pairs (a feedback never dangles without its assistant message).
-  The initial message is never dropped. A single over-budget LLM reply is kept and allowed to exceed
-  the budget transiently (Assumption 4). Dropping emits a pi-style marker message so the model knows
-  history is partial (D3). Summarisation is explicitly deferred (D4).
-- **Budgets are module constants, not public options (Assumption 5).** No new `RlmOptions`/`types.ts`
-  surface; `src/types.ts` stays untouched.
-- **Aggregate input cap is a flat head+tail cut (D6).** `buildInitialPrompt` keeps its per-value 5000-char
-  preview but passes the rendered input section through `truncateText` with
-  `INPUT_PREVIEW_MAX_BYTES = 32 KiB`, `VALUE_HEAD_RATIO`, and an input-naming recovery clause.
-- **Determinism over timing.** All tests assert structure (message roles/order, marker presence,
-  byte ceilings via `Buffer.byteLength`), never wall-clock or race behaviour — the suite recently
-  fought mutation flakiness and must stay deterministic.
+- **Reuse, don't re-implement (D9, invariant 4).** Both new caps go through the one imported symbol
+  `truncateText` from `./truncate.js` (already imported since #74). No byte measurement, no `Buffer`,
+  no `byteLength` enters `src/rlm.ts`; `contentBytes` keeps using `TextEncoder` (docs Exception 3).
+- **Error cap = value shape (D7).** A traceback is a single value identified by both ends (first
+  frame + exception message), so `result.error` reuses `VALUE_HEAD_RATIO` (50/50) at
+  `ERROR_MAX_BYTES = 16 * 1024` — the same budget as `output` — with a real recovery route
+  (`ERROR_RECOVERY`: re-run under `try/except` and print the full traceback; the model owns the
+  Python). Applied in `buildFeedback` on the `status === "error"` branch, before interpolation.
+- **Question cap = value shape (D8).** The question is the user's query and is never dropped, so its
+  budget bounds the worst case while leaving every realistic question untouched:
+  `QUESTION_MAX_BYTES = 64 * 1024`, `VALUE_HEAD_RATIO`, and a deliberately weaker recovery clause
+  (`QUESTION_RECOVERY`) because the question is **not** sandbox-accessible — the marker may not
+  advertise a route that does not exist (policy Q3). Applied in `buildInitialPrompt` before the
+  `# Question` header.
+- **Budgets are module constants, not public options** (Assumption 5, unchanged from #74).
+- **Under-budget is a marker-free no-op.** Both `truncateText` calls are no-ops for ordinary
+  errors/questions, so the normal path is byte-identical to today (each test asserts this).
+- **Determinism over timing.** Tests assert structure (section boundaries, marker presence, byte
+  ceilings via `Buffer.byteLength` in the test file only), never wall-clock or race behaviour.
 
 ## Task List
 
-### Phase 1: Feedback caps (D1)
+### Phase 1: Cap `result.error` in `buildFeedback` (D7)
 
-- [ ] **T1 — Cap `buildFeedback` `stdout`/`output` via `truncateText` (D1) + tests 2, 3, 6**
+- [ ] **T1 — Cap `result.error` to 16 KiB via `truncateText` (D7) + test 8**
 
-  **Objective:** Make the feedback message bounded independently of the sandbox caps, using the shared
-  helper. Introduce `FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES` and
-  `FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES` as module constants in `src/rlm.ts`; import
-  `truncateText` and the existing shape constants (`STDOUT_HEAD_RATIO`, `STDOUT_RECOVERY`,
-  `VALUE_HEAD_RATIO`, `VALUE_RECOVERY`) from `./truncate.js`; wrap `result.stdout` and
-  `result.output` in `buildFeedback`. `result.error` stays uncapped (policy non-goal).
+  **Objective:** Close the first uncapped path. Introduce `ERROR_MAX_BYTES = 16 * 1024` and
+  `ERROR_RECOVERY = "Catch the exception and print the full traceback to see more."` as module
+  constants in `src/rlm.ts`, then wrap `result.error` on the `status === "error"` branch of
+  `buildFeedback` before interpolation:
+  `const { text: error } = truncateText(result.error, { maxBytes: ERROR_MAX_BYTES, headRatio: VALUE_HEAD_RATIO, recovery: ERROR_RECOVERY });`
+  and interpolate `error` (not `result.error`).
 
   **Scope (files):**
-  - `src/rlm.ts` — import, two module constants, `buildFeedback` interpolation sites.
-  - `test/rlm.test.ts` — tests 2, 3, 6.
+  - `src/rlm.ts` — two module constants + the `buildFeedback` error-branch interpolation site.
+  - `test/rlm.test.ts` — test 8.
 
-  **Dependencies:** None.
+  **Dependencies:** None (`truncateText` and `VALUE_HEAD_RATIO` already imported).
 
   **Acceptance criteria (SPEC success criteria):**
-  - `buildFeedback` caps `stdout` ≤ 32 KiB and `output` ≤ 16 KiB via `truncateText`, independent of the
-    sandbox caps (success criterion 3).
-  - Exactly one truncation implementation is used by `rlm.ts` (success criterion 6).
+  - A huge `result.error` cannot push any iteration's conversation over 256 KiB — the `Error: `
+    feedback section is ≤ 16 KiB and carries the marker + `ERROR_RECOVERY` (success criterion 1).
+  - A small `error` passes through marker-free (no `elided`), byte-identical to the pre-change shape
+    (success criterion 3).
 
-  **RED → GREEN tests:**
-  - **Test 2 (RED):** `buildFeedback` with a synthetic `RunResult` whose `output` is huge returns a
-    feedback string whose `Output:` section is ≤ 16 KiB and carries the policy marker — assert the
-    marker text, not merely the ceiling.
-  - **Test 3 (RED):** `buildFeedback` with a synthetic `RunResult` whose `stdout` is huge yields a
-    `stdout:` section ≤ 32 KiB even though the sandbox passed more (assert via a raised
-    `runOptions.maxStdoutBytes` path or a synthetic `RunResult`).
-  - **Test 6 (RED):** source-level check that `rlm.ts` imports `truncateText` from `./truncate.js`
-    (the same symbol `sandbox.ts` uses) and defines no hand-rolled truncation.
+  **RED → GREEN test (test 8):**
+  - **Over-budget:** `buildFeedback({ status: "error", error: "E".repeat(100 * 1024), stdout: "", stdoutTruncated: false, calls: [] })` — the section between the `Error: ` prefix and `\nstdout:` is
+    ≤ 16 KiB (`Buffer.byteLength`), matches `/elided/`, and matches the recovery clause
+    (`/traceback/`). **RED because** the source interpolates `result.error` raw → the section is
+    ~100 KiB with no marker and no recovery clause.
+  - **No-op:** `buildFeedback({ status: "error", error: "boom", errorKind: "syntax", stdout: "", stdoutTruncated: false, calls: [] })` starts with `Error: boom\n` and contains no `elided` marker.
+    **RED because** (pre-fix) it already passes — this assertion is a regression guard, not the
+    failing half; the over-budget half is what goes RED first.
 
   **Verify:** `npx tsx --test test/rlm.test.ts` (red → green); `npm test`; `npm run check`;
   `npm run build`; `npm run lint`.
 
-### Phase 2: Conversation bound + drop notice (D2–D3)
+### Phase 2: Cap the `question` in `buildInitialPrompt` (D8)
 
-- [ ] **T2 — Bound `messages` to 256 KiB, drop oldest whole turns, emit marker (D2–D3) + tests 1, 4, 5**
+- [ ] **T2 — Cap the `question` to 64 KiB via `truncateText` (D8) + test 9**
 
-  **Objective:** Bound cumulative conversation growth. Introduce `MAX_CONVERSATION_BYTES = 256 * 1024`.
-  After each push of an assistant+feedback pair, if total `Buffer.byteLength` of `messages[].content`
-  exceeds the budget, drop the oldest middle turns in whole pairs (keeping `messages[0]` and the newest
-  pair) and emit the D3 marker message (user role, pi-style ellipsis vocabulary) that states what was
-  dropped and why. The marker counts toward the budget. A single over-budget reply is kept and allowed
-  to exceed the budget transiently (Assumption 4).
+  **Objective:** Close the second uncapped path. Introduce `QUESTION_MAX_BYTES = 64 * 1024` and
+  `QUESTION_RECOVERY = "The question was truncated. Answer from the part shown and state the assumption if ambiguous."` as module constants in `src/rlm.ts`, then wrap the `question` in
+  `buildInitialPrompt` before the `# Question` header:
+  `const { text: q } = truncateText(question, { maxBytes: QUESTION_MAX_BYTES, headRatio: VALUE_HEAD_RATIO, recovery: QUESTION_RECOVERY });`
+  and build `const parts = [\`# Question\n${q}\`];`.
 
   **Scope (files):**
-  - `src/rlm.ts` — `MAX_CONVERSATION_BYTES` constant, drop loop, marker constant, integration into the
-    iteration append site.
-  - `test/rlm.test.ts` — tests 1, 4, 5.
+  - `src/rlm.ts` — two module constants + the `buildInitialPrompt` question interpolation site.
+  - `test/rlm.test.ts` — test 9.
 
-  **Dependencies:** T1 (the reproduction's feedback must already be capped before the 256 KiB bound can
-  be meaningfully asserted).
+  **Dependencies:** T1 (sequential — same two files; single-writer order).
 
   **Acceptance criteria (SPEC success criteria):**
-  - The 1.57 MB reproduction stays bounded (success criteria 1, 2).
-  - The conversation-bounding strategy — keep first + last N, drop oldest turns whole — is asserted at
-    the boundary (success criterion 4).
-  - The model is told when history was dropped (success criterion 5).
+  - A huge `question` cannot appear uncapped in `messages[0]` — the `# Question` section of the
+    initial prompt is ≤ 64 KiB and carries the marker + `QUESTION_RECOVERY` (success criterion 2).
+  - A normal `question` appears whole and marker-free in `messages[0]` (success criterion 3).
 
-  **RED → GREEN tests:**
-  - **Test 1 (RED):** four iterations each printing 300 KB (→ ≤32 KiB `stdout` + ≤16 KiB `output` per
-    run under default caps) keep the total conversation bytes passed to `llmClient.query` under
-    `MAX_CONVERSATION_BYTES` (regression target: no call's total messages exceed 256 KiB; 1.57 MB
-    cannot recur).
-  - **Test 4 (RED):** enough iterations (or large-enough feedback) to cross 256 KiB → the messages sent
-    to the LLM drop the oldest middle turns in whole pairs, keep the initial message and the newest
-    turns, and total ≤ budget.
-  - **Test 5 (RED):** after a drop, the messages contain the history-dropped marker (D3) and no dangling
-    feedback (pairs dropped whole).
+  **RED → GREEN test (test 9):**
+  - **Over-budget:** `runRlm("Q".repeat(128 * 1024), { llmClient, registry, maxIterations: 5 })`
+    (mock returns a single `SUBMIT`), then read `llm.calls()[0].messages[0].content`. The
+    `# Question` section — from after `# Question\n` up to `\n# Context` (the default `context`
+    input always renders a `# Context` header) — is ≤ 64 KiB, matches `/elided/`, and matches
+    `/state the assumption/`. **RED because** the source interpolates the question raw → the section
+    is ~128 KiB with no marker and no recovery clause.
+  - **No-op:** `runRlm("what is the answer?", …)` → `messages[0].content` includes the whole
+    question and contains no `elided` marker. Regression guard (passes pre-fix).
 
   **Verify:** `npx tsx --test test/rlm.test.ts` (red → green); `npm test`; `npm run check`;
   `npm run build`; `npm run lint`.
 
-### Phase 3: Aggregate input cap (D6)
+### Phase 3: Record the two new budgets in the truncation policy
 
-- [ ] **T3 — Cap the initial-prompt input section to 32 KiB (D6) + test 7**
+- [ ] **T3 — Update `docs/truncation-policy.md` for the D7/D8 caps**
 
-  **Objective:** Close the #72 deferral: `buildInitialPrompt` keeps its per-value 5000-char head/tail
-  preview but bounds the aggregate rendered input section. Introduce
-  `INPUT_PREVIEW_MAX_BYTES = 32 * 1024` and pass the assembled input section through `truncateText`
-  with `VALUE_HEAD_RATIO` and a recovery clause that names the input and says to slice it in Python.
-
-  **Scope (files):**
-  - `src/rlm.ts` — `INPUT_PREVIEW_MAX_BYTES` constant + `buildInitialPrompt` aggregate cap.
-  - `test/rlm.test.ts` — test 7.
-
-  **Dependencies:** T1 (the `truncateText` import and pattern are already in place); independent of T2.
-
-  **Acceptance criteria (SPEC success criteria):**
-  - The D6 aggregate test exists and passes (success criterion 1).
-  - `runRlm` with several large inputs produces an initial message whose input-preview section is
-    ≤ `INPUT_PREVIEW_MAX_BYTES` (testing strategy item 7).
-
-  **RED → GREEN tests:**
-  - **Test 7 (RED):** `runRlm` (or `buildInitialPrompt` via `runRlm`'s recorded initial message) with
-    several large inputs produces an initial message whose input-preview section is
-    ≤ `INPUT_PREVIEW_MAX_BYTES`.
-
-  **Verify:** `npx tsx --test test/rlm.test.ts` (red → green); `npm test`; `npm run check`;
-  `npm run build`; `npm run lint`.
-
-### Phase 4: Document the budgets and strategy
-
-- [ ] **T4 — Record feedback/conversation budgets + history-bounding strategy in `docs/truncation-policy.md`**
-
-  **Objective:** Add implementation-record rows for the RLM feedback budgets (32 KiB `stdout`,
-  16 KiB `output`, via the shared helper), the 256 KiB conversation budget with keep-first+last-N /
-  drop-oldest-whole-turns strategy, and the 32 KiB aggregate input cap. Record the D4 trade-off
-  (no summarisation, why) and the recorded edges (single over-budget reply kept; `error` uncapped).
+  **Objective:** Extend the implementation-record table with two rows (`buildFeedback` `error`
+  16 KiB / 50/50 head+tail, `buildInitialPrompt` `question` 64 KiB / 50/50 head+tail, both #144),
+  retire the "Truncating `error` / `errorKind`" non-goal line (the `error` half is now implemented;
+  `errorKind` stays uncapped as a small bounded enum string), and add a short note under the #74
+  additions paragraph recording the two new budgets and the deliberate weaker `question` recovery
+  (the question is not sandbox-accessible, so its marker does not advertise a route it cannot honour
+  — policy Q3).
 
   **Scope (files):**
-  - `docs/truncation-policy.md` — implementation-record table + strategy note.
+  - `docs/truncation-policy.md` — implementation-record table + non-goal edit + one paragraph.
 
-  **Dependencies:** T1–T3 (documents the implemented behaviour).
+  **Dependencies:** T1, T2 (documents the implemented behaviour).
 
-  **Acceptance criteria (SPEC success criteria):**
-  - The chosen history-bounding strategy and its trade-off are documented (success criterion 4).
+  **Acceptance criteria:** The two budgets and the `question` recovery rationale are recorded;
+  the stale "`error` uncapped" non-goal no longer contradicts the code.
 
   **RED → GREEN tests:** none (documentation task; no code/test change).
 
@@ -163,44 +133,39 @@ Out of scope and never touched: `src/truncate.ts`, `src/sandbox.ts`, `src/repl.t
 
 ### Checkpoint: Complete
 
-- [ ] All of T1–T4 done; `npm test`, `npm run check`, `npm run build`, `npm run lint`,
+- [ ] All of T1–T3 done; `npm test`, `npm run check`, `npm run build`, `npm run lint`,
   `npm run coverage` all exit 0; mutation score does not regress.
 
 ## Definition of Done (whole flight, from SPEC success criteria)
 
-1. All five issue tests (plus the D6 aggregate test) exist and pass; tests 1–5 are red before their
-   fix where applicable.
-2. The 1.57 MB reproduction stays bounded: 4 iterations of a 300 KB print never exceed 256 KiB of
-   total conversation, and 10 iterations trigger the drop, not unbounded growth.
-3. `buildFeedback` caps `stdout` ≤ 32 KiB and `output` ≤ 16 KiB via `truncateText`, independent of the
-   sandbox caps.
-4. The conversation-bounding strategy (keep first + last N, drop oldest turns whole) is asserted at
-   the boundary and documented with its trade-off in `docs/truncation-policy.md`.
-5. The model is told when history was dropped (D3 marker present).
-6. Exactly one truncation implementation is used by `rlm.ts`, `repl.ts` and `sandbox.ts` (verified by
-   construction, not by duplicated behaviour).
-7. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` exit 0; mutation
-   score does not regress.
+1. An oversized `result.error` cannot push any iteration's conversation over 256 KiB — the
+   `Error: ` feedback section is ≤ 16 KiB via `truncateText`, and the 256 KiB conversation bound is
+   intact (test 8).
+2. An oversized `question` cannot appear uncapped in `messages[0]` — the `# Question` section is
+   ≤ 64 KiB via `truncateText` (test 9).
+3. Both paths are RED→GREEN tested (tests 8 and 9), including the under-budget no-op.
+4. `truncateText` remains the only truncation implementation (test 6 still passes; no
+   `Buffer`/`byteLength` in `src/rlm.ts`).
+5. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` exit 0;
+   mutation score does not regress.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| New branches (feedback caps, drop loop, notice, aggregate cap) fall below the `src/rlm.ts` 95.94% coverage floor | High | Each task's tests exercise both truncation paths (over/under budget) and both the drop and no-drop paths; do not hand-edit `coverage-baseline.json`. |
-| Determinism/mutation flakiness in the RLM loop tests | Med | Assert structure (roles, order, marker text, `Buffer.byteLength` ceilings), never timing; reuse the existing `mockLlmCodeGen` + real `ToolRegistry` pattern. |
-| Double-truncation totals when a caller raises the sandbox cap above the feedback budget | Low | Recorded in SPEC (open question 1); cosmetic, not a correctness failure. |
-| A single over-budget LLM reply transiently exceeds 256 KiB | Med | Accepted per Assumption 4; documented; residual risk until summarisation lands. |
-| Budget numbers are judgement, not live-model measurement | Low | Recorded in SPEC (open question 3); constants are easy to tune later. |
+| The two new `truncateText` call sites fall below the `src/rlm.ts` 95.94% coverage floor | Med | Each task's test exercises both the over-budget (truncation) and under-budget (no-op) paths, so every new line is hit; do not hand-edit `coverage-baseline.json`. |
+| Section-locating assertions break on a prompt-template wording change | Low | Locate the error section via the stable `Error: ` / `\nstdout:` boundaries and the question section via `# Question\n` / `\n# Context`; these are the same literals F-74's test 7 already couples to (recorded gotcha). |
+| Double-truncation totals when a caller raises the sandbox cap above the feedback budget | Low | Inherited from #74 (SPEC open question 3); cosmetic, recorded. |
+| Budget numbers are judgement, not live-model measurement | Low | Recorded in SPEC (open question 2); constants are easy to tune later. |
 
 ## Open Questions
 
-- None blocking — the SPEC records its open questions (double-truncation totals, over-budget LLM
-  reply, judgement-based budget numbers, uncapped `error`) and marks them fire-and-forget. Any
-  unexpected divergence found during BUILD should be recorded in the ship report, not silently decided.
+- None blocking — the SPEC records its open questions (weaker `question` recovery, judgement-based
+  budgets, double-truncation totals) and marks them fire-and-forget. Any unexpected divergence found
+  during BUILD should be recorded in the ship report, not silently decided.
 
 ## Parallelization
 
-- T1 → T2 → T3 → T4 is a strict sequence: T2 depends on T1's feedback caps (test 1 measures the
-  bound over capped feedback), T3 reuses T1's `truncateText` import pattern, and T4 documents all of
-  them. All four tasks touch `src/rlm.ts`/`test/rlm.test.ts` (T4 only docs), so no two tasks run in
-  parallel without conflicting edits.
+- T1 → T2 → T3 is a strict sequence: T1 and T2 both touch `src/rlm.ts` and `test/rlm.test.ts`
+  (single-writer order avoids conflicting edits), and T3 documents both. No two tasks run in
+  parallel without touching the same files.
