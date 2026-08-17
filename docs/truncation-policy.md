@@ -380,8 +380,12 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `output` | 16 KiB | 50/50 head+tail | #34 |
 | `read_file` | 256 KiB | 50/50 head+tail | #29 |
 | `http_get` | 256 KiB | head-only, total unknown | #29 |
+| `buildFeedback` `stdout` | 32 KiB | 25/75 head+tail | #74 |
+| `buildFeedback` `output` | 16 KiB | 50/50 head+tail | #74 |
+| `runRlm` conversation (`messages`) | 256 KiB | keep first + last N, drop oldest whole pairs | #74 |
+| `buildInitialPrompt` input preview | 32 KiB aggregate | 50/50 head+tail | #74 |
 
-All four go through one implementation, `src/truncate.ts`, per invariant 4.
+The four `#29`/`#34` rows go through one implementation, `src/truncate.ts`, per invariant 4.
 
 **Exception 1 — `builtins.ts` keeps its 256 KiB ceiling; it is not part of the 48 KiB budget.**
 `read_file` and `http_get` return a value *into the sandbox*, not into the model's context: the model
@@ -396,6 +400,28 @@ is the same defect under a different consumer — `docs/REVIEW.md` A23 records a
 bare `context` appending a full copy of the context to every subsequent prompt. Capping in
 `sandbox.ts` covers both, and is the stronger reading of "one policy, not two". `formatResult` then
 interpolates an already-bounded value, and says so.
+
+**#74 (RLM feedback loop) additions.** Three of the four new rows reuse `truncateText` at the same
+budgets the sandbox already applies, so the normal feedback path is a marker-free no-op — a caller
+who raises `runOptions.maxStdoutBytes` / `maxOutputBytes` no longer leaks that raised ceiling into
+the model's context. The conversation row is not a truncation: `runRlm` measures the whole
+`messages` array against `MAX_CONVERSATION_BYTES = 256 KiB` and drops the oldest middle turns in
+whole assistant+feedback pairs (keeping `messages[0]` and the newest pair). Each drop emits a
+cumulative user-role marker — `[… N earlier turns dropped — conversation bounded at 256KB. The most
+recent context follows. …]` — that counts toward the budget, so the model is told the history it
+sees is partial. The input-preview row uses a named-variable recovery clause ("Each input is
+available as a named Python variable — slice it in Python to see more."), because inputs are already
+declared as sandbox variables and need no assignment step.
+
+**Exception 3 — the conversation byte count uses `TextEncoder`, not `Buffer.byteLength`.** D2 writes
+the budget as `Buffer.byteLength`, but test 6 asserts `rlm.ts` never references `Buffer` or
+`byteLength` — the canonical signals of a hand-rolled byte truncator. `TextEncoder.encode().length`
+yields the same UTF-8 byte count, so the budget is measured identically while `rlm.ts` still owns no
+byte-level measurement (invariant 4). [#74]
+
+**Exception 4 — a single over-budget LLM reply is kept.** The loop cannot truncate model output
+without summarising (deferred, D4), so one reply larger than 256 KiB is kept and the conversation is
+allowed to exceed the budget transiently until it ages out (#74, Assumption 4).
 
 **The budget-smaller-than-the-marker edge**, which #29 asked to decide explicitly: the result is
 **empty**, with the truncated flag set. A partial marker is misinformation and the budget is a hard
