@@ -37,14 +37,7 @@ import { join } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 
-import {
-  belowFloor,
-  combineRuns,
-  exceedsSpreadLimit,
-  keepFloorable,
-  pct,
-  refusalReasons,
-} from "./coverage-core.js";
+import { belowFloor, combineRuns, keepFloorable, pct, refusalReasons } from "./coverage-core.js";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const BASELINE = join(REPO, "coverage-baseline.json");
@@ -251,7 +244,10 @@ if (argv.includes("--update")) {
 
   const baseline = {};
   for (const [file, f] of Object.entries(combined.files)) baseline[file] = f.min;
-  writeFileSync(BASELINE, `${JSON.stringify({ global: combined.global, files: baseline }, null, 2)}\n`);
+  writeFileSync(
+    BASELINE,
+    `${JSON.stringify({ global: combined.global, files: baseline }, null, 2)}\n`,
+  );
   console.log(
     `\nBaseline written: ${Object.keys(baseline).length} files, ${combined.global.toFixed(
       2,
