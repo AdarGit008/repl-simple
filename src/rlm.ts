@@ -3,6 +3,7 @@ import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
 import {
   truncateText,
+  formatSize,
   STDOUT_MAX_BYTES,
   STDOUT_HEAD_RATIO,
   STDOUT_RECOVERY,
@@ -428,7 +429,9 @@ const RAW_FALLBACK_NOTICE = "Note: no code block found — treating the whole re
  * model must know the history it sees is partial, not assume completeness.
  */
 function historyDropMarker(droppedTurns: number): string {
-  return `[… ${droppedTurns} earlier turns dropped — conversation bounded at 256KB. The most recent context follows. …]`;
+  // The label derives from the budget via the shared formatter (pi's size
+  // format, D10) so a budget change can never silently drift the marker.
+  return `[… ${droppedTurns} earlier turns dropped — conversation bounded at ${formatSize(MAX_CONVERSATION_BYTES)}. The most recent context follows. …]`;
 }
 
 /**

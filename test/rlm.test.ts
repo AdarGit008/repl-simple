@@ -1163,6 +1163,10 @@ describe("buildFeedback() — feedback byte caps", () => {
     // never measure bytes itself.
     assert.doesNotMatch(rlmSource, /\bBuffer\b/, "rlm.ts must not hand-roll byte truncation");
     assert.doesNotMatch(rlmSource, /\bbyteLength\b/, "rlm.ts must not measure bytes itself");
+
+    // D10: the drop-marker label is derived from MAX_CONVERSATION_BYTES via
+    // the shared formatSize — a literal "256KB" here would be a re-hardcode.
+    assert.doesNotMatch(rlmSource, /256KB/, "rlm.ts must derive the marker label, not hardcode it");
   });
 
   it("caps the error branch's stdout to 32 KiB with the policy marker (test 13)", () => {
@@ -1326,7 +1330,7 @@ describe("runRlm() — conversation bound", () => {
     assert.equal(last.messages[0].role, "user");
     assert.equal(last.messages[1].role, "user");
     assert.match(last.messages[1].content, /earlier turns dropped/);
-    assert.match(last.messages[1].content, /conversation bounded at 256KB/);
+    assert.match(last.messages[1].content, /conversation bounded at 256\.0KB/);
 
     // Pairs are dropped whole: after the marker the retained messages
     // alternate assistant → user, so no feedback dangles without its
