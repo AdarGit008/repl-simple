@@ -1,6 +1,66 @@
 import type { RlmIteration, RlmOptions, RlmResult, RunResult } from "./types.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
+import {
+  truncateText,
+  STDOUT_MAX_BYTES,
+  STDOUT_HEAD_RATIO,
+  STDOUT_RECOVERY,
+  OUTPUT_MAX_BYTES,
+  VALUE_HEAD_RATIO,
+  VALUE_RECOVERY,
+} from "./truncate.js";
+
+// ── Feedback budgets ────────────────────────────────────────────
+//
+// The sandbox already caps `stdout` (32 KiB) and `output` (16 KiB), but a
+// caller may raise either ceiling via `runOptions`. The feedback must not
+// inherit that raised ceiling, so it re-caps here with the same budgets and
+// the same shared helper — the normal path is a marker-free no-op (#74, D1).
+
+/** Byte ceiling for `stdout` in a feedback message. */
+const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
+
+/** Byte ceiling for `output` in a feedback message. */
+const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
+
+// ── Conversation budget ─────────────────────────────────────────
+//
+// The feedback caps bound each turn, but the conversation as a whole grows by
+// two messages per iteration with no ceiling of its own. The cumulative budget
+// below is the backstop: when the whole conversation exceeds it, the oldest
+// middle turns are dropped in whole assistant+feedback pairs (#74, D2).
+
+/** Byte ceiling on the whole RLM conversation, over every message's content. */
+const MAX_CONVERSATION_BYTES = 256 * 1024;
+
+// ── Initial-prompt aggregate cap ───────────────────────────────
+//
+// Each input renders a bounded ~5 KB head/tail preview, but the aggregate
+// still scales with the input count. The assembled input section is re-cut as
+// one flat head+tail so the initial message cannot grow with N (#74, D6).
+
+/** Byte ceiling on the rendered input-preview section of the initial prompt. */
+const INPUT_PREVIEW_MAX_BYTES = 32 * 1024;
+
+/**
+ * Route to an elided input: each input is already declared as a named sandbox
+ * variable, so the recovery is to slice that variable — no assignment step is
+ * needed (unlike `VALUE_RECOVERY`, where the value has no name yet).
+ */
+const INPUT_PREVIEW_RECOVERY =
+  "Each input is available as a named Python variable — slice it in Python to see more.";
+
+/**
+ * UTF-8 length of a message's content — the unit the conversation budget is
+ * measured in. `TextEncoder` yields the same count without reintroducing
+ * byte-level measurement here (the shared truncator owns that, #74 invariant 4).
+ */
+const textEncoder = new TextEncoder();
+
+function contentBytes(text: string): number {
+  return textEncoder.encode(text).length;
+}
 
 // ── System prompt ────────────────────────────────────────────────
 
@@ -193,16 +253,28 @@ async function raceAgainstSignal<T>(promise: Promise<T>, signal?: AbortSignal): 
  * and empty values render header-only, never an empty fence.
  */
 function buildInitialPrompt(question: string, inputs: Record<string, string>): string {
-  const parts = [`# Question\n${question}`];
+  const inputParts: string[] = [];
   for (const [name, value] of Object.entries(inputs)) {
     const header = name === "context" ? "# Context" : "# Input";
-    parts.push(`\n${header} (available as \`${name}\` variable)`);
+    inputParts.push(`${header} (available as \`${name}\` variable)`);
     if (value) {
       const preview =
         value.length > 5000 ? `${value.slice(0, 2500)}\n...\n${value.slice(-2500)}` : value;
-      parts.push(`\`\`\`\n${preview}\n\`\`\``);
+      inputParts.push(`\`\`\`\n${preview}\n\`\`\``);
     }
   }
+
+  // Per-value previews bound each input, but not their sum. Cut the assembled
+  // section as one flat head+tail so N inputs cannot scale the initial prompt
+  // past this budget (#74, D6).
+  const { text: inputSection } = truncateText(inputParts.join("\n"), {
+    maxBytes: INPUT_PREVIEW_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: INPUT_PREVIEW_RECOVERY,
+  });
+
+  const parts = [`# Question\n${question}`];
+  if (inputSection) parts.push(`\n${inputSection}`);
   parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
   return parts.join("\n");
 }
@@ -233,7 +305,12 @@ function extractBestAnswer(iterations: RlmIteration[]): string {
  */
 export function buildFeedback(result: RunResult): string {
   if (result.status === "error") {
-    let feedback = `Error: ${result.error}\nstdout: ${result.stdout}`;
+    const { text: stdout } = truncateText(result.stdout, {
+      maxBytes: FEEDBACK_STDOUT_MAX_BYTES,
+      headRatio: STDOUT_HEAD_RATIO,
+      recovery: STDOUT_RECOVERY,
+    });
+    let feedback = `Error: ${result.error}\nstdout: ${stdout}`;
     if (result.errorKind === "syntax") {
       feedback += "\n\nFix the syntax error in your Python code.";
     } else if (result.errorKind === "typing") {
@@ -287,9 +364,18 @@ export function buildFeedback(result: RunResult): string {
     return "Your code ran without errors and produced no output. Write more code to investigate.";
   }
 
-  const output = result.output !== "None" ? result.output : "";
-  const stdout = result.stdout ? `\nstdout:\n${result.stdout}` : "";
-  return `Output: ${output}${stdout}`;
+  const { text: output } = truncateText(result.output !== "None" ? result.output : "", {
+    maxBytes: FEEDBACK_OUTPUT_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: VALUE_RECOVERY,
+  });
+  const { text: stdout } = truncateText(result.stdout, {
+    maxBytes: FEEDBACK_STDOUT_MAX_BYTES,
+    headRatio: STDOUT_HEAD_RATIO,
+    recovery: STDOUT_RECOVERY,
+  });
+  const stdoutSection = stdout ? `\nstdout:\n${stdout}` : "";
+  return `Output: ${output}${stdoutSection}`;
 }
 
 // ── Main API ─────────────────────────────────────────────────────
@@ -300,6 +386,68 @@ export function buildFeedback(result: RunResult): string {
  * syntax error in code it never wrote (#73).
  */
 const RAW_FALLBACK_NOTICE = "Note: no code block found — treating the whole reply as Python code.";
+
+/**
+ * The D3 notice emitted when oldest-middle turns are dropped. User role,
+ * pi-style ellipsis vocabulary, consistent with the truncation markers: the
+ * model must know the history it sees is partial, not assume completeness.
+ */
+function historyDropMarker(droppedTurns: number): string {
+  return `[… ${droppedTurns} earlier turns dropped — conversation bounded at 256KB. The most recent context follows. …]`;
+}
+
+/**
+ * Bound the conversation to `MAX_CONVERSATION_BYTES` (D2).
+ *
+ * Drops the oldest middle turns in whole assistant+feedback pairs — the
+ * initial user message and the newest pair are never dropped — so a feedback
+ * never dangles without its assistant message. When anything is dropped, a
+ * user-role marker (D3) is inserted right after the initial message and
+ * counts toward the budget. A single over-budget message (an LLM reply the
+ * loop cannot truncate without summarising) is kept and may exceed the budget
+ * transiently until it ages out (#74, Assumption 4).
+ *
+ * `droppedTurns` is the cumulative count across iterations; the function
+ * returns the updated count.
+ */
+function boundConversation(
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  droppedTurns: number,
+): number {
+  // A prior marker always sits at index 1, right after the initial message,
+  // and is the only user-role message that can occupy that slot (a feedback
+  // never appears there while pairs are whole). Strip it before dropping so
+  // `splice(1, 2)` always removes a whole assistant+feedback pair, then
+  // re-insert a fresh marker with the cumulative count below.
+  if (messages.length >= 2 && messages[1].role === "user") {
+    messages.splice(1, 1);
+  }
+
+  const totalBytes = () =>
+    messages.reduce((sum, message) => sum + contentBytes(message.content), 0);
+
+  // Drop the oldest pairs while over budget. A droppable pair is the oldest
+  // assistant+feedback pair after the initial message; dropping needs at least
+  // two pairs — one to drop and the newest to keep — i.e. five messages.
+  while (totalBytes() > MAX_CONVERSATION_BYTES && messages.length >= 5) {
+    messages.splice(1, 2);
+    droppedTurns++;
+  }
+
+  if (droppedTurns === 0) return 0;
+
+  // The marker counts toward the budget; if it would push the conversation
+  // back over, drop more oldest pairs first.
+  let marker = historyDropMarker(droppedTurns);
+  while (totalBytes() + contentBytes(marker) > MAX_CONVERSATION_BYTES && messages.length >= 5) {
+    messages.splice(1, 2);
+    droppedTurns++;
+    marker = historyDropMarker(droppedTurns);
+  }
+
+  messages.splice(1, 0, { role: "user", content: marker });
+  return droppedTurns;
+}
 
 /**
  * Run the Repeated LLM → Monty loop.
@@ -350,6 +498,9 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       content: buildInitialPrompt(question, runInputs),
     },
   ];
+
+  // Cumulative number of whole turns dropped by the conversation bound (D3).
+  let droppedTurns = 0;
 
   for (let i = 0; i < maxIterations; i++) {
     // Abort check between iterations
@@ -418,6 +569,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         ? `${RAW_FALLBACK_NOTICE}\n\n`
         : "") + buildFeedback(result);
     messages.push({ role: "user", content: feedback });
+
+    // 9. Bound the conversation: drop the oldest middle turns in whole pairs
+    // and tell the model when history was dropped (#74, D2/D3).
+    droppedTurns = boundConversation(messages, droppedTurns);
   }
 
   // Max iterations exhausted

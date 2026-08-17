@@ -1039,6 +1039,221 @@ describe("runRlm() — a run that hit a limit", () => {
   });
 });
 
+// ── Feedback byte caps (D1) ─────────────────────────────────────
+
+describe("buildFeedback() — feedback byte caps", () => {
+  it("caps a huge result.output to 16 KiB with the policy marker (test 2)", () => {
+    // The sandbox already cuts `output` at 16 KiB, but a caller may raise
+    // `runOptions.maxOutputBytes`. The feedback must not inherit that raised
+    // ceiling — it re-caps here, and the model must be told what went.
+    const hugeOutput = "A".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "ok",
+      output: hugeOutput,
+      outputTruncated: false,
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const prefix = "Output: ";
+    assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
+    const outputSection = feedback.slice(prefix.length);
+    assert.ok(
+      Buffer.byteLength(outputSection, "utf8") <= 16 * 1024,
+      `Output section is ${Buffer.byteLength(outputSection, "utf8")} bytes`,
+    );
+    assert.match(outputSection, /elided/, "the truncation marker must state what went");
+    assert.match(outputSection, /Assign the value to a name and slice it/);
+  });
+
+  it("caps a huge result.stdout to 32 KiB even when the sandbox passed more (test 3)", () => {
+    // A synthetic RunResult bypasses the sandbox cap, so this proves the
+    // feedback budget is independent of `runOptions.maxStdoutBytes`.
+    const hugeStdout = "S".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "ok",
+      output: "None",
+      outputTruncated: false,
+      stdout: hugeStdout,
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const marker = "stdout:\n";
+    const idx = feedback.indexOf(marker);
+    assert.ok(idx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const stdoutSection = feedback.slice(idx + marker.length);
+    assert.ok(
+      Buffer.byteLength(stdoutSection, "utf8") <= 32 * 1024,
+      `stdout section is ${Buffer.byteLength(stdoutSection, "utf8")} bytes`,
+    );
+    assert.match(stdoutSection, /elided/, "the truncation marker must state what went");
+    assert.match(stdoutSection, /Re-run with a narrower print/);
+  });
+
+  it("uses the shared truncateText helper, not a hand-rolled truncation (test 6)", () => {
+    // Assumption 8 / invariant 4: one truncation implementation. rlm.ts must
+    // import the same symbol and module sandbox.ts uses, and must never
+    // measure bytes itself.
+    const rlmPath = join(fileURLToPath(import.meta.url), "..", "..", "src", "rlm.ts");
+    const sandboxPath = join(fileURLToPath(import.meta.url), "..", "..", "src", "sandbox.ts");
+    const rlmSource = readFileSync(rlmPath, "utf-8");
+    const sandboxSource = readFileSync(sandboxPath, "utf-8");
+
+    assert.match(rlmSource, /from "\.\/truncate\.js"/, "rlm.ts must import from ./truncate.js");
+    assert.match(
+      sandboxSource,
+      /from "\.\/truncate\.js"/,
+      "sandbox.ts must import from ./truncate.js",
+    );
+    assert.match(rlmSource, /\btruncateText\b/, "rlm.ts must reference the shared truncateText");
+    assert.match(sandboxSource, /\btruncateText\b/, "sandbox.ts must reference truncateText");
+
+    // The canonical signals of a hand-rolled byte truncator are `Buffer` and
+    // `byteLength`. rlm.ts may slice strings for unrelated reasons, but it must
+    // never measure bytes itself.
+    assert.doesNotMatch(rlmSource, /\bBuffer\b/, "rlm.ts must not hand-roll byte truncation");
+    assert.doesNotMatch(rlmSource, /\bbyteLength\b/, "rlm.ts must not measure bytes itself");
+  });
+});
+
+// ── Conversation bound (D2/D3) ──────────────────────────────────
+
+describe("runRlm() — conversation bound", () => {
+  /** Total UTF-8 bytes of a recorded call's message contents. */
+  function conversationBytes(messages: Array<{ role: string; content: string }>): number {
+    return messages.reduce((n, m) => n + Buffer.byteLength(m.content, "utf8"), 0);
+  }
+
+  /** A large, labelled print so a dropped turn can be identified by label. */
+  const labelledPrint = (i: number): string =>
+    `\`\`\`python\nprint('TURN_${i}_' + 'x' * 300000)\n\`\`\``;
+
+  it("keeps the 4×300 KB reproduction under 256 KiB (test 1)", async () => {
+    // The issue's reproduction, re-budgeted: four iterations each printing
+    // 300 KB. The sandbox caps stdout at 32 KiB and output at 16 KiB per run,
+    // and the feedback re-caps at the same budgets, so the historical
+    // [119, 262403, 524687, 786971] growth cannot recur.
+    const { llm } = mockLlmCodeGen([0, 1, 2, 3].map(labelledPrint));
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 4 });
+
+    assert.equal(result.status, "max_iterations");
+    for (const call of llm.calls()) {
+      const total = conversationBytes(call.messages);
+      assert.ok(total <= 256 * 1024, `conversation exceeded 256 KiB: ${total} bytes`);
+    }
+  });
+
+  it("drops the oldest middle turns in whole pairs at the boundary (test 4)", async () => {
+    // Ten iterations each add ~32 KiB of capped feedback, crossing the 256 KiB
+    // budget around turn eight, so the oldest turns must be dropped.
+    const { llm } = mockLlmCodeGen(Array.from({ length: 10 }, (_, i) => labelledPrint(i)));
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
+
+    const calls = llm.calls();
+    for (const call of calls) {
+      const total = conversationBytes(call.messages);
+      assert.ok(total <= 256 * 1024, `conversation exceeded 256 KiB: ${total} bytes`);
+    }
+
+    // The final query reflects the bound applied after the previous turn.
+    const last = calls[calls.length - 1];
+    // The initial message is never dropped.
+    assert.equal(last.messages[0].role, "user");
+    assert.match(last.messages[0].content, /# Question/);
+    // The newest queried turn survives...
+    assert.ok(
+      last.messages.some((m) => m.content.includes("TURN_8_")),
+      "the newest turn must be kept",
+    );
+    // ...and the oldest turn was dropped.
+    assert.ok(
+      !last.messages.some((m) => m.content.includes("TURN_0_")),
+      "the oldest turn must be dropped",
+    );
+  });
+
+  it("emits a history-dropped marker and never leaves a dangling feedback (test 5)", async () => {
+    const { llm } = mockLlmCodeGen(Array.from({ length: 10 }, (_, i) => labelledPrint(i)));
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
+
+    const last = llm.calls()[llm.calls().length - 1];
+    // The initial message is followed by the drop marker (user role, D3).
+    assert.equal(last.messages[0].role, "user");
+    assert.equal(last.messages[1].role, "user");
+    assert.match(last.messages[1].content, /earlier turns dropped/);
+    assert.match(last.messages[1].content, /conversation bounded at 256KB/);
+
+    // Pairs are dropped whole: after the marker the retained messages
+    // alternate assistant → user, so no feedback dangles without its
+    // assistant message.
+    for (let i = 2; i < last.messages.length; i++) {
+      const expected = (i - 2) % 2 === 0 ? "assistant" : "user";
+      assert.equal(
+        last.messages[i].role,
+        expected,
+        `messages[${i}] should be ${expected}, got ${last.messages[i].role}`,
+      );
+    }
+  });
+});
+
+// ── Aggregate input preview cap (D6) ───────────────────────────
+
+describe("runRlm() — aggregate input preview cap", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("caps the initial prompt's input section to 32 KiB with many large inputs (test 7)", async () => {
+    // Eight large inputs render a ~5 KB head/tail preview each, so the
+    // aggregate preview (~40 KB) exceeds the 32 KiB budget without the D6
+    // cap. The cap is flat head+tail, so it must stay under 32 KiB and tell
+    // the model how to get the rest.
+    const large = "L".repeat(50 * 1024);
+    const inputs: Record<string, string> = {};
+    for (let i = 0; i < 8; i++) inputs[`data_${i}`] = large;
+
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const result = await runRlm("what do these inputs contain?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs,
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    const inputStart = prompt.indexOf("# Input (available as `data_0` variable)");
+    const inputEnd = prompt.indexOf("\n\nWrite Python code to answer the question.");
+    assert.ok(inputStart >= 0, `input section missing:\n${prompt.slice(0, 300)}`);
+    assert.ok(inputEnd > inputStart, "input section end not found");
+    const inputSection = prompt.slice(inputStart, inputEnd);
+    assert.ok(
+      Buffer.byteLength(inputSection, "utf8") <= 32 * 1024,
+      `input section is ${Buffer.byteLength(inputSection, "utf8")} bytes`,
+    );
+    assert.match(inputSection, /elided/, "the truncation marker must state what went");
+    assert.match(inputSection, /slice it in Python/, "the recovery clause must name the input");
+  });
+});
+
 // ── A SUBMIT that never resolved ────────────────────────────────
 
 describe("runRlm() — a SUBMIT call that failed to resolve", () => {
