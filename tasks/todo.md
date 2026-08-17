@@ -12,3 +12,4 @@
 - [x] T10 — Running byte total in boundConversation (D12) + rename ERROR_MAX_BYTES → FEEDBACK_ERROR_MAX_BYTES (D22) + convention comment
 - [x] T11 — Reword the TextEncoder framing honestly (D14): src/rlm.ts JSDoc + docs Exception 3
 - [x] T12 — Rename the q binding to questionText + docs line 390 reword (D23)
+- [x] T13 — Close VERIFY gaps: H1 test 14 both-ends + elided-count pins, H2 assistant-reply boundary/magnitude pin (test 22), H3 marker-overshoot loop execution (test 23), M4 docs rows + sentinel exception + #145 paragraph, M5 input-name regex boundary cases, L1 test 7 comment

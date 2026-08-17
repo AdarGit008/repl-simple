@@ -950,6 +950,51 @@ describe("runRlm() — context input", () => {
     );
     assert.equal(runOptLlm.calls().length, 0, "the runOptions.inputs path must reject too");
 
+    // M5: boundary cases around the anchored pattern. A dropped `$` turns
+    // /^[A-Za-z_][A-Za-z0-9_]*$/ into a prefix match, which accepts "a b"
+    // and "a-" on their leading valid fragment; "" guards the required first
+    // character (a first-class-optional mutant accepts the empty key). Every
+    // case must reject before any query.
+    for (const [boundary, why] of [
+      ["a b", "a space terminates the name mid-key"],
+      ["a-", "a dash is not an identifier character"],
+      ["", "an empty key has no first character to anchor"],
+    ] as const) {
+      const { llm: boundaryLlm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+      await assert.rejects(
+        runRlm("q", {
+          llmClient: boundaryLlm,
+          registry: rlmRegistry(),
+          inputs: { [boundary]: "x" },
+          maxIterations: 5,
+        }),
+        /invalid input name/,
+        `${JSON.stringify(boundary)} must be rejected (${why})`,
+      );
+      assert.equal(
+        boundaryLlm.calls().length,
+        0,
+        `${JSON.stringify(boundary)} must be rejected before any query`,
+      );
+    }
+
+    // "_" alone is deliberately ACCEPTED: the pattern's first class includes
+    // the underscore (SPEC D20) because Python identifiers may start with
+    // one, and the header interpolates it safely. Pinning the accept side
+    // guards the `[A-Za-z_]` first class against a letter-only mutant.
+    const { llm: underscoreLlm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const underscoreResult = await runRlm("q", {
+      llmClient: underscoreLlm,
+      registry: rlmRegistry(),
+      inputs: { _: "v" },
+      maxIterations: 5,
+    });
+    assert.equal(underscoreResult.status, "ok", "an underscore key is a valid Python identifier");
+    assert.ok(
+      underscoreLlm.calls()[0].messages[0].content.includes("# Input (available as `_` variable)"),
+      "the underscore key must render its header",
+    );
+
     // Valid names are unaffected: they render in the prompt and the run completes.
     const { llm: okLlm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
     const result = await runRlm("q", {
@@ -1799,6 +1844,154 @@ describe("runRlm() — conversation bound", () => {
     );
   });
 
+  it("pins the assistant-reply cap's 256 KiB boundary and full-budget magnitude (test 22)", async () => {
+    // H2: test 16 (2 MiB) and test 11 (300 KiB) pin the ceiling and the
+    // marker, but a silent 8 KiB cap or a halved cap passes both. Pin the
+    // strict `>` spill boundary and the magnitude directly, under the D17
+    // sentinel-overhead convention (tests 20/21): at the effective payload
+    // budget the reply renders whole; exactly at the full budget it renders
+    // sentinel-wrapped within the ceiling; one byte over fires the marker;
+    // and a ~300 KiB reply spends the full budget (a halved cap can never
+    // retain more than half).
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+    /** Push `reply` through one iteration and return the pushed assistant message. */
+    const pushedAssistant = async (reply: string): Promise<{ role: string; content: string }> => {
+      const { llm } = mockLlmCodeGen([reply, '```python\nSUBMIT("done")\n```']);
+      await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
+      return llm.calls()[1].messages[1];
+    };
+
+    // (a) At the effective payload budget (256 KiB − sentinel overhead) the
+    // reply passes through byte-identical, sentinel-free, marker-free.
+    {
+      const exactlyAt = silentPaddedReply(256 * 1024 - SENTINEL_OVERHEAD_BYTES, "AT_PAYLOAD");
+      const pushed = await pushedAssistant(exactlyAt);
+      assert.equal(pushed.content, exactlyAt, "an at-payload-budget reply must render whole");
+      assert.doesNotMatch(pushed.content, /elided/, "no marker may fire at the payload budget");
+      assert.ok(
+        !pushed.content.includes(TRUNCATED_VIEW_BEGIN) &&
+          !pushed.content.includes(TRUNCATED_VIEW_END),
+        "no sentinels may wrap a whole reply",
+      );
+    }
+
+    // (b) Exactly at the full 256 KiB budget: sentinel-wrapped, ceiling holds.
+    {
+      const atBudget = silentPaddedReply(256 * 1024, "AT_BUDGET");
+      const pushed = await pushedAssistant(atBudget);
+      assert.ok(
+        pushed.content.startsWith(TRUNCATED_VIEW_BEGIN),
+        `an exactly-at-budget reply must be wrapped:\n${pushed.content.slice(0, 120)}`,
+      );
+      assert.ok(
+        pushed.content.endsWith(TRUNCATED_VIEW_END),
+        `an exactly-at-budget reply must be wrapped:\n${pushed.content.slice(-120)}`,
+      );
+      assert.ok(
+        Buffer.byteLength(pushed.content, "utf8") <= 256 * 1024,
+        `the wrapped reply is ${Buffer.byteLength(pushed.content, "utf8")} bytes — the ceiling must hold with the sentinels included`,
+      );
+    }
+
+    // (c) One byte over: the marker fires with the weak recovery clause, and
+    // the ceiling still holds.
+    {
+      const justOver = silentPaddedReply(256 * 1024 + 1, "JUST_OVER");
+      const pushed = await pushedAssistant(justOver);
+      const inside = insideSentinels(pushed.content);
+      assert.match(inside, /elided/, "the truncation marker must fire just over the budget");
+      assert.match(
+        inside,
+        /Keep replies concise and re-state anything important/,
+        "the capped reply must carry the weak recovery clause",
+      );
+      assert.ok(
+        Buffer.byteLength(pushed.content, "utf8") <= 256 * 1024,
+        `the capped reply is ${Buffer.byteLength(pushed.content, "utf8")} bytes`,
+      );
+    }
+
+    // (d) Magnitude: a ~300 KiB reply must spend the budget — more than half
+    // of it survives into the conversation. A halved cap (128 KiB) can never
+    // retain more than its own half.
+    {
+      const pushed = await pushedAssistant(silentPaddedReply(300 * 1024, "MAGNITUDE"));
+      const pushedBytes = Buffer.byteLength(pushed.content, "utf8");
+      assert.ok(
+        pushedBytes > 128 * 1024,
+        `a ~300 KiB reply must retain more than half the budget, got ${pushedBytes} bytes`,
+      );
+    }
+  });
+
+  it("makes room for the drop marker with an extra pair drop (test 23)", async () => {
+    // H3: the marker-overshoot loop in boundConversation — after the first
+    // drop loop, when the conversation is under budget but the marker's own
+    // bytes would push it back over, an extra oldest pair is dropped. No
+    // test entered that loop (its 13 mutants all survived the bounded
+    // sweep); this construction does. Sizes are chosen so the first drop
+    // loop leaves the conversation 8 bytes under the budget — inside the
+    // marker's byte count — so the marker loop must drop one more pair.
+    // The observable is the invariant, not the drop count: the conversation
+    // the model sees must stay ≤ 256 KiB WITH the marker included.
+    const callRecords: Array<{
+      systemPrompt: string;
+      messages: Array<{ role: string; content: string }>;
+    }> = [];
+    const llm: LlmClient & {
+      calls(): Array<{ systemPrompt: string; messages: Array<{ role: string; content: string }> }>;
+    } = {
+      async query(systemPrompt, messages) {
+        callRecords.push({
+          systemPrompt,
+          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        });
+        if (callRecords.length === 1) return silentPaddedReply(100 * 1024, "OVERSHOOT_FIRST");
+        if (callRecords.length === 2) return silentPaddedReply(50 * 1024, "OVERSHOOT_SECOND");
+        if (callRecords.length === 3) {
+          // The third query carries [I, A0, F0, A1, F1]. The first drop loop
+          // removes (A0, F0); size A2 so what remains — I + A1 + F0 + A2 + F1
+          // — lands 8 bytes under the budget. The drop marker (~100 bytes)
+          // then forces the marker-overshoot loop to drop (A1, F1) too.
+          const msgs = callRecords[2].messages;
+          const bytes = (i: number) => Buffer.byteLength(msgs[i].content, "utf8");
+          const feedback = bytes(2); // F0 — every silent-run feedback is identical
+          const a2 = 256 * 1024 - 8 - bytes(0) - bytes(3) - 2 * feedback;
+          return silentPaddedReply(a2, "OVERSHOOT_THIRD");
+        }
+        if (callRecords.length === 4) return '```python\nSUBMIT("done")\n```';
+        return "";
+      },
+      calls() {
+        return callRecords;
+      },
+    };
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 6 });
+
+    assert.equal(result.status, "ok", "the run must complete through the marker-overshoot path");
+    const final = callRecords[3].messages;
+    assert.deepEqual(
+      final.map((m) => m.role),
+      ["user", "user", "assistant", "user"],
+      "after the extra drop: initial message, marker, newest pair",
+    );
+    assert.match(final[1].content, /earlier turns dropped/);
+    assert.ok(
+      conversationBytes(final) <= 256 * 1024,
+      `the conversation must stay ≤ 256 KiB including the marker, got ${conversationBytes(final)} bytes`,
+    );
+    // The loop's effect, pinned directly: the extra pair was dropped, so the
+    // cumulative count is 2 — one pair from the budget loop, one for the
+    // marker's room.
+    const dropped = final[1].content.match(/… (\d+) earlier turns dropped/);
+    assert.ok(dropped, "the drop marker must state the count");
+    assert.equal(Number(dropped[1]), 2, "one pair for the budget, one for the marker");
+  });
+
   it("keeps a just-under-budget conversation whole and marker-free (test 12)", async () => {
     // The complement of the strict boundary: ~100 bytes under the budget,
     // nothing may be dropped and no marker may appear.
@@ -1841,8 +2034,9 @@ describe("runRlm() — aggregate input preview cap", () => {
   it("caps the initial prompt's input section to 32 KiB with many large inputs (test 7)", async () => {
     // Eight large inputs render a ~5 KB head/tail preview each, so the
     // aggregate preview (~40 KB) exceeds the 32 KiB budget without the D6
-    // cap. The cap is flat head+tail, so it must stay under 32 KiB and tell
-    // the model how to get the rest.
+    // cap. The cap is block-level (D15): whole blocks are kept from the head
+    // and tail and the middle inputs are elided wholesale, so the section
+    // must stay under 32 KiB and tell the model how to get the rest.
     const large = "L".repeat(50 * 1024);
     const inputs: Record<string, string> = {};
     for (let i = 0; i < 8; i++) inputs[`data_${i}`] = large;
@@ -1878,9 +2072,15 @@ describe("runRlm() — aggregate input preview cap", () => {
     // start of the tail (an even fence count, but a broken pair). The
     // aggregate cut must elide whole input blocks instead: the aggregate
     // marker sits between blocks, never inside a fence pair.
-    const large = "L".repeat(50 * 1024);
+    // Distinct head/tail anchors per value so the WHICH-blocks assertions
+    // below can tell the first input from the last (H1): every value is
+    // still 50 KiB so the aggregate cut still fires, but data_0's value
+    // starts with a unique head anchor and data_7's ends with a unique tail
+    // anchor.
     const inputs: Record<string, string> = {};
-    for (let i = 0; i < 8; i++) inputs[`data_${i}`] = large;
+    for (let i = 0; i < 8; i++) {
+      inputs[`data_${i}`] = `INPUT_${i}_HEAD_${"L".repeat(50 * 1024)}_INPUT_${i}_TAIL`;
+    }
 
     const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
     const result = await runRlm("what do these inputs contain?", {
@@ -1929,6 +2129,59 @@ describe("runRlm() — aggregate input preview cap", () => {
         );
       }
     }
+
+    // WHICH blocks are kept (H1): the block-level elision must keep blocks
+    // from BOTH ends of the input list — the first input's block with its
+    // value head, and the last input's block with its value tail. A head-only
+    // aggregate elision (or one that keeps the wrong end) satisfies every
+    // fence/header invariant above while dropping the blocks the model most
+    // needs. The per-value previews are 50/50 head+tail, so both anchors
+    // survive inside their kept blocks.
+    assert.ok(
+      inputSection.includes("# Input (available as `data_0` variable)"),
+      "the first input's block must be kept",
+    );
+    assert.ok(inputSection.includes("INPUT_0_HEAD_"), "the first input's value head must be kept");
+    assert.ok(
+      inputSection.includes("# Input (available as `data_7` variable)"),
+      "the last input's block must be kept",
+    );
+    assert.ok(inputSection.includes("_INPUT_7_TAIL"), "the last input's value tail must be kept");
+    assert.ok(
+      inputSection.indexOf("# Input (available as `data_0` variable)") <
+        inputSection.indexOf(markerLine),
+      "the first input's block must sit in the head, before the elision marker",
+    );
+    assert.ok(
+      inputSection.indexOf("# Input (available as `data_7` variable)") >
+        inputSection.indexOf(markerLine),
+      "the last input's block must sit in the tail, after the elision marker",
+    );
+
+    // The elided-count arithmetic (H1): the marker's "X of Y inputs elided"
+    // must state the true block total and the number of blocks absent from
+    // the section — a wrong-arithmetic mutant (Y−1, X+1) passes the ceiling
+    // while lying to the model. Derive X from which headers survive, the
+    // same label-accounting test 5 uses for dropped turns (D16). The total
+    // is 9, not 8: `context` is always declared alongside the inputs and
+    // renders its own header-only block, and it counts too.
+    const countMatch = markerLine.match(/… (\d+) of (\d+) inputs elided/);
+    assert.ok(countMatch, `the marker must state the elided/total counts:\n${markerLine}`);
+    const kept: number[] = [];
+    for (let i = 0; i < 8; i++) {
+      if (inputSection.includes(`# Input (available as \`data_${i}\` variable)`)) kept.push(i);
+    }
+    const contextKept = inputSection.includes("# Context (available as `context` variable)");
+    assert.equal(
+      Number(countMatch[2]),
+      9,
+      "the marker must state the true block total (8 inputs + context)",
+    );
+    assert.equal(
+      Number(countMatch[1]),
+      9 - (kept.length + (contextKept ? 1 : 0)),
+      `the marker's elided count must equal the absent headers (kept data ${JSON.stringify(kept)}, context ${contextKept})`,
+    );
 
     assert.ok(
       Buffer.byteLength(inputSection, "utf8") <= 32 * 1024,

@@ -386,6 +386,7 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `buildInitialPrompt` input preview | 32 KiB aggregate; 5 KiB per value | per-value 50/50 head+tail; aggregate whole-block elision | #74, #145 |
 | `buildFeedback` `error` | 16 KiB | 50/50 head+tail | #144 |
 | `buildInitialPrompt` `question` | 64 KiB | 50/50 head+tail | #144 |
+| `runRlm` assistant reply (conversation copy) | 256 KiB | 50/50 head+tail | #145 |
 
 Every `truncateText` row in this table goes through one implementation, `src/truncate.ts`, per
 invariant 4 — the `#74`/`#144`/`#145` rows too, not only the four `#29`/`#34` rows. The conversation
@@ -431,6 +432,17 @@ the question is **not** sandbox-accessible: unlike `output` and inputs, the mode
 Python, so the marker must not advertise a route it cannot honour (policy Q3, the same rule as the
 `_` binding). Both caps go through the one shared `truncateText`.
 
+**#145 (RLM message-growth polish).** The last uncapped model-facing path is now bounded and every
+truncated view is authenticated: the assistant reply copied into the conversation is capped at the
+conversation budget (256 KiB, 50/50 head+tail — the row above) with a deliberately weak recovery
+clause ("Keep replies concise and re-state anything important."), because the model cannot recover
+its own elided reply from anywhere (policy Q3), while `iterations[].llmResponse` keeps the raw
+reply for the caller; truncated views are sentinel-delimited (Exception 5); error lines are
+`> `-quoted so a forged `stdout:` line cannot pass as the real delimiter (D19); input names are
+validated against a Python-identifier pattern before any query (D20); the drop marker's label
+derives from the budget via `formatSize` ("256.0KB"); and the aggregate input-preview cut is
+block-level elision over whole per-value previews (D15), so no cut can split a fence or a header.
+
 **Exception 3 — the conversation byte count uses `TextEncoder`, and that *is* byte measurement.**
 D2 writes the budget as `Buffer.byteLength`; `TextEncoder.encode().length` is UTF-8 byte measurement
 too, and byte-for-byte identical to `Buffer.byteLength` for the same text (verified, including lone
@@ -443,6 +455,15 @@ one-shared-truncator invariant (invariant 4). [#74]
 **Exception 4 — a single over-budget LLM reply is kept.** The loop cannot truncate model output
 without summarising (deferred, D4), so one reply larger than 256 KiB is kept and the conversation is
 allowed to exceed the budget transiently until it ages out (#74, Assumption 4).
+
+**Exception 5 — every truncated view is sentinel-delimited (#145, D17).** A marker carried by
+attacker-controlled text is indistinguishable from a real one, so `rlm.ts` wraps every truncated
+view in `[TRUNCATED VIEW BEGIN]` / `[TRUNCATED VIEW END]` lines and the RLM system prompt tells
+the model that only elision markers inside the sentinels are authentic — marker-looking text
+anywhere else is literal data. The sentinel bytes are subtracted from the section budget before
+the `truncateText` call, so the ceilings in the table stay hard with the sentinels included;
+under the budget the path is a byte-identical, sentinel-free no-op, and forged marker-looking
+text stays raw.
 
 **The budget-smaller-than-the-marker edge**, which #29 asked to decide explicitly: the result is
 **empty**, with the truncated flag set. A partial marker is misinformation and the budget is a hard
