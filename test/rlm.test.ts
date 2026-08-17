@@ -961,6 +961,90 @@ describe("runRlm() — preamble lineOffset wiring", () => {
   });
 });
 
+// ── Fresh-sandbox contract: the prompt says the truth (#77, D2) ──
+//
+// Every RLM iteration runs in a fresh sandbox — no variables, imports, or
+// state carry over between iterations. The model-facing text must say so
+// plainly, and continuity-implying wording must not survive anywhere in it.
+
+describe("runRlm() — fresh-sandbox contract (issue test 4)", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  /** Reply set: iteration 1 fails, iteration 2 terminates cleanly. */
+  const FAIL_THEN_SUBMIT = ["```python\n1 +\n```", '```python\nSUBMIT("done")\n```'];
+
+  /** Everything the model reads in a run: the system prompt plus every
+   *  user-role message (initial prompt, feedback, drop markers). */
+  function modelFacingText(llm: ReturnType<typeof mockLlmCodeGen>["llm"]): string {
+    return llm
+      .calls()
+      .flatMap((call) => [
+        call.systemPrompt,
+        ...call.messages.filter((m) => m.role === "user").map((m) => m.content),
+      ])
+      .join("\n");
+  }
+
+  it("the system prompt states the fresh-sandbox contract plainly", async () => {
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    // Captured through the loop — the prompt the model actually received,
+    // not the exported literal asserted against itself.
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.match(
+      systemPrompt,
+      /fresh sandbox/,
+      `the prompt must name the fresh sandbox:\n${systemPrompt}`,
+    );
+    assert.match(
+      systemPrompt,
+      /No variables, imports, or state carry\s+over between iterations/,
+      `the prompt must state that nothing carries over:\n${systemPrompt}`,
+    );
+    assert.match(
+      systemPrompt,
+      /self-contained/,
+      `the prompt must demand self-contained snippets:\n${systemPrompt}`,
+    );
+  });
+
+  it("no RLM-facing text implies continuity", async () => {
+    // The loop used to say nothing at all about state, and phrasing around
+    // an ongoing environment invited the reading that iteration 1's
+    // variables were still there in iteration 2. Under the fresh-sandbox
+    // contract nothing persists between iterations, so the claim must not
+    // appear anywhere the model reads — prompt or feedback alike.
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const text = modelFacingText(llm);
+    assert.doesNotMatch(text, /\bpersist/i, `continuity-implying wording survived:\n${text}`);
+    assert.doesNotMatch(text, /\bsession\b/i, `"session" implies continuity:\n${text}`);
+    assert.doesNotMatch(text, /\bongoing\b/i, `"ongoing" implies continuity:\n${text}`);
+  });
+});
+
 // ── Direct answers and the raw fall-through (#73) ────────────────
 
 describe("runRlm() — direct answers and the raw fall-through", () => {

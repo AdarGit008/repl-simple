@@ -30,7 +30,7 @@
   - Verify: `npm test` (focused session tests green, full suite green), `npm run check`
   - Files: `src/session.ts`, `test/session.test.ts`
 
-- [ ] Task 5: Rewrite RLM prompt + feedback wording to state the fresh-sandbox contract — issue test 4
+- [x] Task 5: Rewrite RLM prompt + feedback wording to state the fresh-sandbox contract — issue test 4
   - Acceptance: the RLM system prompt (and any feedback wording) states that each iteration runs
     in a fresh sandbox with no state carried over; continuity-implying wording ("session",
     "ongoing", "persist") is gone from RLM-facing text; D3 section-header literals preserved and

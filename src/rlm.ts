@@ -89,6 +89,10 @@ function contentBytes(text: string): number {
 export const DEFAULT_RLM_SYSTEM_PROMPT = `\
 You are a Python data analyst. You have access to a sandboxed Python environment.
 
+Each iteration runs in a fresh sandbox. No variables, imports, or state carry
+over between iterations: every code snippet you submit must be self-contained,
+re-declaring or recomputing whatever it needs.
+
 Your job: investigate the user's question by writing Python code, running it,
 interpreting the results, and submitting your final answer.
 
