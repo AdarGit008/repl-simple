@@ -23,7 +23,7 @@
   - Verify: `npm test` (focused rlm tests green, full suite green), `npm run check`
   - Files: `src/rlm.ts`, `test/rlm.test.ts`
 
-- [ ] Task 4: `Session.run` passes `lineOffset` (preamble + prior snippets) — issue test 3
+- [x] Task 4: `Session.run` passes `lineOffset` (preamble + prior snippets) — issue test 3
   - Acceptance: under `Session`, a diagnostic on line K of the latest snippet is reported as
     line K (offset = preamble + stacked prior snippets); no earlier-snippet or preamble source in
     the fed-back diagnostic; REPL-path tests stay green.

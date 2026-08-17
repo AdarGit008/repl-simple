@@ -299,6 +299,16 @@ export class Session {
     parts.push(...this.snippets, code);
     const allCode = parts.join("\n");
 
+    // Everything before the last part is the prefix the sandbox numbers its
+    // diagnostics from, so the session owns the offset: the line count of the
+    // actual assembled prefix (preamble + stacked prior snippets), computed
+    // from the parts really joined — never a hardcoded constant (#77, D1).
+    // A caller-supplied `lineOffset` cannot be right here: the session is the
+    // one doing the prepending.
+    const lineOffset = parts
+      .slice(0, -1)
+      .reduce((total, part) => total + part.split("\n").length, 0);
+
     // Record the cache length BEFORE this run (for trace filtering)
     const priorEntryCount = this.callCacheEntries.length;
 
@@ -319,6 +329,7 @@ export class Session {
 
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
+      lineOffset,
       onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
 
