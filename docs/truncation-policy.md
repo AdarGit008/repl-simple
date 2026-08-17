@@ -440,7 +440,9 @@ its own elided reply from anywhere (policy Q3), while `iterations[].llmResponse`
 reply for the caller; truncated views are sentinel-delimited (Exception 5); error lines are
 `> `-quoted so a forged `stdout:` line cannot pass as the real delimiter (D19); input names are
 validated against a Python-identifier pattern before any query (D20); the drop marker's label
-derives from the budget via `formatSize` ("256.0KB"); and the aggregate input-preview cut is
+derives from the budget via `formatSize` ("256.0KB"); the quoted error section renders ≤ 2× its
+value budget (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
+vector); and the aggregate input-preview cut is
 block-level elision over whole per-value previews (D15), so no cut can split a fence or a header.
 
 **Exception 3 — the conversation byte count uses `TextEncoder`, and that *is* byte measurement.**
@@ -460,10 +462,18 @@ allowed to exceed the budget transiently until it ages out (#74, Assumption 4).
 attacker-controlled text is indistinguishable from a real one, so `rlm.ts` wraps every truncated
 view in `[TRUNCATED VIEW BEGIN]` / `[TRUNCATED VIEW END]` lines and the RLM system prompt tells
 the model that only elision markers inside the sentinels are authentic — marker-looking text
-anywhere else is literal data. The sentinel bytes are subtracted from the section budget before
-the `truncateText` call, so the ceilings in the table stay hard with the sentinels included;
-under the budget the path is a byte-identical, sentinel-free no-op, and forged marker-looking
-text stays raw.
+anywhere else is literal data (the history-drop notice after the first message is carved out as
+also system-emitted and authentic). Sentinel-token sequences inside a value itself
+(`[TRUNCATED VIEW`, under budget or over) are neutralised before wrapping — the ordinary space
+becomes a zero-width space, `[TRUNCATED\u200BVIEW`, which cannot form a sentinel — leaving no
+residual forgery vector: a forged pair can neither render whole-and-sentinel-free under the
+budget nor land inside the authentic pair over it. The sentinel bytes are subtracted from the
+section budget before the `truncateText` call, so the ceilings in the table stay hard with the
+sentinels included; the value is byte-measured after the neutralisation swap, so the budgets
+stay exact. Under the budget the path is a sentinel-free no-op (byte-identical apart from that
+swap), and forged marker-looking text stays raw. A caller-supplied `options.systemPrompt`
+replaces the default wholesale, dropping the authentication rule while the sentinel wrapping
+still happens — callers who override it should restate the rule.
 
 **The budget-smaller-than-the-marker edge**, which #29 asked to decide explicitly: the result is
 **empty**, with the truncated flag set. A partial marker is misinformation and the budget is a hard

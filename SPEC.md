@@ -181,8 +181,7 @@ Self-consistent — no need to predict the exact count for the 10 × 300 KB-labe
 **Prove-it guard — GREEN immediately** with completed-turns scope (the marker count is consistent
 today). **(Build-correction note: the original D16 wording counted labels 0–9 and was unsatisfiable
 at HEAD — amended to completed-turns scope, recorded 2026-08-17.)** The head/tail-ratio half of
-item 7's complaint is pinned by tests 20/21 (D21, both-ends assertions) rather than here. The head/tail-ratio half of item 7's complaint is pinned by tests 20/21 (D21, both-ends
-assertions) rather than here.
+item 7's complaint is pinned by tests 20/21 (D21, both-ends assertions) rather than here.
 
 ### D17 — Absorbed 1: sentinel-delimited truncation markers + system-prompt note (no `truncate.ts` edit)
 

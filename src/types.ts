@@ -246,7 +246,13 @@ export interface RlmOptions {
   registry: ToolRegistry;
   /** Python preamble injected before user code (e.g. repl_server.py). */
   preamble?: string;
-  /** System prompt for the LLM. Defaults to DEFAULT_RLM_SYSTEM_PROMPT. */
+  /**
+   * System prompt for the LLM. Defaults to `DEFAULT_RLM_SYSTEM_PROMPT`.
+   * Note: a caller-supplied prompt replaces the default wholesale — the
+   * sentinel-authentication rule (D17) lives only in the default, so a
+   * custom prompt drops that rule while `truncateWithSentinels` wrapping
+   * still happens. Callers who override it should restate the rule.
+   */
   systemPrompt?: string;
   /** Max RLM iterations before giving up. Default: 10. */
   maxIterations?: number;
