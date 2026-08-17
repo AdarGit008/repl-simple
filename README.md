@@ -339,11 +339,14 @@ Four things worth knowing before relying on it:
 
   A function cannot run its body 380 times without being called. Nothing about test execution
   differed between the runs; V8's per-function range count is lost when coverage from several test
-  processes is merged, while the block counts inside it survive. **A file that varies gets its floor
-  set by hand at the low observation, not at whatever `--update` happened to measure** —
-  `truncate.ts` is pinned to 99.74 for this reason. Which end you land on is machine-dependent:
-  `registry.ts` reported its high in five of six local runs and its low on both CI runs of the same
-  commit. This is *not*
+  processes is merged, while the block counts inside it survive. **This is why `coverage:update`
+  measures three times and writes the per-file minimum**, prints every file that varied with its
+  range, and **refuses to write** (naming the file) when a spread is wider than one line's worth —
+  a whole process's data going missing is a thing to look at, not to average away. The plain gate
+  carries the matching tolerance: a file fails only when it is **more than one line** below its
+  floor, because the instrument cannot resolve sub-line differences. Which end a run lands on is
+  machine-dependent: `registry.ts` reported its high in five of six local runs and its low on both
+  CI runs of the same commit. This is *not*
   [#109](https://github.com/AdarGit008/repl-simple/issues/109) — that is real ordering-dependent
   behaviour in the rlm tests, whereas nothing here executes differently.
 
