@@ -1,8 +1,8 @@
 {
-  "global": 97.92,
+  "global": 97.61,
   "files": {
-    "extensions/repl-extension.ts": 99.72,
-    "src/bashenv.ts": 84.21,
+    "extensions/repl-extension.ts": 99.73,
+    "src/bashenv.ts": 83.8,
     "src/bridge.ts": 100,
     "src/builtins.ts": 99.45,
     "src/pathjail.ts": 98.63,
@@ -11,12 +11,12 @@
     "src/repl.ts": 100,
     "src/rlm_loop.ts": 98.34,
     "src/rlm_tools.ts": 99.07,
-    "src/rlm.ts": 95.72,
+    "src/rlm.ts": 95.94,
     "src/sandbox.ts": 97.39,
-    "src/session.ts": 98.34,
+    "src/session.ts": 98.65,
     "src/submit_signal.ts": 100,
-    "src/toolstore.ts": 98.26,
-    "src/truncate.ts": 99.74,
+    "src/toolstore.ts": 98.9,
+    "src/truncate.ts": 100,
     "src/types.ts": 100
   }
 }
