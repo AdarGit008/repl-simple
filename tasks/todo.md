@@ -8,7 +8,7 @@
     `npm run lint`.
   - Files: `src/repl.ts`, `test/repl.test.ts`
 
-- [ ] Task 2: LRU cap + eviction + suspension protection (D4–D6, D9) + issue tests 4 and 6
+- [x] Task 2: LRU cap + eviction + suspension protection (D4–D6, D9) + issue tests 4 and 6
   - Acceptance: `ReplRunnerOptions.maxSessions` and `REPL_MAX_SESSIONS` env with stated precedence
     and default 32; touch on run/resume/abandon; oldest non-suspended session evicted, never the
     just-inserted id; suspended sessions skipped (pool exceeds cap rather than drop a pending
@@ -16,14 +16,14 @@
   - Verify: focused tests; `npm test`; `npm run check`; `npm run build`; `npm run lint`.
   - Files: `src/repl.ts`, `test/repl.test.ts`
 
-- [ ] Task 3: `reset()` removes the entry (D7–D8) + issue test 5 + update the two existing tests
+- [x] Task 3: `reset()` removes the entry (D7–D8) + issue test 5 + update the two existing tests
   - Acceptance: after reset the entry is gone — count drops, `resume` answers the no-session
     sentence, next `run` recreates fresh; `ResetOutcome` unchanged; reset during an in-flight
     creation reports `existed: false`.
   - Verify: focused tests; `npm test`; `npm run check`; `npm run build`; `npm run lint`.
   - Files: `src/repl.ts`, `test/repl.test.ts`
 
-- [ ] Task 4: README records the cap and eviction policy
+- [x] Task 4: README records the cap and eviction policy
   - Acceptance: default cap 32 + override knobs named; LRU rule; refuse-to-evict-suspended rule;
     reset removes the session; `maxSessions` on `ReplRunnerOptions`; no claim the code does not
     implement.
