@@ -254,7 +254,13 @@ export interface RlmOptions {
   signal?: AbortSignal;
   /** Callback invoked after each iteration completes. */
   onIteration?: (iteration: RlmIteration) => void;
-  /** Inputs passed to each sandbox run (e.g. { context: "..." }). */
+  /**
+   * Inputs declared in the sandbox and **announced to the LLM**: every key
+   * and value is rendered into the initial prompt (head/tail preview beyond
+   * 5000 chars per value). Never pass secrets or data the model must not
+   * see — the model reads these values from the prompt and from sandbox code.
+   * `context` is always declared and defaults to `""` when absent.
+   */
   inputs?: Record<string, string>;
   /** Sandbox RunOptions propagated to each sandbox run. */
   runOptions?: RunOptions;
