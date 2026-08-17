@@ -55,6 +55,16 @@ export interface ReplRunnerOptions {
    * direction is arbitrary code execution.
    */
   isProjectTrusted?: () => boolean;
+
+  /**
+   * Maximum number of live sessions in the pool.
+   *
+   * When a new session would exceed the cap, the least-recently-used session
+   * is evicted — except one with a pending approval, which is never evicted.
+   * Defaults to `REPL_MAX_SESSIONS` (a positive integer) or 32; an explicit
+   * option wins over both. Non-positive values fall back the same way (#59).
+   */
+  maxSessions?: number;
 }
 
 /** A live session, plus what the preamble decision for it was. */
@@ -65,12 +75,53 @@ interface LiveSession {
   /** Whether that decision actually put saved code in front of every run. */
   hasPreamble: boolean;
   /**
+   * How many `run`/`resume` calls are executing right now.
+   *
+   * A count, not a flag, so nested calls cannot reset each other. Eviction
+   * skips busy sessions: a session whose run is mid-flight — with an approval
+   * dialog open, say — is not `isSuspended()` yet, and evicting it would
+   * orphan the answer the user was asked to give (#59).
+   */
+  busy: number;
+  /**
+   * Whether the one-shot `[trust changed]` notice has been delivered to this
+   * session. Two concurrent discarders of the same rebuilt session must not
+   * deliver it twice (#59).
+   */
+  trustChangeNoticed: boolean;
+  /**
    * A one-shot notice about the preamble, prepended to the next result.
    *
    * Cleared once delivered. It is written at the moment the environment was
    * decided — session creation — because that is the only moment it is news.
    */
   notice?: string;
+}
+
+// ── Pool cap ───────────────────────────────────────────────────
+
+/**
+ * Default pool cap.
+ *
+ * A session retains every snippet it ever ran plus its full call cache, so
+ * the cap is the only thing standing between a model that mints session ids
+ * and unbounded memory. 32 follows the preamble's `DEFAULT_PREAMBLE_LIMITS`
+ * precedent: a session is strictly heavier than a preamble file (#59).
+ */
+const DEFAULT_MAX_SESSIONS = 32;
+
+/** Positive integer or fallback — the same rule `src/pool.ts` applies. */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** The pool cap: explicit option > `REPL_MAX_SESSIONS` env > default. */
+function sessionCap(explicit: number | undefined): number {
+  if (explicit !== undefined && Number.isInteger(explicit) && explicit > 0) return explicit;
+  return envInt("REPL_MAX_SESSIONS", DEFAULT_MAX_SESSIONS);
 }
 
 // ── ReplRunner ─────────────────────────────────────────────────────
@@ -85,12 +136,25 @@ interface LiveSession {
  */
 export class ReplRunner {
   private sessions = new Map<string, LiveSession>();
+  /**
+   * Creations in flight, keyed by session id.
+   *
+   * The promise is stored *before* awaiting anything, so a concurrent caller
+   * joins the same creation instead of starting a second. On success the
+   * promise inserts the session and removes itself; on rejection it removes
+   * itself and rethrows — one failed creation must not poison the id for
+   * every later caller, which is the same contract `getSandboxPool` pins for
+   * the worker pool (#59).
+   */
+  private inflight = new Map<string, Promise<LiveSession>>();
   private cwd: string;
   private isProjectTrusted: () => boolean;
+  private maxSessions: number;
 
   constructor(cwd: string, options: ReplRunnerOptions = {}) {
     this.cwd = cwd;
     this.isProjectTrusted = options.isProjectTrusted ?? (() => false);
+    this.maxSessions = sessionCap(options.maxSessions);
   }
 
   // ── Public API ──────────────────────────────────────────────
@@ -115,8 +179,13 @@ export class ReplRunner {
     signal?: AbortSignal,
   ): Promise<string> {
     const live = await this.getOrCreateSession(sessionId);
-    const result = await live.session.run(code, { onApproval, signal });
-    return withNotice(live, formatResult(result, sessionId));
+    live.busy++;
+    try {
+      const result = await live.session.run(code, { onApproval, signal });
+      return withNotice(live, formatResult(result, sessionId));
+    } finally {
+      live.busy--;
+    }
   }
 
   /**
@@ -141,6 +210,7 @@ export class ReplRunner {
     if (!live) {
       return `No session '${sessionId}' exists. Run some code first.`;
     }
+    this.touch(sessionId, live);
     // Resuming replays the whole transcript, preamble included, so a trust
     // decision made during the pause has to be honoured here too — otherwise
     // revoking trust and answering the pending dialog runs the withdrawn code
@@ -148,14 +218,25 @@ export class ReplRunner {
     if (await this.trustChangeDiscards(sessionId, live)) {
       return trustChangedMessage(sessionId, live.session.isSuspended());
     }
+    // The trust check awaited; the entry may have been evicted in the gap
+    // (D3 parity with `run`): a resumed call on a session the pool no longer
+    // holds must not report a result for it.
+    if (this.sessions.get(sessionId) !== live) {
+      return `No session '${sessionId}' exists. Run some code first.`;
+    }
     if (!live.session.isSuspended()) {
       return (
         `Session '${sessionId}' has nothing waiting for approval. ` +
         `Nothing was resumed — run code with repl to continue.`
       );
     }
-    const result = await live.session.resume({ onApproval, signal });
-    return withNotice(live, formatResult(result, sessionId));
+    live.busy++;
+    try {
+      const result = await live.session.resume({ onApproval, signal });
+      return withNotice(live, formatResult(result, sessionId));
+    } finally {
+      live.busy--;
+    }
   }
 
   /**
@@ -167,11 +248,16 @@ export class ReplRunner {
   abandon(sessionId: string): AbandonOutcome {
     const live = this.sessions.get(sessionId);
     if (!live) return "no-session";
+    this.touch(sessionId, live);
     return live.session.abandon() ? "abandoned" : "nothing-pending";
   }
 
   /**
-   * Clear all state in a session.
+   * Clear all state in a session, and remove it from the pool.
+   *
+   * The entry is evicted, not hollowed: a cleared-but-kept session would keep
+   * answering "nothing waiting" on `resume` — a session the model believes is
+   * still there. The next `run` on the id recreates it fresh (#59).
    *
    * @returns whether the session existed, and the approval grants that were
    *          live when the reset happened — empty for an unknown session, and
@@ -180,7 +266,21 @@ export class ReplRunner {
   reset(sessionId: string): ResetOutcome {
     const live = this.sessions.get(sessionId);
     if (!live) return { existed: false, revoked: [] };
-    return { existed: true, revoked: live.session.reset() };
+    const revoked = live.session.reset();
+    this.sessions.delete(sessionId);
+    return { existed: true, revoked };
+  }
+
+  /**
+   * The number of live sessions in the pool.
+   *
+   * A diagnostic for hosts and tests, not a model-facing tool: the issue's
+   * definition of done demands eviction be asserted on the map size, and a
+   * size that cannot be observed cannot be asserted. Creations still in
+   * flight are not counted — they are not sessions yet.
+   */
+  liveSessionCount(): number {
+    return this.sessions.size;
   }
 
   // ── Private helpers ─────────────────────────────────────────
@@ -198,16 +298,112 @@ export class ReplRunner {
    * both directions so the rule stays one sentence rather than two.
    */
   private async getOrCreateSession(sessionId: string): Promise<LiveSession> {
-    const existing = this.sessions.get(sessionId);
-    let rebuilt = false;
-    if (existing) {
-      if (!(await this.trustChangeDiscards(sessionId, existing))) return existing;
-      rebuilt = true;
+    let trustChanged = false;
+    for (;;) {
+      const existing = this.sessions.get(sessionId);
+      if (existing) {
+        this.touch(sessionId, existing);
+        if (!(await this.trustChangeDiscards(sessionId, existing))) {
+          // The trust check awaited, and awaits are where another caller
+          // acts: the session may have been evicted or rebuilt in the gap.
+          // Hand out only the object the map still holds.
+          if (this.sessions.get(sessionId) !== existing) continue;
+          if (trustChanged) {
+            this.attachTrustChangeNotice(sessionId, existing);
+            trustChanged = false;
+          }
+          return existing;
+        }
+        // trustChangeDiscards deleted the entry. The replacement must say so
+        // — but which session replaces it is decided by whoever lands the
+        // shared flight, so the notice is attached after landing, not baked
+        // into the creation (the `rebuilt` argument used to be, and a racy
+        // joiner could start the replacement flight without it).
+        trustChanged = true;
+      }
+      // Await the flight, then re-enter the loop: the landed entry must pass
+      // through the same trust revalidation as a pre-existing one. Returning
+      // it directly would hand a session built under a now-revoked trust
+      // decision to its first run — the stale snapshot the live callback
+      // exists to prevent. A rejected creation still propagates out.
+      await this.joinOrStartCreation(sessionId);
     }
+  }
 
-    const live = await this.createSession(this.isProjectTrusted(), rebuilt ? sessionId : undefined);
+  /**
+   * Deliver the one-shot `[trust changed]` notice to a rebuilt session.
+   *
+   * Prepended so it stays the first thing the model reads, in front of any
+   * preamble notice the rebuild produced. Guarded per session: two callers
+   * that both observed the discard deliver it once (#59).
+   */
+  private attachTrustChangeNotice(sessionId: string, live: LiveSession): void {
+    if (live.trustChangeNoticed) return;
+    live.trustChangeNoticed = true;
+    const message = trustChangedMessage(sessionId, false);
+    live.notice = live.notice === undefined ? message : `${message}\n\n${live.notice}`;
+  }
+
+  /**
+   * Join the in-flight creation for `sessionId`, or start one.
+   */
+  private joinOrStartCreation(sessionId: string): Promise<LiveSession> {
+    const pending = this.inflight.get(sessionId);
+    if (pending) return pending;
+
+    const promise = this.createSession(this.isProjectTrusted())
+      .then((live) => {
+        this.inflight.delete(sessionId);
+        this.insert(sessionId, live);
+        return live;
+      })
+      .catch((err: unknown) => {
+        this.inflight.delete(sessionId);
+        throw err;
+      });
+    this.inflight.set(sessionId, promise);
+    return promise;
+  }
+
+  /**
+   * Mark a live session as most recently used.
+   *
+   * Map iteration order is insertion order, so delete + set moves the entry
+   * to the tail: the head is "oldest", the tail "most recent". Every
+   * retrieval of a live session — `run`, `resume`, `abandon` — touches.
+   * `reset` does not: it removes the entry outright (#59).
+   */
+  private touch(sessionId: string, live: LiveSession): void {
+    if (this.sessions.get(sessionId) !== live) return;
+    this.sessions.delete(sessionId);
     this.sessions.set(sessionId, live);
-    return live;
+  }
+
+  /**
+   * Insert a finished creation, evicting past the cap.
+   *
+   * Eviction takes the oldest session that is **neither suspended nor
+   * mid-call**, and never the one just inserted. A suspended session is a
+   * call the user was asked to approve, and a busy one may be about to
+   * suspend — evicting either would lose a call with the model never told,
+   * so the pool exceeds its cap rather than discard one. The decision is the
+   * one #59 demands be recorded: refuse to evict, never report-and-drop.
+   *
+   * The over-cap state is self-limiting — every suspension demands user
+   * attention, and the protection ends the moment the session is no longer
+   * suspended or busy (resumed, abandoned, or overwritten).
+   */
+  private insert(sessionId: string, live: LiveSession): void {
+    this.sessions.set(sessionId, live);
+    if (this.sessions.size <= this.maxSessions) return;
+
+    for (const [key, entry] of this.sessions) {
+      if (key === sessionId) continue;
+      if (entry.session.isSuspended()) continue;
+      if (entry.busy > 0) continue;
+      this.sessions.delete(key);
+      if (this.sessions.size <= this.maxSessions) return;
+    }
   }
 
   /**
@@ -234,18 +430,20 @@ export class ReplRunner {
       return false;
     }
 
-    this.sessions.delete(sessionId);
+    // D3 parity on the delete path: a stale checker whose await resolved late
+    // must not destroy a session a concurrent caller has since rebuilt under
+    // the current decision.
+    if (this.sessions.get(sessionId) === live) this.sessions.delete(sessionId);
     return true;
   }
 
-  private async createSession(trusted: boolean, rebuiltId?: string): Promise<LiveSession> {
+  private async createSession(trusted: boolean): Promise<LiveSession> {
     const bridgeTools = createPiBridgeTools(this.cwd, { gateMutating: true });
     const builtinTools = createBuiltinTools({ root: this.cwd });
     const registry = new ToolRegistry([...bridgeTools, ...builtinTools]);
     const sandboxOpts: SandboxOptions = { registry };
 
     const notices: string[] = [];
-    if (rebuiltId !== undefined) notices.push(trustChangedMessage(rebuiltId, false));
 
     // The shadowing gates (#54 load, #56 write) must see every host-tool name
     // the session will have — including the toolstore's own, which are not in
@@ -313,6 +511,8 @@ export class ReplRunner {
       session: new Session(sandboxOpts, preamble || undefined),
       trusted,
       hasPreamble: preamble !== "",
+      busy: 0,
+      trustChangeNoticed: false,
       notice: notices.length > 0 ? notices.join("\n\n") : undefined,
     };
   }

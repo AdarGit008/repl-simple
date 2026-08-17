@@ -1,34 +1,33 @@
-# Tasks — coverage:update floors immune to instrument variance (#113)
+# Tasks — Serialize session creation and bound the session pool (#59)
 
-- [x] Task 1: `scripts/coverage-core.ts` + unit tests (TDD: RED → GREEN)
-  - Acceptance: exports `pct`, `combineRuns`, `spreadLimit`, `oneLineTolerance`, `belowFloor`;
-    `combineRuns` → per-file `{ min, max, found }` (found = max across runs), `missingInSomeRuns`
-    set, `global` = min of run globals; `spreadLimit(found)` = max(1.00, 100/found);
-    `belowFloor` fails only more than one line below the floor; issue's exact cases pinned
-    (floor 100.00 vs measured 99.74 at found 384 → pass; two lines → fail).
-  - Verify: `npx tsx --test test/coverage-core.test.ts`; `npm run check`; `npm run lint`.
-  - Files: `scripts/coverage-core.ts`, `test/coverage-core.test.ts`
+- [x] Task 1: `inflight` single-flight creation (D1–D3) + issue tests 1–3 (TDD: RED → GREEN)
+  - Acceptance: `Promise.all` of two runs on one id leaves both variables alive; the counter seam
+    shows `createSession` called once; a rejected creation is removed from `inflight` and the next
+    call on that id succeeds; a session the map no longer holds is never returned (D3).
+  - Verify: `npx tsx --test test/repl.test.ts`; `npm test`; `npm run check`; `npm run build`;
+    `npm run lint`.
+  - Files: `src/repl.ts`, `test/repl.test.ts`
 
-- [x] Task 2: rewrite `scripts/coverage.mjs` update + gate paths; runner → tsx
-  - Acceptance: `--update` measures 3×, writes per-file minima + min global, prints spread report
-    (every file whose runs differed, with range), refuses (exit 1, file + range named) on spread
-    > threshold or a file missing from some runs; plain gate FAIL uses the one-line tolerance;
-    manifest/unfloored/UNMEASURED behavior unchanged; `package.json` coverage scripts run via
-    `tsx`.
-  - Verify: `npm run coverage` green on current baseline; `npm run check`; `npm run lint`.
-  - Files: `scripts/coverage.mjs`, `package.json`
+- [x] Task 2: LRU cap + eviction + suspension protection (D4–D6, D9) + issue tests 4 and 6
+  - Acceptance: `ReplRunnerOptions.maxSessions` and `REPL_MAX_SESSIONS` env with stated precedence
+    and default 32; touch on run/resume/abandon; oldest non-suspended session evicted, never the
+    just-inserted id; suspended sessions skipped (pool exceeds cap rather than drop a pending
+    approval); `liveSessionCount()` reports the map size.
+  - Verify: focused tests; `npm test`; `npm run check`; `npm run build`; `npm run lint`.
+  - Files: `src/repl.ts`, `test/repl.test.ts`
 
-- [x] Task 3: README "Coverage floors" rewrite
-  - Acceptance: by-hand pinning paragraph removed; section describes N=3 min-of-runs, refusal
-    threshold, spread report, one-line compare tolerance; no surviving claim the script does not
+- [x] Task 3: `reset()` removes the entry (D7–D8) + issue test 5 + update the two existing tests
+  - Acceptance: after reset the entry is gone — count drops, `resume` answers the no-session
+    sentence, next `run` recreates fresh; `ResetOutcome` unchanged; reset during an in-flight
+    creation reports `existed: false`.
+  - Verify: focused tests; `npm test`; `npm run check`; `npm run build`; `npm run lint`.
+  - Files: `src/repl.ts`, `test/repl.test.ts`
+
+- [x] Task 4: README records the cap and eviction policy
+  - Acceptance: default cap 32 + override knobs named; LRU rule; refuse-to-evict-suspended rule;
+    reset removes the session; `maxSessions` on `ReplRunnerOptions`; no claim the code does not
     implement.
-  - Verify: read-through against `scripts/coverage.mjs`; `npm run lint`.
+  - Verify: read-through against `src/repl.ts`; `npm run lint`.
   - Files: `README.md`
 
-- [x] Task 4: empirical verification + script-written baseline
-  - Acceptance: `coverage:update` completes with spread report; `src/truncate.ts` floor is
-    script-written; three consecutive plain `npm run coverage` runs pass; `npm test`, `npm run
-    check`, `npm run build`, `npm run lint` all exit 0; `coverage-baseline.json` diff is exactly
-    what the script wrote; per-task commits reference #113.
-  - Verify: full suite + gate ×3 + check + build + lint, exit codes recorded.
-  - Files: `coverage-baseline.json`
+- [x] Checkpoint: Complete — `npm run coverage` green (repl.ts 100.00%); targeted mutation 79.09 ≥ break 58; review closed; ship report written

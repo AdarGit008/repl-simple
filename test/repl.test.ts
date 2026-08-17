@@ -562,8 +562,11 @@ describe("ReplRunner — every tool answers, in every state (#48)", () => {
 
     assert.equal(runner.reset("reset-me").existed, true);
 
+    // The reset evicts the session outright (#59): a hollow entry that
+    // answers "nothing waiting" would be a session the model believes is
+    // still there. "No session" is the truth.
     const out = await runner.resume("reset-me", approve);
-    assert.match(out, /nothing waiting for approval/i);
+    assert.match(out, /No session 'reset-me' exists/);
     assert.equal(existsSync(join(cwd, "reset.txt")), false);
   });
 });
@@ -1626,6 +1629,512 @@ describe("ReplRunner — a symlinked .pi is refused on the loader path too (#57)
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(victim, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── The creation race: one id, one session (#59) ────────────────
+//
+// getOrCreateSession used to `get` → `await createSession()` → `set`, so two
+// concurrent runs on one sessionId each built a session and the second `set`
+// silently discarded the first — while both calls reported success. The
+// model then reasoned from a state that did not exist. The tests below pin
+// the issue's six-test Definition of Done.
+
+describe("ReplRunner — concurrent creation builds one session (#59)", () => {
+  it("the exact reproduction: both variables survive two concurrent runs", async () => {
+    const cwd = makeTempDir();
+    // A trusted project with preamble files widens the creation window: the
+    // race lives in the gap between the `get` and the `set`, and
+    // `createSession` reads every tool file inside it.
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    saveToolFile(cwd, "beta", "def beta():\n    return 'b'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      await Promise.all([runner.run("x = 1", "s"), runner.run("y = 2", "s")]);
+
+      // Asserted on state, never on the reported statuses: both already said
+      // success while one session was being dropped.
+      const x = await runner.run("x", "s");
+      const y = await runner.run("y", "s");
+      assert.match(x, /\[result\]\n1/, `x was lost to the race: ${x}`);
+      assert.match(y, /\[result\]\n2/, `y was lost to the race: ${y}`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("concurrent creation calls createSession once, not twice", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+    const counter = countCreateSessions(runner);
+
+    try {
+      await Promise.all([runner.run("x = 1", "once"), runner.run("y = 2", "once")]);
+      assert.equal(counter.calls(), 1, "two concurrent runs must share one creation");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a failed creation does not poison the id — the next call retries and succeeds", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+    const failing = failCreateSessionOnce(runner);
+
+    try {
+      await assert.rejects(
+        runner.run("x = 1", "retry"),
+        /simulated creation failure/,
+        "the injected failure did not reach the caller",
+      );
+
+      const out = await runner.run("x = 1", "retry");
+      assert.match(out, /\[result\]\nNone/, `the retry did not succeed: ${out}`);
+
+      const state = await runner.run("x", "retry");
+      assert.match(state, /\[result\]\n1/, "the session the retry built did not persist");
+    } finally {
+      cleanup();
+      failing.restore();
+    }
+  });
+});
+
+// ── Test seams for the creation counter (#59) ───────────────────
+//
+// TypeScript `private` is a compile-time check: the method is an ordinary
+// prototype member at runtime, so an own-property wrapper on the instance
+// shadows it for the class body's `this.createSession(...)` calls. This is a
+// test-only seam — the production API grows no hooks for it.
+
+/** Wrap `createSession` so the test can count how many times it ran. */
+function countCreateSessions(runner: ReplRunner): { calls: () => number } {
+  const target = runner as unknown as {
+    createSession: (...args: unknown[]) => Promise<unknown>;
+  };
+  const original = target.createSession.bind(runner);
+  let calls = 0;
+  target.createSession = async (...args: unknown[]) => {
+    calls++;
+    return original(...args);
+  };
+  return { calls: () => calls };
+}
+
+/** Make the next `createSession` call reject, then behave normally again. */
+function failCreateSessionOnce(runner: ReplRunner): { restore: () => void } {
+  const target = runner as unknown as {
+    createSession: (...args: unknown[]) => Promise<unknown>;
+  };
+  const original = target.createSession.bind(runner);
+  let armed = true;
+  target.createSession = async (...args: unknown[]) => {
+    if (armed) {
+      armed = false;
+      throw new Error("simulated creation failure");
+    }
+    return original(...args);
+  };
+  return { restore: () => (target.createSession = original.bind(runner)) };
+}
+
+// ── The bounded pool: LRU cap, eviction, suspension protection (#59) ─
+
+describe("ReplRunner — the pool is capped and never drops a pending approval (#59)", () => {
+  it("the LRU cap evicts the least-recently-used session, and releases it", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("b = 2", "b");
+      await runner.run("a", "a"); // touch a — b is now the eviction candidate
+      await runner.run("c = 3", "c"); // over the cap: b is evicted
+
+      assert.equal(runner.liveSessionCount(), 2, "the pool exceeded its cap");
+      assert.match(await runner.run("c", "c"), /\[result\]\n3/, "the new session is not live");
+      assert.match(await runner.run("a", "a"), /\[result\]\n1/, "the touched session was evicted");
+
+      // Eviction really released b: the id comes back as a fresh session.
+      const b = await runner.run("b", "b");
+      assert.match(b, /used when not defined/, `b kept its state through eviction: ${b}`);
+      assert.equal(runner.liveSessionCount(), 2, "recreating b exceeded the cap again");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a pending suspension is never evicted — the pool exceeds its cap instead", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    try {
+      const pending = await runner.run("write('p.txt', 'v1')", "suspended", suspend);
+      assert.match(pending, /requires approval/);
+
+      // The only eviction candidate is suspended, so inserting must not evict
+      // it: the pool exceeds its cap rather than lose a call the user was
+      // asked to approve.
+      await runner.run("v = 1", "second");
+      assert.equal(runner.liveSessionCount(), 2, "a suspended session was evicted");
+
+      // The suspended call is still there and still answerable.
+      const resumed = await runner.resume("suspended", approve);
+      assert.doesNotMatch(resumed, /PermissionError/);
+      assert.equal(readFileSync(join(cwd, "p.txt"), "utf8"), "v1");
+      assert.match(await runner.run("v", "second"), /\[result\]\n1/, "second lost its state");
+
+      // No longer suspended, it loses its protection: the next insert evicts
+      // it, and the pool is back under its cap.
+      await runner.run("w = 2", "third");
+      assert.equal(runner.liveSessionCount(), 1, "the abandoned protection kept the pool over cap");
+      assert.match(await runner.run("w", "third"), /\[result\]\n2/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── Reset evicts: no hollow entries (#59) ───────────────────────
+
+describe("ReplRunner — reset removes the entry, not just its state (#59)", () => {
+  it("the entry is gone from the pool, and the id comes back fresh", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("x = 1", "gone");
+      assert.equal(runner.liveSessionCount(), 1);
+
+      assert.deepEqual(runner.reset("gone"), { existed: true, revoked: [] });
+
+      // The map size, not just the behaviour: a reset that cleared the fields
+      // but kept the entry would leave a hollow session behind.
+      assert.equal(runner.liveSessionCount(), 0, "reset left a hollow entry in the pool");
+      assert.deepEqual(
+        runner.reset("gone"),
+        { existed: false, revoked: [] },
+        "a second reset claims to have reset something",
+      );
+
+      const resume = await runner.resume("gone", approve);
+      assert.match(resume, /No session 'gone' exists/);
+
+      const fresh = await runner.run("x", "gone");
+      assert.match(fresh, /used when not defined/, `the recreated session kept state: ${fresh}`);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── Fan-out review findings (#59) ───────────────────────────────
+//
+// The three-agent fan-out found two windows the six issue tests do not
+// cover, both in the concurrency path: a session whose run is mid-flight
+// (approval dialog open) was evictable, and joiners of an in-flight creation
+// used the creator's trust snapshot without revalidation. The tests below pin
+// the fixes, plus the lower-severity gaps the reviewers named.
+
+describe("ReplRunner — a session mid-run is never evicted (#59)", () => {
+  it("an open approval dialog survives an insert over the cap", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    let asked = false;
+    let answer!: (d: ApprovalDecision) => void;
+    const gate = new Promise<ApprovalDecision>((resolve) => {
+      answer = resolve;
+    });
+
+    try {
+      const pending = runner.run("write('p.txt', 'v1')", "a", async () => {
+        asked = true;
+        return gate;
+      });
+      await untilTrue(() => asked);
+      assert.ok(asked, "the run never reached the approval dialog");
+
+      // The only eviction candidate is mid-run, so inserting must not evict
+      // it — the pool exceeds its cap rather than orphan the dialog.
+      await runner.run("v = 1", "b");
+      assert.equal(runner.liveSessionCount(), 2, "a mid-run session was evicted");
+
+      // The user answers; the call completes against a session that still
+      // exists, and the side effect landed exactly once.
+      answer(true);
+      await pending;
+      assert.equal(readFileSync(join(cwd, "p.txt"), "utf8"), "v1");
+      assert.equal(runner.liveSessionCount(), 2, "the answered session vanished after approval");
+
+      // Idle now, it loses its protection: the next insert evicts back down
+      // to the cap (both idle sessions are older than the newcomer).
+      await runner.run("w = 1", "c");
+      assert.equal(runner.liveSessionCount(), 1, "idle sessions kept the pool over its cap");
+      assert.match(await runner.run("w", "c"), /\[result\]\n1/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("ReplRunner — joiners of an in-flight creation revalidate trust (#59)", () => {
+  it("a run joined after a trust flip never executes the withdrawn preamble", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "hostile", "write('pwned.txt', 'owned')\n");
+    let trusted = true;
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => trusted });
+    const counter = countCreateSessions(runner);
+
+    try {
+      const prompts: string[] = [];
+      const ask = async () => {
+        prompts.push("write");
+        return true;
+      };
+
+      const p1 = runner.run("1 + 1", "flip", ask); // snapshots trusted at creation
+      trusted = false; // the flip lands while the creation is in flight
+      const p2 = runner.run("2 + 2", "flip", ask); // joins the in-flight creation
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+
+      // Neither run executed the preamble loaded under the revoked decision.
+      assert.equal(
+        existsSync(join(cwd, "pwned.txt")),
+        false,
+        "a preamble executed after trust was revoked",
+      );
+      assert.deepEqual(prompts, [], "the withdrawn preamble reached the approval gate");
+      assert.match(r1, /\[result\]/);
+      assert.match(r2, /\[result\]/);
+
+      // Both joiners revalidated, discarded the stale session, and shared one
+      // rebuild — and the one-shot notice was delivered once.
+      assert.equal(
+        counter.calls(),
+        2,
+        "the stale creation and the rebuild were not shared as two flights",
+      );
+      const notices = [r1, r2].filter((r) => /\[trust changed\]/.test(r)).length;
+      assert.equal(notices, 1, "the trust-change notice was not one-shot");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("ReplRunner — LRU and cap edges the fan-out named (#59)", () => {
+  it("resume touches the session it answers for", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("b = 2", "b");
+      const answered = await runner.resume("a", approve); // touches a
+      assert.match(answered, /nothing waiting for approval/i);
+
+      await runner.run("c = 3", "c"); // evicts b, not a
+      assert.equal(runner.liveSessionCount(), 2);
+      assert.match(await runner.run("a", "a"), /\[result\]\n1/, "the resumed session was evicted");
+      assert.match(await runner.run("b", "b"), /used when not defined/, "b kept its state");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("abandon touches the session it answers for", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("b = 2", "b");
+      assert.equal(runner.abandon("a"), "nothing-pending"); // touches a
+
+      await runner.run("c = 3", "c"); // evicts b, not a
+      assert.match(
+        await runner.run("a", "a"),
+        /\[result\]\n1/,
+        "the abandoned session was evicted",
+      );
+      assert.match(await runner.run("b", "b"), /used when not defined/, "b kept its state");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("eviction scans past a suspended session to a later idle one", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("write('s.txt', 'v1')", "b", suspend); // b suspended
+      await runner.run("c = 3", "c"); // evicts a (idle), skips b
+      assert.match(await runner.run("a", "a"), /used when not defined/, "a kept its state");
+
+      await runner.run("d = 4", "d"); // skips b (suspended), evicts c
+      assert.equal(runner.liveSessionCount(), 2);
+      assert.match(await runner.run("c", "c"), /used when not defined/, "c kept its state");
+
+      // The suspended session survived the whole scan, approval intact.
+      const resumed = await runner.resume("b", approve);
+      assert.doesNotMatch(resumed, /PermissionError/);
+      assert.equal(readFileSync(join(cwd, "s.txt"), "utf8"), "v1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("REPL_MAX_SESSIONS sets the cap, and the explicit option wins over it", async () => {
+    const cwd = makeTempDir();
+    const previous = process.env.REPL_MAX_SESSIONS;
+    try {
+      process.env.REPL_MAX_SESSIONS = "1";
+      const fromEnv = new ReplRunner(cwd);
+      await fromEnv.run("a = 1", "a");
+      await fromEnv.run("b = 2", "b"); // evicts a: cap 1 from the env
+      assert.equal(fromEnv.liveSessionCount(), 1, "the env cap was not applied");
+
+      const explicitWins = new ReplRunner(cwd, { maxSessions: 2 });
+      await explicitWins.run("a = 1", "a");
+      await explicitWins.run("b = 2", "b");
+      assert.equal(explicitWins.liveSessionCount(), 2, "the explicit option lost to the env");
+
+      const zeroFallsBack = new ReplRunner(cwd, { maxSessions: 0 });
+      await zeroFallsBack.run("a = 1", "a");
+      await zeroFallsBack.run("b = 2", "b");
+      assert.equal(zeroFallsBack.liveSessionCount(), 1, "a non-positive option ignored the env");
+    } finally {
+      if (previous === undefined) delete process.env.REPL_MAX_SESSIONS;
+      else process.env.REPL_MAX_SESSIONS = previous;
+      cleanup();
+    }
+  });
+
+  it("concurrent joiners of a failing creation all reject, and share it", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd);
+    let calls = 0;
+    let armed = true;
+    const target = runner as unknown as {
+      createSession: (...args: unknown[]) => Promise<unknown>;
+    };
+    const original = target.createSession.bind(runner);
+    target.createSession = async (...args: unknown[]) => {
+      calls++;
+      if (armed) {
+        armed = false;
+        throw new Error("simulated creation failure");
+      }
+      return original(...args);
+    };
+
+    try {
+      const [r1, r2] = await Promise.allSettled([
+        runner.run("x = 1", "fail"),
+        runner.run("y = 2", "fail"),
+      ]);
+      assert.equal(r1.status, "rejected");
+      assert.equal(r2.status, "rejected");
+      assert.equal(calls, 1, "the joiner restarted a creation that had failed");
+
+      const out = await runner.run("x = 1", "fail");
+      assert.match(out, /\[result\]\nNone/, "the id was poisoned by the failed creation");
+      assert.match(await runner.run("x", "fail"), /\[result\]\n1/);
+    } finally {
+      target.createSession = original.bind(runner);
+      cleanup();
+    }
+  });
+
+  it("reset during an in-flight creation reports the truth, and the creation lands", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      const pending = runner.run("x = 1", "s");
+      assert.deepEqual(
+        runner.reset("s"),
+        { existed: false, revoked: [] },
+        "the reset claimed a session that does not exist yet",
+      );
+      await pending;
+      assert.equal(runner.liveSessionCount(), 1, "the reset killed the in-flight creation");
+      assert.match(await runner.run("x", "s"), /\[result\]\n1/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("liveSessionCount does not count creations still in flight", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      const pending = runner.run("x = 1", "s");
+      assert.equal(runner.liveSessionCount(), 0, "an in-flight creation was counted as live");
+      await pending;
+      assert.equal(runner.liveSessionCount(), 1);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/** Resolve once `fn` is true — bounded, so a deadlock fails instead of hanging. */
+async function untilTrue(fn: () => boolean): Promise<void> {
+  for (let i = 0; i < 2000 && !fn(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+// ── Resume D3 parity (#59, coverage floor) ──────────────────────
+
+describe("ReplRunner — resume revalidates after its trust check (#59)", () => {
+  it("a session evicted during the check answers no-session, not a result", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    // Park the trust check on an explicit gate so the eviction deterministically
+    // lands inside it — the same own-property seam philosophy as the creation
+    // counter above. A timer would race the fs I/O in the insertion.
+    const target = runner as unknown as {
+      trustChangeDiscards: (id: string, live: unknown) => Promise<boolean>;
+    };
+    const original = target.trustChangeDiscards.bind(runner);
+    let armed = false;
+    let releaseCheck!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCheck = resolve;
+    });
+    target.trustChangeDiscards = async (id: string, live: unknown) => {
+      const result = await original(id, live);
+      if (armed && id === "victim") await gate; // others, and the setup run, pass through
+      return result;
+    };
+
+    try {
+      await runner.run("a = 1", "victim");
+      armed = true; // from here on, the victim's revalidation parks
+
+      const resuming = runner.resume("victim", approve); // parked in the widened check
+      await runner.run("b = 2", "other"); // evicts victim while the check is open
+      releaseCheck();
+
+      const out = await resuming;
+      assert.match(out, /No session 'victim' exists/, `a result for an evicted session: ${out}`);
+      assert.equal(runner.liveSessionCount(), 1, "the eviction did not stick");
+    } finally {
+      target.trustChangeDiscards = original.bind(runner);
+      cleanup();
     }
   });
 });
