@@ -95,10 +95,30 @@ export function spreadLimit(found: number): number {
   return Math.max(1, 100 / found);
 }
 
+/**
+ * Both `pct` and the stored floors are floored to 2dp. A measurement whose
+ * true value is one line below the floor can report up to 0.01 below
+ * `floor - oneLine` after that flooring, so the failure test allows for it.
+ * With this slack, `belowFloor` is false exactly when the measurement's true
+ * value is within one line of the floor (for files under 10,000 lines).
+ * `exceedsSpreadLimit` applies the same slack on the update side.
+ */
+const FLOORING_SLACK = 0.01;
+
 /** One line, expressed in percentage points of the file. */
 export function oneLineTolerance(found: number): number {
   if (!found) return 0;
   return 100 / found;
+}
+
+/**
+ * The update's refusal test: did a file's spread exceed what the known
+ * one-line defect can produce? Mirrors `belowFloor`'s `FLOORING_SLACK` —
+ * both `min` and `max` are 2dp-floored, so a true one-line spread can report
+ * up to 0.01 above `spreadLimit` and must still pass.
+ */
+export function exceedsSpreadLimit(min: number, max: number, found: number): boolean {
+  return max - min > spreadLimit(found) + FLOORING_SLACK;
 }
 
 /**
@@ -112,15 +132,6 @@ export function oneLineTolerance(found: number): number {
 export function keepFloorable(run: MeasuredRun, floorable: ReadonlySet<string>): MeasuredRun {
   return { global: run.global, rows: run.rows.filter((row) => floorable.has(row.file)) };
 }
-
-/**
- * Both `pct` and the stored floors are floored to 2dp. A measurement whose
- * true value is one line below the floor can report up to 0.01 below
- * `floor - oneLine` after that flooring, so the failure test allows for it.
- * With this slack, `belowFloor` is false exactly when the measurement's true
- * value is within one line of the floor (for files under 10,000 lines).
- */
-const FLOORING_SLACK = 0.01;
 
 /**
  * The plain-run gate's failure test (#132's correction): a file fails only

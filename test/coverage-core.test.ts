@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   belowFloor,
   combineRuns,
+  exceedsSpreadLimit,
   keepFloorable,
   oneLineTolerance,
   pct,
@@ -123,6 +124,29 @@ describe("spreadLimit", () => {
 
   it("is 1 for a file with no instrumented lines", () => {
     assert.equal(spreadLimit(0), 1);
+  });
+});
+
+// ── exceedsSpreadLimit ───────────────────────────────────────
+
+describe("exceedsSpreadLimit", () => {
+  it("passes a spread at the floor of one line's worth (small file, unfavourable 2dp floor)", () => {
+    // One line of a 42-line file is 100/42 ≈ 2.3810 pp; the 2dp flooring can
+    // report it as 2.39, which must not refuse the update.
+    assert.equal(exceedsSpreadLimit(0, 2.39, 42), false);
+  });
+
+  it("passes a spread at one percentage point on a large file", () => {
+    assert.equal(exceedsSpreadLimit(99, 100, 391), false);
+  });
+
+  it("passes an exactly-zero spread", () => {
+    assert.equal(exceedsSpreadLimit(98.34, 98.34, 150), false);
+  });
+
+  it("refuses a spread above one line's worth", () => {
+    assert.equal(exceedsSpreadLimit(97.6, 100, 42), true);
+    assert.equal(exceedsSpreadLimit(98.9, 100, 391), true);
   });
 });
 

@@ -34,7 +34,14 @@ import { join } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { belowFloor, combineRuns, keepFloorable, pct, spreadLimit } from "./coverage-core.js";
+import {
+  belowFloor,
+  combineRuns,
+  exceedsSpreadLimit,
+  keepFloorable,
+  pct,
+  spreadLimit,
+} from "./coverage-core.js";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const BASELINE = join(REPO, "coverage-baseline.json");
@@ -228,7 +235,7 @@ if (argv.includes("--update")) {
 
   const refusals = [];
   for (const [file, f] of Object.entries(combined)) {
-    if (f.max - f.min > spreadLimit(f.found)) {
+    if (exceedsSpreadLimit(f.min, f.max, f.found)) {
       refusals.push(
         `${file}: spread ${f.min.toFixed(2)}–${f.max.toFixed(2)} exceeds one line's worth (${spreadLimit(
           f.found,
