@@ -194,14 +194,6 @@ describe("runInSandbox — lineOffset syntax-error correction", () => {
     assert.match(result.error, /PREFIX_MARKER_77/, "prefix source appears without a lineOffset");
   });
 
-  it("does not shift typing diagnostics (they are already line-correct)", async () => {
-    const result = await runInSandbox("x: int = 'hello'", { registry }, { lineOffset: 3 });
-    err(result);
-    assert.equal(result.errorKind, "typing");
-    assert.match(result.error, / --> <repl>:1:4/, "typing diagnostics keep their own line numbers");
-    assert.match(result.error, /^1 \| x: int = 'hello'$/m);
-  });
-
   it("strips a blank prefix-region excerpt line (prefix ends with an empty line)", async () => {
     // Monty renders a blank source line as `N |` — no trailing space, no
     // text after the pipe. When the blank line belongs to the prefix, it
@@ -240,6 +232,59 @@ describe("runInSandbox — lineOffset syntax-error correction", () => {
     assert.match(result.error, /^ {2}2 \| 1 \+$/m, "the error excerpt line is 2, gutter padded");
     assert.doesNotMatch(result.error, /99 \|/, "no unrenumbered excerpt line survives");
     assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+});
+
+// ── lineOffset: typing-error correction ────────────────────────
+//
+// The stub file's contribution is removed out-of-band (`typeCheckStubs`),
+// but the prefix the caller assembled around the code still shifts typing
+// diagnostics exactly as it shifts syntax ones — the `"full"` typing render
+// uses the same ` --> file:line:col` / `<n> |` excerpt shapes (measured).
+// `lineOffset` corrects them the same way.
+
+describe("runInSandbox — lineOffset typing-error correction", () => {
+  const registry = new ToolRegistry();
+
+  function prefixOf(n: number): string {
+    return Array.from({ length: n }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+  }
+
+  for (const n of [1, 3, 7]) {
+    it(`reports a user-line-1 typing error at line 1 with a ${n}-line prefix (lineOffset=${n})`, async () => {
+      const result = await runInSandbox(
+        `${prefixOf(n)}\nx: int = 'oops'`,
+        { registry },
+        { lineOffset: n },
+      );
+      err(result);
+      assert.equal(result.errorKind, "typing");
+      assert.match(result.error, / --> <repl>:1:/, "the diagnostic location is line 1");
+      assert.match(result.error, /^1 \| x: int = 'oops'$/m, "the excerpt line is line 1");
+      assert.match(result.error, /Incompatible value/, "the caret annotation rows pass through");
+      assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+    });
+  }
+
+  it("leaves the diagnostic untouched when lineOffset is absent", async () => {
+    const result = await runInSandbox(`${prefixOf(3)}\nx: int = 'oops'`, { registry });
+    err(result);
+    assert.equal(result.errorKind, "typing");
+    assert.match(result.error, / --> <repl>:4:/, "assembled line 4, no correction applied");
+    assert.match(result.error, /PREFIX_MARKER_77/, "prefix source appears without a lineOffset");
+  });
+
+  it("drops a location inside the prefix instead of emitting a non-positive line number", async () => {
+    // A caller that overstates the offset (here: 3, against code with no
+    // prefix at all) must not get ` --> <repl>:0:` or ` --> <repl>:-2:` rows.
+    // A location whose line is at or before the offset is prefix-position
+    // information and is dropped, like its excerpt rows.
+    const result = await runInSandbox("x: int = 'oops'", { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "typing");
+    assert.match(result.error, /^error\[invalid-assignment\]/m, "the heading survives");
+    assert.doesNotMatch(result.error, / --> <repl>:(?:0|-)/, "no non-positive line number");
+    assert.doesNotMatch(result.error, /^\d+ \|/m, "no excerpt row survives the oversized offset");
   });
 });
 

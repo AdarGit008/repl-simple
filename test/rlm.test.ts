@@ -925,6 +925,36 @@ describe("runRlm() — preamble lineOffset wiring", () => {
     assert.ok(!feedback.includes(token), "preamble source must not reach the model");
   });
 
+  it("corrects a typing error on the model's line 1 and feeds back no preamble source", async () => {
+    // The `"full"` typing render uses the same ` --> file:line:col` / `<n> |`
+    // shapes as the syntax one, and the caller-assembled preamble shifts it
+    // exactly the same way (`typeCheckStubs` removes only the stub file's
+    // contribution out-of-band). Same token derivation as issue test 2.
+    const preambleLines = REPL_SERVER.split("\n");
+    const lastSourceLine = preambleLines[preambleLines.length - 2];
+    const token = lastSourceLine.trim();
+    assert.ok(token.length > 0, "the preamble must end with a non-empty source line");
+
+    const { llm } = mockLlmCodeGen([
+      "```python\nx: int = 'oops'\n```",
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = lastMessage(llm.calls()[1]);
+    assert.match(feedback, /Fix the type error/, "the typing kind survives to the advice");
+    assert.match(feedback, / --> rlm\.py:1:/, "the diagnostic location is the model's line 1");
+    assert.match(feedback, /^\s*1 \| x: int = 'oops'$/m, "the excerpt line is the model's line 1");
+    assert.ok(!feedback.includes(token), "preamble source must not reach the model");
+  });
+
   it("still caps corrected error text at 16 KiB (test 8 re-assert on the corrected path)", async () => {
     // #144's 16 KiB cap must hold on the *corrected* text: the correction
     // happens upstream of buildFeedback, and the huge raise the model sent

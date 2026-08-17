@@ -45,3 +45,14 @@
     renumbered (gutter padding preserved); the 6 existing syntax-correction tests stay green.
   - Verify: `npm test` (976/976 green — 973 baseline + 3 new), `npm run check`, `npm run lint`
   - Files: `src/sandbox.ts`, `test/sandbox.test.ts`
+
+- [x] Task 7: Correct the typing-diagnostic path (VERIFY blocking finding)
+  - Acceptance: `classifyStartError` applies `correctSyntaxErrorText` to pure typing diagnostics
+    too (same ` --> file:line:col` / `<n> |` render; caret/continuation rows pass through); a
+    location/excerpt line whose number ≤ offset is dropped, never emitted with a non-positive
+    number; false "typing is already line-correct" comments corrected in `src/sandbox.ts` and
+    `src/types.ts`; bogus test replaced with real-prefix + control tests; RLM-level typing
+    feedback test pins line 1 and no preamble source.
+  - Verify: `npm test` (981/981 green — 976 baseline − 1 replaced + 6 new), `npm run check`,
+    `npm run lint`, `npm run coverage` floors met
+  - Files: `src/sandbox.ts`, `src/types.ts`, `test/sandbox.test.ts`, `test/rlm.test.ts`
