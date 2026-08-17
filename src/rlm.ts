@@ -24,6 +24,16 @@ const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
 /** Byte ceiling for `output` in a feedback message. */
 const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
 
+/** Byte ceiling for `result.error` in a feedback message (16 KiB, value shape). */
+const ERROR_MAX_BYTES = 16 * 1024;
+
+/**
+ * Route to an elided error: the model owns the Python, so it can wrap the
+ * failing code in `try/except` and print the full traceback to see the whole
+ * exception the feedback truncated away (#144, D7).
+ */
+const ERROR_RECOVERY = "Catch the exception and print the full traceback to see more.";
+
 // ── Conversation budget ─────────────────────────────────────────
 //
 // The feedback caps bound each turn, but the conversation as a whole grows by
@@ -310,7 +320,12 @@ export function buildFeedback(result: RunResult): string {
       headRatio: STDOUT_HEAD_RATIO,
       recovery: STDOUT_RECOVERY,
     });
-    let feedback = `Error: ${result.error}\nstdout: ${stdout}`;
+    const { text: error } = truncateText(result.error, {
+      maxBytes: ERROR_MAX_BYTES,
+      headRatio: VALUE_HEAD_RATIO,
+      recovery: ERROR_RECOVERY,
+    });
+    let feedback = `Error: ${error}\nstdout: ${stdout}`;
     if (result.errorKind === "syntax") {
       feedback += "\n\nFix the syntax error in your Python code.";
     } else if (result.errorKind === "typing") {

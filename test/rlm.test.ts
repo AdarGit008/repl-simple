@@ -1092,6 +1092,54 @@ describe("buildFeedback() — feedback byte caps", () => {
     assert.match(stdoutSection, /Re-run with a narrower print/);
   });
 
+  it("caps a huge result.error to 16 KiB with the policy marker (test 8)", () => {
+    // The sandbox does not cap `result.error` at all — a huge Python exception
+    // (e.g. `raise ValueError("A"*10**7)`) flows into one feedback message raw
+    // (#144). The feedback must re-cap it here, and the model must be told
+    // what went and how to recover the full traceback.
+    const hugeError = "E".repeat(100 * 1024);
+    const feedback = buildFeedback({
+      status: "error",
+      error: hugeError,
+      errorKind: "runtime",
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    const prefix = "Error: ";
+    assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
+    const rest = feedback.slice(prefix.length);
+    const stdoutIdx = rest.indexOf("\nstdout:");
+    assert.ok(stdoutIdx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const errorSection = rest.slice(0, stdoutIdx);
+    assert.ok(
+      Buffer.byteLength(errorSection, "utf8") <= 16 * 1024,
+      `Error section is ${Buffer.byteLength(errorSection, "utf8")} bytes`,
+    );
+    assert.match(errorSection, /elided/, "the truncation marker must state what went");
+    assert.match(
+      errorSection,
+      /Catch the exception and print the full traceback/,
+      "the recovery clause must name the route to the rest",
+    );
+  });
+
+  it("passes a small result.error through marker-free (test 8 no-op)", () => {
+    // The normal path is a marker-free no-op: a typical exception is far under
+    // 16 KiB and must render byte-identical to the pre-change shape.
+    const feedback = buildFeedback({
+      status: "error",
+      error: "boom",
+      errorKind: "syntax",
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    });
+    assert.ok(feedback.startsWith("Error: boom\n"), `unexpected feedback: ${feedback}`);
+    assert.doesNotMatch(feedback, /elided/, "a small error must not be marked elided");
+  });
+
   it("uses the shared truncateText helper, not a hand-rolled truncation (test 6)", () => {
     // Assumption 8 / invariant 4: one truncation implementation. rlm.ts must
     // import the same symbol and module sandbox.ts uses, and must never
