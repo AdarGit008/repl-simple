@@ -90,22 +90,37 @@ function cleanFenceContent(raw: string, fenceIndent: string): string {
 
 /**
  * The direct-answer contract (#73, reused by #76's salvage): the tail of the
- * reply matches an explicit anchor, and the captured fragment cannot contain
- * sentence-final punctuation or newlines — so "The answer is 42. Let me
- * submit." is NOT an answer, while leading prose is fine ("Based on the
- * data, the answer is 42."). Surrounding quotes and markdown emphasis are
- * stripped; an empty result is rejected.
+ * reply matches an explicit anchor. A decimal (e.g. "The answer is 3.14.")
+ * matches first, then the general fragment rule: no sentence-final
+ * punctuation or newlines — so "The answer is 42. Let me submit." is NOT an
+ * answer, while leading prose is fine ("Based on the data, the answer is
+ * 42."). Surrounding quotes and markdown emphasis are stripped to a fixpoint;
+ * an empty result is rejected. A comma hedge ("42, I think") is submitted
+ * verbatim — pinned by test, refinement deferred to #76's synthesis.
  */
+const DECIMAL_ANSWER_RE =
+  /(?:the answer is|answer is|the answer:|answer:)\s*([+-]?\d+\.\d+)\s*[.!?]?\s*$/i;
 const DIRECT_ANSWER_RE =
   /(?:the answer is|answer is|the answer:|answer:)\s*([^.!?\n]+)["'“”]?\s*[.!?]?\s*$/i;
 
 export function extractDirectAnswer(text: string): string | null {
+  const decimal = text.match(DECIMAL_ANSWER_RE);
+  if (decimal) return decimal[1];
   const m = text.match(DIRECT_ANSWER_RE);
   if (!m) return null;
-  let answer = m[1].trim();
-  answer = stripWrapping(answer, ["'", '"', "“", "”"]);
-  answer = stripWrapping(answer, ["**", "__", "*", "_"]);
+  const answer = stripWrappers(m[1].trim());
   return answer.length > 0 ? answer : null;
+}
+
+/** Strip quote and emphasis pairs alternately, to a fixpoint (bounded). */
+function stripWrappers(s: string): string {
+  let out = s;
+  for (let i = 0; i < 4; i++) {
+    const emph = stripWrapping(stripWrapping(out, ["'", '"', "“", "”"]), ["**", "__", "*", "_"]);
+    if (emph === out) return out;
+    out = emph;
+  }
+  return out;
 }
 
 /** Remove one surrounding pair from `wrappers` (longest first), if present. */
