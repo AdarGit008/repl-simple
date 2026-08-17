@@ -21,6 +21,7 @@ import {
   MontySyntaxError,
   MontyTypingError,
   MountDir,
+  type Frame,
   type MontySession,
   NameLookupSnapshot,
   type PrintCallback,
@@ -160,8 +161,13 @@ function runError(kind: RunErrorKind, error: string, acc: DispatchAccumulators):
  * is gone, not merely errored, and a caller that resumes or retries against it
  * is working with nothing.
  */
-function classifyResumeError(err: unknown, acc: DispatchAccumulators): RunError {
-  if (err instanceof MontyRuntimeError) return runError(runtimeKind(err), err.message, acc);
+function classifyResumeError(
+  err: unknown,
+  acc: DispatchAccumulators,
+  lineOffset?: number,
+): RunError {
+  if (err instanceof MontyRuntimeError)
+    return runError(runtimeKind(err), correctRuntimeError(err, lineOffset), acc);
   if (err instanceof MontyCrashedError) return runError("crashed", crashMessage(err), acc);
   throw err;
 }
@@ -236,7 +242,7 @@ function classifyStartError(
     }
     return runError(kind, diagnostics, acc);
   }
-  return classifyResumeError(err, acc);
+  return classifyResumeError(err, acc, lineOffset);
 }
 
 /**
@@ -286,6 +292,61 @@ function correctSyntaxErrorText(text: string, lineOffset?: number): string {
     corrected.push(line);
   }
   return corrected.join("\n");
+}
+
+/**
+ * Correct a rendered runtime error for code assembled with a prefix.
+ *
+ * The sandbox executes the script the caller assembled — prefix included —
+ * so a runtime error's traceback frames are numbered against the assembled
+ * script and carry `sourceLine` previews that can show prefix source.
+ * `MontyRuntimeError.traceback()` exposes those frames structured (measured
+ * on 0.0.21: filename, line, column, endLine, endColumn, functionName,
+ * sourceLine, outermost first). When `lineOffset` is set, the correction
+ * re-renders the traceback from the frames: `lineOffset` is subtracted from
+ * every `line`/`endLine`, frames inside the prefix (`line <= lineOffset`) are
+ * dropped together with their previews, and the survivors are rendered below
+ * the untouched `<type>: msg` heading — the heading is the historical
+ * rendering (`err.message`) and existing callers and tests rely on its shape;
+ * only the traceback portion changes.
+ *
+ * Falls back to the bare message — the historical behavior — when the error
+ * carries no frames (`traceback()` is empty for interpreter-raised ceilings
+ * such as `TimeoutError`, measured), when every frame lies inside the prefix
+ * (nothing survives to render), or when the offset is absent or not positive.
+ */
+function correctRuntimeError(err: MontyRuntimeError, lineOffset?: number): string {
+  if (lineOffset === undefined || !Number.isFinite(lineOffset) || lineOffset <= 0) {
+    return err.message;
+  }
+  const frames = err.traceback();
+  if (frames.length === 0) return err.message;
+  const offset = Math.floor(lineOffset);
+  const survivors: Frame[] = [];
+  for (const frame of frames) {
+    if (frame.line <= offset) continue;
+    survivors.push({ ...frame, line: frame.line - offset, endLine: frame.endLine - offset });
+  }
+  if (survivors.length === 0) return err.message;
+  const lines = [err.message, "Traceback (most recent call last):"];
+  for (const frame of survivors) {
+    lines.push(
+      `  File "${frame.filename}", line ${frame.line}, in ${frame.functionName ?? "<module>"}`,
+    );
+    if (frame.sourceLine !== undefined) {
+      // Mirrors monty's own rendering: the preview is trimmed of leading
+      // whitespace, and the caret is aligned by compensating for the trim.
+      const leading = frame.sourceLine.length - frame.sourceLine.trimStart().length;
+      const preview = frame.sourceLine.trimStart();
+      lines.push(`    ${preview}`);
+      if (!preview.startsWith("raise") && frame.column > 0 && frame.endColumn > frame.column) {
+        const column = Math.max(1, frame.column - leading);
+        const width = Math.max(1, frame.endColumn - frame.column);
+        lines.push(`    ${" ".repeat(column - 1)}${"~".repeat(width)}`);
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -872,7 +933,7 @@ async function runDispatchLoop(
         // `NameError: SENTINEL` (#66). There is no sentinel to leak now.
         current = tool ? await current.resume(name) : await current.resume();
       } catch (err) {
-        return classifyResumeError(err, acc);
+        return classifyResumeError(err, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -906,7 +967,7 @@ async function runDispatchLoop(
       try {
         current = await snapshot.resumeAuto();
       } catch (err) {
-        return classifyResumeError(err, acc);
+        return classifyResumeError(err, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -918,7 +979,7 @@ async function runDispatchLoop(
       try {
         current = await snapshot.resumeNotFound();
       } catch (err) {
-        return classifyResumeError(err, acc);
+        return classifyResumeError(err, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -948,7 +1009,7 @@ async function runDispatchLoop(
           ),
         );
       } catch (resumeErr) {
-        return classifyResumeError(resumeErr, acc);
+        return classifyResumeError(resumeErr, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -990,7 +1051,7 @@ async function runDispatchLoop(
             pythonError("PermissionError", `tool '${tool.name}' requires approval`),
           );
         } catch (err) {
-          return classifyResumeError(err, acc);
+          return classifyResumeError(err, acc, runOpts?.lineOffset);
         }
         continue;
       }
@@ -1046,7 +1107,7 @@ async function runDispatchLoop(
       try {
         current = await snapshot.resumeError(pythonError(pythonType, message));
       } catch (resumeErr) {
-        return classifyResumeError(resumeErr, acc);
+        return classifyResumeError(resumeErr, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -1065,7 +1126,7 @@ async function runDispatchLoop(
     try {
       current = await snapshot.resume(returnValue);
     } catch (err) {
-      return classifyResumeError(err, acc);
+      return classifyResumeError(err, acc, runOpts?.lineOffset);
     }
     // Loop back for next pause point
   }
@@ -1362,7 +1423,7 @@ async function resumeInSession(
         ? await snapshot.resumeError(resumeWith.raise)
         : await snapshot.resume(resumeWith.returnValue);
   } catch (err) {
-    return classifyResumeError(err, acc);
+    return classifyResumeError(err, acc, runOpts?.lineOffset);
   }
 
   // Continue via shared dispatch loop

@@ -7,7 +7,7 @@
   - Verify: `npm test` (focused sandbox tests green, full suite green), `npm run check`
   - Files: `src/types.ts`, `src/sandbox.ts`, `test/sandbox.test.ts`
 
-- [ ] Task 2: Runtime-error correction via `traceback()` frames in `sandbox.ts`
+- [x] Task 2: Runtime-error correction via `traceback()` frames in `sandbox.ts`
   - Acceptance: runtime error frames have `lineOffset` subtracted from `line`/`endLine`; frames
     with `line <= lineOffset` (prefix frames) are dropped, `sourceLine` previews included; the
     fed-back diagnostic contains no preamble source; existing `Error: <type>: msg` heading shape
