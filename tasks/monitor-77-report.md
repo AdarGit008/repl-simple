@@ -55,3 +55,22 @@ flight-start staleness comment on #77 (id 5318877797) carries the same false hal
 `tasks/verify-77.md`, `tasks/review.md`, `tasks/ship-report.md` (F-77), and this report were
 committed before the final report; `tasks/ship-report.md` previously held the stale F-144 report —
 replaced deliberately.
+
+## Applied (2026-08-17, user-approved)
+
+- **#77**: body edited — header marks F-77 landed; "Under #40" replaced with the settled record;
+  all three DoD boxes checked with landing notes. Two comments posted: the staleness-block
+  correction (typing half-premise) and the landing comment (resume bug + `endLine` cosmetic
+  residual). **Left OPEN — closes after merge with a "tests retained" note.**
+- **#70**: sub-issue line `#77 ← landed (F-77, 12 commits, ship GO, 986/986)`; new
+  "Bucket gotchas (recorded by the F-77 flight)" section (6 gotchas).
+- **#78**: Do item 2 extended (merged prompt must carry the fresh-sandbox wording); Do item 8
+  extended (fold or supersede the RLMLoop lineOffset case); template-coupling note extended
+  (test 4 coupling + diagnostic-regex coupling).
+- **#87**: "Fresh-sandbox contract note (from F-77/#77)" section appended (re-declaration
+  overhead in the worked example).
+- **#145**: item 8 added (`prefixLineCount()` O(n²)); item 6 extended (rename nit);
+  DoD updated to Items 1–8.
+- **New issue filed: #154** — "9.x — True RLM sandbox continuity once Monty FeedOptions supports
+  externalFunctions" (labels: bucket-9, question) — carries the deferred continuity decision so
+  it survives #77's and #70's eventual closes.
