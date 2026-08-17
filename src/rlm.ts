@@ -14,10 +14,14 @@ import {
 
 // ── Feedback budgets ────────────────────────────────────────────
 //
-// The sandbox already caps `stdout` (32 KiB) and `output` (16 KiB), but a
-// caller may raise either ceiling via `runOptions`. The feedback must not
-// inherit that raised ceiling, so it re-caps here with the same budgets and
-// the same shared helper — the normal path is a marker-free no-op (#74, D1).
+// Naming convention (D22): the `FEEDBACK_` prefix marks budgets applied
+// inside `buildFeedback`. Budgets that bound other sections stay unprefixed —
+// `INPUT_PREVIEW_`, `QUESTION_`, `MAX_CONVERSATION_BYTES`,
+// `ASSISTANT_REPLY_`. The sandbox already caps `stdout` (32 KiB) and
+// `output` (16 KiB), but a caller may raise either ceiling via `runOptions`.
+// The feedback must not inherit that raised ceiling, so it re-caps here with
+// the same budgets and the same shared helper — the normal path is a
+// marker-free no-op (#74, D1).
 
 /** Byte ceiling for `stdout` in a feedback message. */
 const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
@@ -26,7 +30,7 @@ const FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES;
 const FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES;
 
 /** Byte ceiling for `result.error` in a feedback message (16 KiB, value shape). */
-const ERROR_MAX_BYTES = 16 * 1024;
+const FEEDBACK_ERROR_MAX_BYTES = 16 * 1024;
 
 /**
  * Route to an elided error: the model owns the Python, so it can wrap the
@@ -490,7 +494,7 @@ export function buildFeedback(result: RunResult): string {
       recovery: STDOUT_RECOVERY,
     });
     const error = truncateWithSentinels(result.error, {
-      maxBytes: ERROR_MAX_BYTES,
+      maxBytes: FEEDBACK_ERROR_MAX_BYTES,
       headRatio: VALUE_HEAD_RATIO,
       recovery: ERROR_RECOVERY,
     });
@@ -619,26 +623,33 @@ function boundConversation(
     messages.splice(1, 1);
   }
 
-  const totalBytes = () =>
-    messages.reduce((sum, message) => sum + contentBytes(message.content), 0);
+  // One initial byte total, then a running total (D12): each drop subtracts
+  // the removed pair's bytes instead of re-encoding the whole array per
+  // while-iteration.
+  let totalBytes = messages.reduce((sum, message) => sum + contentBytes(message.content), 0);
 
   // Drop the oldest pairs while over budget. A droppable pair is the oldest
   // assistant+feedback pair after the initial message; dropping needs at least
   // two pairs — one to drop and the newest to keep — i.e. five messages.
-  while (totalBytes() > MAX_CONVERSATION_BYTES && messages.length >= 5) {
-    messages.splice(1, 2);
+  while (totalBytes > MAX_CONVERSATION_BYTES && messages.length >= 5) {
+    const [assistant, feedback] = messages.splice(1, 2);
+    totalBytes -= contentBytes(assistant.content) + contentBytes(feedback.content);
     droppedTurns++;
   }
 
   if (droppedTurns === 0) return 0;
 
   // The marker counts toward the budget; if it would push the conversation
-  // back over, drop more oldest pairs first.
+  // back over, drop more oldest pairs first. The marker grows with the
+  // cumulative count, so its bytes are re-measured every iteration.
   let marker = historyDropMarker(droppedTurns);
-  while (totalBytes() + contentBytes(marker) > MAX_CONVERSATION_BYTES && messages.length >= 5) {
-    messages.splice(1, 2);
+  let markerBytes = contentBytes(marker);
+  while (totalBytes + markerBytes > MAX_CONVERSATION_BYTES && messages.length >= 5) {
+    const [assistant, feedback] = messages.splice(1, 2);
+    totalBytes -= contentBytes(assistant.content) + contentBytes(feedback.content);
     droppedTurns++;
     marker = historyDropMarker(droppedTurns);
+    markerBytes = contentBytes(marker);
   }
 
   messages.splice(1, 0, { role: "user", content: marker });
