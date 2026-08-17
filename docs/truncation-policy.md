@@ -387,7 +387,11 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `buildFeedback` `error` | 16 KiB | 50/50 head+tail | #144 |
 | `buildInitialPrompt` `question` | 64 KiB | 50/50 head+tail | #144 |
 
-The four `#29`/`#34` rows go through one implementation, `src/truncate.ts`, per invariant 4.
+Every `truncateText` row in this table goes through one implementation, `src/truncate.ts`, per
+invariant 4 — the `#74`/`#144`/`#145` rows too, not only the four `#29`/`#34` rows. The conversation
+row is not a truncation (`boundConversation` drops whole message pairs), and after #145 the aggregate
+input-preview cut is block-level elision in `rlm.ts` over whole per-value previews (D15), not a
+second byte-level truncator.
 
 **Exception 1 — `builtins.ts` keeps its 256 KiB ceiling; it is not part of the 48 KiB budget.**
 `read_file` and `http_get` return a value *into the sandbox*, not into the model's context: the model

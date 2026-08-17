@@ -456,13 +456,13 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
 
   // The question is never dropped from `messages[0]`, so its budget bounds the
   // worst case while leaving every realistic question untouched (#144, D8).
-  const q = truncateWithSentinels(question, {
+  const questionText = truncateWithSentinels(question, {
     maxBytes: QUESTION_MAX_BYTES,
     headRatio: VALUE_HEAD_RATIO,
     recovery: QUESTION_RECOVERY,
   });
 
-  const parts = [`# Question\n${q}`];
+  const parts = [`# Question\n${questionText}`];
   if (inputSection) parts.push(`\n${inputSection}`);
   parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
   return parts.join("\n");

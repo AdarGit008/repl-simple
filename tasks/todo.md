@@ -11,4 +11,4 @@
 - [x] T9 — Reject invalid input names before any query (D20) + test 15
 - [x] T10 — Running byte total in boundConversation (D12) + rename ERROR_MAX_BYTES → FEEDBACK_ERROR_MAX_BYTES (D22) + convention comment
 - [x] T11 — Reword the TextEncoder framing honestly (D14): src/rlm.ts JSDoc + docs Exception 3
-- [ ] T12 — Rename the q binding to questionText + docs line 390 reword (D23)
+- [x] T12 — Rename the q binding to questionText + docs line 390 reword (D23)
