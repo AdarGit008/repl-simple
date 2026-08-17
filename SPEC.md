@@ -83,9 +83,9 @@ and the pending call is *not executed* (no disk write). It uses the existing fix
 
 ### D2 — "AbortError" at the public layer is the `aborted` result string, not a throw
 
-`Repl.resume()` is documented "never throws" (`src/repl.ts:198`, #48) — every model-believable state
+`Repl.resume()` is documented "never throws" (`src/repl.ts:200`, #48) — every model-believable state
 returns a sentence. The abort therefore surfaces as `[error: aborted]\nexecution aborted` (produced by
-`formatOutcome` in `src/repl.ts:655` from `errorKind: "aborted"`). A thrown `AbortError` would only be
+`formatOutcome` in `src/repl.ts:652` from `errorKind: "aborted"`). A thrown `AbortError` would only be
 observable one layer down at the `Session`/sandbox boundary, which the DoD explicitly does **not** test
 (it says drive `Repl.resume()`, not `Session.resume()`). Assert the public string, not an exception.
 
@@ -171,8 +171,10 @@ Verification sequence (executed by the BUILD/VERIFY phases, recorded here as DoD
 1. **GREEN (expected):** `npx tsx --test test/repl.test.ts` — the new test passes on the unmodified
    tree.
 2. **RED (prove-it):** hand-edit `src/repl.ts:235` to `session.resume({ onApproval })`, run the focused
-   test, confirm the new test fails 1/1 with the `existsSync` assertion (file written). Restore the
-   file, confirm green again.
+   test, confirm the new test fails 1/1 at `test/repl.test.ts:539` — the first failing assertion is the
+   `[error: aborted]` match, and the output shows the write landed
+   (`'[result]\nSuccessfully wrote 2 bytes to abort-rt.txt'`), so the `existsSync` no-write assertion
+   kills independently. Restore the file, confirm green again.
 3. **Regression:** `npm test` — 947/947.
 4. **Static:** `npm run check` && `npm run build` && `npm run lint` — all exit 0.
 5. **Mutation (evidence):** `node scripts/contained.mjs --limit 12G npx stryker run --mutate src/repl.ts`;
@@ -198,7 +200,8 @@ Verification sequence (executed by the BUILD/VERIFY phases, recorded here as DoD
 1. One new test exists in `test/repl.test.ts`, drives `Repl.resume()` (not `Session.resume()`), and
    passes on the unmodified tree — proving the `signal` field is wired end-to-end.
 2. The hand-applied single-field mutant (`{ onApproval }`, dropping `signal`) makes that test fail 1/1
-   with the exact no-write assertion, and is restored.
+   (first on the `[error: aborted]` match; the output shows the write landed, so the `existsSync`
+   no-write assertion kills independently), and is restored.
 3. The targeted `--mutate src/repl.ts` sweep keeps the `ObjectLiteral` `{}` mutant at `src/repl.ts:235`
    Killed, with a fresh single-file report and zero harness deaths.
 4. `npm test` (947/947), `npm run check`, `npm run build`, `npm run lint` all exit 0.

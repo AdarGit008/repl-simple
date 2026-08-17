@@ -72,7 +72,7 @@ always restored before commit.
   4. **Restore:** `git restore src/repl.ts`; assert `git diff -- src/repl.ts` is empty (the mutant is
      **never committed**).
   5. **GREEN:** `npx tsx --test test/repl.test.ts` — the new test passes again.
-  6. **Regression:** `npm test` → **940/940** (suite grows by exactly one: 939 → 940, Assumption 5).
+  6. **Regression:** `npm test` → **947/947** (suite grows by exactly one: 946 → 947, Assumption 5).
   7. **Static gates:** `npm run check` && `npm run build` && `npm run lint` — all exit 0.
   8. **Commit** `test/repl.test.ts` **only** (no `src/` diff), message
      `150 — Prove Repl.resume() honours an aborted signal (#150)`. Confirm
@@ -116,7 +116,7 @@ always restored before commit.
 
 ### Checkpoint: Complete
 
-- [ ] T1 and T2 done; `npm test` → 940/940; `npm run check`, `npm run build`, `npm run lint` exit 0;
+- [ ] T1 and T2 done; `npm test` → 947/947; `npm run check`, `npm run build`, `npm run lint` exit 0;
   tree clean; `src/` has no permanent diff against the branch base.
 
 ## Definition of Done (whole flight, from SPEC success criteria 1–5)
@@ -127,7 +127,7 @@ always restored before commit.
    with the exact no-write assertion, and is restored.
 3. The targeted `--mutate src/repl.ts` sweep keeps the `ObjectLiteral` `{}` mutant at `src/repl.ts:235`
    Killed, with a fresh single-file report and zero harness deaths.
-4. `npm test` (940/940), `npm run check`, `npm run build`, `npm run lint` all exit 0.
+4. `npm test` (947/947), `npm run check`, `npm run build`, `npm run lint` all exit 0.
 5. The evidence chain (RED/GREEN/mutation/harness-death) is recorded in `docs/verify-150.md` with the
    mutation-report freshness check stated (D4).
 
@@ -151,7 +151,7 @@ always restored before commit.
 
 - **BUILD → VERIFY:** BUILD leaves on disk: the committed killing test, the fresh
   `reports/mutation/mutation.json` (single `src/repl.ts` key), and the recorded per-mutant status.
-  VERIFY must independently re-run the full suite (**940/940**), `npm run check` / `npm run build` /
+  VERIFY must independently re-run the full suite (**947/947**), `npm run check` / `npm run build` /
   `npm run lint`, machine-read the JSON for freshness and the `ObjectLiteral`/`:235` `Killed` status,
   re-run `node scripts/mutation-guard.mjs --report`, confirm `git status --porcelain` clean and the
   diff vs base is exactly `test/repl.test.ts` (plus this flight's docs), then write
