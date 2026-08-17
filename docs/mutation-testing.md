@@ -206,6 +206,23 @@ freshness: mtime must postdate the sweep start **and** `list(json['files'].keys(
 contain exactly the file(s) mutated. A `files` map with only `src/rlm.ts` while you sweep
 `src/repl.ts` is the previous run, not yours (observed live on the #110 flight, 2026-08-17).
 
+### Freshness is not provenance — the `coverageAnalysis: "off"` reuse trap
+
+With `coverageAnalysis: "off"` and `incremental: true` (this repo's config), a non-`--force`
+sweep **re-executes zero mutants**: the incremental differ's `mutantCanBeReused` returns `true`
+unconditionally when the test runner reported no coverage
+(`@stryker-mutator/core` `dist/src/mutants/incremental-differ.js`). Every `status`,
+`statusReason` and `testsCompleted` is carried over from the previous run's cache, while the
+report gets a fresh mtime and the right `files` key — the freshness check above passes and the
+machine evidence still proves nothing new. Observed on the #150 flight (2026-08-17): 0 of 287
+mutants re-ran; all 193 Killed `statusReason` strings embed the previous run's sandbox directory
+(`sandbox-hybUqk` × 193 in `.stryker-incremental.json`; the current run's sandbox `WMtY7e` × 0).
+Before trusting a report: (a) the SPEC must state which mode the DoD requires — `--force` (true
+re-execution; ~2h15m cold for a single-file `--mutate src/repl.ts`) or incremental (fast,
+carried-over); and (b) verify provenance, not just freshness — confirm `statusReason` strings cite
+the **current** run's sandbox token, and treat a report whose statuses all cite a different token
+as carried-over evidence that another proof must close (e.g. a hand-applied RED).
+
 ### `REQUIRE_BRIDGE_TOOLS=1` is not optional
 
 The test command sets it. Without `fd` and `rg` present, `test/support/bridge-tools.ts` **silently
