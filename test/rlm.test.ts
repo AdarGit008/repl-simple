@@ -907,6 +907,68 @@ describe("runRlm() — context input", () => {
     );
     assert.ok(!prompt2.includes("..."), `at-budget value was elided:\n${prompt2.slice(0, 200)}`);
   });
+
+  it("rejects an invalid input name before any LLM query (test 15)", async () => {
+    // D20: input keys are interpolated unescaped into the prompt header
+    // (`# Input (available as \`${name}\` variable)`) and become sandbox
+    // variables — a backtick/newline key injects prompt structure. Reject,
+    // don't sanitize: an invalid key is already a deterministic downstream
+    // Python type-check failure, and silently renaming would desync the
+    // caller's model of `inputs` from the sandbox variables.
+    const badKey = "bad`key\nforged header";
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    await assert.rejects(
+      runRlm("q", {
+        llmClient: llm,
+        registry: rlmRegistry(),
+        inputs: { [badKey]: "x" },
+        maxIterations: 5,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError, `expected a TypeError, got: ${error}`);
+        assert.match((error as Error).message, /invalid input name/);
+        assert.ok(
+          (error as Error).message.includes(badKey),
+          `the error must name the invalid key:\n${(error as Error).message}`,
+        );
+        return true;
+      },
+    );
+    assert.equal(llm.calls().length, 0, "no LLM query may be made for an invalid name");
+
+    // The choke point covers runOptions.inputs too — both sources merge
+    // into runInputs at the same site (SPEC D20).
+    const { llm: runOptLlm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    await assert.rejects(
+      runRlm("q", {
+        llmClient: runOptLlm,
+        registry: rlmRegistry(),
+        runOptions: { inputs: { "9.2.x": "x" } },
+        maxIterations: 5,
+      }),
+      /invalid input name: 9\.2\.x — must match/,
+    );
+    assert.equal(runOptLlm.calls().length, 0, "the runOptions.inputs path must reject too");
+
+    // Valid names are unaffected: they render in the prompt and the run completes.
+    const { llm: okLlm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const result = await runRlm("q", {
+      llmClient: okLlm,
+      registry: rlmRegistry(),
+      inputs: { data_0: "x", context: "c" },
+      maxIterations: 5,
+    });
+    assert.equal(result.status, "ok");
+    const prompt = okLlm.calls()[0].messages[0].content;
+    assert.ok(
+      prompt.includes("# Input (available as `data_0` variable)"),
+      "a valid non-context name must render",
+    );
+    assert.ok(
+      prompt.includes("# Context (available as `context` variable)"),
+      "the legacy context header must render",
+    );
+  });
 });
 
 // ── Direct answers and the raw fall-through (#73) ────────────────

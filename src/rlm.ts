@@ -98,6 +98,22 @@ const QUESTION_MAX_BYTES = 64 * 1024;
 const QUESTION_RECOVERY =
   "The question was truncated. Answer from the part shown and state the assumption if ambiguous.";
 
+// ── Input-name validation (D20) ─────────────────────────────────
+//
+// Input keys are interpolated unescaped into the prompt header
+// (`# Input (available as \`${name}\` variable)`) and become sandbox
+// variables — a backtick/newline key injects prompt structure. Reject, don't
+// sanitize: the sandbox needs valid Python identifiers anyway, so an invalid
+// key is already a deterministic downstream type-check failure (the #72
+// `context` precedent), and silently renaming would desync the caller's
+// model of `inputs` from the sandbox variables. Validated at the merge site
+// in runRlm, where `runInputs` is built from `runOptions.inputs` and
+// `options.inputs` — one choke point for both sources and the sandbox-facing
+// path, thrown before any LLM query.
+
+/** Valid input names: a letter or underscore, then letters, digits or underscores. */
+const INPUT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
  * UTF-8 length of a message's content — the unit the conversation budget is
  * measured in. `TextEncoder` yields the same count without reintroducing
@@ -664,6 +680,15 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     ...(sandboxRunOpts.inputs ?? {}),
     ...(options.inputs ?? {}),
   };
+  // D20: one choke point for both input sources and the sandbox-facing
+  // path — reject before any LLM query (see INPUT_NAME_PATTERN).
+  for (const name of Object.keys(runInputs)) {
+    if (!INPUT_NAME_PATTERN.test(name)) {
+      throw new TypeError(
+        `invalid input name: ${name} — must match ${INPUT_NAME_PATTERN.toString()}`,
+      );
+    }
+  }
   runInputs.context = runInputs.context ?? "";
   sandboxRunOpts.inputs = runInputs;
   sandboxRunOpts.scriptName = sandboxRunOpts.scriptName ?? "rlm.py";
