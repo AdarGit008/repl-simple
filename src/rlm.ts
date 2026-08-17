@@ -61,6 +61,18 @@ const INPUT_PREVIEW_MAX_BYTES = 32 * 1024;
 const INPUT_PREVIEW_RECOVERY =
   "Each input is available as a named Python variable — slice it in Python to see more.";
 
+/** Byte ceiling for the `question` in the initial prompt (64 KiB, value shape). */
+const QUESTION_MAX_BYTES = 64 * 1024;
+
+/**
+ * Route to an elided question: the question is not a sandbox variable, so the
+ * model cannot slice it — the marker must not advertise a route it cannot
+ * honour (policy Q3). It directs the model to answer from the part shown and
+ * flag ambiguity instead (#144, D8).
+ */
+const QUESTION_RECOVERY =
+  "The question was truncated. Answer from the part shown and state the assumption if ambiguous.";
+
 /**
  * UTF-8 length of a message's content — the unit the conversation budget is
  * measured in. `TextEncoder` yields the same count without reintroducing
@@ -283,7 +295,15 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
     recovery: INPUT_PREVIEW_RECOVERY,
   });
 
-  const parts = [`# Question\n${question}`];
+  // The question is never dropped from `messages[0]`, so its budget bounds the
+  // worst case while leaving every realistic question untouched (#144, D8).
+  const { text: q } = truncateText(question, {
+    maxBytes: QUESTION_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: QUESTION_RECOVERY,
+  });
+
+  const parts = [`# Question\n${q}`];
   if (inputSection) parts.push(`\n${inputSection}`);
   parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
   return parts.join("\n");

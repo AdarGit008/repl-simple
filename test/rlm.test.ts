@@ -1302,6 +1302,73 @@ describe("runRlm() — aggregate input preview cap", () => {
   });
 });
 
+// ── Question cap (D8) ──────────────────────────────────────────
+
+describe("runRlm() — question cap", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("caps an oversized question to 64 KiB in messages[0] with the policy marker (test 9)", async () => {
+    // `boundConversation` never drops messages[0] (it carries the question,
+    // inputs and instructions), so an oversized question used to live in every
+    // query for the whole run (#144). The initial prompt must re-cap it here
+    // and tell the model what was lost and how to proceed.
+    const hugeQuestion = "Q".repeat(128 * 1024);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm(hugeQuestion, {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    const qHeader = "# Question\n";
+    const qHeaderIdx = prompt.indexOf(qHeader);
+    assert.ok(qHeaderIdx >= 0, `question section missing:\n${prompt.slice(0, 300)}`);
+    const qStart = qHeaderIdx + qHeader.length;
+    const qEnd = prompt.indexOf("\n\n# Context", qStart);
+    assert.ok(qEnd > qStart, "question section end not found");
+    const questionSection = prompt.slice(qStart, qEnd);
+    assert.ok(
+      Buffer.byteLength(questionSection, "utf8") <= 64 * 1024,
+      `question section is ${Buffer.byteLength(questionSection, "utf8")} bytes`,
+    );
+    assert.match(questionSection, /elided/, "the truncation marker must state what went");
+    assert.match(
+      questionSection,
+      /state the assumption/,
+      "the recovery clause must direct the model to answer from what is shown",
+    );
+  });
+
+  it("passes a normal question through marker-free (test 9 no-op)", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("what is the answer?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(
+      prompt.includes("# Question\nwhat is the answer?"),
+      `question not whole:\n${prompt.slice(0, 300)}`,
+    );
+    assert.doesNotMatch(prompt, /elided/, "a normal question must not be marked elided");
+  });
+});
+
 // ── A SUBMIT that never resolved ────────────────────────────────
 
 describe("runRlm() — a SUBMIT call that failed to resolve", () => {
