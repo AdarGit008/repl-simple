@@ -514,7 +514,7 @@ against #144's baseline for a no-regression signal; the full matrix is explicitl
 the spec missed issue item 8 and absorbed-item-6's second half. The issue-monitor's end-of-flight scan
 caught both against the live body. Corrected here rather than shipped silently.
 
-### D26 — Scope expansion: issue item 8 + absorbed-6 second half are IN scope (added at SHIP stage)
+### D26 — Scope expansion: issue item 8 + absorbed-6 second half are IN scope (added at SHIP stage) — **BLOCKED on this branch (recorded)**
 
 - **Item 8:** `Session.prefixLineCount()` is O(n²) (`src/session.ts:603-612`, from F-77): re-splits
   every prior snippet on each call. Fix to an incrementally maintained count; behavior byte-identical.
@@ -526,6 +526,17 @@ caught both against the live body. Corrected here rather than shipped silently.
 - The earlier out-of-scope lists excluding `src/session.ts` / `src/sandbox.ts` are amended by this
   decision. `coverage-baseline.json` still never hand-edited; new/changed lines must stay above the
   per-file floors.
+
+**BUILD blocker (verified 2026-08-17):** T17 found NEITHER target exists on this branch. F-77
+(issue #77's flight) merged to `origin/main` as `e796174` **after** this branch was cut — our
+merge-base with main is still `791096a`. `prefixLineCount` exists only on main (`src/session.ts:610`
+post-F-77) along with its `lineOffset` wiring; `correctSyntaxErrorText` exists only on main's
+`sandbox.ts`. Porting F-77's session/types/sandbox/rlm `lineOffset` work into this branch to make the
+fixes implementable would be a full flight merge touching four files this flight must not churn at
+SHIP stage. **Disposition: item 8 and absorbed-6b remain OPEN on #145 as post-merge follow-ups**
+(they are F-77-era code; fixing them requires F-77's merge into this branch's successor). Both are
+perf/rename items with zero interaction with D10–D25; no ship impact. T17/T18 dropped; todo.md gains
+no entries for them.
 
 ### D27 — Security-auditor Medium fix: scope the sentinel rule's marker grant to the system's marker
 
