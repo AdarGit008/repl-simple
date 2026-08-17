@@ -34,38 +34,118 @@ const ANSWER = (answer: string): CodeExtraction => ({ kind: "answer", answer });
 describe("extractPythonCode()", () => {
   const CASES: Array<{ name: string; reply: string; expected: CodeExtraction }> = [
     // Fenced shapes — tag tolerance.
-    { name: "5.2.1 python fence", reply: "```python\nprint('hi')\n```", expected: FENCE("print('hi')") },
+    {
+      name: "5.2.1 python fence",
+      reply: "```python\nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
     { name: "9.3.1 py fence", reply: "```py\nprint('hi')\n```", expected: FENCE("print('hi')") },
-    { name: "9.3.1 Python fence (capitalised)", reply: "```Python\nprint('hi')\n```", expected: FENCE("print('hi')") },
-    { name: "9.3.1 python3 fence", reply: "```python3\nprint('hi')\n```", expected: FENCE("print('hi')") },
+    {
+      name: "9.3.1 Python fence (capitalised)",
+      reply: "```Python\nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "9.3.1 python3 fence",
+      reply: "```python3\nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
     { name: "5.2.2 generic fence", reply: "```\nx=1\n```", expected: FENCE("x=1") },
-    { name: "foreign tag fence (any tag extracts)", reply: "```js\nlet x = 1;\n```", expected: FENCE("let x = 1;") },
+    {
+      name: "foreign tag fence (any tag extracts)",
+      reply: "```js\nlet x = 1;\n```",
+      expected: FENCE("let x = 1;"),
+    },
     // Fenced shapes — newline tolerance.
-    { name: "9.3.2 single-line fence", reply: "```python print('hi') ```", expected: FENCE("print('hi')") },
-    { name: "9.3.3 fence with no newline before the close", reply: "```python\nx = 1```", expected: FENCE("x = 1") },
-    { name: "5.2.6 windows line endings", reply: "```python\r\nprint('hi')\r\n```", expected: FENCE("print('hi')") },
-    { name: "5.2.x multiline python code", reply: "```python\nx = 1\ny = 2\nprint(x + y)\n```", expected: FENCE("x = 1\ny = 2\nprint(x + y)") },
-    { name: "5.2.x trailing whitespace stripped", reply: "```python\nprint('hi')   \n\n```", expected: FENCE("print('hi')") },
+    {
+      name: "9.3.2 single-line fence",
+      reply: "```python print('hi') ```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "9.3.3 fence with no newline before the close",
+      reply: "```python\nx = 1```",
+      expected: FENCE("x = 1"),
+    },
+    {
+      name: "5.2.6 windows line endings",
+      reply: "```python\r\nprint('hi')\r\n```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "5.2.x multiline python code",
+      reply: "```python\nx = 1\ny = 2\nprint(x + y)\n```",
+      expected: FENCE("x = 1\ny = 2\nprint(x + y)"),
+    },
+    {
+      name: "5.2.x trailing whitespace stripped",
+      reply: "```python\nprint('hi')   \n\n```",
+      expected: FENCE("print('hi')"),
+    },
     { name: "5.2.5 empty python fence", reply: "```python\n\n```", expected: FENCE("") },
-    { name: "5.2.x only whitespace between fences", reply: "```python\n   \n```", expected: FENCE("") },
+    {
+      name: "5.2.x only whitespace between fences",
+      reply: "```python\n   \n```",
+      expected: FENCE(""),
+    },
     // Fenced shapes — indentation.
-    { name: "9.3.4 indented fence", reply: "  ```python\n  print('hi')\n  ```", expected: FENCE("print('hi')") },
-    { name: "9.3.4 indented fence with a flush first line", reply: "  ```python\nprint('a')\n  print('b')\n  ```", expected: FENCE("print('a')\nprint('b')") },
+    {
+      name: "9.3.4 indented fence",
+      reply: "  ```python\n  print('hi')\n  ```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "9.3.4 indented fence with a flush first line",
+      reply: "  ```python\nprint('a')\n  print('b')\n  ```",
+      expected: FENCE("print('a')\nprint('b')"),
+    },
     // Selection rule — the last complete block is a correction.
-    { name: "9.3.5 two python blocks — the second is taken", reply: "```python\nprint('wrong')\n```\n```python\nprint('corrected')\n```", expected: FENCE("print('corrected')") },
-    { name: "9.3.5 a later generic block is a correction too", reply: "```python\nprint('first')\n```\nsome text\n```\nprint('second')\n```", expected: FENCE("print('second')") },
+    {
+      name: "9.3.5 two python blocks — the second is taken",
+      reply: "```python\nprint('wrong')\n```\n```python\nprint('corrected')\n```",
+      expected: FENCE("print('corrected')"),
+    },
+    {
+      name: "9.3.5 a later generic block is a correction too",
+      reply: "```python\nprint('first')\n```\nsome text\n```\nprint('second')\n```",
+      expected: FENCE("print('second')"),
+    },
     // Unfenced shapes.
     { name: "5.2.3 naked code (no fence)", reply: "print('hi')", expected: RAW("print('hi')") },
     { name: "5.2.5 empty reply", reply: "", expected: RAW("") },
-    { name: "9.3.6 prose with a recognised answer", reply: "The answer is 42.", expected: ANSWER("42") },
-    { name: "9.3.6 quoted answer", reply: "Based on the data, the answer is 'hello world'.", expected: ANSWER("hello world") },
+    {
+      name: "9.3.6 prose with a recognised answer",
+      reply: "The answer is 42.",
+      expected: ANSWER("42"),
+    },
+    {
+      name: "9.3.6 quoted answer",
+      reply: "Based on the data, the answer is 'hello world'.",
+      expected: ANSWER("hello world"),
+    },
     { name: "9.3.6 emphasised answer", reply: "The answer is **42**.", expected: ANSWER("42") },
     { name: "9.3.6 answer: shorthand", reply: "Answer: 42", expected: ANSWER("42") },
-    { name: "9.3.7 prose with trailing text is not a direct answer", reply: "I think the answer is 42. Let me submit.", expected: RAW("I think the answer is 42. Let me submit.") },
-    { name: "9.3.7 prose without an answer falls through as raw code", reply: "Here is my analysis of the data.", expected: RAW("Here is my analysis of the data.") },
+    {
+      name: "9.3.7 prose with trailing text is not a direct answer",
+      reply: "I think the answer is 42. Let me submit.",
+      expected: RAW("I think the answer is 42. Let me submit."),
+    },
+    {
+      name: "9.3.7 prose without an answer falls through as raw code",
+      reply: "Here is my analysis of the data.",
+      expected: RAW("Here is my analysis of the data."),
+    },
     // Refusals and priorities.
-    { name: "unclosed fence is skipped — raw fall-through", reply: "```python\nprint('never closed')", expected: RAW("```python\nprint('never closed')") },
-    { name: "a complete fence wins over a trailing answer", reply: "```python\nx = 1\n```\nThe answer is 42.", expected: FENCE("x = 1") },
+    {
+      name: "unclosed fence is skipped — raw fall-through",
+      reply: "```python\nprint('never closed')",
+      expected: RAW("```python\nprint('never closed')"),
+    },
+    {
+      name: "a complete fence wins over a trailing answer",
+      reply: "```python\nx = 1\n```\nThe answer is 42.",
+      expected: FENCE("x = 1"),
+    },
   ];
 
   for (const { name, reply, expected } of CASES) {
