@@ -2095,3 +2095,46 @@ async function untilTrue(fn: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+// ── Resume D3 parity (#59, coverage floor) ──────────────────────
+
+describe("ReplRunner — resume revalidates after its trust check (#59)", () => {
+  it("a session evicted during the check answers no-session, not a result", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    // Park the trust check on an explicit gate so the eviction deterministically
+    // lands inside it — the same own-property seam philosophy as the creation
+    // counter above. A timer would race the fs I/O in the insertion.
+    const target = runner as unknown as {
+      trustChangeDiscards: (id: string, live: unknown) => Promise<boolean>;
+    };
+    const original = target.trustChangeDiscards.bind(runner);
+    let armed = false;
+    let releaseCheck!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseCheck = resolve;
+    });
+    target.trustChangeDiscards = async (id: string, live: unknown) => {
+      const result = await original(id, live);
+      if (armed && id === "victim") await gate; // others, and the setup run, pass through
+      return result;
+    };
+
+    try {
+      await runner.run("a = 1", "victim");
+      armed = true; // from here on, the victim's revalidation parks
+
+      const resuming = runner.resume("victim", approve); // parked in the widened check
+      await runner.run("b = 2", "other"); // evicts victim while the check is open
+      releaseCheck();
+
+      const out = await resuming;
+      assert.match(out, /No session 'victim' exists/, `a result for an evicted session: ${out}`);
+      assert.equal(runner.liveSessionCount(), 1, "the eviction did not stick");
+    } finally {
+      target.trustChangeDiscards = original.bind(runner);
+      cleanup();
+    }
+  });
+});
