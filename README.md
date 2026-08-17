@@ -354,6 +354,9 @@ CI runs coverage as its own job on Node 24 / ubuntu only. The floors are exact m
 V8 line attribution differs enough between Node majors that a baseline shared across the matrix would
 have to be slackened until it stopped biting.
 
+(The reported `global` figure includes `scripts/` rows while the floors exclude them — the floor
+universe is tracked `src/` and `extensions/` sources; the global is reported, not a gate.)
+
 ### Mutation score
 
 `npm run mutation` mutates `src/` and `extensions/` and fails below a **58%** floor

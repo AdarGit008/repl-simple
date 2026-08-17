@@ -115,10 +115,38 @@ export function oneLineTolerance(found: number): number {
  * The update's refusal test: did a file's spread exceed what the known
  * one-line defect can produce? Mirrors `belowFloor`'s `FLOORING_SLACK` —
  * both `min` and `max` are 2dp-floored, so a true one-line spread can report
- * up to 0.01 above `spreadLimit` and must still pass.
+ * up to 0.01 above `spreadLimit` and must still pass. The mirror direction
+ * is safe by the same arithmetic: a spread can also *under*-report by 0.01,
+ * so a true spread up to one line + a hair may slip past — but the floor
+ * then sits within `limit + 0.01` of every observation, which the gate's
+ * one-line tolerance exactly absorbs. It cannot go red.
  */
 export function exceedsSpreadLimit(min: number, max: number, found: number): boolean {
   return max - min > spreadLimit(found) + FLOORING_SLACK;
+}
+
+/**
+ * The update's refusal report: every reason to refuse the write, as the
+ * messages `coverage.mjs` prints and exits on. Assembled here — not in the
+ * script — so the refusal wiring is unit-tested rather than being a silent
+ * happy-path branch nobody ever executes (no file in this repo has yet
+ * exceeded its spread limit).
+ */
+export function refusalReasons(combined: CombinedRuns, runCount: number): string[] {
+  const refusals: string[] = [];
+  for (const [file, f] of Object.entries(combined.files)) {
+    if (exceedsSpreadLimit(f.min, f.max, f.found)) {
+      refusals.push(
+        `${file}: spread ${f.min.toFixed(2)}–${f.max.toFixed(2)} exceeds one line's worth (${spreadLimit(
+          f.found,
+        ).toFixed(2)} pp)`,
+      );
+    }
+  }
+  for (const file of combined.missingInSomeRuns) {
+    refusals.push(`${file}: absent from at least one of the ${runCount} runs`);
+  }
+  return refusals;
 }
 
 /**

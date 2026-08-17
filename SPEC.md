@@ -52,7 +52,10 @@ of plain `coverage` runs is green on the same tree, with no hand-tuned numbers a
   orchestration importing it, and `npm run coverage` / `coverage:update` run the script via `tsx`
   (plain `node` cannot import `.ts`). CI already invokes `npm run coverage`, so it is unaffected.
   `tsconfig.json` does not include `scripts/`, but tsc follows imports — the core gets strictly
-  checked without joining the built package (tsconfig.build.json emits only src/ + test/).
+  checked. **Correction (2026-08-17, review):** `npm run build` also follows that import and emits
+  `dist/scripts/coverage-core.js` + `.d.ts`. Harmless — `dist/` is gitignored, the package is
+  `private`, and pi loads the extension from source — but the claim below that the build is
+  untouched was wrong; #80's dist restructure will absorb the file.
 - **`found` for threshold/tolerance purposes = the maximum LF across the N runs.** On an unchanged
   tree LF is constant; max is the conservative choice if it ever is not.
 - **`scripts/` files are printed but never floored.** `scripts/coverage-core.ts` loads in the unit

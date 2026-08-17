@@ -2,8 +2,11 @@
 // Per-file line-coverage floors.
 //
 // Usage:
-//   node scripts/coverage.mjs             measure, compare against the baseline
-//   node scripts/coverage.mjs --update    measure, rewrite the baseline
+//   npm run coverage             measure, compare against the baseline
+//   npm run coverage:update      measure 3×, rewrite the baseline (or refuse)
+//
+// (Runs via `tsx` — the script imports `./coverage-core.ts`, which plain
+// `node` cannot load.)
 //
 // Why per-file and not one global number: measured on this repo, deleting
 // `test/sandbox.test.ts` — 813 lines, and the only file that kills any
@@ -40,7 +43,7 @@ import {
   exceedsSpreadLimit,
   keepFloorable,
   pct,
-  spreadLimit,
+  refusalReasons,
 } from "./coverage-core.js";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -152,6 +155,7 @@ function measure(files) {
         `--test-reporter-destination=${lcovPath}`,
         "--test-reporter=dot",
         "--test-reporter-destination=stdout",
+        "--",
         ...files,
       ],
       { cwd: REPO, encoding: "utf8", stdio: ["ignore", "inherit", "inherit"] },
@@ -210,11 +214,11 @@ if (argv.includes("--update")) {
     measured = measure(files);
     runs.push(keepFloorable(runResult(measured), floorable));
   }
-  const { files: combined, missingInSomeRuns, global } = combineRuns(runs);
+  const combined = combineRuns(runs);
 
   // The measured spread is printed so a file that starts varying becomes
   // visible rather than being silently absorbed.
-  const varying = Object.entries(combined)
+  const varying = Object.entries(combined.files)
     .map(([file, f]) => ({ file, ...f, spread: f.max - f.min }))
     .filter((r) => r.spread > 0)
     .sort((a, b) => b.spread - a.spread);
@@ -233,19 +237,7 @@ if (argv.includes("--update")) {
     console.log(`\nNo file varied across the ${UPDATE_RUNS} runs.`);
   }
 
-  const refusals = [];
-  for (const [file, f] of Object.entries(combined)) {
-    if (exceedsSpreadLimit(f.min, f.max, f.found)) {
-      refusals.push(
-        `${file}: spread ${f.min.toFixed(2)}–${f.max.toFixed(2)} exceeds one line's worth (${spreadLimit(
-          f.found,
-        ).toFixed(2)} pp)`,
-      );
-    }
-  }
-  for (const file of missingInSomeRuns) {
-    refusals.push(`${file}: absent from at least one of the ${UPDATE_RUNS} runs`);
-  }
+  const refusals = refusalReasons(combined, UPDATE_RUNS);
   if (refusals.length > 0) {
     console.error(
       "\nRefusing to write the baseline — variance wider than the known one-line defect:\n",
@@ -258,10 +250,10 @@ if (argv.includes("--update")) {
   }
 
   const baseline = {};
-  for (const [file, f] of Object.entries(combined)) baseline[file] = f.min;
-  writeFileSync(BASELINE, `${JSON.stringify({ global, files: baseline }, null, 2)}\n`);
+  for (const [file, f] of Object.entries(combined.files)) baseline[file] = f.min;
+  writeFileSync(BASELINE, `${JSON.stringify({ global: combined.global, files: baseline }, null, 2)}\n`);
   console.log(
-    `\nBaseline written: ${Object.keys(baseline).length} files, ${global.toFixed(
+    `\nBaseline written: ${Object.keys(baseline).length} files, ${combined.global.toFixed(
       2,
     )}% global (per-file minima over ${UPDATE_RUNS} runs).`,
   );

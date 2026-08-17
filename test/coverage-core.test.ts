@@ -7,6 +7,7 @@ import {
   keepFloorable,
   oneLineTolerance,
   pct,
+  refusalReasons,
   spreadLimit,
   type MeasuredRun,
 } from "../scripts/coverage-core.js";
@@ -148,6 +149,47 @@ describe("exceedsSpreadLimit", () => {
     assert.equal(exceedsSpreadLimit(97.6, 100, 42), true);
     assert.equal(exceedsSpreadLimit(98.9, 100, 391), true);
   });
+
+  it("passes a spread just above 1pp where one line is 1pp exactly", () => {
+    assert.equal(exceedsSpreadLimit(0, 1.01, 100), false);
+  });
+
+  it("refuses a spread a hair past the slack", () => {
+    assert.equal(exceedsSpreadLimit(0, 1.02, 100), true);
+  });
+});
+
+// ── refusalReasons ─────────────────────────────────────────────
+
+describe("refusalReasons", () => {
+  it("returns an empty list when nothing varies beyond a line", () => {
+    const combined = combineRuns([
+      run(97, [{ file: "src/a.ts", pct: 99.74, found: 391 }]),
+      run(97, [{ file: "src/a.ts", pct: 100, found: 391 }]),
+    ]);
+    assert.deepEqual(refusalReasons(combined, 3), []);
+  });
+
+  it("names the file and its measured range for a wide spread", () => {
+    const combined = combineRuns([
+      run(97, [{ file: "src/a.ts", pct: 90, found: 391 }]),
+      run(97, [{ file: "src/a.ts", pct: 100, found: 391 }]),
+    ]);
+    const refusals = refusalReasons(combined, 3);
+    assert.equal(refusals.length, 1);
+    assert.match(refusals[0], /^src\/a\.ts: spread 90\.00–100\.00 exceeds one line's worth/);
+  });
+
+  it("names a file absent from some runs, with the run count", () => {
+    const combined = combineRuns([
+      run(97, [{ file: "src/a.ts", pct: 100, found: 391 }]),
+      run(97, []),
+      run(97, []),
+    ]);
+    assert.deepEqual(refusalReasons(combined, 3), [
+      "src/a.ts: absent from at least one of the 3 runs",
+    ]);
+  });
 });
 
 // ── oneLineTolerance ───────────────────────────────────────────
@@ -191,6 +233,14 @@ describe("belowFloor", () => {
 
   it("fails a wide drop", () => {
     assert.equal(belowFloor(98, 99.74, 391), true);
+  });
+
+  it("passes one line below the floor on a small file (gate-side mirror of the 42-line case)", () => {
+    assert.equal(belowFloor(97.61, 100, 42), false);
+  });
+
+  it("fails at the closest boundary below the tolerance", () => {
+    assert.equal(belowFloor(99.73, 100, 391), true);
   });
 
   it("fails when found is 0 and any lines are missed", () => {
