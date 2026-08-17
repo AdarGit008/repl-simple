@@ -260,7 +260,9 @@ function classifyStartError(
  * line, an ` --> <file>:<line>:<col>` location line, a `  |` gutter, excerpt
  * lines of the shape `<n> | <source>` (number right-aligned in a gutter
  * padded to the widest line number shown), caret lines (`  |    ^`), and a
- * closing gutter line. Header, caret and gutter lines pass through verbatim,
+ * closing gutter line. Blank source lines render as `<n> |` with no text
+ * after the pipe, so the excerpt shape also accepts zero trailing
+ * characters. Header, caret and gutter lines pass through verbatim,
  * so the `error[invalid-syntax]: <msg>` heading shape is preserved.
  *
  * A no-op when the offset is absent or not positive.
@@ -272,9 +274,11 @@ function correctSyntaxErrorText(text: string, lineOffset?: number): string {
   const offset = Math.floor(lineOffset);
   const corrected: string[] = [];
   for (const line of text.split("\n")) {
-    // Excerpt line. Drop it when it shows prefix source, else renumber in
-    // place, preserving the gutter width (the number stays right-aligned).
-    const excerpt = /^(\s*)(\d+)( \| .*)$/.exec(line);
+    // Excerpt line (blank source lines render without the trailing space,
+    // so zero characters after the pipe are allowed too). Drop it when it
+    // shows prefix source, else renumber in place, preserving the gutter
+    // width (the number stays right-aligned).
+    const excerpt = /^(\s*)(\d+)( \|.*)$/.exec(line);
     if (excerpt) {
       const n = Number(excerpt[2]);
       if (n <= offset) continue;

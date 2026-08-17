@@ -37,3 +37,11 @@
     the coupled existing tests stay green; test asserts the prompt says so.
   - Verify: `npm test` (focused rlm tests green, full suite green), `npm run check`
   - Files: `src/rlm.ts`, `test/rlm.test.ts`
+
+- [x] Task 6: Fixup — blank excerpt lines survive the syntax-error correction
+  - Acceptance: `correctSyntaxErrorText`'s excerpt regex also matches blank excerpt lines
+    (`N |` with no text after the pipe — Monty renders them without the trailing space); a blank
+    excerpt line in the prefix region (line ≤ lineOffset) is stripped, one in the user region is
+    renumbered (gutter padding preserved); the 6 existing syntax-correction tests stay green.
+  - Verify: `npm test` (976/976 green — 973 baseline + 3 new), `npm run check`, `npm run lint`
+  - Files: `src/sandbox.ts`, `test/sandbox.test.ts`

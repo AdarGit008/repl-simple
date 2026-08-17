@@ -201,6 +201,46 @@ describe("runInSandbox — lineOffset syntax-error correction", () => {
     assert.match(result.error, / --> <repl>:1:4/, "typing diagnostics keep their own line numbers");
     assert.match(result.error, /^1 \| x: int = 'hello'$/m);
   });
+
+  it("strips a blank prefix-region excerpt line (prefix ends with an empty line)", async () => {
+    // Monty renders a blank source line as `N |` — no trailing space, no
+    // text after the pipe. When the blank line belongs to the prefix, it
+    // must be stripped like any other prefix excerpt line.
+    const result = await runInSandbox(`${prefixOf(2)}\n\n1 +`, { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:1:/, "the user's error is line 1");
+    assert.match(result.error, /^1 \| 1 \+$/m, "the excerpt line is line 1");
+    assert.doesNotMatch(result.error, /^\s*\d+ \|$/m, "no blank excerpt line survives");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("renumbers a blank user-region excerpt line (user code starts with an empty line)", async () => {
+    // The same `N |` shape, but on a line the user owns: it must be
+    // renumbered like any other user excerpt line.
+    const result = await runInSandbox(`${prefixOf(2)}\n\n1 +`, { registry }, { lineOffset: 2 });
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/, "the user's error is user line 2");
+    assert.match(result.error, /^1 \|$/m, "the blank user line is renumbered to 1");
+    assert.match(result.error, /^2 \| 1 \+$/m, "the error excerpt line is 2");
+    assert.doesNotMatch(result.error, /^3 \|$/m, "no unrenumbered excerpt line survives");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("preserves gutter padding when renumbering a blank user-region excerpt line", async () => {
+    // A 3-digit-wide gutter (from the 98-line prefix) right-aligns short
+    // numbers; the renumbered blank line keeps the width.
+    const wide = Array.from({ length: 98 }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+    const result = await runInSandbox(`${wide}\n\n1 +`, { registry }, { lineOffset: 98 });
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:4/, "the user's error is user line 2");
+    assert.match(result.error, /^ {2}1 \|$/m, "the blank user line is 1, gutter padded to 3");
+    assert.match(result.error, /^ {2}2 \| 1 \+$/m, "the error excerpt line is 2, gutter padded");
+    assert.doesNotMatch(result.error, /99 \|/, "no unrenumbered excerpt line survives");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
 });
 
 // ── lineOffset: runtime-error correction ────────────────────────
