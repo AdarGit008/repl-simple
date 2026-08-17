@@ -56,12 +56,13 @@ export function extractPythonCode(text: string): CodeExtraction {
     const indent = open[1];
     fenceClose.lastIndex = fenceOpen.lastIndex;
     const close = fenceClose.exec(text);
-    if (close) {
-      const raw = text.slice(fenceOpen.lastIndex, close.index);
-      fenced = cleanFenceContent(raw, indent);
-      fenceOpen.lastIndex = fenceClose.lastIndex;
-    }
-    // Unclosed fence — not a complete block; skipped.
+    // No close after this open means none after any later open either (opens
+    // advance monotonically), so the scan is linear, not O(k·n) — a reply of
+    // unclosed openings used to re-scan the whole suffix per open.
+    if (!close) break;
+    const raw = text.slice(fenceOpen.lastIndex, close.index);
+    fenced = cleanFenceContent(raw, indent);
+    fenceOpen.lastIndex = fenceClose.lastIndex;
     open = fenceOpen.exec(text);
   }
   if (fenced !== null) return { kind: "code", code: fenced, from: "fence" };
@@ -79,8 +80,10 @@ export function extractPythonCode(text: string): CodeExtraction {
  * indented fence implies uniformly indented content.
  */
 function cleanFenceContent(raw: string, fenceIndent: string): string {
-  const detrailed = raw.replace(/\r?\n[ \t]*$/, "");
-  const trimmed = detrailed.trim();
+  // Normalise CRLF first so dedent splits on \n only and never leaks a \r
+  // into the middle of a line; trim handles the fence's own trailing
+  // whitespace (structural newline and the close line's indent alike).
+  const trimmed = raw.replace(/\r\n/g, "\n").trim();
   if (!fenceIndent) return trimmed;
   return trimmed
     .split("\n")
@@ -89,24 +92,43 @@ function cleanFenceContent(raw: string, fenceIndent: string): string {
 }
 
 /**
- * The direct-answer contract (#73, reused by #76's salvage): the tail of the
- * reply matches an explicit anchor. A decimal (e.g. "The answer is 3.14.")
- * matches first, then the general fragment rule: no sentence-final
- * punctuation or newlines — so "The answer is 42. Let me submit." is NOT an
- * answer, while leading prose is fine ("Based on the data, the answer is
- * 42."). Surrounding quotes and markdown emphasis are stripped to a fixpoint;
- * an empty result is rejected. A comma hedge ("42, I think") is submitted
- * verbatim — pinned by test, refinement deferred to #76's synthesis.
+ * The direct-answer contract (#73, reused by #76's salvage). The reply is
+ * searched for the LAST anchor occurrence (linear `lastIndexOf` over the four
+ * variants) and only that tail is validated against an anchored pattern — a
+ * `$`-anchored scan over every anchor occurrence backtracks quadratically on
+ * adversarial replies. A decimal (e.g. "The answer is 3.14.") matches first,
+ * then the general fragment rule: no sentence-final punctuation or newlines —
+ * so "The answer is 42. Let me submit." is NOT an answer, while leading prose
+ * is fine ("Based on the data, the answer is 42."). Surrounding quotes and
+ * markdown emphasis are stripped to a fixpoint; an empty result is rejected.
+ * A comma hedge ("42, I think") is submitted verbatim — pinned by test,
+ * refinement deferred to #76's synthesis.
  */
+const ANCHORS = ["the answer is", "answer is", "the answer:", "answer:"];
+
+/** Index of the LAST anchor occurrence (case-insensitive), or -1. */
+function lastAnchorIndex(text: string): number {
+  let best = -1;
+  const lower = text.toLowerCase();
+  for (const anchor of ANCHORS) {
+    const idx = lower.lastIndexOf(anchor);
+    if (idx > best) best = idx;
+  }
+  return best;
+}
+
 const DECIMAL_ANSWER_RE =
-  /(?:the answer is|answer is|the answer:|answer:)\s*([+-]?\d+\.\d+)\s*[.!?]?\s*$/i;
+  /^(?:the answer is|answer is|the answer:|answer:)\s*([+-]?\d+\.\d+)\s*[.!?]?\s*$/i;
 const DIRECT_ANSWER_RE =
-  /(?:the answer is|answer is|the answer:|answer:)\s*([^.!?\n]+)["'“”]?\s*[.!?]?\s*$/i;
+  /^(?:the answer is|answer is|the answer:|answer:)\s*([^.!?\n]+)["'“”]?\s*[.!?]?\s*$/i;
 
 export function extractDirectAnswer(text: string): string | null {
-  const decimal = text.match(DECIMAL_ANSWER_RE);
+  const idx = lastAnchorIndex(text);
+  if (idx === -1) return null;
+  const tail = text.slice(idx);
+  const decimal = tail.match(DECIMAL_ANSWER_RE);
   if (decimal) return decimal[1];
-  const m = text.match(DIRECT_ANSWER_RE);
+  const m = tail.match(DIRECT_ANSWER_RE);
   if (!m) return null;
   const answer = stripWrappers(m[1].trim());
   return answer.length > 0 ? answer : null;
