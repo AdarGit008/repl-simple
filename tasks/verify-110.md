@@ -48,7 +48,9 @@ This matches the excerpt in `docs/verify-110.md` **exactly**.
 
 ### 4. Git hygiene
 
-- Branch has exactly the expected commits: `3d617b0` (spec+plan), `b63d84d` (verify doc).
+- Branch had exactly the expected commits at VERIFY time: `3d617b0` (spec+plan), `b63d84d` (verify doc).
+  Later phases added `9980891` (this verdict), `d7a98c6` (review + nit fix), and the ship commit —
+  all still docs-only.
 - `git status --porcelain` empty at check time (I then added this untracked verdict file).
 - `git diff --name-status origin/main` → only `SPEC.md`, `tasks/plan.md`, `tasks/todo.md` (M) and
   `docs/verify-110.md`, `docs/verify-110.md-issue-comment.txt` (A). **No `src/` or `test/` diffs.**

@@ -51,10 +51,10 @@ Reviewer: fresh review context, adversarial pass, per `code-review-and-quality` 
 - **Verified** `docs/verify-110.md` claims are exact: the five target-mutant statuses, the commit
   ref, the test name/line, the guard test lines, and the "287 mutants: 193 Killed / 60 Survived /
   34 Timeout" full-file context all match the raw JSON. No drift, no rounding, no paraphrase error.
-- **FYI** `src/repl.ts:220` (`if (this.sessions.get(sessionId) !== live)`, the D3-parity guard) is a
-  *second* no-session guard whose mutants are outside #110's DoD. Some of the 60 surviving mutants
-  may live there; this is honest, correctly excluded from the deliverable, and belongs to later
-  buckets — not a defect in this flight.
+- **FYI** `src/repl.ts:224` (`if (this.sessions.get(sessionId) !== live)`, the D3-parity guard) is a
+  *second* no-session guard whose mutants are outside #110's DoD; the SHIP test-engineer check
+  confirmed all four of its mutants are Killed (no follow-up gap there). Corrected from `:220`
+  per the SHIP-phase finding.
 - **FYI** `docs/verify-110.md` correctly scopes `signal` as wired-but-unproven (SPEC Assumption 4),
   and correctly flags the stale tree-wide mutation floor. Neither is silently claimed as done.
 
@@ -98,7 +98,8 @@ Reviewer: fresh review context, adversarial pass, per `code-review-and-quality` 
   machine-read).
 - `gh issue comment 110 --body …` and `gh issue close 110 --reason completed --comment …` are valid
   subcommands/flags (checked against `gh issue comment --help` / `gh issue close --help`).
-- Git hygiene: three commits (`3d617b0` spec+plan, `b63d84d` verify doc, `9980891` verify verdict);
+- Git hygiene: three commits at review time (`3d617b0` spec+plan, `b63d84d` verify doc, `9980891` verify verdict);
+  the review fix (`d7a98c6`) and the ship report landed after this section was written.
   `git diff --name-status origin/main` shows only the docs/spec/plan/todo files, no `src/`/`test/`.
 
 ## Verdict
