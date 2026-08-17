@@ -856,6 +856,225 @@ describe("runRlm() — context input", () => {
   });
 });
 
+// ── lineOffset wiring: the RLM preamble is the prefix (#77) ──────
+//
+// The loop assembles `preamble + "\n" + code`, so the sandbox numbers every
+// diagnostic from the top of the preamble. The loop must tell the sandbox how
+// many lines it prepended (`RunOptions.lineOffset`), computed from the
+// preamble string actually used — the model's line 1 is line 1, and preamble
+// source never reaches it.
+
+describe("runRlm() — preamble lineOffset wiring", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  /** The feedback for iteration 1 — the last message of the second LLM call. */
+  function lastMessage(call: { messages: Array<{ role: string; content: string }> }): string {
+    return call.messages[call.messages.length - 1].content;
+  }
+
+  /** Reply set: iteration 1 fails, iteration 2 terminates cleanly. */
+  const FAIL_THEN_SUBMIT = ["```python\n1 +\n```", '```python\nSUBMIT("done")\n```'];
+
+  it("reports a syntax error on the model's line 1 as line 1 (issue test 1)", async () => {
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.iterations.length, 2);
+    const feedback = lastMessage(llm.calls()[1]);
+    assert.match(feedback, / --> rlm\.py:1:/, "the diagnostic location is the model's line 1");
+    assert.match(feedback, /^\s*1 \| 1 \+$/m, "the excerpt line is the model's line 1");
+  });
+
+  it("feeds back no preamble source (issue test 2)", async () => {
+    // The preamble's final source line sits directly above the model's code in
+    // the assembled script, so it is the first thing a diagnostic excerpt
+    // leaks when the offset is missing — a number-only fix leaves it in.
+    // Derived from the shipped preamble, not a literal, so the pin survives
+    // preamble edits.
+    const preambleLines = REPL_SERVER.split("\n");
+    const lastSourceLine = preambleLines[preambleLines.length - 2];
+    const token = lastSourceLine.trim();
+    assert.ok(token.length > 0, "the preamble must end with a non-empty source line");
+
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = lastMessage(llm.calls()[1]);
+    assert.ok(!feedback.includes(token), "preamble source must not reach the model");
+  });
+
+  it("corrects a typing error on the model's line 1 and feeds back no preamble source", async () => {
+    // The `"full"` typing render uses the same ` --> file:line:col` / `<n> |`
+    // shapes as the syntax one, and the caller-assembled preamble shifts it
+    // exactly the same way (`typeCheckStubs` removes only the stub file's
+    // contribution out-of-band). Same token derivation as issue test 2.
+    const preambleLines = REPL_SERVER.split("\n");
+    const lastSourceLine = preambleLines[preambleLines.length - 2];
+    const token = lastSourceLine.trim();
+    assert.ok(token.length > 0, "the preamble must end with a non-empty source line");
+
+    const { llm } = mockLlmCodeGen([
+      "```python\nx: int = 'oops'\n```",
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = lastMessage(llm.calls()[1]);
+    assert.match(feedback, /Fix the type error/, "the typing kind survives to the advice");
+    assert.match(feedback, / --> rlm\.py:1:/, "the diagnostic location is the model's line 1");
+    assert.match(feedback, /^\s*1 \| x: int = 'oops'$/m, "the excerpt line is the model's line 1");
+    assert.ok(!feedback.includes(token), "preamble source must not reach the model");
+  });
+
+  it("still caps corrected error text at 16 KiB (test 8 re-assert on the corrected path)", async () => {
+    // #144's 16 KiB cap must hold on the *corrected* text: the correction
+    // happens upstream of buildFeedback, and the huge raise the model sent
+    // still arrives capped — with the offset-corrected frame intact.
+    const { llm } = mockLlmCodeGen([
+      "```python\nraise ValueError('X' * 100000)\n```",
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = lastMessage(llm.calls()[1]);
+    const prefix = "Error: ";
+    assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
+    const rest = feedback.slice(prefix.length);
+    const stdoutIdx = rest.indexOf("\nstdout:");
+    assert.ok(stdoutIdx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+    const errorSection = rest.slice(0, stdoutIdx);
+    assert.ok(
+      Buffer.byteLength(errorSection, "utf8") <= 16 * 1024,
+      `Error section is ${Buffer.byteLength(errorSection, "utf8")} bytes`,
+    );
+    assert.match(
+      errorSection,
+      /File "<python-input-0>", line 1, in <module>/,
+      "the offset-corrected frame survives the cap",
+    );
+  });
+});
+
+// ── Fresh-sandbox contract: the prompt says the truth (#77, D2) ──
+//
+// Every RLM iteration runs in a fresh sandbox — no variables, imports, or
+// state carry over between iterations. The model-facing text must say so
+// plainly, and continuity-implying wording must not survive anywhere in it.
+
+describe("runRlm() — fresh-sandbox contract (issue test 4)", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  /** Reply set: iteration 1 fails, iteration 2 terminates cleanly. */
+  const FAIL_THEN_SUBMIT = ["```python\n1 +\n```", '```python\nSUBMIT("done")\n```'];
+
+  /** Everything the model reads in a run: the system prompt plus every
+   *  user-role message (initial prompt, feedback, drop markers). */
+  function modelFacingText(llm: ReturnType<typeof mockLlmCodeGen>["llm"]): string {
+    return llm
+      .calls()
+      .flatMap((call) => [
+        call.systemPrompt,
+        ...call.messages.filter((m) => m.role === "user").map((m) => m.content),
+      ])
+      .join("\n");
+  }
+
+  it("the system prompt states the fresh-sandbox contract plainly", async () => {
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    // Captured through the loop — the prompt the model actually received,
+    // not the exported literal asserted against itself.
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.match(
+      systemPrompt,
+      /fresh sandbox/,
+      `the prompt must name the fresh sandbox:\n${systemPrompt}`,
+    );
+    assert.match(
+      systemPrompt,
+      /No variables, imports, or state carry\s+over between iterations/,
+      `the prompt must state that nothing carries over:\n${systemPrompt}`,
+    );
+    assert.match(
+      systemPrompt,
+      /self-contained/,
+      `the prompt must demand self-contained snippets:\n${systemPrompt}`,
+    );
+  });
+
+  it("no RLM-facing text implies continuity", async () => {
+    // The loop used to say nothing at all about state, and phrasing around
+    // an ongoing environment invited the reading that iteration 1's
+    // variables were still there in iteration 2. Under the fresh-sandbox
+    // contract nothing persists between iterations, so the claim must not
+    // appear anywhere the model reads — prompt or feedback alike.
+    const { llm } = mockLlmCodeGen(FAIL_THEN_SUBMIT);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const text = modelFacingText(llm);
+    assert.doesNotMatch(text, /\bpersist/i, `continuity-implying wording survived:\n${text}`);
+    assert.doesNotMatch(text, /\bsession\b/i, `"session" implies continuity:\n${text}`);
+    assert.doesNotMatch(text, /\bongoing\b/i, `"ongoing" implies continuity:\n${text}`);
+  });
+});
+
 // ── Direct answers and the raw fall-through (#73) ────────────────
 
 describe("runRlm() — direct answers and the raw fall-through", () => {

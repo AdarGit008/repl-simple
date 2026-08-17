@@ -89,6 +89,10 @@ function contentBytes(text: string): number {
 export const DEFAULT_RLM_SYSTEM_PROMPT = `\
 You are a Python data analyst. You have access to a sandboxed Python environment.
 
+Each iteration runs in a fresh sandbox. No variables, imports, or state carry
+over between iterations: every code snippet you submit must be self-contained,
+re-declaring or recomputing whatever it needs.
+
 Your job: investigate the user's question by writing Python code, running it,
 interpreting the results, and submitting your final answer.
 
@@ -562,6 +566,12 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
 
     // 3. Build full script: preamble (if any) + code
     const fullCode = options.preamble ? `${options.preamble}\n${code}` : code;
+    if (options.preamble) {
+      // The preamble is the prefix the sandbox numbers its diagnostics from,
+      // so the loop owns the offset: computed from the preamble string
+      // actually used, never a hardcoded constant (#77, D1).
+      sandboxRunOpts.lineOffset = options.preamble.split("\n").length;
+    }
 
     // 4. Run in sandbox
     const result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);

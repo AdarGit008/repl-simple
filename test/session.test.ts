@@ -242,6 +242,140 @@ describe("Session — error handling", () => {
   });
 });
 
+// ── lineOffset wiring: preamble + prior snippets are the prefix (#77) ──
+//
+// `Session.run` assembles preamble + prior snippets + new code, so the
+// sandbox numbers every diagnostic from the top of the assembled transcript.
+// The session must tell the sandbox how many lines it prepended
+// (`RunOptions.lineOffset`), computed from the parts actually assembled — a
+// diagnostic on line K of the latest snippet is reported as line K, and
+// neither preamble nor earlier-snippet source ever reaches the caller
+// (issue test 3).
+
+describe("Session — lineOffset wiring (#77 issue test 3)", () => {
+  // Unique marker tokens, one in the preamble and one in the prior snippet:
+  // a diagnostic that leaks prefix source will contain one of them. Distinct
+  // from each other so a leak is attributable to the part that leaked.
+  const PREAMBLE_MARKER = "PREAMBLE_MARKER_77";
+  const PRIOR_MARKER = "PRIOR_SNIPPET_MARKER_77";
+
+  // 3 lines. The marker line sits directly above the stacked snippets in the
+  // assembled transcript, so it is the first thing an excerpt leaks.
+  const preamble = [
+    "# session preamble",
+    `${PREAMBLE_MARKER} = "preamble source must never reach the caller"`,
+    "pre_offset = 1",
+  ].join("\n");
+
+  /** A session whose preamble + one prior snippet stack 5 prefix lines. */
+  async function sessionWithStack(): Promise<Session> {
+    const session = new Session({ registry: new ToolRegistry() }, preamble);
+    // 2 lines; succeeds, so it stacks into every later run's prefix.
+    ok(await session.run(`first = 1\n${PRIOR_MARKER} = "prior"`));
+    return session;
+  }
+
+  it("reports a syntax error on line K of the latest snippet as line K (issue test 3)", async () => {
+    const session = await sessionWithStack();
+
+    // Latest snippet: syntax error on its own line 2 — assembled line 7.
+    const result = await session.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(
+      result.error,
+      / --> <repl>:2:/,
+      "the diagnostic location is line 2 of the latest snippet, not the assembled line 7",
+    );
+    assert.match(result.error, /^2 \| 1 \+$/m, "the excerpt line is the latest snippet's line 2");
+    assert.doesNotMatch(result.error, new RegExp(PREAMBLE_MARKER), "preamble source leaked");
+    assert.doesNotMatch(result.error, new RegExp(PRIOR_MARKER), "prior-snippet source leaked");
+  });
+
+  it("reports a runtime error on line K of the latest snippet as line K", async () => {
+    const session = await sessionWithStack();
+
+    // Latest snippet: raise on its own line 2 — assembled line 7.
+    const result = await session.run('ok = 1\nraise ValueError("boom")');
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /^ValueError: boom$/m, "the <type>: msg heading is preserved");
+    assert.match(
+      result.error,
+      /File "<python-input-0>", line 2, in <module>/,
+      "the raising frame is line 2 of the latest snippet",
+    );
+    assert.ok(
+      result.error.includes('raise ValueError("boom")'),
+      "the surviving frame keeps its source preview",
+    );
+    assert.doesNotMatch(result.error, new RegExp(PREAMBLE_MARKER), "preamble source leaked");
+    assert.doesNotMatch(result.error, new RegExp(PRIOR_MARKER), "prior-snippet source leaked");
+  });
+});
+
+// ── lineOffset through suspension and resume (#77) ──────────────
+//
+// `runInSandbox` corrects diagnostics on the resume paths too — the dispatch
+// loop and `resumeInSession` pass `runOpts.lineOffset` into
+// `classifyResumeError` at every resume. The session owns the offset
+// (`Session.run` computes it), so a resumed run whose remaining code raises
+// must get the same correction: user-relative line numbers, no preamble or
+// prior-snippet source. The resumed transcript is the same one `run()`
+// assembled (preamble + prior snippets + the suspended snippet), so
+// `Session.resume` must pass the offset `run()` would have computed.
+
+describe("Session — lineOffset through the suspended-resume path (#77)", () => {
+  // Unique markers, distinct from the issue-test ones above so a leak is
+  // attributable to this describe's parts.
+  const PREAMBLE_MARKER = "RESUME_PREAMBLE_MARKER_77";
+  const PRIOR_MARKER = "RESUME_PRIOR_SNIPPET_MARKER_77";
+
+  // 3 lines — the same stack shape as the issue test above.
+  const preamble = [
+    "# resume-path preamble",
+    `${PREAMBLE_MARKER} = "preamble source must never reach the caller"`,
+    "pre_offset = 1",
+  ].join("\n");
+
+  const gated: HostTool = {
+    name: "gated_resume",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  it("reports a runtime error raised after resume at the latest snippet's line", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) }, preamble);
+    // 2 lines; succeeds, so it stacks into the prefix of the suspended run.
+    ok(await session.run(`first = 1\n${PRIOR_MARKER} = "prior"`));
+
+    // Latest snippet: the gated call on line 1 suspends; line 2 raises once
+    // the resume approves it. Assembled position: line 7 (3 preamble + 2
+    // prior + 2 own).
+    suspended(await session.run('gated_resume("x")\ny = 1 / 0', { onApproval: () => "suspend" }));
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(
+      result.error,
+      /^ZeroDivisionError: division by zero$/m,
+      "the <type>: msg heading is preserved",
+    );
+    assert.match(
+      result.error,
+      /File "<python-input-0>", line 2, in <module>/,
+      "the raising frame is line 2 of the latest snippet, not the assembled line 7",
+    );
+    assert.ok(result.error.includes("y = 1 / 0"), "the surviving frame keeps its source preview");
+    assert.doesNotMatch(result.error, new RegExp(PREAMBLE_MARKER), "preamble source leaked");
+    assert.doesNotMatch(result.error, new RegExp(PRIOR_MARKER), "prior-snippet source leaked");
+  });
+});
+
 // ── Approval / Suspension ───────────────────────────────────────
 
 describe("Session — approval & suspension", () => {

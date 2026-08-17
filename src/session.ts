@@ -299,6 +299,14 @@ export class Session {
     parts.push(...this.snippets, code);
     const allCode = parts.join("\n");
 
+    // Everything before the last part is the prefix the sandbox numbers its
+    // diagnostics from, so the session owns the offset: the line count of the
+    // actual assembled prefix (preamble + stacked prior snippets), computed
+    // from the parts really joined — never a hardcoded constant (#77, D1).
+    // A caller-supplied `lineOffset` cannot be right here: the session is the
+    // one doing the prepending.
+    const lineOffset = this.prefixLineCount();
+
     // Record the cache length BEFORE this run (for trace filtering)
     const priorEntryCount = this.callCacheEntries.length;
 
@@ -319,6 +327,7 @@ export class Session {
 
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
+      lineOffset,
       onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
 
@@ -413,6 +422,7 @@ export class Session {
     // a grant or by the user — never by "something like it ran once".
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
+      lineOffset: this.prefixLineCount(),
       onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
 
@@ -585,6 +595,24 @@ export class Session {
   }
 
   // ── Private helpers ────────────────────────────────────────
+
+  /**
+   * The number of lines the assembled transcript prepends before the code
+   * being run right now: the preamble plus every stacked prior snippet.
+   *
+   * This is the `RunOptions.lineOffset` the session hands the sandbox, and
+   * the same figure applies to a resumed run: the resumed transcript is the
+   * one `run()` assembled for the suspended snippet, and `snippets` cannot
+   * have changed since — the run that suspended never appended its snippet,
+   * and any later `run()` discards the pending suspension before touching
+   * the list (#129). Computed from the parts, never hardcoded (#77).
+   */
+  private prefixLineCount(): number {
+    let total = 0;
+    if (this.preamble) total += this.preamble.split("\n").length;
+    for (const snippet of this.snippets) total += snippet.split("\n").length;
+    return total;
+  }
 
   /**
    * Close out a suspension left over from an earlier call, if there is one.

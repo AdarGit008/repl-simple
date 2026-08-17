@@ -1,5 +1,95 @@
-# Tasks — Cap `result.error` and the `question` in the RLM feedback loop (#144)
+# F-77 Task List
 
-- [x] T1 — Cap `result.error` to 16 KiB via `truncateText` (D7) + test 8
-- [x] T2 — Cap the `question` to 64 KiB via `truncateText` (D8) + test 9
-- [x] T3 — Update `docs/truncation-policy.md` for the D7/D8 caps
+- [x] Task 1: `lineOffset` in `RunOptions` + syntax-error correction in `sandbox.ts`
+  - Acceptance: `RunOptions.lineOffset?: number` exists (default absent); a syntax error in
+    user code appended after an N-line prefix is reported at the user's line number (N subtracted);
+    rendered diagnostic contains no excerpt lines from the prefix (lines ≤ offset stripped).
+  - Verify: `npm test` (focused sandbox tests green, full suite green), `npm run check`
+  - Files: `src/types.ts`, `src/sandbox.ts`, `test/sandbox.test.ts`
+
+- [x] Task 2: Runtime-error correction via `traceback()` frames in `sandbox.ts`
+  - Acceptance: runtime error frames have `lineOffset` subtracted from `line`/`endLine`; frames
+    with `line <= lineOffset` (prefix frames) are dropped, `sourceLine` previews included; the
+    fed-back diagnostic contains no preamble source; existing `Error: <type>: msg` heading shape
+    preserved; message fallback when frames unavailable.
+  - Verify: `npm test` (focused sandbox tests green, full suite green), `npm run check`
+  - Files: `src/sandbox.ts`, `test/sandbox.test.ts`
+
+- [x] Task 3: RLM passes `lineOffset` (actual preamble line count) — issue tests 1+2
+  - Acceptance: `runInSandbox` call in `rlm.ts` passes `lineOffset` computed from the preamble
+    string actually used (never hardcoded); syntax error on the model's line 1 is reported as
+    line 1; fed-back diagnostic contains no known preamble token; #144's 16 KiB error cap still
+    applies to corrected text.
+  - Verify: `npm test` (focused rlm tests green, full suite green), `npm run check`
+  - Files: `src/rlm.ts`, `test/rlm.test.ts`
+
+- [x] Task 4: `Session.run` passes `lineOffset` (preamble + prior snippets) — issue test 3
+  - Acceptance: under `Session`, a diagnostic on line K of the latest snippet is reported as
+    line K (offset = preamble + stacked prior snippets); no earlier-snippet or preamble source in
+    the fed-back diagnostic; REPL-path tests stay green.
+  - Verify: `npm test` (focused session tests green, full suite green), `npm run check`
+  - Files: `src/session.ts`, `test/session.test.ts`
+
+- [x] Task 5: Rewrite RLM prompt + feedback wording to state the fresh-sandbox contract — issue test 4
+  - Acceptance: the RLM system prompt (and any feedback wording) states that each iteration runs
+    in a fresh sandbox with no state carried over; continuity-implying wording ("session",
+    "ongoing", "persist") is gone from RLM-facing text; D3 section-header literals preserved and
+    the coupled existing tests stay green; test asserts the prompt says so.
+  - Verify: `npm test` (focused rlm tests green, full suite green), `npm run check`
+  - Files: `src/rlm.ts`, `test/rlm.test.ts`
+
+- [x] Task 6: Fixup — blank excerpt lines survive the syntax-error correction
+  - Acceptance: `correctSyntaxErrorText`'s excerpt regex also matches blank excerpt lines
+    (`N |` with no text after the pipe — Monty renders them without the trailing space); a blank
+    excerpt line in the prefix region (line ≤ lineOffset) is stripped, one in the user region is
+    renumbered (gutter padding preserved); the 6 existing syntax-correction tests stay green.
+  - Verify: `npm test` (976/976 green — 973 baseline + 3 new), `npm run check`, `npm run lint`
+  - Files: `src/sandbox.ts`, `test/sandbox.test.ts`
+
+- [x] Task 7: Correct the typing-diagnostic path (VERIFY blocking finding)
+  - Acceptance: `classifyStartError` applies `correctSyntaxErrorText` to pure typing diagnostics
+    too (same ` --> file:line:col` / `<n> |` render; caret/continuation rows pass through); a
+    location/excerpt line whose number ≤ offset is dropped, never emitted with a non-positive
+    number; false "typing is already line-correct" comments corrected in `src/sandbox.ts` and
+    `src/types.ts`; bogus test replaced with real-prefix + control tests; RLM-level typing
+    feedback test pins line 1 and no preamble source.
+  - Verify: `npm test` (981/981 green — 976 baseline − 1 replaced + 6 new), `npm run check`,
+    `npm run lint`, `npm run coverage` floors met
+  - Files: `src/sandbox.ts`, `src/types.ts`, `test/sandbox.test.ts`, `test/rlm.test.ts`
+
+- [x] Task 8: Close the VERIFY-flagged test gaps (test-strengthening)
+  - Acceptance: a behavioral test covers stack + suspension + post-resume runtime error
+    through `Session.resume` — user-relative line, no preamble/prior-snippet source; the
+    test exposed a real bug (`Session.resume` never passed `lineOffset`, so post-resume
+    errors lost their corrected traceback) — fixed minimally in `src/session.ts` via a
+    shared `prefixLineCount()`; the plain `MontySyntaxError` branch of
+    `classifyStartError` is behaviorally exercised (forceable only via Monty's
+    input-name validation — message carries no line numbers, so the test pins kind +
+    uncorrupted heading + no prefix-source leak); the stale types test "RunOptions with
+    all fields" now includes `lineOffset`.
+  - Verify: `npm test` (983/983 green — 981 baseline + 2 new), `npm run check`
+  - Files: `src/session.ts`, `test/session.test.ts`, `test/sandbox.test.ts`,
+    `test/types.test.ts`
+
+- [x] Task 9: Document the fresh-sandbox contract in the README (docs-only)
+  - Acceptance: the README's RLM Loop section states the contract shipped in the prompt
+    (Task 5) — each iteration runs in a fresh sandbox; no variables, imports, or state carry
+    over between iterations; each snippet must be self-contained; the #77 lineOffset behavior
+    is recorded briefly (diagnostics fed back are offset-corrected, line numbers refer to the
+    model's own code, no preamble source shown). No src/ or test/ changes.
+  - Verify: `npm test` (983/983 green, no code change), own diff read for minimality
+  - Files: `README.md`
+
+- [x] Task 10: Review fixes — RLMLoop lineOffset wiring + location-regex digit-collision
+  - Acceptance (10a): `RLMLoop.executeCode` (src/rlm_loop.ts) passes `lineOffset` computed
+    from the preamble string actually used (`preamble.split("\n").length`, same truthiness
+    convention as the assembly site in the file), mirroring the rlm.ts wiring — never
+    hardcoded; tests pin a syntax error on the model's line 1 reported as line 1 with an
+    N-line preamble, no preamble source (unique marker absent) in the fed-back diagnostic,
+    and the `[error: kind]` feedback shape survives.
+  - Acceptance (10b): `correctSyntaxErrorText`'s location regex hardened to
+    `^(\s*--> .+:)(\d+)(:\d+.*)$` (greedy prefix) so a digit-ending scriptName
+    (` --> file0:3:4`) captures the line number, not the filename's trailing digits;
+    regression test via the public `RunOptions.scriptName`.
+  - Verify: `npm test` (986/986 green — 983 baseline + 3 new), `npm run check`, `npm run lint`
+  - Files: `src/rlm_loop.ts`, `src/sandbox.ts`, `test/rlm_loop.test.ts`, `test/sandbox.test.ts`

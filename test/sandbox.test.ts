@@ -140,6 +140,358 @@ describe("runInSandbox — error handling", () => {
   });
 });
 
+// ── lineOffset: syntax-error correction ─────────────────────────
+//
+// The sandbox runs whatever script the caller assembles, prefix included, so
+// a syntax error reports line numbers counted from the top of the prefix and
+// echoes prefix source lines as context. `lineOffset` tells the sandbox how
+// many prefix lines to subtract so the model only ever sees line numbers (and
+// source) relative to its own code.
+
+describe("runInSandbox — lineOffset syntax-error correction", () => {
+  const registry = new ToolRegistry();
+
+  function prefixOf(n: number): string {
+    return Array.from({ length: n }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+  }
+
+  for (const n of [1, 3, 7]) {
+    it(`reports a user-line-1 syntax error at line 1 with a ${n}-line prefix (lineOffset=${n})`, async () => {
+      const result = await runInSandbox(`${prefixOf(n)}\n1 +`, { registry }, { lineOffset: n });
+      err(result);
+      assert.equal(result.errorKind, "syntax");
+      assert.match(result.error, /^error\[invalid-syntax\]: Expected an expression$/m);
+      assert.match(result.error, / --> <repl>:1:/, "the diagnostic location is line 1");
+      assert.match(result.error, /^1 \| 1 \+$/m, "the excerpt line is line 1");
+      assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+    });
+  }
+
+  it("renumbers every diagnostic block and lines after the error line", async () => {
+    // `def f(:` yields two diagnostics, each echoing the line after the error
+    // (`5 |     pass`), so both block relocation and after-line renumbering
+    // are exercised.
+    const result = await runInSandbox(
+      `${prefixOf(3)}\ndef f(:\n    pass`,
+      { registry },
+      { lineOffset: 3 },
+    );
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.deepEqual(result.error.match(/ --> <repl>:\d+:\d+/g), [
+      " --> <repl>:1:7",
+      " --> <repl>:1:8",
+    ]);
+    assert.match(result.error, /^1 \| def f\(:$/m, "the error line is excerpt line 1");
+    assert.match(result.error, /^2 \| {5}pass$/m, "the after-line is renumbered too");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("leaves the diagnostic untouched when lineOffset is absent", async () => {
+    const result = await runInSandbox(`${prefixOf(3)}\n1 +`, { registry });
+    err(result);
+    assert.match(result.error, / --> <repl>:4:/, "assembled line 4, no correction applied");
+    assert.match(result.error, /PREFIX_MARKER_77/, "prefix source appears without a lineOffset");
+  });
+
+  it("strips a blank prefix-region excerpt line (prefix ends with an empty line)", async () => {
+    // Monty renders a blank source line as `N |` — no trailing space, no
+    // text after the pipe. When the blank line belongs to the prefix, it
+    // must be stripped like any other prefix excerpt line.
+    const result = await runInSandbox(`${prefixOf(2)}\n\n1 +`, { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:1:/, "the user's error is line 1");
+    assert.match(result.error, /^1 \| 1 \+$/m, "the excerpt line is line 1");
+    assert.doesNotMatch(result.error, /^\s*\d+ \|$/m, "no blank excerpt line survives");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("renumbers a blank user-region excerpt line (user code starts with an empty line)", async () => {
+    // The same `N |` shape, but on a line the user owns: it must be
+    // renumbered like any other user excerpt line.
+    const result = await runInSandbox(`${prefixOf(2)}\n\n1 +`, { registry }, { lineOffset: 2 });
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/, "the user's error is user line 2");
+    assert.match(result.error, /^1 \|$/m, "the blank user line is renumbered to 1");
+    assert.match(result.error, /^2 \| 1 \+$/m, "the error excerpt line is 2");
+    assert.doesNotMatch(result.error, /^3 \|$/m, "no unrenumbered excerpt line survives");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("preserves gutter padding when renumbering a blank user-region excerpt line", async () => {
+    // A 3-digit-wide gutter (from the 98-line prefix) right-aligns short
+    // numbers; the renumbered blank line keeps the width.
+    const wide = Array.from({ length: 98 }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+    const result = await runInSandbox(`${wide}\n\n1 +`, { registry }, { lineOffset: 98 });
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:4/, "the user's error is user line 2");
+    assert.match(result.error, /^ {2}1 \|$/m, "the blank user line is 1, gutter padded to 3");
+    assert.match(result.error, /^ {2}2 \| 1 \+$/m, "the error excerpt line is 2, gutter padded");
+    assert.doesNotMatch(result.error, /99 \|/, "no unrenumbered excerpt line survives");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("reads the line number after a digit-ending scriptName (digit-collision regression)", async () => {
+    // A filename ending in digits sits flush against the location's line
+    // colon: ` --> file0:3:4`. The location regex must read the digits after
+    // the final colon of the prefix as the line number — the lazy-prefix
+    // version captured the trailing `0` of the name, and a prefix-region
+    // location was then dropped instead of corrected.
+    const result = await runInSandbox(
+      `${prefixOf(2)}\n1 +`,
+      { registry },
+      { scriptName: "file0", lineOffset: 2 },
+    );
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(
+      result.error,
+      / --> file0:1:4/,
+      "the filename survives intact and the location is the user's line 1",
+    );
+    assert.match(result.error, /^1 \| 1 \+$/m, "the excerpt line is line 1");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+});
+
+// ── lineOffset: typing-error correction ────────────────────────
+//
+// The stub file's contribution is removed out-of-band (`typeCheckStubs`),
+// but the prefix the caller assembled around the code still shifts typing
+// diagnostics exactly as it shifts syntax ones — the `"full"` typing render
+// uses the same ` --> file:line:col` / `<n> |` excerpt shapes (measured).
+// `lineOffset` corrects them the same way.
+
+describe("runInSandbox — lineOffset typing-error correction", () => {
+  const registry = new ToolRegistry();
+
+  function prefixOf(n: number): string {
+    return Array.from({ length: n }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+  }
+
+  for (const n of [1, 3, 7]) {
+    it(`reports a user-line-1 typing error at line 1 with a ${n}-line prefix (lineOffset=${n})`, async () => {
+      const result = await runInSandbox(
+        `${prefixOf(n)}\nx: int = 'oops'`,
+        { registry },
+        { lineOffset: n },
+      );
+      err(result);
+      assert.equal(result.errorKind, "typing");
+      assert.match(result.error, / --> <repl>:1:/, "the diagnostic location is line 1");
+      assert.match(result.error, /^1 \| x: int = 'oops'$/m, "the excerpt line is line 1");
+      assert.match(result.error, /Incompatible value/, "the caret annotation rows pass through");
+      assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+    });
+  }
+
+  it("leaves the diagnostic untouched when lineOffset is absent", async () => {
+    const result = await runInSandbox(`${prefixOf(3)}\nx: int = 'oops'`, { registry });
+    err(result);
+    assert.equal(result.errorKind, "typing");
+    assert.match(result.error, / --> <repl>:4:/, "assembled line 4, no correction applied");
+    assert.match(result.error, /PREFIX_MARKER_77/, "prefix source appears without a lineOffset");
+  });
+
+  it("drops a location inside the prefix instead of emitting a non-positive line number", async () => {
+    // A caller that overstates the offset (here: 3, against code with no
+    // prefix at all) must not get ` --> <repl>:0:` or ` --> <repl>:-2:` rows.
+    // A location whose line is at or before the offset is prefix-position
+    // information and is dropped, like its excerpt rows.
+    const result = await runInSandbox("x: int = 'oops'", { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "typing");
+    assert.match(result.error, /^error\[invalid-assignment\]/m, "the heading survives");
+    assert.doesNotMatch(result.error, / --> <repl>:(?:0|-)/, "no non-positive line number");
+    assert.doesNotMatch(result.error, /^\d+ \|/m, "no excerpt row survives the oversized offset");
+  });
+});
+
+// ── lineOffset: runtime-error correction ────────────────────────
+//
+// A runtime error surfaces as a `MontyRuntimeError` whose `traceback()`
+// frames are numbered against the assembled script, prefix included, with a
+// `sourceLine` preview on each frame. `lineOffset` tells the sandbox how many
+// prefix lines to subtract: frames inside the prefix are dropped (preview
+// included), the survivors are re-rendered under the untouched
+// `<type>: msg` heading, and the model only ever sees its own code.
+
+describe("runInSandbox — lineOffset runtime-error correction", () => {
+  const registry = new ToolRegistry();
+
+  function prefixOf(n: number): string {
+    return Array.from({ length: n }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+  }
+
+  for (const n of [1, 3, 7]) {
+    it(`reports a runtime error at the user's line 2 with a ${n}-line prefix (lineOffset=${n})`, async () => {
+      const result = await runInSandbox(
+        `${prefixOf(n)}\nx = 1\ny = 1 / 0`,
+        { registry },
+        { lineOffset: n },
+      );
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(
+        result.error,
+        /^ZeroDivisionError: division by zero$/m,
+        "the <type>: msg heading is preserved",
+      );
+      assert.match(result.error, /File "<python-input-0>", line 2, in <module>/);
+      assert.ok(result.error.includes("y = 1 / 0"), "the surviving frame keeps its source preview");
+      assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+    });
+  }
+
+  it("re-renders multi-frame tracebacks with the user's line numbers", async () => {
+    const user = "def f():\n    raise ValueError('boom')\nf()";
+    const result = await runInSandbox(`${prefixOf(3)}\n${user}`, { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /^ValueError: boom$/m);
+    assert.match(
+      result.error,
+      /File "<python-input-0>", line 3, in <module>/,
+      "the call site is line 3",
+    );
+    assert.match(
+      result.error,
+      /File "<python-input-0>", line 2, in f/,
+      "the raising frame is line 2",
+    );
+    assert.match(result.error, /^ {4}~~~$/m, "the call site keeps its caret marker");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("drops frames that live inside the prefix, source previews included", async () => {
+    // The prefix defines a function that raises on its own line 2; the user
+    // code only calls it. The call frame (user line 1) survives; the raising
+    // frame and its preview are prefix source and must never reach the caller.
+    const prefix =
+      "def prefix_boom():\n    raise ValueError('prefix raised')\nPREFIX_MARKER_77 = 3";
+    const result = await runInSandbox(`${prefix}\nprefix_boom()`, { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /^ValueError: prefix raised$/m);
+    assert.match(result.error, /File "<python-input-0>", line 1, in <module>/);
+    assert.ok(result.error.includes("prefix_boom()"), "the call frame keeps its source preview");
+    assert.doesNotMatch(
+      result.error,
+      /raise ValueError\('prefix raised'\)/,
+      "the prefix frame's preview is dropped",
+    );
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("corrects runtime errors raised from a host tool on the user's line", async () => {
+    // The dispatch-loop resume path: a tool that raises is re-raised in Python
+    // as a `MontyRuntimeError`, whose frames point at the call site.
+    const boom: HostTool = {
+      name: "boom",
+      description: "always raises",
+      params: [],
+      returns: "str",
+      execute: () => {
+        throw new HostToolError("ValueError", "tool exploded");
+      },
+    };
+    const reg = new ToolRegistry([boom]);
+    const result = await runInSandbox(
+      `${prefixOf(3)}\nboom()`,
+      { registry: reg },
+      { lineOffset: 3 },
+    );
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /^ValueError: tool exploded$/m);
+    assert.match(result.error, /File "<python-input-0>", line 1, in <module>/);
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("leaves the message untouched when lineOffset is absent", async () => {
+    const result = await runInSandbox(`${prefixOf(3)}\n1 / 0`, { registry });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.equal(
+      result.error,
+      "ZeroDivisionError: division by zero",
+      "no traceback is added without a lineOffset",
+    );
+  });
+
+  it("falls back to the bare message when the error carries no frames", async () => {
+    // Interpreter-raised ceilings such as `TimeoutError` have an empty
+    // `traceback()` — measured — so the message path is the only option.
+    const result = await runInSandbox(
+      `${prefixOf(3)}\nwhile True:\n    pass`,
+      { registry },
+      { lineOffset: 3, limits: { maxDurationSecs: 0.2 } },
+    );
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+    assert.match(result.error, /^TimeoutError:/);
+    assert.doesNotMatch(result.error, /Traceback/);
+  });
+
+  it("falls back to the bare message when every frame lies inside the prefix", async () => {
+    const result = await runInSandbox(
+      "raise ValueError('prefix-only')\nPREFIX_MARKER_77 = 1\nPREFIX_MARKER_77 = 2\n1 + 1",
+      { registry },
+      { lineOffset: 3 },
+    );
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.equal(
+      result.error,
+      "ValueError: prefix-only",
+      "no frame survives, so the heading alone is rendered",
+    );
+  });
+});
+
+// ── lineOffset: the plain MontySyntaxError branch ────────────────
+//
+// `classifyStartError` corrects two shapes: the `MontyTypingError`
+// display-with-`invalid-syntax` render every syntax test above arrives
+// through, and a plain `MontySyntaxError`, which still reaches the feed from
+// paths that do not go through the type checker's diagnostic render. On
+// 0.0.21 the only such path reachable from the public API is input-name
+// validation: `feedStart` refuses an input whose name is not a valid Python
+// identifier by raising a native `SyntaxError`, which the bridge maps to
+// `MontySyntaxError` (measured). Its message is the bare heading —
+// `SyntaxError: Input name '...' not a valid identifier` — with no
+// ` --> file:line` location and no excerpt rows (the line information lives
+// in `tracebackText`, which this branch does not render), so there is no
+// line number to correct. The test pins what the branch must do with such
+// an error: keep kind `syntax`, pass the heading through uncorrupted
+// (`correctSyntaxErrorText` is a no-op on text with no locations), and leak
+// no prefix source.
+
+describe("runInSandbox — lineOffset on the plain MontySyntaxError branch", () => {
+  it("classifies an input-name validation failure as syntax, message intact, no prefix source", async () => {
+    const registry = new ToolRegistry();
+    // The validation failure fires at feed start, before any of this code
+    // runs; the prefix still guards the branch against leaking prefix source
+    // into whatever MontySyntaxError text survives the correction.
+    const result = await runInSandbox(
+      "PREFIX_MARKER_77 = 1\nPREFIX_MARKER_77 = 2\nPREFIX_MARKER_77 = 3\n1 + 1",
+      { registry },
+      { lineOffset: 3, inputs: { "not a name": "x" } },
+    );
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.equal(
+      result.error,
+      "SyntaxError: Input name 'not a name' not a valid identifier",
+      "the plain MontySyntaxError message passes through uncorrupted",
+    );
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+  });
+});
+
 // ── Host tool execution ─────────────────────────────────────────
 
 describe("runInSandbox — host tool execution", () => {
