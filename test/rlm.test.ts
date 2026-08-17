@@ -1607,7 +1607,9 @@ describe("runRlm() — conversation bound", () => {
     // whole pairs and needs >= 5 messages, so the loop-guard must exit without
     // hanging and the over-budget reply is kept transiently (docs Exception 4).
     // Assert a recognisable head prefix, not the whole reply, so the test
-    // stays green after D18's reply cap (which keeps the head).
+    // stays green after D18's reply cap (which keeps the head); the cap goes
+    // through the D17 sentinel wrapper, so the prefix is asserted inside the
+    // sentinel-delimited view (T7 — template-coupling gotcha).
     const hugeReply = silentPaddedReply(300 * 1024, "HUGE_REPLY_HEAD");
     const { llm } = mockLlmCodeGen([hugeReply, '```python\nSUBMIT("done")\n```']);
     const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
@@ -1628,9 +1630,48 @@ describe("runRlm() — conversation bound", () => {
       );
     }
     const headPrefix = hugeReply.slice(0, 120);
+    const cappedView = insideSentinels(second[1].content);
     assert.ok(
-      second[1].content.startsWith(headPrefix),
-      `the huge reply's head must survive:\n${second[1].content.slice(0, 200)}`,
+      cappedView.startsWith(headPrefix),
+      `the huge reply's head must survive inside the sentinels:\n${cappedView.slice(0, 200)}`,
+    );
+  });
+
+  it("caps a pathological assistant reply in the conversation, raw llmResponse kept (test 16)", async () => {
+    // D18: a prompt-injection-induced multi-MiB reply would otherwise be
+    // carried in every subsequent query. The conversation copy is capped at
+    // ASSISTANT_REPLY_MAX_BYTES = MAX_CONVERSATION_BYTES (256 KiB) via the
+    // D17 sentinel wrapper, with a deliberately weak recovery clause (policy
+    // Q3 — the model cannot recover its own elided reply); the caller's
+    // record in iterations[].llmResponse stays raw.
+    const hugeReply = silentPaddedReply(2 * 1024 * 1024, "PATHOLOGICAL_REPLY");
+    const { llm } = mockLlmCodeGen([hugeReply, '```python\nSUBMIT("done")\n```']);
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok", "the run must complete despite the pathological reply");
+    const calls = llm.calls();
+    assert.equal(calls.length, 2);
+    const pushed = calls[1].messages[1];
+    assert.equal(pushed.role, "assistant");
+    const pushedBytes = Buffer.byteLength(pushed.content, "utf8");
+    assert.ok(
+      pushedBytes <= 256 * 1024,
+      `the pushed assistant message must stay within the 256 KiB cap, got ${pushedBytes}`,
+    );
+    const inside = insideSentinels(pushed.content);
+    assert.match(inside, /elided/, "the capped reply must carry the elision marker");
+    assert.match(
+      inside,
+      /Keep replies concise and re-state anything important/,
+      "the capped reply must carry the weak recovery clause",
+    );
+    assert.equal(
+      result.iterations[0].llmResponse,
+      hugeReply,
+      "iterations[].llmResponse must stay the full raw reply",
     );
   });
 

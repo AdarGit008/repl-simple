@@ -45,6 +45,24 @@ const ERROR_RECOVERY = "Catch the exception and print the full traceback to see 
 /** Byte ceiling on the whole RLM conversation, over every message's content. */
 const MAX_CONVERSATION_BYTES = 256 * 1024;
 
+/**
+ * Byte ceiling on the assistant reply copied into the conversation (#145,
+ * D18). Equal to the whole-conversation budget: a pathological reply is
+ * capped, not failed — the iteration already executed, so its raw reply
+ * stays on the iteration record and only this conversation copy is bounded.
+ * Realistic replies (≤ the budget) pass through byte-identical.
+ */
+const ASSISTANT_REPLY_MAX_BYTES = MAX_CONVERSATION_BYTES;
+
+/**
+ * Route to an elided assistant reply. Deliberately weak (policy Q3): the
+ * model cannot recover its own elided reply from anywhere, so the clause
+ * must not name a route that does not exist — only advise concision and
+ * re-stating anything important.
+ */
+const ASSISTANT_REPLY_RECOVERY =
+  "Your previous reply exceeded the conversation budget and was truncated. Keep replies concise and re-state anything important.";
+
 // ── Initial-prompt aggregate cap ───────────────────────────────
 //
 // Each input renders a whole block: a header plus a fenced per-value preview,
@@ -713,7 +731,19 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     }
 
     // 7. Append iteration to conversation
-    messages.push({ role: "assistant", content: llmResponse });
+    //
+    // The reply is capped at ASSISTANT_REPLY_MAX_BYTES via the D17 sentinel
+    // wrapper: the raw reply stays on the iteration record (`llmResponse`),
+    // only this conversation copy is bounded (#145, D18). Under the budget
+    // the path is a byte-identical, sentinel-free no-op.
+    messages.push({
+      role: "assistant",
+      content: truncateWithSentinels(llmResponse, {
+        maxBytes: ASSISTANT_REPLY_MAX_BYTES,
+        headRatio: VALUE_HEAD_RATIO,
+        recovery: ASSISTANT_REPLY_RECOVERY,
+      }),
+    });
 
     // 8. Build feedback for next iteration
     const feedback =
