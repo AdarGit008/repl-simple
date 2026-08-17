@@ -99,6 +99,26 @@ describe("extractPythonCode()", () => {
       reply: "  ```python\nprint('a')\n  print('b')\n  ```",
       expected: FENCE("print('a')\nprint('b')"),
     },
+    {
+      name: "CRLF content in an indented fence dedents cleanly",
+      reply: "  ```python\r\n  print('a')\r\n  print('b')\r\n  ```",
+      expected: FENCE("print('a')\nprint('b')"),
+    },
+    {
+      name: "trailing spaces on the open line",
+      reply: "```python   \nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "trailing spaces on the close line",
+      reply: "```python\nprint('hi')\n```   \n",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "a zero-content fence",
+      reply: "```python\n```",
+      expected: FENCE(""),
+    },
     // Selection rule — the last complete block is a correction.
     {
       name: "9.3.5 two python blocks — the second is taken",
@@ -120,6 +140,11 @@ describe("extractPythonCode()", () => {
       reply: "```python\nprint('first')\n```\n```python\nprint('second')",
       expected: FENCE("print('first')"),
     },
+    {
+      name: "an unclosed fence containing an answer yields the answer",
+      reply: "```python\nprint('x')\nThe answer is 42.",
+      expected: ANSWER("42"),
+    },
     // Unfenced shapes.
     { name: "5.2.3 naked code (no fence)", reply: "print('hi')", expected: RAW("print('hi')") },
     { name: "5.2.5 empty reply", reply: "", expected: RAW("") },
@@ -136,6 +161,27 @@ describe("extractPythonCode()", () => {
     { name: "9.3.6 emphasised answer", reply: "The answer is **42**.", expected: ANSWER("42") },
     { name: "9.3.6 answer: shorthand", reply: "Answer: 42", expected: ANSWER("42") },
     { name: "9.3.6 decimal answer", reply: "The answer is 3.14.", expected: ANSWER("3.14") },
+    {
+      name: "9.3.6 negative decimal answer",
+      reply: "The answer is -3.14.",
+      expected: ANSWER("-3.14"),
+    },
+    { name: "uppercase ANSWER: shorthand", reply: "ANSWER: 42", expected: ANSWER("42") },
+    {
+      name: "an empty quoted answer is rejected",
+      reply: "The answer is ''.",
+      expected: RAW("The answer is ''."),
+    },
+    {
+      name: "a quoted answer with internal punctuation falls through raw",
+      reply: "The answer is '42.'.",
+      expected: RAW("The answer is '42.'."),
+    },
+    {
+      name: "triple-nested wrappers strip fully",
+      reply: "The answer is **\"'hi'\"**.",
+      expected: ANSWER("hi"),
+    },
     {
       name: "9.3.6 wrappers strip to a fixpoint",
       reply: "The answer is **\"hi\"**.",
@@ -180,9 +226,12 @@ describe("extractDirectAnswer()", () => {
   const CASES: Array<{ name: string; reply: string; expected: string | null }> = [
     { name: "recognises the answer at the end", reply: "The answer is 42.", expected: "42" },
     { name: "recognises a decimal", reply: "The answer is 3.14.", expected: "3.14" },
+    { name: "recognises a negative decimal", reply: "The answer is -3.14.", expected: "-3.14" },
+    { name: "recognises an uppercase shorthand", reply: "ANSWER: 42", expected: "42" },
     { name: "strips quotes and emphasis", reply: "The answer is '**hello**'.", expected: "hello" },
     { name: "rejects trailing prose", reply: "The answer is 42. Let me submit.", expected: null },
     { name: "rejects a reply without an anchor", reply: "Everything ran fine.", expected: null },
+    { name: "rejects an empty quoted fragment", reply: "The answer is ''.", expected: null },
   ];
 
   for (const { name, reply, expected } of CASES) {
@@ -190,6 +239,22 @@ describe("extractDirectAnswer()", () => {
       assert.equal(extractDirectAnswer(reply), expected);
     });
   }
+
+  it("completes on an adversarial many-anchor reply (regression: quadratic scan)", () => {
+    // A reply of repeated anchors with no valid tail used to backtrack
+    // quadratically (measured ~2.2s at 30 KB). The linear last-anchor scan
+    // must return the final anchor's tail as the answer.
+    const reply = "The answer is ".repeat(5000) + "x";
+    assert.equal(extractDirectAnswer(reply), "x");
+  });
+
+  it("completes on an adversarial many-open-fence reply (regression: quadratic scan)", () => {
+    // Repeated unclosed openings used to re-scan the remaining suffix per
+    // open (measured ~2.5s at 96 KB). With no complete fence and no answer,
+    // the whole reply is the raw fall-through.
+    const reply = "``` x\n".repeat(16000);
+    assert.deepEqual(extractPythonCode(reply), RAW(reply.trim()));
+  });
 });
 
 // ── Mock LlmClient for RLM loop tests ───────────────────────────
