@@ -527,6 +527,26 @@ describe("ReplRunner — every tool answers, in every state (#48)", () => {
     assert.equal(readFileSync(join(cwd, "ok.txt"), "utf8"), "v1");
   });
 
+  it("suspend → resume with an already-aborted signal does not run the pending call", async () => {
+    const suspendedOut = await runner.run("write('abort-rt.txt', 'v1')", "abort-rt", suspend);
+    assert.match(suspendedOut, /requires approval/);
+    assert.equal(existsSync(join(cwd, "abort-rt.txt")), false, "suspended means not yet run");
+
+    const controller = new AbortController();
+    controller.abort(); // already aborted before resume — the escape/turn-cancel case
+    const out = await runner.resume("abort-rt", approve, controller.signal);
+
+    assert.match(out, /\[error: aborted\]/);
+    // Also the mutant that drops `signal` from `session.resume({ onApproval, signal })`
+    // (#150): without the signal the already-aborted resume approves, and the write
+    // lands on disk.
+    assert.equal(
+      existsSync(join(cwd, "abort-rt.txt")),
+      false,
+      "an already-aborted resume must not execute the pending gated call",
+    );
+  });
+
   it("suspend → resume(deny) raises PermissionError in the resumed code", async () => {
     const code = [
       "try:",

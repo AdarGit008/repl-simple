@@ -1,0 +1,24 @@
+Verified and closed. The defect described by #150 is proven on this tree by a new killing test —
+no production change was needed; the wiring at `src/repl.ts:235` was already correct.
+
+**Killing test:** `test/repl.test.ts:530` ("suspend → resume with an already-aborted signal does
+not run the pending call") drives `Repl.resume()` with a pre-aborted `AbortController` and asserts
+both the `[error: aborted]` surface and the no-write invariant. Names #150 and the `signal`-drop
+mutant in its comment.
+
+**RED proof (primary):** Stryker cannot generate the single-field mutant `{ onApproval, signal }`
+→ `{ onApproval }` (`ObjectLiteral` yields only `{}`), so it was hand-applied transiently: the new
+test fails 1/1 (`'[result]\nSuccessfully wrote 2 bytes to abort-rt.txt'` — abort silently dropped,
+write ran), then restored with a verified empty diff. Re-proven independently by BUILD, VERIFY,
+REVIEW, and SHIP — four hand-proofs, both mutant variants.
+
+**Mutation sweep:** targeted `--mutate src/repl.ts`, fresh single-file report (mtime 15:02:56,
+`files == ["src/repl.ts"]`), `ObjectLiteral {}` @ `src/repl.ts:235` Killed; `mutation-guard
+--report` exit 0, no harness deaths. 193 Killed / 60 Survived / 34 Timeout — Survived/Timeout are
+pre-existing and unchanged. Caveat disclosed in `docs/verify-150.md`: the sweep re-used the
+incremental cache, so the hand-applied RED is the primary proof.
+
+**Suite:** `npm test` 947/947 (baseline 946, grew by exactly one) · check/build/lint all exit 0,
+re-verified independently in VERIFY, REVIEW, and SHIP contexts.
+
+Evidence: `docs/verify-150.md` · `docs/review-150.md` · `docs/ship-150.md`.

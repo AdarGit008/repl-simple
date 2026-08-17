@@ -1,206 +1,170 @@
-# Implementation Plan: Bound message growth in the RLM feedback loop (#74)
+# Implementation Plan: Prove `Repl.resume()` honours an aborted signal (#150)
 
 ## Overview
 
-`runRlm` (`src/rlm.ts`) accumulates a conversation of `messages` that grows by two entries per
-iteration with no total ceiling, and `buildFeedback` re-interpolates sandbox `stdout`/`output` with
-no budget of its own. This plan orders the work in `SPEC.md` into four single-commit tasks, each a
-RED → GREEN TDD cycle, so every task lands on a green, type-checked, build-clean tree. The source of
-truth for *what* to build is `SPEC.md` decisions D0–D6; this plan only sequences them and states the
-per-task acceptance and tests.
+This is a **proof-of-wiring flight, not a fix flight**. `Repl.resume()` already threads `signal`
+into `session.resume({ onApproval, signal })` (`src/repl.ts:235`) and `resumeSuspended`
+(`src/sandbox.ts:1113`) already early-returns `runError("aborted", …)` before replaying the suspended
+call — but no test proves the `signal` field is load-bearing on the resume path. The deliverable is a
+single killing test driving `Repl.resume()` with an already-aborted signal, plus the evidence that
+proves it kills the single-field mutant `{ onApproval, signal }` → `{ onApproval }`.
 
-Out of scope and never touched: `src/truncate.ts`, `src/sandbox.ts`, `src/repl.ts`, `src/builtins.ts`,
-`src/rlm_loop.ts`, `src/types.ts`, `coverage-baseline.json`.
+The source of truth for *what* to build is `SPEC.md` decisions D0–D4 and Assumptions 1–6; this plan
+only sequences them into two single-commit BUILD tasks and states per-task acceptance, tests, and
+handoff. VERIFY, REVIEW, and SHIP are separate phases (not tasks here) — the last section names what
+VERIFY must independently re-check.
+
+Out of scope and never touched (as permanent changes): `src/repl.ts`, `src/session.ts`,
+`src/sandbox.ts`, `extensions/*`, `src/rlm.ts`, `src/rlm_loop.ts`, `coverage-baseline.json`. The only
+exception is the **transient hand-applied mutant** at `src/repl.ts:235` for the RED step (D0/D3),
+always restored before commit.
 
 ## Architecture Decisions
 
-- **Reuse, don't re-implement (D1, invariant 4).** `buildFeedback` imports the existing `truncateText`
-  symbol from `./truncate.js` — the same symbol `sandbox.ts` imports — with feedback budgets equal to
-  the policy budgets (`FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES = 32 KiB`,
-  `FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES = 16 KiB`). The normal path is a marker-free no-op
-  because the sandbox already cut at these values; a raised `runOptions.maxStdoutBytes` /
-  `maxOutputBytes` no longer flows through to the model.
-- **Bound the conversation by dropping whole turns, not by summarising (D2–D4).** The `messages` array
-  is bounded at `MAX_CONVERSATION_BYTES = 256 KiB` measured with `Buffer.byteLength` over
-  `messages[].content`. Keep the initial user message plus the newest turns; drop the oldest middle
-  turns in whole assistant+feedback pairs (a feedback never dangles without its assistant message).
-  The initial message is never dropped. A single over-budget LLM reply is kept and allowed to exceed
-  the budget transiently (Assumption 4). Dropping emits a pi-style marker message so the model knows
-  history is partial (D3). Summarisation is explicitly deferred (D4).
-- **Budgets are module constants, not public options (Assumption 5).** No new `RlmOptions`/`types.ts`
-  surface; `src/types.ts` stays untouched.
-- **Aggregate input cap is a flat head+tail cut (D6).** `buildInitialPrompt` keeps its per-value 5000-char
-  preview but passes the rendered input section through `truncateText` with
-  `INPUT_PREVIEW_MAX_BYTES = 32 KiB`, `VALUE_HEAD_RATIO`, and an input-naming recovery clause.
-- **Determinism over timing.** All tests assert structure (message roles/order, marker presence,
-  byte ceilings via `Buffer.byteLength`), never wall-clock or race behaviour — the suite recently
-  fought mutation flakiness and must stay deterministic.
+- **Test-only change (D3).** The wiring is already correct. The new test is expected to be GREEN on
+  first run against the unmodified tree — that is recorded as the correct outcome, never "fixed
+  around". RED is exercised honestly by hand-applying the single-field mutant Stryker cannot generate.
+- **The mutant to kill is the single-field drop, proven by hand-application (D0).** Stryker 9.6.1's
+  `ObjectLiteral` mutator yields only `{}` (verified in SPEC Objective), so
+  `{ onApproval, signal }` → `{ onApproval }` survives the suite. The hand-apply prove-it technique
+  from the #110 flight is the primary kill; the targeted sweep is a confirmatory regression check.
+- **The public abort surface is the `[error: aborted]` result string, not a throw (D2).**
+  `Repl.resume()` never throws; abort surfaces as `[error: aborted]\nexecution aborted`. Assert the
+  string, not an `AbortError`.
+- **Single-file targeted sweep only (Assumption 4).** `--mutate src/repl.ts` — not the full tree — and
+  no re-baseline of the tree-wide floor.
+- **Mutation-report freshness is a gate (D4).** `reports/mutation/mutation.json` is overwritten only
+  when the run finishes; assert mtime postdates sweep start **and** `list(json['files'].keys())` is
+  exactly `["src/repl.ts"]` before reading any evidence.
 
 ## Task List
 
-### Phase 1: Feedback caps (D1)
+### Phase 1: The killing test
 
-- [ ] **T1 — Cap `buildFeedback` `stdout`/`output` via `truncateText` (D1) + tests 2, 3, 6**
+- [ ] **T1 — Add the abort-propagation killing test + prove RED via the hand-applied mutant (D1, D3)**
 
-  **Objective:** Make the feedback message bounded independently of the sandbox caps, using the shared
-  helper. Introduce `FEEDBACK_STDOUT_MAX_BYTES = STDOUT_MAX_BYTES` and
-  `FEEDBACK_OUTPUT_MAX_BYTES = OUTPUT_MAX_BYTES` as module constants in `src/rlm.ts`; import
-  `truncateText` and the existing shape constants (`STDOUT_HEAD_RATIO`, `STDOUT_RECOVERY`,
-  `VALUE_HEAD_RATIO`, `VALUE_RECOVERY`) from `./truncate.js`; wrap `result.stdout` and
-  `result.output` in `buildFeedback`. `result.error` stays uncapped (policy non-goal).
+  **Objective:** Add one test inside the existing
+  `describe("ReplRunner — every tool answers, in every state (#48)")` block in `test/repl.test.ts`,
+  immediately after the #110 test at `:517`, driving `Repl.resume()` (not `Session.resume()`) with an
+  `AbortController` aborted **before** resume. The test (SPEC D1, verbatim shape) asserts
+  `[error: aborted]` is surfaced **and** `abort-rt.txt` was never written. Then prove it kills the
+  mutant by hand-applying `{ onApproval }` at `src/repl.ts:235`, observing RED, restoring, observing
+  GREEN.
 
   **Scope (files):**
-  - `src/rlm.ts` — import, two module constants, `buildFeedback` interpolation sites.
-  - `test/rlm.test.ts` — tests 2, 3, 6.
+  - `test/repl.test.ts` — one new test (D1), reusing `runner`/`cwd`/`suspend`/`approve` fixtures.
+  - `src/repl.ts` — **transient only**: `:235` `{ onApproval, signal }` → `{ onApproval }` for RED,
+    restored via `git restore src/repl.ts` before commit.
 
   **Dependencies:** None.
 
-  **Acceptance criteria (SPEC success criteria):**
-  - `buildFeedback` caps `stdout` ≤ 32 KiB and `output` ≤ 16 KiB via `truncateText`, independent of the
-    sandbox caps (success criterion 3).
-  - Exactly one truncation implementation is used by `rlm.ts` (success criterion 6).
+  **Acceptance criteria (SPEC success criteria 1–2, D1, D3):**
+  - The new test drives `Repl.resume()` and passes on the unmodified tree (success criterion 1).
+  - The hand-applied `{ onApproval }` mutant makes it fail 1/1 — first on the `[error: aborted]`
+    match, with the output showing the write landed, so the `existsSync(...) === false` assertion
+    kills independently — and the mutant is restored (success criterion 2).
 
-  **RED → GREEN tests:**
-  - **Test 2 (RED):** `buildFeedback` with a synthetic `RunResult` whose `output` is huge returns a
-    feedback string whose `Output:` section is ≤ 16 KiB and carries the policy marker — assert the
-    marker text, not merely the ceiling.
-  - **Test 3 (RED):** `buildFeedback` with a synthetic `RunResult` whose `stdout` is huge yields a
-    `stdout:` section ≤ 32 KiB even though the sandbox passed more (assert via a raised
-    `runOptions.maxStdoutBytes` path or a synthetic `RunResult`).
-  - **Test 6 (RED):** source-level check that `rlm.ts` imports `truncateText` from `./truncate.js`
-    (the same symbol `sandbox.ts` uses) and defines no hand-rolled truncation.
+  **RED → GREEN choreography (exact, in order):**
+  1. **Write the test** (D1) — no production change.
+  2. **GREEN-expected:** `npx tsx --test test/repl.test.ts` — the new test passes on the unmodified
+     tree (recorded, not "fixed around", D3).
+  3. **RED (prove-it):** edit `src/repl.ts:235` to `session.resume({ onApproval })`; run the focused
+     test; confirm the new test fails 1/1 (first on the `[error: aborted]` match; the output shows
+     the write landed, so the `existsSync` assertion kills independently).
+  4. **Restore:** `git restore src/repl.ts`; assert `git diff -- src/repl.ts` is empty (the mutant is
+     **never committed**).
+  5. **GREEN:** `npx tsx --test test/repl.test.ts` — the new test passes again.
+  6. **Regression:** `npm test` → **947/947** (suite grows by exactly one: 946 → 947, Assumption 5).
+  7. **Static gates:** `npm run check` && `npm run build` && `npm run lint` — all exit 0.
+  8. **Commit** `test/repl.test.ts` **only** (no `src/` diff), message
+     `150 — Prove Repl.resume() honours an aborted signal (#150)`. Confirm
+     `git diff --name-only HEAD~1` is exactly `test/repl.test.ts`.
 
-  **Verify:** `npx tsx --test test/rlm.test.ts` (red → green); `npm test`; `npm run check`;
-  `npm run build`; `npm run lint`.
+  **Verify:** the eight steps above; `git status --porcelain` clean after commit.
 
-### Phase 2: Conversation bound + drop notice (D2–D3)
+### Phase 2: Mutation evidence
 
-- [ ] **T2 — Bound `messages` to 256 KiB, drop oldest whole turns, emit marker (D2–D3) + tests 1, 4, 5**
+- [ ] **T2 — Targeted single-file mutation sweep + freshness + harness-death check (D4)**
 
-  **Objective:** Bound cumulative conversation growth. Introduce `MAX_CONVERSATION_BYTES = 256 * 1024`.
-  After each push of an assistant+feedback pair, if total `Buffer.byteLength` of `messages[].content`
-  exceeds the budget, drop the oldest middle turns in whole pairs (keeping `messages[0]` and the newest
-  pair) and emit the D3 marker message (user role, pi-style ellipsis vocabulary) that states what was
-  dropped and why. The marker counts toward the budget. A single over-budget reply is kept and allowed
-  to exceed the budget transiently (Assumption 4).
+  **Objective:** Run the single-file sweep that regenerates `reports/mutation/mutation.json` for
+  `src/repl.ts`, assert its freshness, confirm the `ObjectLiteral` at `src/repl.ts:235` is **Killed**
+  (whole-object `{}` mutant, already killed by #110, must remain so) and that no new survivor appears
+  at that line, and confirm zero harness deaths. This is a confirmatory regression check; the primary
+  kill is T1's hand-applied RED.
 
-  **Scope (files):**
-  - `src/rlm.ts` — `MAX_CONVERSATION_BYTES` constant, drop loop, marker constant, integration into the
-    iteration append site.
-  - `test/rlm.test.ts` — tests 1, 4, 5.
+  **Scope (files):** none committed — `reports/` and `.stryker-*` are gitignored. The fresh JSON is the
+  on-disk artifact VERIFY machine-reads and records in `docs/verify-150.md`.
 
-  **Dependencies:** T1 (the reproduction's feedback must already be capped before the 256 KiB bound can
-  be meaningfully asserted).
+  **Dependencies:** T1 (the killing test must land first so the sweep runs against it).
 
-  **Acceptance criteria (SPEC success criteria):**
-  - The 1.57 MB reproduction stays bounded (success criteria 1, 2).
-  - The conversation-bounding strategy — keep first + last N, drop oldest turns whole — is asserted at
-    the boundary (success criterion 4).
-  - The model is told when history was dropped (success criterion 5).
+  **Budget (SPEC open risk 1):** ~2h15m on the #110 flight. Rely on the incremental state
+  (`.stryker-incremental.json`) to keep it bounded. **If the sweep is impractical in this flight's
+  window, T1's hand-applied RED is the primary evidence; record the sweep as pending in the ship
+  report — do not block the remaining phases.**
 
-  **RED → GREEN tests:**
-  - **Test 1 (RED):** four iterations each printing 300 KB (→ ≤32 KiB `stdout` + ≤16 KiB `output` per
-    run under default caps) keep the total conversation bytes passed to `llmClient.query` under
-    `MAX_CONVERSATION_BYTES` (regression target: no call's total messages exceed 256 KiB; 1.57 MB
-    cannot recur).
-  - **Test 4 (RED):** enough iterations (or large-enough feedback) to cross 256 KiB → the messages sent
-    to the LLM drop the oldest middle turns in whole pairs, keep the initial message and the newest
-    turns, and total ≤ budget.
-  - **Test 5 (RED):** after a drop, the messages contain the history-dropped marker (D3) and no dangling
-    feedback (pairs dropped whole).
+  **Acceptance criteria (SPEC success criterion 3, D4):**
+  - `reports/mutation/mutation.json` is fresh: mtime postdates sweep start **and**
+    `list(json['files'].keys())` is exactly `["src/repl.ts"]`.
+  - `ObjectLiteral` at `src/repl.ts:235` is `Killed`; no new survivor at that line.
+  - `node scripts/mutation-guard.mjs --report` → `mutation-guard: no harness deaths recorded`, exit 0.
 
-  **Verify:** `npx tsx --test test/rlm.test.ts` (red → green); `npm test`; `npm run check`;
-  `npm run build`; `npm run lint`.
+  **Commands:**
+  1. `node scripts/contained.mjs --limit 12G npx stryker run --mutate src/repl.ts` (record start time).
+  2. Freshness check (D4) on `reports/mutation/mutation.json`.
+  3. Extract per-mutant status at `src/repl.ts:235` (machine-read, not eyeballed).
+  4. `node scripts/mutation-guard.mjs --report`.
 
-### Phase 3: Aggregate input cap (D6)
-
-- [ ] **T3 — Cap the initial-prompt input section to 32 KiB (D6) + test 7**
-
-  **Objective:** Close the #72 deferral: `buildInitialPrompt` keeps its per-value 5000-char head/tail
-  preview but bounds the aggregate rendered input section. Introduce
-  `INPUT_PREVIEW_MAX_BYTES = 32 * 1024` and pass the assembled input section through `truncateText`
-  with `VALUE_HEAD_RATIO` and a recovery clause that names the input and says to slice it in Python.
-
-  **Scope (files):**
-  - `src/rlm.ts` — `INPUT_PREVIEW_MAX_BYTES` constant + `buildInitialPrompt` aggregate cap.
-  - `test/rlm.test.ts` — test 7.
-
-  **Dependencies:** T1 (the `truncateText` import and pattern are already in place); independent of T2.
-
-  **Acceptance criteria (SPEC success criteria):**
-  - The D6 aggregate test exists and passes (success criterion 1).
-  - `runRlm` with several large inputs produces an initial message whose input-preview section is
-    ≤ `INPUT_PREVIEW_MAX_BYTES` (testing strategy item 7).
-
-  **RED → GREEN tests:**
-  - **Test 7 (RED):** `runRlm` (or `buildInitialPrompt` via `runRlm`'s recorded initial message) with
-    several large inputs produces an initial message whose input-preview section is
-    ≤ `INPUT_PREVIEW_MAX_BYTES`.
-
-  **Verify:** `npx tsx --test test/rlm.test.ts` (red → green); `npm test`; `npm run check`;
-  `npm run build`; `npm run lint`.
-
-### Phase 4: Document the budgets and strategy
-
-- [ ] **T4 — Record feedback/conversation budgets + history-bounding strategy in `docs/truncation-policy.md`**
-
-  **Objective:** Add implementation-record rows for the RLM feedback budgets (32 KiB `stdout`,
-  16 KiB `output`, via the shared helper), the 256 KiB conversation budget with keep-first+last-N /
-  drop-oldest-whole-turns strategy, and the 32 KiB aggregate input cap. Record the D4 trade-off
-  (no summarisation, why) and the recorded edges (single over-budget reply kept; `error` uncapped).
-
-  **Scope (files):**
-  - `docs/truncation-policy.md` — implementation-record table + strategy note.
-
-  **Dependencies:** T1–T3 (documents the implemented behaviour).
-
-  **Acceptance criteria (SPEC success criteria):**
-  - The chosen history-bounding strategy and its trade-off are documented (success criterion 4).
-
-  **RED → GREEN tests:** none (documentation task; no code/test change).
-
-  **Verify:** read-through against `src/rlm.ts`; `npm run lint`.
+  **Verify:** all four commands; record the per-mutant status and freshness check for VERIFY.
 
 ### Checkpoint: Complete
 
-- [ ] All of T1–T4 done; `npm test`, `npm run check`, `npm run build`, `npm run lint`,
-  `npm run coverage` all exit 0; mutation score does not regress.
+- [ ] T1 and T2 done; `npm test` → 947/947; `npm run check`, `npm run build`, `npm run lint` exit 0;
+  tree clean; `src/` has no permanent diff against the branch base.
 
-## Definition of Done (whole flight, from SPEC success criteria)
+## Definition of Done (whole flight, from SPEC success criteria 1–5)
 
-1. All five issue tests (plus the D6 aggregate test) exist and pass; tests 1–5 are red before their
-   fix where applicable.
-2. The 1.57 MB reproduction stays bounded: 4 iterations of a 300 KB print never exceed 256 KiB of
-   total conversation, and 10 iterations trigger the drop, not unbounded growth.
-3. `buildFeedback` caps `stdout` ≤ 32 KiB and `output` ≤ 16 KiB via `truncateText`, independent of the
-   sandbox caps.
-4. The conversation-bounding strategy (keep first + last N, drop oldest turns whole) is asserted at
-   the boundary and documented with its trade-off in `docs/truncation-policy.md`.
-5. The model is told when history was dropped (D3 marker present).
-6. Exactly one truncation implementation is used by `rlm.ts`, `repl.ts` and `sandbox.ts` (verified by
-   construction, not by duplicated behaviour).
-7. `npm test`, `npm run check`, `npm run build`, `npm run lint`, `npm run coverage` exit 0; mutation
-   score does not regress.
+1. One new test exists in `test/repl.test.ts`, drives `Repl.resume()` (not `Session.resume()`), and
+   passes on the unmodified tree — proving `signal` is wired end-to-end.
+2. The hand-applied single-field mutant (`{ onApproval }`, dropping `signal`) makes that test fail 1/1
+   (first on the `[error: aborted]` match; the `existsSync` no-write assertion kills independently),
+   and is restored.
+3. The targeted `--mutate src/repl.ts` sweep keeps the `ObjectLiteral` `{}` mutant at `src/repl.ts:235`
+   Killed, with a fresh single-file report and zero harness deaths.
+4. `npm test` (947/947), `npm run check`, `npm run build`, `npm run lint` all exit 0.
+5. The evidence chain (RED/GREEN/mutation/harness-death) is recorded in `docs/verify-150.md` with the
+   mutation-report freshness check stated (D4).
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| New branches (feedback caps, drop loop, notice, aggregate cap) fall below the `src/rlm.ts` 95.94% coverage floor | High | Each task's tests exercise both truncation paths (over/under budget) and both the drop and no-drop paths; do not hand-edit `coverage-baseline.json`. |
-| Determinism/mutation flakiness in the RLM loop tests | Med | Assert structure (roles, order, marker text, `Buffer.byteLength` ceilings), never timing; reuse the existing `mockLlmCodeGen` + real `ToolRegistry` pattern. |
-| Double-truncation totals when a caller raises the sandbox cap above the feedback budget | Low | Recorded in SPEC (open question 1); cosmetic, not a correctness failure. |
-| A single over-budget LLM reply transiently exceeds 256 KiB | Med | Accepted per Assumption 4; documented; residual risk until summarisation lands. |
-| Budget numbers are judgement, not live-model measurement | Low | Recorded in SPEC (open question 3); constants are easy to tune later. |
+| The single-file sweep is slow (~2h15m, SPEC open risk 1) | Med | Own late task (T2) with an explicit budget; rely on incremental state; if impractical, T1's hand-applied RED is primary and the sweep is recorded pending in the ship report. |
+| 60-Survived / 34-Timeout mutants elsewhere in `src/repl.ts` (SPEC open risk 2) read as this flight's regression | High (false-evidence) | Recorded as pre-existing/out-of-scope in every downstream report; the only line under assertion is `src/repl.ts:235`. |
+| The transient mutant leaks into a commit | High (would change production code) | Choreography step 4 mandates `git restore src/repl.ts` + `git diff` empty; commit step asserts `git diff --name-only HEAD~1` is exactly `test/repl.test.ts`. |
+| Stale `mutation.json` misread as this run's evidence (D4 / monitor Item H) | High | Freshness check is part of T2's DoD (mtime + `files == ["src/repl.ts"]`). |
+| The new test is green-on-first-run and someone "fixes around" it | Med | D3 records GREEN-first as the correct outcome; RED is proven only via the hand-applied mutant, never by editing the test. |
 
 ## Open Questions
 
-- None blocking — the SPEC records its open questions (double-truncation totals, over-budget LLM
-  reply, judgement-based budget numbers, uncapped `error`) and marks them fire-and-forget. Any
-  unexpected divergence found during BUILD should be recorded in the ship report, not silently decided.
+- None blocking — the SPEC records its open questions (sweep budget, pre-existing survivors) and marks
+  them fire-and-forget. Any unexpected divergence found during BUILD is recorded in the ship report,
+  not silently decided.
+
+## Phase handoff notes
+
+- **BUILD → VERIFY:** BUILD leaves on disk: the committed killing test, the fresh
+  `reports/mutation/mutation.json` (single `src/repl.ts` key), and the recorded per-mutant status.
+  VERIFY must independently re-run the full suite (**947/947**), `npm run check` / `npm run build` /
+  `npm run lint`, machine-read the JSON for freshness and the `ObjectLiteral`/`:235` `Killed` status,
+  re-run `node scripts/mutation-guard.mjs --report`, confirm `git status --porcelain` clean and the
+  diff vs base is exactly `test/repl.test.ts` (plus this flight's docs), then write
+  `docs/verify-150.md`.
+- **VERIFY → REVIEW / SHIP:** the evidence chain lives in `docs/verify-150.md`; REVIEW reads it (and
+  the diff) for the five-axis pass; SHIP fans out to the three reviewers and merges into go/no-go +
+  rollback plan, writing `docs/review-150.md` and `docs/ship-150.md`.
 
 ## Parallelization
 
-- T1 → T2 → T3 → T4 is a strict sequence: T2 depends on T1's feedback caps (test 1 measures the
-  bound over capped feedback), T3 reuses T1's `truncateText` import pattern, and T4 documents all of
-  them. All four tasks touch `src/rlm.ts`/`test/rlm.test.ts` (T4 only docs), so no two tasks run in
-  parallel without conflicting edits.
+- T1 → T2 is a strict sequence (T2 must sweep against the committed killing test). Both are BUILD
+  tasks in a single writer context. VERIFY / REVIEW / SHIP are separate phases, each in a fresh
+  subagent context, and must not run concurrently with each other in the same worktree.
