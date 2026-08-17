@@ -109,6 +109,8 @@ export {
 export {
   runRlm,
   extractPythonCode,
+  extractDirectAnswer,
+  type CodeExtraction,
   DEFAULT_RLM_SYSTEM_PROMPT,
 } from "./rlm.js";
 

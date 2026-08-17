@@ -22,25 +22,137 @@ Rules:
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+/** What a reply yields for the loop: code (fenced or raw), or a direct answer. */
+export type CodeExtraction =
+  | { kind: "code"; code: string; from: "fence" | "raw" }
+  | { kind: "answer"; answer: string };
+
 /**
- * Extract Python code from an LLM response.
+ * Extract Python code from an LLM reply.
  *
- * Strategy (in priority order):
- * 1. ```python ... ```  (preferred)
- * 2. ``` ... ```        (generic fence)
- * 3. Raw text           (no fence — treat as code)
+ * Priority order:
+ * 1. The **last complete fenced block** — a later block is a correction of an
+ *    earlier one (#73). The tag is tolerated (py, python, python3, any other,
+ *    case-insensitive), as are single-line fences, fences with no newline
+ *    before the close, and indented fences. Unclosed fences are skipped.
+ * 2. A **direct answer** — a fence-less reply whose tail matches
+ *    `extractDirectAnswer`. Recognised, never executed as code.
+ * 3. Raw fall-through — the whole reply is treated as code, marked
+ *    `from: "raw"` so the loop can tell the model what happened.
  */
-export function extractPythonCode(text: string): string {
-  // 1. ```python\n...\n```  (preferred)
-  const pyMatch = text.match(/```python\r?\n([\s\S]*?)\r?\n```/);
-  if (pyMatch) return pyMatch[1].trim();
+export function extractPythonCode(text: string): CodeExtraction {
+  // Two-stage scan: an opening fence and its matching close delimit a block.
+  // One regex per shape (as before) never expressed that structure. The close
+  // must be a backtick run at line end (EOL-anchored lookahead): a ``` inside
+  // the content — `print("```")` — is not a close. The open scan skips past a
+  // consumed close, so a close line can never be re-consumed as an opening.
+  const fenceOpen = /^([ \t]*)```([A-Za-z0-9_+-]*)[^\S\r\n]*(?:\r?\n)?/gm;
+  const fenceClose = /```(?=[^\S\r\n]*(?:\r?\n|$))/g;
 
-  // 2. ```\n...\n```  (generic fence)
-  const genMatch = text.match(/```\r?\n([\s\S]*?)\r?\n```/);
-  if (genMatch) return genMatch[1].trim();
+  let fenced: string | null = null;
+  fenceOpen.lastIndex = 0;
+  let open = fenceOpen.exec(text);
+  while (open !== null) {
+    const indent = open[1];
+    fenceClose.lastIndex = fenceOpen.lastIndex;
+    const close = fenceClose.exec(text);
+    // No close after this open means none after any later open either (opens
+    // advance monotonically), so the scan is linear, not O(k·n) — a reply of
+    // unclosed openings used to re-scan the whole suffix per open.
+    if (!close) break;
+    const raw = text.slice(fenceOpen.lastIndex, close.index);
+    fenced = cleanFenceContent(raw, indent);
+    fenceOpen.lastIndex = fenceClose.lastIndex;
+    open = fenceOpen.exec(text);
+  }
+  if (fenced !== null) return { kind: "code", code: fenced, from: "fence" };
 
-  // 3. No fence — treat whole response as code
-  return text.trim();
+  const answer = extractDirectAnswer(text);
+  if (answer !== null) return { kind: "answer", answer };
+
+  return { kind: "code", code: text.trim(), from: "raw" };
+}
+
+/**
+ * Strip the fence structure from raw block content: the newline directly
+ * before the closing fence belongs to the fence (and the close line's own
+ * indentation goes with it), then dedent by the opening fence's indent — an
+ * indented fence implies uniformly indented content.
+ */
+function cleanFenceContent(raw: string, fenceIndent: string): string {
+  // Normalise CRLF first so dedent splits on \n only and never leaks a \r
+  // into the middle of a line; trim handles the fence's own trailing
+  // whitespace (structural newline and the close line's indent alike).
+  const trimmed = raw.replace(/\r\n/g, "\n").trim();
+  if (!fenceIndent) return trimmed;
+  return trimmed
+    .split("\n")
+    .map((line) => (line.startsWith(fenceIndent) ? line.slice(fenceIndent.length) : line))
+    .join("\n");
+}
+
+/**
+ * The direct-answer contract (#73, reused by #76's salvage). The reply is
+ * searched for the LAST anchor occurrence (linear `lastIndexOf` over the four
+ * variants) and only that tail is validated against an anchored pattern — a
+ * `$`-anchored scan over every anchor occurrence backtracks quadratically on
+ * adversarial replies. A decimal (e.g. "The answer is 3.14.") matches first,
+ * then the general fragment rule: no sentence-final punctuation or newlines —
+ * so "The answer is 42. Let me submit." is NOT an answer, while leading prose
+ * is fine ("Based on the data, the answer is 42."). Surrounding quotes and
+ * markdown emphasis are stripped to a fixpoint; an empty result is rejected.
+ * A comma hedge ("42, I think") is submitted verbatim — pinned by test,
+ * refinement deferred to #76's synthesis.
+ */
+const ANCHORS = ["the answer is", "answer is", "the answer:", "answer:"];
+
+/** Index of the LAST anchor occurrence (case-insensitive), or -1. */
+function lastAnchorIndex(text: string): number {
+  let best = -1;
+  const lower = text.toLowerCase();
+  for (const anchor of ANCHORS) {
+    const idx = lower.lastIndexOf(anchor);
+    if (idx > best) best = idx;
+  }
+  return best;
+}
+
+const DECIMAL_ANSWER_RE =
+  /^(?:the answer is|answer is|the answer:|answer:)\s*([+-]?\d+\.\d+)\s*[.!?]?\s*$/i;
+const DIRECT_ANSWER_RE =
+  /^(?:the answer is|answer is|the answer:|answer:)\s*([^.!?\n]+)["'“”]?\s*[.!?]?\s*$/i;
+
+export function extractDirectAnswer(text: string): string | null {
+  const idx = lastAnchorIndex(text);
+  if (idx === -1) return null;
+  const tail = text.slice(idx);
+  const decimal = tail.match(DECIMAL_ANSWER_RE);
+  if (decimal) return decimal[1];
+  const m = tail.match(DIRECT_ANSWER_RE);
+  if (!m) return null;
+  const answer = stripWrappers(m[1].trim());
+  return answer.length > 0 ? answer : null;
+}
+
+/** Strip quote and emphasis pairs alternately, to a fixpoint (bounded). */
+function stripWrappers(s: string): string {
+  let out = s;
+  for (let i = 0; i < 4; i++) {
+    const emph = stripWrapping(stripWrapping(out, ["'", '"', "“", "”"]), ["**", "__", "*", "_"]);
+    if (emph === out) return out;
+    out = emph;
+  }
+  return out;
+}
+
+/** Remove one surrounding pair from `wrappers` (longest first), if present. */
+function stripWrapping(s: string, wrappers: string[]): string {
+  for (const w of wrappers) {
+    if (s.length >= 2 * w.length && s.startsWith(w) && s.endsWith(w)) {
+      return s.slice(w.length, s.length - w.length);
+    }
+  }
+  return s;
 }
 
 /**
@@ -183,6 +295,13 @@ export function buildFeedback(result: RunResult): string {
 // ── Main API ─────────────────────────────────────────────────────
 
 /**
+ * Prepended to the feedback when a fence-less reply was treated as raw code.
+ * Without it, a SyntaxError on prose is baffling: the model is told to fix a
+ * syntax error in code it never wrote (#73).
+ */
+const RAW_FALLBACK_NOTICE = "Note: no code block found — treating the whole reply as Python code.";
+
+/**
  * Run the Repeated LLM → Monty loop.
  *
  * Takes a question, iteratively generates Python code via the LLM,
@@ -244,8 +363,16 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       options.signal,
     );
 
-    // 2. Extract Python code
-    const code = extractPythonCode(llmResponse);
+    // 2. Extract the payload: a fenced block, a direct answer, or the
+    // raw reply treated as code. A direct answer is executed as a
+    // synthesised SUBMIT — it exits through the same RunOk + ok-SUBMIT
+    // trace as a model-written call, so provenance is unchanged (#76
+    // layers on top); the prose itself is never executed.
+    const extraction = extractPythonCode(llmResponse);
+    const code =
+      extraction.kind === "answer"
+        ? `SUBMIT(${JSON.stringify(extraction.answer)})`
+        : extraction.code;
 
     // 3. Build full script: preamble (if any) + code
     const fullCode = options.preamble ? `${options.preamble}\n${code}` : code;
@@ -286,7 +413,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     messages.push({ role: "assistant", content: llmResponse });
 
     // 8. Build feedback for next iteration
-    const feedback = buildFeedback(result);
+    const feedback =
+      (extraction.kind === "code" && extraction.from === "raw"
+        ? `${RAW_FALLBACK_NOTICE}\n\n`
+        : "") + buildFeedback(result);
     messages.push({ role: "user", content: feedback });
   }
 

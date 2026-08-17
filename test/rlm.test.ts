@@ -7,61 +7,253 @@ import { ToolRegistry } from "../src/registry.js";
 import type { LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
-import { runRlm, extractPythonCode, buildFeedback } from "../src/rlm.js";
+import {
+  runRlm,
+  extractPythonCode,
+  extractDirectAnswer,
+  buildFeedback,
+  type CodeExtraction,
+} from "../src/rlm.js";
 
 // ── Load repl_server.py — the shipped RLM preamble ──────────────
 
 const replServerPath = join(fileURLToPath(import.meta.url), "..", "..", "repl", "repl_server.py");
 const REPL_SERVER = readFileSync(replServerPath, "utf-8");
 
-// ── Section 5.2: extractPythonCode() — unit tests ────────────────
+// ── Section 5.2: extractPythonCode() — table-driven unit tests ──
+//
+// One row per H38 shape (the review's executed set, enumerated in SPEC.md), plus the
+// pre-existing shapes. Each row is either an extraction or a deliberate refusal.
+// `extractPythonCode` returns the CodeExtraction union (#73): code plus where it came
+// from, or a recognised direct answer.
+
+const FENCE = (code: string): CodeExtraction => ({ kind: "code", code, from: "fence" });
+const RAW = (code: string): CodeExtraction => ({ kind: "code", code, from: "raw" });
+const ANSWER = (answer: string): CodeExtraction => ({ kind: "answer", answer });
 
 describe("extractPythonCode()", () => {
-  it("5.2.1 Python fence", () => {
-    assert.equal(extractPythonCode("```python\nprint('hi')\n```"), "print('hi')");
+  const CASES: Array<{ name: string; reply: string; expected: CodeExtraction }> = [
+    // Fenced shapes — tag tolerance.
+    {
+      name: "5.2.1 python fence",
+      reply: "```python\nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
+    { name: "9.3.1 py fence", reply: "```py\nprint('hi')\n```", expected: FENCE("print('hi')") },
+    {
+      name: "9.3.1 Python fence (capitalised)",
+      reply: "```Python\nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "9.3.1 python3 fence",
+      reply: "```python3\nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
+    { name: "5.2.2 generic fence", reply: "```\nx=1\n```", expected: FENCE("x=1") },
+    {
+      name: "foreign tag fence (any tag extracts)",
+      reply: "```js\nlet x = 1;\n```",
+      expected: FENCE("let x = 1;"),
+    },
+    // Fenced shapes — newline tolerance.
+    {
+      name: "9.3.2 single-line fence",
+      reply: "```python print('hi') ```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "9.3.3 fence with no newline before the close",
+      reply: "```python\nx = 1```",
+      expected: FENCE("x = 1"),
+    },
+    {
+      name: "5.2.6 windows line endings",
+      reply: "```python\r\nprint('hi')\r\n```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "5.2.x multiline python code",
+      reply: "```python\nx = 1\ny = 2\nprint(x + y)\n```",
+      expected: FENCE("x = 1\ny = 2\nprint(x + y)"),
+    },
+    {
+      name: "5.2.x trailing whitespace stripped",
+      reply: "```python\nprint('hi')   \n\n```",
+      expected: FENCE("print('hi')"),
+    },
+    { name: "5.2.5 empty python fence", reply: "```python\n\n```", expected: FENCE("") },
+    {
+      name: "5.2.x only whitespace between fences",
+      reply: "```python\n   \n```",
+      expected: FENCE(""),
+    },
+    // Fenced shapes — indentation.
+    {
+      name: "9.3.4 indented fence",
+      reply: "  ```python\n  print('hi')\n  ```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "9.3.4 indented fence with a flush first line",
+      reply: "  ```python\nprint('a')\n  print('b')\n  ```",
+      expected: FENCE("print('a')\nprint('b')"),
+    },
+    {
+      name: "CRLF content in an indented fence dedents cleanly",
+      reply: "  ```python\r\n  print('a')\r\n  print('b')\r\n  ```",
+      expected: FENCE("print('a')\nprint('b')"),
+    },
+    {
+      name: "trailing spaces on the open line",
+      reply: "```python   \nprint('hi')\n```",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "trailing spaces on the close line",
+      reply: "```python\nprint('hi')\n```   \n",
+      expected: FENCE("print('hi')"),
+    },
+    {
+      name: "a zero-content fence",
+      reply: "```python\n```",
+      expected: FENCE(""),
+    },
+    // Selection rule — the last complete block is a correction.
+    {
+      name: "9.3.5 two python blocks — the second is taken",
+      reply: "```python\nprint('wrong')\n```\n```python\nprint('corrected')\n```",
+      expected: FENCE("print('corrected')"),
+    },
+    {
+      name: "9.3.5 a later generic block is a correction too",
+      reply: "```python\nprint('first')\n```\nsome text\n```\nprint('second')\n```",
+      expected: FENCE("print('second')"),
+    },
+    {
+      name: "a fence inside a string is not a close",
+      reply: "```python\nprint('```')\nprint('done')\n```",
+      expected: FENCE("print('```')\nprint('done')"),
+    },
+    {
+      name: "a complete block survives a later unclosed fence",
+      reply: "```python\nprint('first')\n```\n```python\nprint('second')",
+      expected: FENCE("print('first')"),
+    },
+    {
+      name: "an unclosed fence containing an answer yields the answer",
+      reply: "```python\nprint('x')\nThe answer is 42.",
+      expected: ANSWER("42"),
+    },
+    // Unfenced shapes.
+    { name: "5.2.3 naked code (no fence)", reply: "print('hi')", expected: RAW("print('hi')") },
+    { name: "5.2.5 empty reply", reply: "", expected: RAW("") },
+    {
+      name: "9.3.6 prose with a recognised answer",
+      reply: "The answer is 42.",
+      expected: ANSWER("42"),
+    },
+    {
+      name: "9.3.6 quoted answer",
+      reply: "Based on the data, the answer is 'hello world'.",
+      expected: ANSWER("hello world"),
+    },
+    { name: "9.3.6 emphasised answer", reply: "The answer is **42**.", expected: ANSWER("42") },
+    { name: "9.3.6 answer: shorthand", reply: "Answer: 42", expected: ANSWER("42") },
+    { name: "9.3.6 decimal answer", reply: "The answer is 3.14.", expected: ANSWER("3.14") },
+    {
+      name: "9.3.6 negative decimal answer",
+      reply: "The answer is -3.14.",
+      expected: ANSWER("-3.14"),
+    },
+    { name: "uppercase ANSWER: shorthand", reply: "ANSWER: 42", expected: ANSWER("42") },
+    {
+      name: "an empty quoted answer is rejected",
+      reply: "The answer is ''.",
+      expected: RAW("The answer is ''."),
+    },
+    {
+      name: "a quoted answer with internal punctuation falls through raw",
+      reply: "The answer is '42.'.",
+      expected: RAW("The answer is '42.'."),
+    },
+    {
+      name: "triple-nested wrappers strip fully",
+      reply: "The answer is **\"'hi'\"**.",
+      expected: ANSWER("hi"),
+    },
+    {
+      name: "9.3.6 wrappers strip to a fixpoint",
+      reply: 'The answer is **"hi"**.',
+      expected: ANSWER("hi"),
+    },
+    {
+      name: "9.3.6 a hedged answer keeps its hedge verbatim",
+      reply: "The answer is 42, I think.",
+      expected: ANSWER("42, I think"),
+    },
+    {
+      name: "9.3.7 prose with trailing text is not a direct answer",
+      reply: "I think the answer is 42. Let me submit.",
+      expected: RAW("I think the answer is 42. Let me submit."),
+    },
+    {
+      name: "9.3.7 prose without an answer falls through as raw code",
+      reply: "Here is my analysis of the data.",
+      expected: RAW("Here is my analysis of the data."),
+    },
+    // Refusals and priorities.
+    {
+      name: "unclosed fence is skipped — raw fall-through",
+      reply: "```python\nprint('never closed')",
+      expected: RAW("```python\nprint('never closed')"),
+    },
+    {
+      name: "a complete fence wins over a trailing answer",
+      reply: "```python\nx = 1\n```\nThe answer is 42.",
+      expected: FENCE("x = 1"),
+    },
+  ];
+
+  for (const { name, reply, expected } of CASES) {
+    it(name, () => {
+      assert.deepEqual(extractPythonCode(reply), expected);
+    });
+  }
+});
+
+describe("extractDirectAnswer()", () => {
+  const CASES: Array<{ name: string; reply: string; expected: string | null }> = [
+    { name: "recognises the answer at the end", reply: "The answer is 42.", expected: "42" },
+    { name: "recognises a decimal", reply: "The answer is 3.14.", expected: "3.14" },
+    { name: "recognises a negative decimal", reply: "The answer is -3.14.", expected: "-3.14" },
+    { name: "recognises an uppercase shorthand", reply: "ANSWER: 42", expected: "42" },
+    { name: "strips quotes and emphasis", reply: "The answer is '**hello**'.", expected: "hello" },
+    { name: "rejects trailing prose", reply: "The answer is 42. Let me submit.", expected: null },
+    { name: "rejects a reply without an anchor", reply: "Everything ran fine.", expected: null },
+    { name: "rejects an empty quoted fragment", reply: "The answer is ''.", expected: null },
+  ];
+
+  for (const { name, reply, expected } of CASES) {
+    it(name, () => {
+      assert.equal(extractDirectAnswer(reply), expected);
+    });
+  }
+
+  it("completes on an adversarial many-anchor reply (regression: quadratic scan)", () => {
+    // A reply of repeated anchors with no valid tail used to backtrack
+    // quadratically (measured ~2.2s at 30 KB). The linear last-anchor scan
+    // must return the final anchor's tail as the answer.
+    const reply = `${"The answer is ".repeat(5000)}x`;
+    assert.equal(extractDirectAnswer(reply), "x");
   });
 
-  it("5.2.2 Generic fence", () => {
-    assert.equal(extractPythonCode("```\nx=1\n```"), "x=1");
-  });
-
-  it("5.2.3 Naked code (no fence)", () => {
-    assert.equal(extractPythonCode("print('hi')"), "print('hi')");
-  });
-
-  it("5.2.4 Python fence wins over generic", () => {
-    const response = [
-      "```python",
-      "print('only this')",
-      "```",
-      "some text",
-      "```",
-      "print('not this')",
-      "```",
-    ].join("\n");
-    assert.equal(extractPythonCode(response), "print('only this')");
-  });
-
-  it("5.2.5 Empty code", () => {
-    assert.equal(extractPythonCode(""), "");
-    assert.equal(extractPythonCode("```python\n\n```"), "");
-  });
-
-  it("5.2.6 Windows line endings", () => {
-    assert.equal(extractPythonCode("```python\r\nprint('hi')\r\n```"), "print('hi')");
-  });
-
-  it("5.2.x Multiline Python code", () => {
-    const code = ["```python", "x = 1", "y = 2", "print(x + y)", "```"].join("\n");
-    assert.equal(extractPythonCode(code), "x = 1\ny = 2\nprint(x + y)");
-  });
-
-  it("5.2.x Trailing whitespace stripped", () => {
-    assert.equal(extractPythonCode("```python\nprint('hi')   \n\n```"), "print('hi')");
-  });
-
-  it("5.2.x Only whitespace between fences", () => {
-    assert.equal(extractPythonCode("```python\n   \n```"), "");
+  it("completes on an adversarial many-open-fence reply (regression: quadratic scan)", () => {
+    // Repeated unclosed openings used to re-scan the remaining suffix per
+    // open (measured ~2.5s at 96 KB). With no complete fence and no answer,
+    // the whole reply is the raw fall-through.
+    const reply = "``` x\n".repeat(16000);
+    assert.deepEqual(extractPythonCode(reply), RAW(reply.trim()));
   });
 });
 
@@ -661,6 +853,69 @@ describe("runRlm() — context input", () => {
     const prompt2 = llm2.calls()[0].messages[0].content;
     assert.ok(prompt2.includes(boundary), "a 5000-char value must render whole");
     assert.ok(!prompt2.includes("..."), `5000-char value was elided:\n${prompt2.slice(0, 200)}`);
+  });
+});
+
+// ── Direct answers and the raw fall-through (#73) ────────────────
+
+describe("runRlm() — direct answers and the raw fall-through", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("9.3.6 executes a fence-less direct answer as a SUBMIT, not as code", async () => {
+    // A prose-only reply must end the run successfully instead of burning an
+    // iteration to a SyntaxError on prose.
+    const { llm } = mockLlmCodeGen(["The answer is 42."]);
+
+    const result = await runRlm("what is the answer?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "42");
+    assert.equal(result.iterations.length, 1);
+    // The prose was never executed — the iteration's code is the synthesised
+    // SUBMIT, and the answer still exits through a RunOk with an ok SUBMIT
+    // trace, so provenance is unchanged for #76.
+    assert.equal(result.iterations[0].code, 'SUBMIT("42")');
+    assert.equal(result.iterations[0].result.status, "ok");
+    const submitCall = result.iterations[0].result.calls.find((c) => c.tool === "SUBMIT");
+    assert.ok(submitCall);
+    assert.equal(submitCall.ok, true);
+  });
+
+  it("9.3.7 tells the model when a fence-less reply was treated as raw code", async () => {
+    // Without the notice, prose → SyntaxError is baffling: the model is
+    // told to fix a syntax error in code it never wrote.
+    const { llm } = mockLlmCodeGen([
+      "here is some prose that contains neither code nor a submission",
+      '```python\nSUBMIT("recovered")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "recovered");
+    // Iteration 0 executed the prose as code and must have failed loudly.
+    assert.equal(result.iterations[0].result.status, "error");
+    const feedback = llm
+      .calls()[1]
+      .messages.map((m) => m.content)
+      .join("\n");
+    assert.match(feedback, /no code block found/, `got: ${feedback}`);
   });
 });
 
