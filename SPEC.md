@@ -37,17 +37,24 @@ itself from `inflight`; on rejection it removes itself and rethrows — a single
 never poison the id (the same contract `src/pool.ts` already pins for the worker pool:
 `getSandboxPool`).
 
-### D2 — Trust-change rebuilds share the flight
+### D2 — Trust-change rebuilds share the flight, and the notice survives the race
 
 `trustChangeDiscards` deletes a session whose trust decision changed; the rebuild then routes
 through the same `inflight` path, so two concurrent rebuilders of one id create **one** session.
+The `[trust changed]` notice is **not** baked into the creation (an argument like `rebuilt` is
+racy: the discarder's delete lands synchronously, its rebuild decision one microtask later, and a
+joiner can start the replacement flight in between without the flag). Instead the discarder
+carries the observation and attaches the notice to whichever session lands and replaces the
+discarded one, guarded per session so two discarders deliver it once (`attachTrustChangeNotice`).
 
 ### D3 — Stale-reference revalidation
 
 `getOrCreateSession` awaits `trustChangeDiscards`, during which the entry may be rebuilt or evicted
 by another caller. After the await it returns `existing` only if `sessions.get(sessionId) ===
 existing`; otherwise it loops (re-get or join the inflight creation). No session object that the
-map no longer holds is ever handed out.
+map no longer holds is ever handed out. `resume` has the same parity check after its trust await
+and answers the no-session sentence on mismatch, and the discard-side delete in
+`trustChangeDiscards` is identity-guarded so a stale checker cannot destroy a rebuilt session.
 
 ### D4 — LRU by Map insertion order
 
@@ -64,13 +71,14 @@ precedent, and a session is strictly heavier than a preamble file.
 
 ### D6 — Eviction policy (the recorded suspension decision)
 
-On insert past the cap: evict the **least-recently-used session that is not suspended**, skipping
-suspended ones and never evicting the id just inserted. If **every** other session is suspended,
-exceed the cap temporarily rather than discard a pending approval. **Decision: refuse to evict a
-suspended session** (never report-and-drop — a dropped suspension loses a call the user was asked
-to approve, and the model is never told). The over-cap state is self-limiting: every suspension
-demands user attention, and an abandoned/resumed/overwritten session loses its protection on the
-next insert.
+On insert past the cap: evict the **least-recently-used session that is neither suspended nor
+mid-call** (`busy > 0`), skipping protected ones and never evicting the id just inserted. If
+**every** other session is protected, exceed the cap temporarily rather than discard a pending
+approval. **Decision: refuse to evict a suspended or busy session** (never report-and-drop — a
+dropped suspension loses a call the user was asked to approve, and the model is never told). The
+busy rule matters because a session with an approval dialog open is not `isSuspended()` yet; the
+over-cap state is self-limiting — every suspension demands user attention, and the protection ends
+the moment the session is no longer suspended or busy (resumed, abandoned, or overwritten).
 
 ### D7 — `reset()` evicts
 
