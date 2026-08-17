@@ -222,7 +222,11 @@ export class ReplRunner {
   }
 
   /**
-   * Clear all state in a session.
+   * Clear all state in a session, and remove it from the pool.
+   *
+   * The entry is evicted, not hollowed: a cleared-but-kept session would keep
+   * answering "nothing waiting" on `resume` — a session the model believes is
+   * still there. The next `run` on the id recreates it fresh (#59).
    *
    * @returns whether the session existed, and the approval grants that were
    *          live when the reset happened — empty for an unknown session, and
@@ -231,7 +235,9 @@ export class ReplRunner {
   reset(sessionId: string): ResetOutcome {
     const live = this.sessions.get(sessionId);
     if (!live) return { existed: false, revoked: [] };
-    return { existed: true, revoked: live.session.reset() };
+    const revoked = live.session.reset();
+    this.sessions.delete(sessionId);
+    return { existed: true, revoked };
   }
 
   /**

@@ -562,8 +562,11 @@ describe("ReplRunner — every tool answers, in every state (#48)", () => {
 
     assert.equal(runner.reset("reset-me").existed, true);
 
+    // The reset evicts the session outright (#59): a hollow entry that
+    // answers "nothing waiting" would be a session the model believes is
+    // still there. "No session" is the truth.
     const out = await runner.resume("reset-me", approve);
-    assert.match(out, /nothing waiting for approval/i);
+    assert.match(out, /No session 'reset-me' exists/);
     assert.equal(existsSync(join(cwd, "reset.txt")), false);
   });
 });
@@ -1789,6 +1792,39 @@ describe("ReplRunner — the pool is capped and never drops a pending approval (
       await runner.run("w = 2", "third");
       assert.equal(runner.liveSessionCount(), 1, "the abandoned protection kept the pool over cap");
       assert.match(await runner.run("w", "third"), /\[result\]\n2/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── Reset evicts: no hollow entries (#59) ───────────────────────
+
+describe("ReplRunner — reset removes the entry, not just its state (#59)", () => {
+  it("the entry is gone from the pool, and the id comes back fresh", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("x = 1", "gone");
+      assert.equal(runner.liveSessionCount(), 1);
+
+      assert.deepEqual(runner.reset("gone"), { existed: true, revoked: [] });
+
+      // The map size, not just the behaviour: a reset that cleared the fields
+      // but kept the entry would leave a hollow session behind.
+      assert.equal(runner.liveSessionCount(), 0, "reset left a hollow entry in the pool");
+      assert.deepEqual(
+        runner.reset("gone"),
+        { existed: false, revoked: [] },
+        "a second reset claims to have reset something",
+      );
+
+      const resume = await runner.resume("gone", approve);
+      assert.match(resume, /No session 'gone' exists/);
+
+      const fresh = await runner.run("x", "gone");
+      assert.match(fresh, /used when not defined/, `the recreated session kept state: ${fresh}`);
     } finally {
       cleanup();
     }
