@@ -42,9 +42,12 @@ export type CodeExtraction =
  */
 export function extractPythonCode(text: string): CodeExtraction {
   // Two-stage scan: an opening fence and its matching close delimit a block.
-  // One regex per shape (as before) never expressed that structure.
+  // One regex per shape (as before) never expressed that structure. The close
+  // must be a backtick run at line end (EOL-anchored lookahead): a ``` inside
+  // the content — `print("```")` — is not a close. The open scan skips past a
+  // consumed close, so a close line can never be re-consumed as an opening.
   const fenceOpen = /^([ \t]*)```([A-Za-z0-9_+-]*)[^\S\r\n]*(?:\r?\n)?/gm;
-  const fenceClose = /[ \t]*```/g;
+  const fenceClose = /```(?=[^\S\r\n]*(?:\r?\n|$))/g;
 
   let fenced: string | null = null;
   fenceOpen.lastIndex = 0;
@@ -56,6 +59,7 @@ export function extractPythonCode(text: string): CodeExtraction {
     if (close) {
       const raw = text.slice(fenceOpen.lastIndex, close.index);
       fenced = cleanFenceContent(raw, indent);
+      fenceOpen.lastIndex = fenceClose.lastIndex;
     }
     // Unclosed fence — not a complete block; skipped.
     open = fenceOpen.exec(text);
