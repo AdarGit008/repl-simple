@@ -233,6 +233,28 @@ describe("runInSandbox — lineOffset syntax-error correction", () => {
     assert.doesNotMatch(result.error, /99 \|/, "no unrenumbered excerpt line survives");
     assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
   });
+
+  it("reads the line number after a digit-ending scriptName (digit-collision regression)", async () => {
+    // A filename ending in digits sits flush against the location's line
+    // colon: ` --> file0:3:4`. The location regex must read the digits after
+    // the final colon of the prefix as the line number — the lazy-prefix
+    // version captured the trailing `0` of the name, and a prefix-region
+    // location was then dropped instead of corrected.
+    const result = await runInSandbox(
+      `${prefixOf(2)}\n1 +`,
+      { registry },
+      { scriptName: "file0", lineOffset: 2 },
+    );
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(
+      result.error,
+      / --> file0:1:4/,
+      "the filename survives intact and the location is the user's line 1",
+    );
+    assert.match(result.error, /^1 \| 1 \+$/m, "the excerpt line is line 1");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
 });
 
 // ── lineOffset: typing-error correction ────────────────────────

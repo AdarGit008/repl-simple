@@ -299,8 +299,10 @@ function correctSyntaxErrorText(text: string, lineOffset?: number): string {
     // Location line. Only the line number moves; the column is unaffected.
     // A location inside the prefix is dropped like its excerpt — emitting
     // `:0:` or a negative number would send the model after a line that does
-    // not exist in its code.
-    const location = /^(\s*--> .*?)(\d+)(:\d+.*)$/.exec(line);
+    // not exist in its code. The greedy prefix pins the line number as the
+    // digits after the final colon of the filename — a name ending in digits
+    // (` --> file0:3:4`) must not donate its trailing digits to the capture.
+    const location = /^(\s*--> .+:)(\d+)(:\d+.*)$/.exec(line);
     if (location) {
       const n = Number(location[2]);
       if (n <= offset) continue;

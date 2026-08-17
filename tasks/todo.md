@@ -79,3 +79,17 @@
     model's own code, no preamble source shown). No src/ or test/ changes.
   - Verify: `npm test` (983/983 green, no code change), own diff read for minimality
   - Files: `README.md`
+
+- [x] Task 10: Review fixes — RLMLoop lineOffset wiring + location-regex digit-collision
+  - Acceptance (10a): `RLMLoop.executeCode` (src/rlm_loop.ts) passes `lineOffset` computed
+    from the preamble string actually used (`preamble.split("\n").length`, same truthiness
+    convention as the assembly site in the file), mirroring the rlm.ts wiring — never
+    hardcoded; tests pin a syntax error on the model's line 1 reported as line 1 with an
+    N-line preamble, no preamble source (unique marker absent) in the fed-back diagnostic,
+    and the `[error: kind]` feedback shape survives.
+  - Acceptance (10b): `correctSyntaxErrorText`'s location regex hardened to
+    `^(\s*--> .+:)(\d+)(:\d+.*)$` (greedy prefix) so a digit-ending scriptName
+    (` --> file0:3:4`) captures the line number, not the filename's trailing digits;
+    regression test via the public `RunOptions.scriptName`.
+  - Verify: `npm test` (986/986 green — 983 baseline + 3 new), `npm run check`, `npm run lint`
+  - Files: `src/rlm_loop.ts`, `src/sandbox.ts`, `test/rlm_loop.test.ts`, `test/sandbox.test.ts`
