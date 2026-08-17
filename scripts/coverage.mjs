@@ -16,6 +16,16 @@
 // anything was asserted, and this suite has a documented history of tests that
 // execute plenty and assert nothing (#23). The mutation score from #24 is the
 // quality gate. This is a cheap regression detector that runs in seconds.
+//
+// Update semantics (#113): a single observation is not a floor. V8 loses
+// per-function range counts when coverage from several test processes is
+// merged, so identical runs of the same tree differ by a line on some files
+// (`src/truncate.ts` measures 99.74% or 100.00%). `--update` measures N times,
+// writes the per-file minimum, and refuses to write when a file's spread
+// exceeds one line's worth — the decision arithmetic lives in
+// `scripts/coverage-core.ts`, unit-tested. The plain gate fails a file only
+// when it is *more than one line* below its floor: the instrument cannot
+// resolve sub-line differences.
 
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -23,6 +33,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath } from "node:url";
+
+import { belowFloor, combineRuns, pct, spreadLimit } from "./coverage-core.js";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const BASELINE = join(REPO, "coverage-baseline.json");
@@ -156,27 +168,88 @@ function parseLcov(text) {
   return result;
 }
 
-/** Line percentage, floored to 2dp so a baseline never sits above what was measured. */
-function pct({ hit, found }) {
-  if (!found) return 100;
-  return Math.floor((hit / found) * 10000) / 100;
+/** How many measurements an update takes. The low observation is rare — the issue saw it once in six runs. */
+const UPDATE_RUNS = 3;
+
+/** Rows plus the run's global, the shape `combineRuns` consumes. */
+function runResult(measured) {
+  const rows = Object.entries(measured)
+    .map(([file, counts]) => ({ file, pct: pct(counts), ...counts }))
+    .sort((a, b) => a.file.localeCompare(b.file));
+  const totalFound = rows.reduce((n, r) => n + r.found, 0);
+  const totalHit = rows.reduce((n, r) => n + r.hit, 0);
+  return { global: pct({ hit: totalHit, found: totalFound }), rows };
 }
 
 const files = testFiles();
-const measured = measure(files);
-const rows = Object.entries(measured)
-  .map(([file, counts]) => ({ file, pct: pct(counts), ...counts }))
-  .sort((a, b) => a.file.localeCompare(b.file));
-
-const totalFound = rows.reduce((n, r) => n + r.found, 0);
-const totalHit = rows.reduce((n, r) => n + r.hit, 0);
-const global = pct({ hit: totalHit, found: totalFound });
 
 if (argv.includes("--update")) {
+  // #113: measure N times and write the per-file minimum. Blind `min` is not
+  // safe on its own — if a whole process's data is ever genuinely lost, `min`
+  // would bake a badly slack floor into the baseline and call it normal — so
+  // a spread wider than the known one-line defect refuses the write instead.
+  const runs = [];
+  let measured;
+  for (let i = 0; i < UPDATE_RUNS; i++) {
+    console.log(`\nUpdate measurement ${i + 1}/${UPDATE_RUNS}:`);
+    measured = measure(files);
+    runs.push(runResult(measured));
+  }
+  const { files: combined, missingInSomeRuns, global } = combineRuns(runs);
+
+  // The measured spread is printed so a file that starts varying becomes
+  // visible rather than being silently absorbed.
+  const varying = Object.entries(combined)
+    .map(([file, f]) => ({ file, ...f, spread: f.max - f.min }))
+    .filter((r) => r.spread > 0)
+    .sort((a, b) => b.spread - a.spread);
+  if (varying.length > 0) {
+    console.log("\nfile                            min     max    spread");
+    console.log("------------------------------------------------");
+    for (const r of varying) {
+      console.log(
+        `${r.file.padEnd(32)}${r.min.toFixed(2).padStart(6)}${r.max.toFixed(2).padStart(8)}${r.spread
+          .toFixed(2)
+          .padStart(9)}`,
+      );
+    }
+    console.log("------------------------------------------------");
+  } else {
+    console.log(`\nNo file varied across the ${UPDATE_RUNS} runs.`);
+  }
+
+  const refusals = [];
+  for (const [file, f] of Object.entries(combined)) {
+    if (f.max - f.min > spreadLimit(f.found)) {
+      refusals.push(
+        `${file}: spread ${f.min.toFixed(2)}–${f.max.toFixed(2)} exceeds one line's worth (${spreadLimit(
+          f.found,
+        ).toFixed(2)} pp)`,
+      );
+    }
+  }
+  for (const file of missingInSomeRuns) {
+    refusals.push(`${file}: absent from at least one of the ${UPDATE_RUNS} runs`);
+  }
+  if (refusals.length > 0) {
+    console.error(
+      "\nRefusing to write the baseline — variance wider than the known one-line defect:\n",
+    );
+    for (const f of refusals) console.error(`  ${f}`);
+    console.error(
+      "\nWide variance is a thing to look at, not to average away. Nothing was written.\n",
+    );
+    exit(1);
+  }
+
   const baseline = {};
-  for (const r of rows) baseline[r.file] = r.pct;
+  for (const [file, f] of Object.entries(combined)) baseline[file] = f.min;
   writeFileSync(BASELINE, `${JSON.stringify({ global, files: baseline }, null, 2)}\n`);
-  console.log(`\nBaseline written: ${rows.length} files, ${global.toFixed(2)}% global.`);
+  console.log(
+    `\nBaseline written: ${Object.keys(baseline).length} files, ${global.toFixed(
+      2,
+    )}% global (per-file minima over ${UPDATE_RUNS} runs).`,
+  );
 
   // A file no test loads cannot be given a floor by measuring — it is absent
   // from the report, so --update cannot write one. Say so here rather than
@@ -195,9 +268,12 @@ let baseline;
 try {
   baseline = JSON.parse(readFileSync(BASELINE, "utf8"));
 } catch {
-  console.error(`No ${BASELINE}. Run: node scripts/coverage.mjs --update`);
+  console.error(`No ${BASELINE}. Run: npm run coverage:update`);
   exit(1);
 }
+
+const measured = measure(files);
+const { rows, global } = runResult(measured);
 
 const failures = [];
 console.log("\nfile                            line %   floor");
@@ -207,9 +283,16 @@ for (const r of rows) {
   // No floor is a failure now (see unflooredFiles), reported once at the end.
   // A row can still land here unfloored and legitimately: an UNMEASURED file
   // that some test has started loading.
-  const flag = floor === undefined ? "  UNMEASURED" : r.pct < floor ? "  FAIL" : "";
-  if (floor !== undefined && r.pct < floor) {
-    failures.push(`${r.file}: ${r.pct.toFixed(2)}% is below its floor of ${floor.toFixed(2)}%`);
+  //
+  // The comparison carries a one-line tolerance (#113/#132): the instrument
+  // cannot resolve sub-line differences, so a file fails only when it is more
+  // than one line below its floor. The manifest checks below stay exact.
+  const breach = floor !== undefined && belowFloor(r.pct, floor, r.found);
+  const flag = floor === undefined ? "  UNMEASURED" : breach ? "  FAIL" : "";
+  if (breach) {
+    failures.push(
+      `${r.file}: ${r.pct.toFixed(2)}% is more than one line below its floor of ${floor.toFixed(2)}%`,
+    );
   }
   console.log(
     `${r.file.padEnd(32)}${r.pct.toFixed(2).padStart(6)}${
