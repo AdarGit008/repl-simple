@@ -70,3 +70,12 @@
   - Verify: `npm test` (983/983 green — 981 baseline + 2 new), `npm run check`
   - Files: `src/session.ts`, `test/session.test.ts`, `test/sandbox.test.ts`,
     `test/types.test.ts`
+
+- [x] Task 9: Document the fresh-sandbox contract in the README (docs-only)
+  - Acceptance: the README's RLM Loop section states the contract shipped in the prompt
+    (Task 5) — each iteration runs in a fresh sandbox; no variables, imports, or state carry
+    over between iterations; each snippet must be self-contained; the #77 lineOffset behavior
+    is recorded briefly (diagnostics fed back are offset-corrected, line numbers refer to the
+    model's own code, no preamble source shown). No src/ or test/ changes.
+  - Verify: `npm test` (983/983 green, no code change), own diff read for minimality
+  - Files: `README.md`

@@ -33,7 +33,7 @@ Verified against HEAD `791096a` on 2026-08-17 before planning. #77's body refs:
 | `RunOptions` | Do-item: add `lineOffset` | **Still open** — no `lineOffset` in `src/types.ts`. |
 | "+103 lines" | shift figure | **Superseded by #40**: `typeCheckStubs` now travels out-of-band (`src/sandbox.ts:1053-1065`), removing the +13 type-check contribution. Remaining shift ≈ RLM preamble length (~90). The `sandbox.ts:425-435` comment records the type-check half as fixed at HEAD. |
 | "runtime errors carry no line info" | | **Superseded by Monty 0.0.21**: `MontyRuntimeError.traceback()` returns structured `Frame[]` (`line`, `endLine`, `column`, `endColumn`, `sourceLine`). Runtime traceback frames ARE affected by the shift. |
-| "both plausibly dissolve under #40" | | **Half-true.** `typeCheckStubs` landed (typing diagnostics are line-correct). `typeCheckFormat: 'json'` did NOT land — `src/sandbox.ts:1067-1073` pins `"full"` with a recorded decision (echo is "the more useful one for a model rewriting its own code"). `feedRun`/continuity did NOT land — no `feedRun` in `src/`. |
+| "both plausibly dissolve under #40" | | **Half-true.** `typeCheckStubs` landed — but it removes only the stub-file contribution; the caller-assembled preamble still shifts typing diagnostics (disproved the "typing is line-correct" premise in VERIFY — measured `rlm.py:91:1` for model line 1 — and corrected it in Task 7). `typeCheckFormat: 'json'` did NOT land — `src/sandbox.ts:1067-1073` pins `"full"` with a recorded decision (echo is "the more useful one for a model rewriting its own code"). `feedRun`/continuity did NOT land — no `feedRun` in `src/`. |
 
 ## Decisions (autonomous run — assumptions recorded, no clarifying questions)
 
@@ -46,8 +46,10 @@ Verified against HEAD `791096a` on 2026-08-17 before planning. #77's body refs:
   - **Syntax errors** (raised at parse/compile of the assembled script): subtract `lineOffset` from
     every line number in the rendered diagnostic, and **drop excerpt lines whose line number is
     ≤ `lineOffset`** (prefix source must never reach the model).
-  - **Typing errors**: already line-correct at HEAD (out-of-band `typeCheckStubs`) — **do not**
-    change `typeCheckFormat: "full"`. The recorded decision at `src/sandbox.ts:1067-1073` stands;
+  - **Typing errors**: NOT line-correct at HEAD — `typeCheckStubs` removes only the stub-file
+    contribution; the caller-assembled preamble still shifts them (measured end-to-end in VERIFY).
+    They get the **same correction** as syntax errors (`correctSyntaxErrorText`, Task 7).
+    `typeCheckFormat: "full"` stays: the recorded decision at `src/sandbox.ts:1067-1073` stands;
     D4 documents why the `displayDiagnostics('json')` route from #77's "Do" is declined.
   - **Runtime errors**: use `MontyRuntimeError.traceback()` frames when available — subtract
     `lineOffset` from `frame.line`/`frame.endLine`, drop frames with `line ≤ lineOffset` (and their
@@ -84,8 +86,10 @@ gate (tests 7/8/9 in the RLM suites must stay green).
 
 ### D4 — Why `displayDiagnostics('json')` is declined
 
-#77's "Do" suggests structured JSON diagnostics. Declined for typing errors: (a) typing diagnostics
-are already line-correct via out-of-band stubs — there is no shift to correct structurally; (b) the
+#77's "Do" suggests structured JSON diagnostics. Declined for typing errors: (a) the shift IS corrected
+structurally-not-needed — the "full" render shares the syntax render's ` --> file:line:col` /
+`N | excerpt` format, so the line-wise offset correction (Task 7) covers typing without parsing JSON;
+(b) the
 `"full"` echo is a recorded, argued decision (sandbox.ts:1067-1073) and more useful to a model
 rewriting its own code; (c) JSON would require re-implementing a renderer to get model-facing text
 back. Structured access IS adopted where it exists and helps: `MontyRuntimeError.traceback()` frames

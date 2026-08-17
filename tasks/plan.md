@@ -13,7 +13,8 @@ prompt to state the fresh-sandbox-per-iteration contract.
 - **D1** — `lineOffset?: number` on the sandbox `RunOptions`; `sandbox.ts` is the single correction
   site (syntax errors: textual line-number correction + prefix-excerpt stripping; runtime errors:
   structured `traceback()` frames, offset-adjusted, prefix frames dropped, survivors re-rendered;
-  typing errors: untouched — already line-correct via out-of-band `typeCheckStubs`).
+  typing errors: same correction as syntax — the "already line-correct" premise was disproved in
+  VERIFY and fixed in Task 7).
 - **D2** — Continuity contract = fresh sandbox per iteration; prompts rewritten to say so. True
   continuity declined: `MontyRepl.feed()` supports only `{mount}` (no `externalFunctions`), and the
   host-tool bridge is external-function-based.
