@@ -1737,3 +1737,60 @@ function failCreateSessionOnce(runner: ReplRunner): { restore: () => void } {
   };
   return { restore: () => (target.createSession = original.bind(runner)) };
 }
+
+// ── The bounded pool: LRU cap, eviction, suspension protection (#59) ─
+
+describe("ReplRunner — the pool is capped and never drops a pending approval (#59)", () => {
+  it("the LRU cap evicts the least-recently-used session, and releases it", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("a = 1", "a");
+      await runner.run("b = 2", "b");
+      await runner.run("a", "a"); // touch a — b is now the eviction candidate
+      await runner.run("c = 3", "c"); // over the cap: b is evicted
+
+      assert.equal(runner.liveSessionCount(), 2, "the pool exceeded its cap");
+      assert.match(await runner.run("c", "c"), /\[result\]\n3/, "the new session is not live");
+      assert.match(await runner.run("a", "a"), /\[result\]\n1/, "the touched session was evicted");
+
+      // Eviction really released b: the id comes back as a fresh session.
+      const b = await runner.run("b", "b");
+      assert.match(b, /used when not defined/, `b kept its state through eviction: ${b}`);
+      assert.equal(runner.liveSessionCount(), 2, "recreating b exceeded the cap again");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a pending suspension is never evicted — the pool exceeds its cap instead", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    try {
+      const pending = await runner.run("write('p.txt', 'v1')", "suspended", suspend);
+      assert.match(pending, /requires approval/);
+
+      // The only eviction candidate is suspended, so inserting must not evict
+      // it: the pool exceeds its cap rather than lose a call the user was
+      // asked to approve.
+      await runner.run("v = 1", "second");
+      assert.equal(runner.liveSessionCount(), 2, "a suspended session was evicted");
+
+      // The suspended call is still there and still answerable.
+      const resumed = await runner.resume("suspended", approve);
+      assert.doesNotMatch(resumed, /PermissionError/);
+      assert.equal(readFileSync(join(cwd, "p.txt"), "utf8"), "v1");
+      assert.match(await runner.run("v", "second"), /\[result\]\n1/, "second lost its state");
+
+      // No longer suspended, it loses its protection: the next insert evicts
+      // it, and the pool is back under its cap.
+      await runner.run("w = 2", "third");
+      assert.equal(runner.liveSessionCount(), 1, "the abandoned protection kept the pool over cap");
+      assert.match(await runner.run("w", "third"), /\[result\]\n2/);
+    } finally {
+      cleanup();
+    }
+  });
+});

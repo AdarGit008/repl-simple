@@ -55,6 +55,16 @@ export interface ReplRunnerOptions {
    * direction is arbitrary code execution.
    */
   isProjectTrusted?: () => boolean;
+
+  /**
+   * Maximum number of live sessions in the pool.
+   *
+   * When a new session would exceed the cap, the least-recently-used session
+   * is evicted — except one with a pending approval, which is never evicted.
+   * Defaults to `REPL_MAX_SESSIONS` (a positive integer) or 32; an explicit
+   * option wins over both. Non-positive values fall back the same way (#59).
+   */
+  maxSessions?: number;
 }
 
 /** A live session, plus what the preamble decision for it was. */
@@ -71,6 +81,32 @@ interface LiveSession {
    * decided — session creation — because that is the only moment it is news.
    */
   notice?: string;
+}
+
+// ── Pool cap ───────────────────────────────────────────────────
+
+/**
+ * Default pool cap.
+ *
+ * A session retains every snippet it ever ran plus its full call cache, so
+ * the cap is the only thing standing between a model that mints session ids
+ * and unbounded memory. 32 follows the preamble's `DEFAULT_PREAMBLE_LIMITS`
+ * precedent: a session is strictly heavier than a preamble file (#59).
+ */
+const DEFAULT_MAX_SESSIONS = 32;
+
+/** Positive integer or fallback — the same rule `src/pool.ts` applies. */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** The pool cap: explicit option > `REPL_MAX_SESSIONS` env > default. */
+function sessionCap(explicit: number | undefined): number {
+  if (explicit !== undefined && Number.isInteger(explicit) && explicit > 0) return explicit;
+  return envInt("REPL_MAX_SESSIONS", DEFAULT_MAX_SESSIONS);
 }
 
 // ── ReplRunner ─────────────────────────────────────────────────────
@@ -98,10 +134,12 @@ export class ReplRunner {
   private inflight = new Map<string, Promise<LiveSession>>();
   private cwd: string;
   private isProjectTrusted: () => boolean;
+  private maxSessions: number;
 
   constructor(cwd: string, options: ReplRunnerOptions = {}) {
     this.cwd = cwd;
     this.isProjectTrusted = options.isProjectTrusted ?? (() => false);
+    this.maxSessions = sessionCap(options.maxSessions);
   }
 
   // ── Public API ──────────────────────────────────────────────
@@ -152,6 +190,7 @@ export class ReplRunner {
     if (!live) {
       return `No session '${sessionId}' exists. Run some code first.`;
     }
+    this.touch(sessionId, live);
     // Resuming replays the whole transcript, preamble included, so a trust
     // decision made during the pause has to be honoured here too — otherwise
     // revoking trust and answering the pending dialog runs the withdrawn code
@@ -178,6 +217,7 @@ export class ReplRunner {
   abandon(sessionId: string): AbandonOutcome {
     const live = this.sessions.get(sessionId);
     if (!live) return "no-session";
+    this.touch(sessionId, live);
     return live.session.abandon() ? "abandoned" : "nothing-pending";
   }
 
@@ -192,6 +232,18 @@ export class ReplRunner {
     const live = this.sessions.get(sessionId);
     if (!live) return { existed: false, revoked: [] };
     return { existed: true, revoked: live.session.reset() };
+  }
+
+  /**
+   * The number of live sessions in the pool.
+   *
+   * A diagnostic for hosts and tests, not a model-facing tool: the issue's
+   * definition of done demands eviction be asserted on the map size, and a
+   * size that cannot be observed cannot be asserted. Creations still in
+   * flight are not counted — they are not sessions yet.
+   */
+  liveSessionCount(): number {
+    return this.sessions.size;
   }
 
   // ── Private helpers ─────────────────────────────────────────
@@ -212,6 +264,7 @@ export class ReplRunner {
     for (;;) {
       const existing = this.sessions.get(sessionId);
       if (existing) {
+        this.touch(sessionId, existing);
         if (!(await this.trustChangeDiscards(sessionId, existing))) {
           // The trust check awaited, and awaits are where another caller
           // acts: the session may have been evicted or rebuilt in the gap.
@@ -241,7 +294,7 @@ export class ReplRunner {
     const promise = this.createSession(this.isProjectTrusted(), rebuilt ? sessionId : undefined)
       .then((live) => {
         this.inflight.delete(sessionId);
-        this.sessions.set(sessionId, live);
+        this.insert(sessionId, live);
         return live;
       })
       .catch((err: unknown) => {
@@ -250,6 +303,45 @@ export class ReplRunner {
       });
     this.inflight.set(sessionId, promise);
     return promise;
+  }
+
+  /**
+   * Mark a live session as most recently used.
+   *
+   * Map iteration order is insertion order, so delete + set moves the entry
+   * to the tail: the head is "oldest", the tail "most recent". Every
+   * retrieval of a live session — `run`, `resume`, `abandon` — touches.
+   * `reset` does not: it removes the entry outright (#59).
+   */
+  private touch(sessionId: string, live: LiveSession): void {
+    if (this.sessions.get(sessionId) !== live) return;
+    this.sessions.delete(sessionId);
+    this.sessions.set(sessionId, live);
+  }
+
+  /**
+   * Insert a finished creation, evicting past the cap.
+   *
+   * Eviction takes the oldest session that is **not suspended**, and never
+   * the one just inserted. A suspended session is a call the user was asked
+   * to approve: evicting it would lose that call with the model never told,
+   * so the pool exceeds its cap rather than discard one. The decision is the
+   * one #59 demands be recorded: refuse to evict, never report-and-drop.
+   *
+   * The over-cap state is self-limiting — every suspension demands user
+   * attention, and the protection ends the moment the session is no longer
+   * suspended (resumed, abandoned, or overwritten).
+   */
+  private insert(sessionId: string, live: LiveSession): void {
+    this.sessions.set(sessionId, live);
+    if (this.sessions.size <= this.maxSessions) return;
+
+    for (const [key, entry] of this.sessions) {
+      if (key === sessionId) continue;
+      if (entry.session.isSuspended()) continue;
+      this.sessions.delete(key);
+      if (this.sessions.size <= this.maxSessions) return;
+    }
   }
 
   /**
