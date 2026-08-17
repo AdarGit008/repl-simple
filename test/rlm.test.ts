@@ -1195,6 +1195,61 @@ describe("buildFeedback() — feedback byte caps", () => {
     assert.match(stdoutSection, /elided/, "the truncation marker must state what went");
     assert.match(stdoutSection, /Re-run with a narrower print/);
   });
+
+  it("pins the error cap's 16 KiB boundary and 50/50 shape (test 20)", () => {
+    // D21: ceiling + marker alone would still pass under a silent 8 KiB cap
+    // or a head-only cut. Pin the 16 KiB magnitude, the strict `>` spill
+    // threshold and the both-ends shape directly.
+    const errorSectionOf = (feedback: string): string => {
+      const prefix = "Error: ";
+      assert.ok(
+        feedback.startsWith(prefix),
+        `unexpected feedback shape: ${feedback.slice(0, 100)}`,
+      );
+      const rest = feedback.slice(prefix.length);
+      const stdoutIdx = rest.indexOf("\nstdout:");
+      assert.ok(stdoutIdx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
+      return rest.slice(0, stdoutIdx);
+    };
+    const feedbackFor = (error: string): string =>
+      buildFeedback({
+        status: "error",
+        error,
+        errorKind: "runtime",
+        stdout: "",
+        stdoutTruncated: false,
+        calls: [],
+      });
+
+    // (a) Exactly at 16 KiB: the spill threshold is strict `>`, so the error
+    // renders whole, byte-for-byte, with no marker.
+    const exactlyAt = "E".repeat(16 * 1024);
+    const whole = errorSectionOf(feedbackFor(exactlyAt));
+    assert.equal(whole, exactlyAt, "an exactly-at-budget error must render whole");
+    assert.doesNotMatch(whole, /elided/, "no marker may fire exactly at the budget");
+
+    // (b) One byte over: the marker fires and the ceiling still holds.
+    const justOver = errorSectionOf(feedbackFor("E".repeat(16 * 1024 + 1)));
+    assert.match(justOver, /elided/, "the truncation marker must fire just over the budget");
+    assert.match(justOver, /Catch the exception/);
+    assert.ok(
+      Buffer.byteLength(justOver, "utf8") <= 16 * 1024,
+      `error section is ${Buffer.byteLength(justOver, "utf8")} bytes`,
+    );
+
+    // (c) 100 KB: the cap is not a silent 8 KiB — the 16 KiB budget is spent —
+    // and the cut is 50/50 head+tail, so both ends of the original value
+    // survive (a head-only cut would fail the tail assertion).
+    const head = "ERR_HEAD_";
+    const tail = "_ERR_TAIL";
+    const shaped = errorSectionOf(feedbackFor(head + "E".repeat(100 * 1024) + tail));
+    assert.ok(
+      Buffer.byteLength(shaped, "utf8") >= 15 * 1024,
+      `error section is only ${Buffer.byteLength(shaped, "utf8")} bytes — the 16 KiB budget must be spent`,
+    );
+    assert.ok(shaped.startsWith(head), `the head must survive:\n${shaped.slice(0, 80)}`);
+    assert.ok(shaped.endsWith(tail), `the tail must survive:\n${shaped.slice(-80)}`);
+  });
 });
 
 // ── Conversation bound (D2/D3) ──────────────────────────────────
@@ -1584,6 +1639,143 @@ describe("runRlm() — question cap", () => {
       `question not whole:\n${prompt.slice(0, 300)}`,
     );
     assert.doesNotMatch(prompt, /elided/, "a normal question must not be marked elided");
+  });
+
+  it("pins the question cap's 64 KiB boundary and 50/50 shape (test 21)", async () => {
+    // D21: ceiling + marker alone would still pass under a silent 8 KiB cap
+    // or a head-only cut. Pin the 64 KiB magnitude, the strict `>` spill
+    // threshold and the both-ends shape directly.
+    const questionSectionOf = (prompt: string): string => {
+      const qHeader = "# Question\n";
+      const qHeaderIdx = prompt.indexOf(qHeader);
+      assert.ok(qHeaderIdx >= 0, `question section missing:\n${prompt.slice(0, 300)}`);
+      const qStart = qHeaderIdx + qHeader.length;
+      const qEnd = prompt.indexOf("\n\n# Context", qStart);
+      assert.ok(qEnd > qStart, "question section end not found");
+      return prompt.slice(qStart, qEnd);
+    };
+
+    // (a) Exactly at 64 KiB: the spill threshold is strict `>`, so the
+    // question renders whole, byte-for-byte, with no marker.
+    const exactlyAt = "Q".repeat(64 * 1024);
+    {
+      const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+      await runRlm(exactlyAt, { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+      const section = questionSectionOf(llm.calls()[0].messages[0].content);
+      assert.equal(section, exactlyAt, "an exactly-at-budget question must render whole");
+      assert.doesNotMatch(section, /elided/, "no marker may fire exactly at the budget");
+    }
+
+    // (b) One byte over: the marker fires and the ceiling still holds.
+    {
+      const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+      await runRlm("Q".repeat(64 * 1024 + 1), {
+        llmClient: llm,
+        registry: rlmRegistry(),
+        maxIterations: 5,
+      });
+      const section = questionSectionOf(llm.calls()[0].messages[0].content);
+      assert.match(section, /elided/, "the truncation marker must fire just over the budget");
+      assert.match(section, /state the assumption/);
+      assert.ok(
+        Buffer.byteLength(section, "utf8") <= 64 * 1024,
+        `question section is ${Buffer.byteLength(section, "utf8")} bytes`,
+      );
+    }
+
+    // (c) 100 KB: the cut is 50/50 head+tail, so both ends of the original
+    // question survive (a head-only cut would fail the tail assertion).
+    {
+      const head = "Q_HEAD_";
+      const tail = "_Q_TAIL";
+      const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+      await runRlm(head + "Q".repeat(100 * 1024) + tail, {
+        llmClient: llm,
+        registry: rlmRegistry(),
+        maxIterations: 5,
+      });
+      const section = questionSectionOf(llm.calls()[0].messages[0].content);
+      assert.ok(section.startsWith(head), `the head must survive:\n${section.slice(0, 80)}`);
+      assert.ok(section.endsWith(tail), `the tail must survive:\n${section.slice(-80)}`);
+      assert.match(section, /elided/);
+    }
+  });
+});
+
+// ── Composition and boundary strength (D21) ────────────────────
+
+describe("runRlm() — composition and boundary strength", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("holds per-section caps when a huge question, inputs and prints compose (test 19)", async () => {
+    // D21: each cap is normally exercised alone. Compose the worst case — a
+    // 128 KiB question, 8 × 50 KiB inputs and four ~300 KB prints — and pin
+    // that each section keeps its own budget with its marker and recovery.
+    // No conversation-wide ≤ 256 KiB assertion: the bound is best-effort
+    // (F-74 watch Items 4/9).
+    const large = "L".repeat(50 * 1024);
+    const inputs: Record<string, string> = {};
+    for (let i = 0; i < 8; i++) inputs[`data_${i}`] = large;
+
+    const { llm } = mockLlmCodeGen([
+      "```python\nprint('x' * 300000)\n```",
+      "```python\nprint('x' * 300000)\n```",
+      "```python\nprint('x' * 300000)\n```",
+      "```python\nprint('x' * 300000)\n```",
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("Q".repeat(128 * 1024), {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs,
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok", "the run must complete under the composed load");
+    const prompt = llm.calls()[0].messages[0].content;
+
+    // The question section: between the `# Question` header and the input
+    // section, which begins with the first input's header.
+    const qHeader = "# Question\n";
+    const qHeaderIdx = prompt.indexOf(qHeader);
+    assert.ok(qHeaderIdx >= 0, `question section missing:\n${prompt.slice(0, 300)}`);
+    const qStart = qHeaderIdx + qHeader.length;
+    const qEnd = prompt.indexOf("\n\n# Input", qStart);
+    assert.ok(qEnd > qStart, "question section end not found");
+    const questionSection = prompt.slice(qStart, qEnd);
+    assert.ok(
+      Buffer.byteLength(questionSection, "utf8") <= 64 * 1024,
+      `question section is ${Buffer.byteLength(questionSection, "utf8")} bytes`,
+    );
+    assert.match(questionSection, /elided/, "the truncation marker must state what went");
+    assert.match(
+      questionSection,
+      /state the assumption/,
+      "the recovery clause must direct the model to answer from what is shown",
+    );
+
+    // The input section: test 7's locators — the first input's header and the
+    // prompt trailer.
+    const inputStart = prompt.indexOf("# Input (available as `data_0` variable)");
+    const inputEnd = prompt.indexOf("\n\nWrite Python code to answer the question.");
+    assert.ok(inputStart >= 0, `input section missing:\n${prompt.slice(0, 300)}`);
+    assert.ok(inputEnd > inputStart, "input section end not found");
+    const inputSection = prompt.slice(inputStart, inputEnd);
+    assert.ok(
+      Buffer.byteLength(inputSection, "utf8") <= 32 * 1024,
+      `input section is ${Buffer.byteLength(inputSection, "utf8")} bytes`,
+    );
+    assert.match(inputSection, /elided/, "the truncation marker must state what went");
+    assert.match(inputSection, /slice it in Python/, "the recovery clause must name the input");
   });
 });
 
