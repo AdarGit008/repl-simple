@@ -94,6 +94,19 @@ export interface RunOptions {
   maxOutputBytes?: number;
   scriptName?: string;
   /**
+   * Number of lines prepended before the caller's code in the assembled
+   * script (preamble, prior snippets, …). When the sandbox renders a
+   * syntax-error diagnostic against the assembled script, this offset is
+   * subtracted from every reported line number, and excerpt lines whose line
+   * number is at or before the prefix are dropped — prefix source must never
+   * reach the caller (or the model it feeds). Absent or `0` means no prefix:
+   * the diagnostics are rendered as-is, which is the historical behavior.
+   *
+   * Typing diagnostics are not offset: they are already line-correct via
+   * out-of-band `typeCheckStubs`.
+   */
+  lineOffset?: number;
+  /**
    * Resource limits, or `"unbounded"` to run with none at all.
    *
    * Omitting this does **not** mean unlimited: every unset knob falls back to

@@ -206,6 +206,12 @@ function runtimeKind(err: MontyRuntimeError): RunErrorKind {
  * misunderstood. `MontySyntaxError` still arrives from the paths that do not
  * type-check, such as stub validation.
  *
+ * When `lineOffset` is set, the syntax rendering is corrected here: line
+ * numbers are made relative to the caller's code and prefix excerpt lines are
+ * dropped (see `correctSyntaxErrorText`). Typing diagnostics are never
+ * corrected — they are already line-correct via out-of-band `typeCheckStubs`,
+ * and subtracting the offset from them would corrupt them.
+ *
  * The reported text is `display()`, not `message`. `MontyTypingError`'s
  * constructor keeps only the **first line** of the rendered diagnostics as its
  * message — so `message` drops every diagnostic after the first, and drops the
@@ -215,14 +221,71 @@ function runtimeKind(err: MontyRuntimeError): RunErrorKind {
  * told: two unresolved names would report one, with no indication of the
  * other.
  */
-function classifyStartError(err: unknown, acc: DispatchAccumulators): RunError {
-  if (err instanceof MontySyntaxError) return runError("syntax", err.message, acc);
+function classifyStartError(
+  err: unknown,
+  acc: DispatchAccumulators,
+  lineOffset?: number,
+): RunError {
+  if (err instanceof MontySyntaxError)
+    return runError("syntax", correctSyntaxErrorText(err.message, lineOffset), acc);
   if (err instanceof MontyTypingError) {
     const diagnostics = err.display();
     const kind = diagnostics.includes("error[invalid-syntax]") ? "syntax" : "typing";
+    if (kind === "syntax") {
+      return runError("syntax", correctSyntaxErrorText(diagnostics, lineOffset), acc);
+    }
     return runError(kind, diagnostics, acc);
   }
   return classifyResumeError(err, acc);
+}
+
+/**
+ * Correct a rendered syntax diagnostic for code assembled with a prefix.
+ *
+ * The sandbox parses the script the caller assembled — for the RLM loop,
+ * `preamble + "\n" + code` — so a syntax error reports line numbers counted
+ * from the top of the prefix and echoes prefix source lines as context. The
+ * correction makes every line number relative to the caller's own code and
+ * drops prefix excerpt lines entirely, which is the half a number-only fix
+ * misses: prefix source must never reach the model.
+ *
+ * The transform is line-wise over the format Monty 0.0.21 renders for
+ * `typeCheckFormat: "full"` (measured): each diagnostic block is a header
+ * line, an ` --> <file>:<line>:<col>` location line, a `  |` gutter, excerpt
+ * lines of the shape `<n> | <source>` (number right-aligned in a gutter
+ * padded to the widest line number shown), caret lines (`  |    ^`), and a
+ * closing gutter line. Header, caret and gutter lines pass through verbatim,
+ * so the `error[invalid-syntax]: <msg>` heading shape is preserved.
+ *
+ * A no-op when the offset is absent or not positive.
+ */
+function correctSyntaxErrorText(text: string, lineOffset?: number): string {
+  if (lineOffset === undefined || !Number.isFinite(lineOffset) || lineOffset <= 0) {
+    return text;
+  }
+  const offset = Math.floor(lineOffset);
+  const corrected: string[] = [];
+  for (const line of text.split("\n")) {
+    // Excerpt line. Drop it when it shows prefix source, else renumber in
+    // place, preserving the gutter width (the number stays right-aligned).
+    const excerpt = /^(\s*)(\d+)( \| .*)$/.exec(line);
+    if (excerpt) {
+      const n = Number(excerpt[2]);
+      if (n <= offset) continue;
+      corrected.push(
+        `${excerpt[1]}${String(n - offset).padStart(excerpt[2].length, " ")}${excerpt[3]}`,
+      );
+      continue;
+    }
+    // Location line. Only the line number moves; the column is unaffected.
+    const location = /^(\s*--> .*?)(\d+)(:\d+.*)$/.exec(line);
+    if (location) {
+      corrected.push(`${location[1]}${Number(location[2]) - offset}${location[3]}`);
+      continue;
+    }
+    corrected.push(line);
+  }
+  return corrected.join("\n");
 }
 
 /**
@@ -1083,7 +1146,7 @@ export async function runInSandbox(
                 mount,
               });
             } catch (err) {
-              return classifyStartError(err, acc);
+              return classifyStartError(err, acc, runOpts?.lineOffset);
             }
             return await runDispatchLoop(current, registry, runOpts, acc);
           }),
@@ -1196,7 +1259,7 @@ async function resumeInSession(
   try {
     snapshot = await session.loadSnapshot(suspended.snapshot, loadOpts);
   } catch (err) {
-    return classifyStartError(err, acc);
+    return classifyStartError(err, acc, runOpts?.lineOffset);
   }
   if (!(snapshot instanceof FunctionSnapshot)) {
     // A dump taken anywhere but at a gated call. `resumeSuspended` is only

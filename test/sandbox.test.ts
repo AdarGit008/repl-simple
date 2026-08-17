@@ -140,6 +140,69 @@ describe("runInSandbox — error handling", () => {
   });
 });
 
+// ── lineOffset: syntax-error correction ─────────────────────────
+//
+// The sandbox runs whatever script the caller assembles, prefix included, so
+// a syntax error reports line numbers counted from the top of the prefix and
+// echoes prefix source lines as context. `lineOffset` tells the sandbox how
+// many prefix lines to subtract so the model only ever sees line numbers (and
+// source) relative to its own code.
+
+describe("runInSandbox — lineOffset syntax-error correction", () => {
+  const registry = new ToolRegistry();
+
+  function prefixOf(n: number): string {
+    return Array.from({ length: n }, (_, i) => `PREFIX_MARKER_77 = ${i}`).join("\n");
+  }
+
+  for (const n of [1, 3, 7]) {
+    it(`reports a user-line-1 syntax error at line 1 with a ${n}-line prefix (lineOffset=${n})`, async () => {
+      const result = await runInSandbox(`${prefixOf(n)}\n1 +`, { registry }, { lineOffset: n });
+      err(result);
+      assert.equal(result.errorKind, "syntax");
+      assert.match(result.error, /^error\[invalid-syntax\]: Expected an expression$/m);
+      assert.match(result.error, / --> <repl>:1:/, "the diagnostic location is line 1");
+      assert.match(result.error, /^1 \| 1 \+$/m, "the excerpt line is line 1");
+      assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+    });
+  }
+
+  it("renumbers every diagnostic block and lines after the error line", async () => {
+    // `def f(:` yields two diagnostics, each echoing the line after the error
+    // (`5 |     pass`), so both block relocation and after-line renumbering
+    // are exercised.
+    const result = await runInSandbox(
+      `${prefixOf(3)}\ndef f(:\n    pass`,
+      { registry },
+      { lineOffset: 3 },
+    );
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.deepEqual(result.error.match(/ --> <repl>:\d+:\d+/g), [
+      " --> <repl>:1:7",
+      " --> <repl>:1:8",
+    ]);
+    assert.match(result.error, /^1 \| def f\(:$/m, "the error line is excerpt line 1");
+    assert.match(result.error, /^2 \| {5}pass$/m, "the after-line is renumbered too");
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/);
+  });
+
+  it("leaves the diagnostic untouched when lineOffset is absent", async () => {
+    const result = await runInSandbox(`${prefixOf(3)}\n1 +`, { registry });
+    err(result);
+    assert.match(result.error, / --> <repl>:4:/, "assembled line 4, no correction applied");
+    assert.match(result.error, /PREFIX_MARKER_77/, "prefix source appears without a lineOffset");
+  });
+
+  it("does not shift typing diagnostics (they are already line-correct)", async () => {
+    const result = await runInSandbox("x: int = 'hello'", { registry }, { lineOffset: 3 });
+    err(result);
+    assert.equal(result.errorKind, "typing");
+    assert.match(result.error, / --> <repl>:1:4/, "typing diagnostics keep their own line numbers");
+    assert.match(result.error, /^1 \| x: int = 'hello'$/m);
+  });
+});
+
 // ── Host tool execution ─────────────────────────────────────────
 
 describe("runInSandbox — host tool execution", () => {

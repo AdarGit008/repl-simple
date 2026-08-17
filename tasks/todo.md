@@ -1,6 +1,6 @@
 # F-77 Task List
 
-- [ ] Task 1: `lineOffset` in `RunOptions` + syntax-error correction in `sandbox.ts`
+- [x] Task 1: `lineOffset` in `RunOptions` + syntax-error correction in `sandbox.ts`
   - Acceptance: `RunOptions.lineOffset?: number` exists (default absent); a syntax error in
     user code appended after an N-line prefix is reported at the user's line number (N subtracted);
     rendered diagnostic contains no excerpt lines from the prefix (lines ≤ offset stripped).
