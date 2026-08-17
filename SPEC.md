@@ -204,16 +204,24 @@ following; each is fixed in a follow-up increment with tests:
 8. **Notice wording**: "start a new session" was ambiguous (`repl_reset` does not reload). Now
    "run `repl` with a new `sessionId`"; save/delete messages say "sessions created after this one".
 
-### Residual risks after the fixes (recorded for the ship report)
+### Residual risks after pass 2 (recorded for the ship report)
 
-- **savedToolNames/loadSavedTools still follow a symlinked toolsDir.** The four *tools* now refuse
-  an escaping directory; the loader and the name-listing path (pre-existing, and execution there is
-  trusted-only) do not. A hostile repo can still have its names listed through a symlink in an
-  untrusted session. Filed as a follow-up, out of #57's tool-registration scope.
-- **The containment check and the operation behind it race** (check → swap dir → act). Same class
-  as the fd-open race now closed for reads; a local attacker with write access to the project tree
-  could exploit the window. Narrow, documented, not closed here.
+- **Check-then-act races remain at the directory level** (containment resolve → mkdir/write/rm).
+  The file-level read and write races are closed via fd ops; a local process swapping `.pi` between
+  the resolve and the act can still redirect one call. Requires write access to the project tree —
+  documented, not closed.
 - **`validateToolName` accepts Windows device names** (`con`, `nul`, …) — pre-existing, Nit-level.
 - **Two commits share a message** (the tsc-fix and the test commit) — cosmetic, history kept.
-- **Detector remains a scan, not a parser** — indented metaprogramming and `sys.modules[__name__]`
-  aliases are documented false negatives; both gates share them.
+- **Detector remains a scan, not a parser** — alias-based metaprogramming (`from builtins import
+  exec as e`) and `match`/`case` captures are documented false negatives; both gates share them.
+  `del` and `;`-split metaprogramming are caught as of pass 2.
+- **Replayed toolstore results are snapshots** — a cached `save_tool`/`delete_tool` message replays
+  verbatim even if the disk changed since; the JSDoc warns, the messages say which *sessions* are
+  affected, and re-querying `list_saved_tools()` is the documented remedy.
+- **`Session.dump/load` half-contract**: the registry/preamble/toolstore view are not serialized;
+  `Session.load`'s JSDoc now documents exactly what a restoring caller must rebuild (fresh
+  `PreambleStatus` + identity, live `isTrusted`, re-derived preamble) and that `grantUses` restores
+  to the default. No production caller persists sessions yet (bucket 7).
+- **Notices render names escaped but unquoted** — a crafted name can still *look* like an
+  annotation inside a notice sentence (list lines are quoted). Accepted; notices name tools the
+  session already told the model not to trust.
