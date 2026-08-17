@@ -1,49 +1,86 @@
-# Ship report — flight F-144 (issue #144: 9.10 — Cap result.error and the question in the RLM feedback loop)
+# Ship report — flight F-145 (issue #145 "9.11 — Post-ship RLM message-growth polish")
 
-Branch: `issue-144-cap-error-question` (7 commits ahead of flight base `34da5c5`; unmerged, not pushed at write time)
-Commits: `01e5c6a` SPEC · `9fb8916` plan · `018e51a` T1 · `e905ce8` T2 · `527244e` T3 · `35b16cd` review · `this` ship
+Branch: `issue-145-rlm-polish` · 24 commits ahead of `origin/main` (base `791096a`; origin/main
+advanced to `e796174` — F-77 — during the flight, intentionally not rebased; merge strategy: resolve
+planning-doc collisions per SPEC/plan, code union is disjoint from F-77's session/types work).
 
-## What was built
+## Decision: GO
 
-| Task | Change | Tests |
-|------|--------|-------|
-| T1 | `buildFeedback` caps `result.error` ≤ 16 KiB (50/50 head+tail) via shared `truncateText`, recovery "Catch the exception and print the full traceback to see more." (D7) | 8 |
-| T2 | `buildInitialPrompt` caps `question` ≤ 64 KiB (50/50) via `truncateText`, recovery "The question was truncated. Answer from the part shown and state the assumption if ambiguous." (D8) | 9 |
-| T3 | `docs/truncation-policy.md` budget table extended with both caps; stale "error uncapped" non-goal scoped down to `errorKind` | — |
+No high-risk or irreversible work in this flight (no auth, secrets, migrations, payments, deploys,
+dependency changes — auditor-confirmed). Doubt-driven risk check: the only flagged risk class is
+prompt-steering residuals inside a defense-in-depth mechanism; the real security boundary (sandbox +
+approval-gated registry) is untouched.
 
-All tasks RED→GREEN: test 8 RED at 100 KiB vs 16 KiB ceiling; test 9 RED at 131072 vs 65536 bytes. Full suite 950/950 (deterministic, run twice); `tsc --noEmit`, build, biome all clean; coverage floors hold (`src/rlm.ts` 97.40% vs 95.94% floor; baseline untouched). Both new tests have under-budget no-op halves proving byte-identical pass-through.
+## What was built (D10–D27)
 
-## Gate results
+| Decision | Item | Landed |
+|---|---|---|
+| D10 | drop-marker label derived from `MAX_CONVERSATION_BYTES` via `formatSize` | T4 + test 5 regex / test 6 grep |
+| D11/D16 | test 5 parity + last-role + dropped-turn count (completed-turns scope, build-corrected) | T2 |
+| D12 | O(n²)→O(n) running byte total in `boundConversation`, byte-identical | T10, guarded by tests 1/4/5/24 |
+| D13 | boundary guard tests 10–13 (exact-at, no-hang, just-under, error stdout cap) | T1 |
+| D14 | honest TextEncoder framing (src token-ban safe, docs may name Buffer) | T11 |
+| D15 | per-value 5 KiB input previews + block-level aggregate elision (fence-split) | T5 + test 14 |
+| D17 | sentinel-delimited truncation markers + system-prompt rule (7 call sites) | T6 + test 17 |
+| D18 | assistant-reply cap 256 KiB, raw `llmResponse` preserved | T7 + test 16 |
+| D19 | error-line `> ` quoting, real `\nstdout:` unforgeable | T8 + test 18 |
+| D20 | input-name regex + 35-keyword denylist at the merge choke point | T9 + test 15 |
+| D21 | cap-strength pins (composition, boundary pairs, 50/50 shape) | T3, tests 19–21 |
+| D22 | `ERROR_MAX_BYTES` → `FEEDBACK_ERROR_MAX_BYTES` | T10 |
+| D23 | `questionText` binding + docs:390 whole-table sentence | T12 |
+| D24 | question-as-input follow-up — deferred, recorded (needs a home) | SPEC |
+| D25 | bounded mutation strategy, honestly recorded | VERIFY |
+| D26 | item 8 + absorbed-6b — **BLOCKED** (F-77-era code absent from branch base; remain open on #145) | recorded |
+| D27 | sentinel-rule marker grant scoped to the system's marker (audit Medium) | T19 |
 
-- **VERIFY** (fresh context): full matrix green ×2 runs — no fixes needed, no blockers. Diff scope `34da5c5..HEAD` = exactly the 6 expected files; no `Buffer`/`byteLength` in `src/rlm.ts` (test 6 invariant). Bounded ~19-min partial mutation sweep of `src/rlm.ts`: 48/451 mutants tested, ≈89.6% detected, no regression signal; full sweep infeasible on this 8-core host (repo's own `docs/mutation-testing.md` warning) — recorded as a limitation.
-- **REVIEW** (fresh context, five-axis): verdict **approve** — 0 blockers, 0 majors, 6 minor, 5 nit (`tasks/review.md`, commit `35b16cd`).
-- **SHIP fan-out** (parallel, independent, read-only):
-  - code-reviewer: **SHIP** — D7/D8/D9 implemented verbatim against SPEC; budget math sound (worst-case `messages[0]` ≈ 97 KiB < 256 KiB).
-  - security-auditor: **SHIP** — 0 critical/high/medium; 3 low + 2 info (all pre-existing or defense-in-depth).
-  - test-engineer: **SHIP** — tests 8/9 are genuine prove-it tests (verified failing against base `34da5c5`), deterministic (98/98 in ~3.0s), coverage-floor risk nil.
+## Gates (VERIFY rounds 1–5)
 
-## Risk assessment (doubt-driven check)
+- Suite: **967/967 ×2 deterministic**, zero flakes (final round; grew 963→967 through T13–T19).
+- Static: `tsc --noEmit`, `tsc build`, biome lint — clean.
+- Coverage: all 16 per-file floors met; `src/rlm.ts` **98.65%** vs 95.94% floor; baseline untouched.
+- Mutation: bounded sweep over changed call sites (D25), guard **PASS**; all named-site survivors
+  killed across rounds (C1/C2 by test 24; M4/M5 + three D27 prose pins by test 17(c)); rlm.ts-only
+  61.9% population, **non-comparable** to #144's 89.6% (different populations — recorded, see
+  monitor report §1.5).
 
-Stop-condition review: no auth, secrets, destructive migrations, payments, or deploys in this change — high-risk/irreversible trigger **not met**; no doubt-driven drill required. Closest risks (all recorded below as follow-ups): forged truncation markers (LOW — model misdirection only, sandbox remains enforcement boundary); budget DoS via pathological assistant replies (LOW — pre-existing Assumption 4, now the only uncapped prompt path).
+## Review / audit fan-out
 
-## Decision: **GO**
+- **code-reviewer (Phase 5):** REQUEST CHANGES at review time — 0 Critical, 4 Important (I1–I4:
+  sentinel-rule vs drop-marker incoherence, rule miswording, sentinel-token forgery residual, keyword
+  gap) — **all fixed in T15**, plus suggestions S1/S2/S4/S5 landed and S3/S6–S8 recorded with routing.
+- **test-engineer (Phase 4 + rounds):** all gates green; H1–H3/M4/M5/L1 closed (T13/T16); C1/C2
+  killed (T14); D27 pins live (round 5).
+- **security-auditor (Phase 6):** 0 Critical, 0 High, 1 Medium (marker grant inside authentic pairs
+  + docs overclaim), 3 Low, 3 Info — Medium **fixed in T19 (D27)**; Low/Info routed (#77/#78/#87/#145
+  close notes). Verdict: nothing blocks GO.
 
-Merge-ready. Rollback plan: nothing is deployed; the branch is the artifact. If a regression surfaces after merge: (1) revert the merge commit on main — each task is a separate commit so T1/T2/T3 can be reverted independently; (2) as last resort, roll back `src/rlm.ts` and `test/rlm.test.ts` to `34da5c5` (`git checkout 34da5c5 -- src/rlm.ts test/rlm.test.ts`), which restores pre-flight behavior exactly; (3) no data migrations or external state are involved, so rollback has no side effects.
+## Rollback plan
 
-## Residual risks & post-ship follow-ups (from fan-out, not blocking)
+- **Trigger:** post-merge regression in RLM runs (the extension is the consumer; `runRlm` behavior is
+  the blast radius).
+- **Steps:** (1) `git revert <merge-commit>` on main (each task is one commit, so bisect to the
+  offending task is possible); (2) verify with `npm test`; (3) if a single task is at fault, revert
+  only that commit.
+- **Time to rollback:** < 5 min (single repo, no infra).
+- **No data migrations, no schema, no persisted state changes** — rollback is purely code.
 
-1. **Authenticate truncation markers** (security LOW): attacker text is indistinguishable from real `[… X of Y elided …]` markers. Sentinel-delimited markers + a system-prompt note would make them self-authenticating. → #145 (or new issue).
-2. **Cap or fail on pathological assistant replies** (`src/rlm.ts:599`, security LOW): the last uncapped prompt path; a prompt-injection-induced multi-MiB reply is carried in every subsequent query. → #145.
-3. **Delimit error/stdout sections in feedback** (`src/rlm.ts:352`, security LOW): an exception message containing `\nstdout:` can forge a fake stdout line. Indent/quote or `###` headers. → #145.
-4. **Sanitize input names** (`src/rlm.ts:281`, security INFO): input keys interpolated unescaped into the prompt header — a backtick/newline key injects prompt structure. One-line fix. → #145 (this is also the #72-deferral note from F-74 monitor Item 3).
-5. **Test-strength gaps** (test-engineer): boundary tests at exactly/just-over budget; "uses the full budget" assertions (a silent 8 KiB cap would still pass today); head/tail shape assertion; composition test (huge question + inputs). → #145.
-6. **Naming** (review minor): `ERROR_MAX_BYTES` breaks the `FEEDBACK_` prefix convention (`src/rlm.ts:28`). → #145.
-7. Cosmetic: `const { text: q }` single-letter binding (`src/rlm.ts:300`); docs/truncation-policy.md "four rows / one implementation" sentence now stale after adding rows five and six (`docs/truncation-policy.md:390`). → #145.
+## Residual risks (non-blocking, all routed — exact wording in tasks/monitor-report.md)
 
-## Merge notes (important)
-
-`origin/main` advanced 5 commits (#110, #150) after this flight branched from `34da5c5`. Overlap is **editorial-only**: SPEC.md, tasks/plan.md, tasks/todo.md. **Zero overlap** in `src/rlm.ts`, `test/rlm.test.ts`, `docs/truncation-policy.md` (the code merges clean). On merge, resolve the three planning-doc conflicts by taking this flight's versions (they are the F-144 spec-of-record; the other flights' versions live in their own commits). Supervisor decision (recorded): no rebase — verify against flight base.
+1. Item 8 (`Session.prefixLineCount` O(n²)) + absorbed-6b rename — **remain open on #145**; fix
+   post-merge on main (F-77-era code; blocked on this branch, verified).
+2. Marker-shaped text inside authentic sentinel pairs — steering-only residual; sandbox remains the
+   boundary; docs Exception 5 now records it honestly.
+3. D19 ok-branch `Output:` forgery — recorded, → #77/#78.
+4. Question-as-input follow-up (D24) — needs a home (#78 or dedicated) before #145 closes.
+5. S3/S5/S7/S8 (silent-drop insurance, custom-systemPrompt rule loss, unquoted() drift, file growth)
+   — recorded with routing.
+6. Merge collision with F-77 (`e796174`): planning-doc overlap only per review; code union disjoint
+   — but F-77 rewrote `src/session.ts`/`src/sandbox.ts`/`src/rlm.ts` lineOffset wiring; the merge must
+   run the full suite after resolution. No rebase was attempted by design (recorded decision).
 
 ## Open-issues recommendations
 
-See `tasks/monitor-report.md` (flight monitor). The monitor's final report carries the exact wording to update #144 (DoD checkboxes), #145 (absorb follow-ups 1–7 above), #77/#70 cross-references, and any newly discovered gotchas.
+Delegated to the monitor's final report (`tasks/monitor-report.md` — advisory): #145 closing record
+(§1.1–1.7), #77 ledger corroboration (§2), #78 convergence constraints (§3), #87 budget inputs (§4),
+#70 epic status (§5), #69 scope update (§6), three new-issue candidates (§7), and process hygiene
+notes (§8). Apply before closing #145.
