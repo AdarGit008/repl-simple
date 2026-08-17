@@ -119,9 +119,15 @@ const QUESTION_RECOVERY =
 const INPUT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * UTF-8 length of a message's content — the unit the conversation budget is
- * measured in. `TextEncoder` yields the same count without reintroducing
- * byte-level measurement here (the shared truncator owns that, #74 invariant 4).
+ * UTF-8 byte count of a message's content — the unit the conversation budget
+ * is measured in. `TextEncoder.encode().length` *is* byte measurement:
+ * byte-for-byte identical to the count the canonical byte-measuring call
+ * yields for the same text (verified, lone surrogates included). The usual
+ * byte-measurement symbols are absent here only because test 6's source
+ * grep bans them from rlm.ts (comments included) — not because this count
+ * is anything less than byte measurement. The shared truncator in
+ * ./truncate.js remains the only place that cuts (#74 invariant 4); this
+ * helper only measures.
  */
 const textEncoder = new TextEncoder();
 

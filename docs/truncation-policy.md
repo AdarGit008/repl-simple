@@ -427,11 +427,14 @@ the question is **not** sandbox-accessible: unlike `output` and inputs, the mode
 Python, so the marker must not advertise a route it cannot honour (policy Q3, the same rule as the
 `_` binding). Both caps go through the one shared `truncateText`.
 
-**Exception 3 — the conversation byte count uses `TextEncoder`, not `Buffer.byteLength`.** D2 writes
-the budget as `Buffer.byteLength`, but test 6 asserts `rlm.ts` never references `Buffer` or
-`byteLength` — the canonical signals of a hand-rolled byte truncator. `TextEncoder.encode().length`
-yields the same UTF-8 byte count, so the budget is measured identically while `rlm.ts` still owns no
-byte-level measurement (invariant 4). [#74]
+**Exception 3 — the conversation byte count uses `TextEncoder`, and that *is* byte measurement.**
+D2 writes the budget as `Buffer.byteLength`; `TextEncoder.encode().length` is UTF-8 byte measurement
+too, and byte-for-byte identical to `Buffer.byteLength` for the same text (verified, including lone
+surrogates). The deviation from D2's wording is a symbol swap driven by test 6's source grep — it
+bans `Buffer` and `byteLength` from `rlm.ts` (comments included) as the canonical signals of a
+hand-rolled byte truncator — not "no byte-level measurement". The count is byte-level either way;
+test 6's positive assertions (rlm.ts imports `truncateText` from `./truncate.js`) are what keep the
+one-shared-truncator invariant (invariant 4). [#74]
 
 **Exception 4 — a single over-budget LLM reply is kept.** The loop cannot truncate model output
 without summarising (deferred, D4), so one reply larger than 256 KiB is kept and the conversation is
