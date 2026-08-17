@@ -48,14 +48,17 @@ export function extractPythonCode(text: string): CodeExtraction {
 
   let fenced: { code: string } | null = null;
   fenceOpen.lastIndex = 0;
-  let open: RegExpExecArray | null;
-  while ((open = fenceOpen.exec(text)) !== null) {
+  let open = fenceOpen.exec(text);
+  while (open !== null) {
     const indent = open[1];
     fenceClose.lastIndex = fenceOpen.lastIndex;
     const close = fenceClose.exec(text);
-    if (!close) continue; // Unclosed fence — not a complete block.
-    const raw = text.slice(fenceOpen.lastIndex, close.index);
-    fenced = { code: cleanFenceContent(raw, indent) };
+    if (close) {
+      const raw = text.slice(fenceOpen.lastIndex, close.index);
+      fenced = { code: cleanFenceContent(raw, indent) };
+    }
+    // Unclosed fence — not a complete block; skipped.
+    open = fenceOpen.exec(text);
   }
   if (fenced) return { kind: "code", code: fenced.code, from: "fence" };
 
@@ -255,8 +258,7 @@ export function buildFeedback(result: RunResult): string {
  * Without it, a SyntaxError on prose is baffling: the model is told to fix a
  * syntax error in code it never wrote (#73).
  */
-const RAW_FALLBACK_NOTICE =
-  "Note: no code block found — treating the whole reply as Python code.";
+const RAW_FALLBACK_NOTICE = "Note: no code block found — treating the whole reply as Python code.";
 
 /**
  * Run the Repeated LLM → Monty loop.
