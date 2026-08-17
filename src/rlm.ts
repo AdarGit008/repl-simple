@@ -22,25 +22,93 @@ Rules:
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+/** What a reply yields for the loop: code (fenced or raw), or a direct answer. */
+export type CodeExtraction =
+  | { kind: "code"; code: string; from: "fence" | "raw" }
+  | { kind: "answer"; answer: string };
+
 /**
- * Extract Python code from an LLM response.
+ * Extract Python code from an LLM reply.
  *
- * Strategy (in priority order):
- * 1. ```python ... ```  (preferred)
- * 2. ``` ... ```        (generic fence)
- * 3. Raw text           (no fence — treat as code)
+ * Priority order:
+ * 1. The **last complete fenced block** — a later block is a correction of an
+ *    earlier one (#73). The tag is tolerated (py, python, python3, any other,
+ *    case-insensitive), as are single-line fences, fences with no newline
+ *    before the close, and indented fences. Unclosed fences are skipped.
+ * 2. A **direct answer** — a fence-less reply whose tail matches
+ *    `extractDirectAnswer`. Recognised, never executed as code.
+ * 3. Raw fall-through — the whole reply is treated as code, marked
+ *    `from: "raw"` so the loop can tell the model what happened.
  */
-export function extractPythonCode(text: string): string {
-  // 1. ```python\n...\n```  (preferred)
-  const pyMatch = text.match(/```python\r?\n([\s\S]*?)\r?\n```/);
-  if (pyMatch) return pyMatch[1].trim();
+export function extractPythonCode(text: string): CodeExtraction {
+  // Two-stage scan: an opening fence and its matching close delimit a block.
+  // One regex per shape (as before) never expressed that structure.
+  const fenceOpen = /^([ \t]*)```([A-Za-z0-9_+-]*)[^\S\r\n]*(?:\r?\n)?/gm;
+  const fenceClose = /[ \t]*```/g;
 
-  // 2. ```\n...\n```  (generic fence)
-  const genMatch = text.match(/```\r?\n([\s\S]*?)\r?\n```/);
-  if (genMatch) return genMatch[1].trim();
+  let fenced: { code: string } | null = null;
+  fenceOpen.lastIndex = 0;
+  let open: RegExpExecArray | null;
+  while ((open = fenceOpen.exec(text)) !== null) {
+    const indent = open[1];
+    fenceClose.lastIndex = fenceOpen.lastIndex;
+    const close = fenceClose.exec(text);
+    if (!close) continue; // Unclosed fence — not a complete block.
+    const raw = text.slice(fenceOpen.lastIndex, close.index);
+    fenced = { code: cleanFenceContent(raw, indent) };
+  }
+  if (fenced) return { kind: "code", code: fenced.code, from: "fence" };
 
-  // 3. No fence — treat whole response as code
-  return text.trim();
+  const answer = extractDirectAnswer(text);
+  if (answer !== null) return { kind: "answer", answer };
+
+  return { kind: "code", code: text.trim(), from: "raw" };
+}
+
+/**
+ * Strip the fence structure from raw block content: the newline directly
+ * before the closing fence belongs to the fence (and the close line's own
+ * indentation goes with it), then dedent by the opening fence's indent — an
+ * indented fence implies uniformly indented content.
+ */
+function cleanFenceContent(raw: string, fenceIndent: string): string {
+  const detrailed = raw.replace(/\r?\n[ \t]*$/, "");
+  const trimmed = detrailed.trim();
+  if (!fenceIndent) return trimmed;
+  return trimmed
+    .split("\n")
+    .map((line) => (line.startsWith(fenceIndent) ? line.slice(fenceIndent.length) : line))
+    .join("\n");
+}
+
+/**
+ * The direct-answer contract (#73, reused by #76's salvage): the tail of the
+ * reply matches an explicit anchor, and the captured fragment cannot contain
+ * sentence-final punctuation or newlines — so "The answer is 42. Let me
+ * submit." is NOT an answer, while leading prose is fine ("Based on the
+ * data, the answer is 42."). Surrounding quotes and markdown emphasis are
+ * stripped; an empty result is rejected.
+ */
+const DIRECT_ANSWER_RE =
+  /(?:the answer is|answer is|the answer:|answer:)\s*([^.!?\n]+)["'“”]?\s*[.!?]?\s*$/i;
+
+export function extractDirectAnswer(text: string): string | null {
+  const m = text.match(DIRECT_ANSWER_RE);
+  if (!m) return null;
+  let answer = m[1].trim();
+  answer = stripWrapping(answer, ["'", '"', "“", "”"]);
+  answer = stripWrapping(answer, ["**", "__", "*", "_"]);
+  return answer.length > 0 ? answer : null;
+}
+
+/** Remove one surrounding pair from `wrappers` (longest first), if present. */
+function stripWrapping(s: string, wrappers: string[]): string {
+  for (const w of wrappers) {
+    if (s.length >= 2 * w.length && s.startsWith(w) && s.endsWith(w)) {
+      return s.slice(w.length, s.length - w.length);
+    }
+  }
+  return s;
 }
 
 /**
