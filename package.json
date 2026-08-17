@@ -13,8 +13,8 @@
     "mutation": "node scripts/contained.mjs --limit 12G stryker run; s=$?; node scripts/mutation-guard.mjs --report; r=$?; exit $((s>r?s:r))",
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
-    "coverage": "node scripts/coverage.mjs",
-    "coverage:update": "node scripts/coverage.mjs --update",
+    "coverage": "tsx scripts/coverage.mjs",
+    "coverage:update": "tsx scripts/coverage.mjs --update",
     "lint": "biome check --error-on-warnings",
     "lint:fix": "biome check --write",
     "format": "biome format --write"
