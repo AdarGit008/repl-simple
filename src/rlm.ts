@@ -251,6 +251,14 @@ export function buildFeedback(result: RunResult): string {
 // ── Main API ─────────────────────────────────────────────────────
 
 /**
+ * Prepended to the feedback when a fence-less reply was treated as raw code.
+ * Without it, a SyntaxError on prose is baffling: the model is told to fix a
+ * syntax error in code it never wrote (#73).
+ */
+const RAW_FALLBACK_NOTICE =
+  "Note: no code block found — treating the whole reply as Python code.";
+
+/**
  * Run the Repeated LLM → Monty loop.
  *
  * Takes a question, iteratively generates Python code via the LLM,
@@ -312,8 +320,16 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       options.signal,
     );
 
-    // 2. Extract Python code
-    const code = extractPythonCode(llmResponse);
+    // 2. Extract the payload: a fenced block, a direct answer, or the
+    // raw reply treated as code. A direct answer is executed as a
+    // synthesised SUBMIT — it exits through the same RunOk + ok-SUBMIT
+    // trace as a model-written call, so provenance is unchanged (#76
+    // layers on top); the prose itself is never executed.
+    const extraction = extractPythonCode(llmResponse);
+    const code =
+      extraction.kind === "answer"
+        ? `SUBMIT(${JSON.stringify(extraction.answer)})`
+        : extraction.code;
 
     // 3. Build full script: preamble (if any) + code
     const fullCode = options.preamble ? `${options.preamble}\n${code}` : code;
@@ -354,7 +370,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     messages.push({ role: "assistant", content: llmResponse });
 
     // 8. Build feedback for next iteration
-    const feedback = buildFeedback(result);
+    const feedback =
+      (extraction.kind === "code" && extraction.from === "raw"
+        ? `${RAW_FALLBACK_NOTICE}\n\n`
+        : "") + buildFeedback(result);
     messages.push({ role: "user", content: feedback });
   }
 
