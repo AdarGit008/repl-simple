@@ -46,7 +46,7 @@ export function extractPythonCode(text: string): CodeExtraction {
   const fenceOpen = /^([ \t]*)```([A-Za-z0-9_+-]*)[^\S\r\n]*(?:\r?\n)?/gm;
   const fenceClose = /[ \t]*```/g;
 
-  let fenced: { code: string } | null = null;
+  let fenced: string | null = null;
   fenceOpen.lastIndex = 0;
   let open = fenceOpen.exec(text);
   while (open !== null) {
@@ -55,12 +55,12 @@ export function extractPythonCode(text: string): CodeExtraction {
     const close = fenceClose.exec(text);
     if (close) {
       const raw = text.slice(fenceOpen.lastIndex, close.index);
-      fenced = { code: cleanFenceContent(raw, indent) };
+      fenced = cleanFenceContent(raw, indent);
     }
     // Unclosed fence — not a complete block; skipped.
     open = fenceOpen.exec(text);
   }
-  if (fenced) return { kind: "code", code: fenced.code, from: "fence" };
+  if (fenced !== null) return { kind: "code", code: fenced, from: "fence" };
 
   const answer = extractDirectAnswer(text);
   if (answer !== null) return { kind: "answer", answer };
