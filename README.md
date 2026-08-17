@@ -21,12 +21,13 @@ precedence order: `ReplRunnerOptions.maxSessions` (embedders) > `REPL_MAX_SESSIO
 integer) > 32. A dropped session is gone — its variables, imports and cache are released, and the
 next `repl` call on that id starts fresh.
 
-**A session with a pending approval is never evicted.** Evicting one would discard a call the user
-was asked to approve, with the model never told — so the pool temporarily exceeds its cap rather
-than drop it. The over-cap state is self-limiting (every suspension demands user attention) and
-ends the moment the session is no longer suspended. `repl_reset` also removes the session from the
-pool, not just its state: after a reset, `repl_resume` on that id says no session exists, and the
-next `repl` call recreates it.
+**A session with a pending approval is never evicted, and neither is one whose call is still
+running.** Evicting either would discard a call the user was asked to approve — or may be about to
+be — with the model never told, so the pool temporarily exceeds its cap rather than drop it. The
+over-cap state is self-limiting (every suspension demands user attention) and ends the moment the
+session is no longer suspended or busy. `repl_reset` also removes the session from the pool, not
+just its state: after a reset, `repl_resume` on that id says no session exists, and the next
+`repl` call recreates it.
 
 Concurrent `repl` calls on one `sessionId` share a single session creation — before #59, two
 overlapping calls each built a session and the loser was silently discarded while both reported
