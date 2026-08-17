@@ -60,15 +60,17 @@ always restored before commit.
 
   **Acceptance criteria (SPEC success criteria 1–2, D1, D3):**
   - The new test drives `Repl.resume()` and passes on the unmodified tree (success criterion 1).
-  - The hand-applied `{ onApproval }` mutant makes it fail 1/1 on the `existsSync(...) === false`
-    assertion (the file is written), and the mutant is restored (success criterion 2).
+  - The hand-applied `{ onApproval }` mutant makes it fail 1/1 — first on the `[error: aborted]`
+    match, with the output showing the write landed, so the `existsSync(...) === false` assertion
+    kills independently — and the mutant is restored (success criterion 2).
 
   **RED → GREEN choreography (exact, in order):**
   1. **Write the test** (D1) — no production change.
   2. **GREEN-expected:** `npx tsx --test test/repl.test.ts` — the new test passes on the unmodified
      tree (recorded, not "fixed around", D3).
   3. **RED (prove-it):** edit `src/repl.ts:235` to `session.resume({ onApproval })`; run the focused
-     test; confirm the new test fails 1/1 with the `existsSync` assertion (write landed).
+     test; confirm the new test fails 1/1 (first on the `[error: aborted]` match; the output shows
+     the write landed, so the `existsSync` assertion kills independently).
   4. **Restore:** `git restore src/repl.ts`; assert `git diff -- src/repl.ts` is empty (the mutant is
      **never committed**).
   5. **GREEN:** `npx tsx --test test/repl.test.ts` — the new test passes again.
@@ -124,7 +126,8 @@ always restored before commit.
 1. One new test exists in `test/repl.test.ts`, drives `Repl.resume()` (not `Session.resume()`), and
    passes on the unmodified tree — proving `signal` is wired end-to-end.
 2. The hand-applied single-field mutant (`{ onApproval }`, dropping `signal`) makes that test fail 1/1
-   with the exact no-write assertion, and is restored.
+   (first on the `[error: aborted]` match; the `existsSync` no-write assertion kills independently),
+   and is restored.
 3. The targeted `--mutate src/repl.ts` sweep keeps the `ObjectLiteral` `{}` mutant at `src/repl.ts:235`
    Killed, with a fresh single-file report and zero harness deaths.
 4. `npm test` (947/947), `npm run check`, `npm run build`, `npm run lint` all exit 0.

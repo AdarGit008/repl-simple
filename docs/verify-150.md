@@ -136,7 +136,9 @@ figures carried in SPEC.md (Assumption 5, Testing-strategy DoD step 3, Success c
 from the #110 flight** — that flight's suite was smaller; the #150 flight started from a 946-test
 HEAD. SPEC.md is amended in this commit (Assumptions/DoD now say 946 → 947 and 947/947).
 `tasks/plan.md` still carries `940/940` in its DoD/handoff lines: the amendment task scoped the
-correction to SPEC.md, and those lines are recorded here rather than silently left ambiguous.
+  correction to SPEC.md, and those lines are recorded here rather than silently left ambiguous.
+  **Superseded at `ca792fa`**, which amended plan.md's four `940/940` quotes to `946 → 947` /
+  `947/947`. Point-in-time note kept for provenance.
 
 ### 4. Static gates — all independently re-run
 

@@ -18,9 +18,10 @@ re-proven by this reviewer, not taken on trust from the doc.
 
 ## Evidence chain — machine re-verified by this review
 
-- Diff is exactly 5 files: `SPEC.md`, `docs/verify-150.md`, `tasks/plan.md`, `tasks/todo.md`,
-  `test/repl.test.ts`. No `src/`, no committed `reports/` (`reports/` gitignored, `.gitignore:12`).
-  ✅
+- Diff is exactly 6 files at final HEAD (`ca792fa` onward): `SPEC.md`, `docs/verify-150.md`,
+  `docs/review-150.md`, `tasks/plan.md`, `tasks/todo.md`, `test/repl.test.ts` (5 files at this
+  review's subject `aa14e30`; this doc + `ca792fa` landed later). No `src/`, no committed
+  `reports/` (`reports/` gitignored, `.gitignore:12`). ✅
 - Test placement: new test at `test/repl.test.ts:530` in the `#48` describe, immediately after the
   #110 test at `:517`; drives `runner.resume("abort-rt", approve, controller.signal)` where
   `runner = new ReplRunner(cwd)` → `Repl.resume()`, **not** `Session.resume()`. ✅
