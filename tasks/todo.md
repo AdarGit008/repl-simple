@@ -2,7 +2,7 @@
 
 Branch: `issue-110-resume-onapproval` · Source of truth: `SPEC.md` · Plan: `tasks/plan.md`
 
-- [ ] **Task 1: Targeted mutation sweep of `src/repl.ts` and read the verdict**
+- [x] **Task 1: Targeted mutation sweep of `src/repl.ts` and read the verdict**
   - Acceptance: sweep exits 0 and `node scripts/mutation-guard.mjs --report` shows zero fatal
     harness deaths; `reports/mutation/mutation.json` shows the `ObjectLiteral` mutant at
     `src/repl.ts:235` as `Killed`/`Timeout`, and every mutant at line `210` (the `if (!live)`
@@ -15,10 +15,10 @@ Branch: `issue-110-resume-onapproval` · Source of truth: `SPEC.md` · Plan: `ta
   - Files: none committed (`reports/mutation/*`, `.stryker-incremental.json` are gitignored)
   - Depends on: none
 
-- [ ] **Checkpoint: evidence captured** — trustworthy verdict; `:235` and `:210` both detected;
-      decide: survivors → Task 2, else skip to Task 3
+- [x] **Checkpoint: evidence captured** — trustworthy verdict (no fatal harness deaths); `:235` and
+      `:210` both Killed; no survivors at the target lines → Task 2 skipped
 
-- [ ] **Task 2 (CONDITIONAL — only if Task 1 found a survivor): add the minimal regression test**
+- [x] **Task 2 (CONDITIONAL — SKIPPED: no survivor at lines 210/235) — add the minimal regression test**
   - Acceptance: new test drives `Repl.resume()` (not `Session.resume()`); previously-surviving
     mutant flips to `Killed`/`Timeout` on a fresh sweep; no redundant "test that cannot fail"; no
     `src/session.ts` edit; no production `src/*.ts` change unless unavoidable.
@@ -29,7 +29,7 @@ Branch: `issue-110-resume-onapproval` · Source of truth: `SPEC.md` · Plan: `ta
   - Files: `test/repl.test.ts` (only if triggered)
   - Depends on: Task 1 (survivor found)
 
-- [ ] **Task 3: Verification report `docs/verify-110.md`**
+- [x] **Task 3: Verification report `docs/verify-110.md`**
   - Acceptance: records issue link, commit `8ac0a1e` (PR #128), the killing test
     `test/repl.test.ts:517`, the exact sweep command, the status excerpt for lines 210 and 235, the
     `--report` result, and a closure recommendation.
@@ -38,12 +38,12 @@ Branch: `issue-110-resume-onapproval` · Source of truth: `SPEC.md` · Plan: `ta
   - Files: `docs/verify-110.md`
   - Depends on: Task 1 (and Task 2 if triggered)
 
-- [ ] **Task 4: Closure mechanics (recorded for SHIP, not executed here)**
+- [x] **Task 4: Closure mechanics (recorded for SHIP, not executed here)**
   - Acceptance: the `gh` commands are recorded verbatim in `docs/verify-110.md`:
     - `gh issue comment 110 --body "$(cat docs/verify-110.md-issue-comment.txt)"`
     - `gh issue close 110 --reason completed --comment "Closed by targeted mutation verification — see docs/verify-110.md (#110)."`
   - Files: none new (recorded in `docs/verify-110.md`)
   - Depends on: Task 3
 
-- [ ] **Checkpoint: Complete** — `docs/verify-110.md` full; focused test + check/build/lint green
-      (only if a test/source file changed); closure commands recorded and flagged for SHIP
+- [x] **Checkpoint: Complete** — `docs/verify-110.md` full; focused test 99/99, check/build/lint
+      green; closure commands recorded and flagged for SHIP
