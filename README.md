@@ -17,6 +17,10 @@ Pi extension — sandboxed Python execution via [Monty](https://github.com/pydan
 
 `RLMLoop` runs a code-gen → execute loop: LLM writes Python, sandbox runs it, results fed back until `SUBMIT(answer)`.
 
+`runRlm` declares every `inputs` entry as a sandbox variable and **announces each in the LLM prompt** —
+`context` is always declared and defaults to `""`; values render head-and-tail beyond 5000 chars.
+Because every input reaches the model, `inputs` must never carry secrets.
+
 | Tool | Description |
 |------|-------------|
 | `llm_query(prompt)` | Ask the LLM a question from sandbox code. |

@@ -1,10 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
 import type { LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
 import { runRlm, extractPythonCode, buildFeedback } from "../src/rlm.js";
+
+// ── Load repl_server.py — the shipped RLM preamble ──────────────
+
+const replServerPath = join(fileURLToPath(import.meta.url), "..", "..", "repl", "repl_server.py");
+const REPL_SERVER = readFileSync(replServerPath, "utf-8");
 
 // ── Section 5.2: extractPythonCode() — unit tests ────────────────
 
@@ -464,6 +472,195 @@ describe("runRlm() edge cases", () => {
     );
     assert.ok(submitCall);
     assert.equal(submitCall.ok, true);
+  });
+});
+
+// ── The advertised context configuration (#72) ─────────────────
+
+describe("runRlm() — context input", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("9.2.1 succeeds with the shipped repl_server.py preamble and no inputs", async () => {
+    // The documented production configuration: preamble + no `inputs`.
+    // The preamble's helpers reference the bare name `context`, which only
+    // type-checks when it is declared as a sandbox input.
+    const { llm } = mockLlmCodeGen([
+      "```python\nprint(context_summary())\nSUBMIT(str(context_length()))\n```",
+    ]);
+
+    const result = await runRlm("how much context is there?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      preamble: REPL_SERVER,
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "0");
+    assert.equal(result.iterations.length, 1);
+  });
+
+  it("9.2.2 declares context as an empty string when no inputs are passed", async () => {
+    // No preamble: `context` resolves only if the sandbox input is declared.
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
+
+    const result = await runRlm("how long is the context?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "0");
+  });
+
+  it("9.2.3 forwards a caller-supplied context into the sandbox", async () => {
+    // Guards M4 ("never forward inputs to the sandbox"): the value can only
+    // arrive through runOpts.inputs, and it must win over the "" default.
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
+
+    const result = await runRlm("how long?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "hello world" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "11");
+  });
+
+  it("9.2.4 declares and forwards a non-context input", async () => {
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(other_data)\n```"]);
+
+    const result = await runRlm("what is the payload?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { other_data: "the payload" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "the payload");
+  });
+
+  it("9.2.5 names every input key in the initial prompt", async () => {
+    // Assert on prompt content, not message count: data present in the
+    // sandbox but unnamed in the instructions is invisible to the model.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("question?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "ctx-value", other_data: "od-value" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(prompt.includes("`context`"), `prompt does not name context:\n${prompt}`);
+    assert.ok(prompt.includes("`other_data`"), `prompt does not name other_data:\n${prompt}`);
+    assert.ok(prompt.includes("ctx-value"), `prompt omits the context value:\n${prompt}`);
+    assert.ok(prompt.includes("od-value"), `prompt omits the other_data value:\n${prompt}`);
+    // The two recorded rendering contracts: `context` keeps its legacy
+    // header, every other key gets the parallel `# Input` header.
+    assert.ok(
+      prompt.includes("# Context (available as `context` variable)"),
+      `context lost its legacy header:\n${prompt}`,
+    );
+    assert.ok(
+      prompt.includes("# Input (available as `other_data` variable)"),
+      `other_data lost the # Input header:\n${prompt}`,
+    );
+  });
+
+  it("9.2.7 renders the default empty context header-only", async () => {
+    // The default `context: ""` is announced (the preamble ships context_*
+    // helpers) but must not render an empty code fence.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(prompt.includes("# Context (available as `context` variable)"));
+    assert.ok(!prompt.includes("```\n\n```"), `empty value rendered an empty fence:\n${prompt}`);
+  });
+
+  it("9.2.8 forwards runOptions.inputs when options.inputs is absent", async () => {
+    // The recorded deviation from RLMLoop.run: runOptions.inputs.context
+    // survives when options.inputs has no context.
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
+
+    const result = await runRlm("how long?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      runOptions: { inputs: { context: "from-run" } },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "8");
+  });
+
+  it("9.2.9 options.inputs wins over runOptions.inputs for the same key", async () => {
+    const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
+
+    const result = await runRlm("how long?", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "winner" },
+      runOptions: { inputs: { context: "loser" } },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "6");
+  });
+
+  it("9.2.6 previews a long context head-and-tail, not the middle", async () => {
+    const head = "H".repeat(2500);
+    const tail = "T".repeat(2500);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: `${head}MIDDLE${tail}` },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.ok(prompt.includes(head), "prompt should include the head");
+    assert.ok(prompt.includes(tail), "prompt should include the tail");
+    assert.ok(!prompt.includes("MIDDLE"), "prompt should elide the middle");
+
+    // Boundary pin: exactly 5000 chars is not elided (only > 5000 is).
+    const boundary = "B".repeat(5000);
+    const { llm: llm2 } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const result2 = await runRlm("q", {
+      llmClient: llm2,
+      registry: rlmRegistry(),
+      inputs: { context: boundary },
+      maxIterations: 5,
+    });
+    assert.equal(result2.status, "ok");
+    const prompt2 = llm2.calls()[0].messages[0].content;
+    assert.ok(prompt2.includes(boundary), "a 5000-char value must render whole");
+    assert.ok(!prompt2.includes("..."), `5000-char value was elided:\n${prompt2.slice(0, 200)}`);
   });
 });
 
