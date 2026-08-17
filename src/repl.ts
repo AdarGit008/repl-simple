@@ -85,6 +85,17 @@ interface LiveSession {
  */
 export class ReplRunner {
   private sessions = new Map<string, LiveSession>();
+  /**
+   * Creations in flight, keyed by session id.
+   *
+   * The promise is stored *before* awaiting anything, so a concurrent caller
+   * joins the same creation instead of starting a second. On success the
+   * promise inserts the session and removes itself; on rejection it removes
+   * itself and rethrows — one failed creation must not poison the id for
+   * every later caller, which is the same contract `getSandboxPool` pins for
+   * the worker pool (#59).
+   */
+  private inflight = new Map<string, Promise<LiveSession>>();
   private cwd: string;
   private isProjectTrusted: () => boolean;
 
@@ -198,16 +209,47 @@ export class ReplRunner {
    * both directions so the rule stays one sentence rather than two.
    */
   private async getOrCreateSession(sessionId: string): Promise<LiveSession> {
-    const existing = this.sessions.get(sessionId);
-    let rebuilt = false;
-    if (existing) {
-      if (!(await this.trustChangeDiscards(sessionId, existing))) return existing;
-      rebuilt = true;
+    for (;;) {
+      const existing = this.sessions.get(sessionId);
+      if (existing) {
+        if (!(await this.trustChangeDiscards(sessionId, existing))) {
+          // The trust check awaited, and awaits are where another caller
+          // acts: the session may have been evicted or rebuilt in the gap.
+          // Hand out only the object the map still holds.
+          if (this.sessions.get(sessionId) === existing) return existing;
+          continue;
+        }
+        // trustChangeDiscards deleted the entry — fall through to a rebuild
+        // that concurrent rebuilders share.
+      }
+      return this.joinOrStartCreation(sessionId, existing !== undefined);
     }
+  }
 
-    const live = await this.createSession(this.isProjectTrusted(), rebuilt ? sessionId : undefined);
-    this.sessions.set(sessionId, live);
-    return live;
+  /**
+   * Join the in-flight creation for `sessionId`, or start one.
+   *
+   * `rebuilt` names a session that a trust change just discarded, so the
+   * replacement carries the `[trust changed]` notice. An evicted session that
+   * comes back later does not — nothing about its environment changed, only
+   * the pool forgot it.
+   */
+  private joinOrStartCreation(sessionId: string, rebuilt: boolean): Promise<LiveSession> {
+    const pending = this.inflight.get(sessionId);
+    if (pending) return pending;
+
+    const promise = this.createSession(this.isProjectTrusted(), rebuilt ? sessionId : undefined)
+      .then((live) => {
+        this.inflight.delete(sessionId);
+        this.sessions.set(sessionId, live);
+        return live;
+      })
+      .catch((err: unknown) => {
+        this.inflight.delete(sessionId);
+        throw err;
+      });
+    this.inflight.set(sessionId, promise);
+    return promise;
   }
 
   /**

@@ -1629,3 +1629,111 @@ describe("ReplRunner — a symlinked .pi is refused on the loader path too (#57)
     }
   });
 });
+
+// ── The creation race: one id, one session (#59) ────────────────
+//
+// getOrCreateSession used to `get` → `await createSession()` → `set`, so two
+// concurrent runs on one sessionId each built a session and the second `set`
+// silently discarded the first — while both calls reported success. The
+// model then reasoned from a state that did not exist. The tests below pin
+// the issue's six-test Definition of Done.
+
+describe("ReplRunner — concurrent creation builds one session (#59)", () => {
+  it("the exact reproduction: both variables survive two concurrent runs", async () => {
+    const cwd = makeTempDir();
+    // A trusted project with preamble files widens the creation window: the
+    // race lives in the gap between the `get` and the `set`, and
+    // `createSession` reads every tool file inside it.
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    saveToolFile(cwd, "beta", "def beta():\n    return 'b'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+
+    try {
+      await Promise.all([runner.run("x = 1", "s"), runner.run("y = 2", "s")]);
+
+      // Asserted on state, never on the reported statuses: both already said
+      // success while one session was being dropped.
+      const x = await runner.run("x", "s");
+      const y = await runner.run("y", "s");
+      assert.match(x, /\[result\]\n1/, `x was lost to the race: ${x}`);
+      assert.match(y, /\[result\]\n2/, `y was lost to the race: ${y}`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("concurrent creation calls createSession once, not twice", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "alpha", "def alpha():\n    return 'a'\n");
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+    const counter = countCreateSessions(runner);
+
+    try {
+      await Promise.all([runner.run("x = 1", "once"), runner.run("y = 2", "once")]);
+      assert.equal(counter.calls(), 1, "two concurrent runs must share one creation");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a failed creation does not poison the id — the next call retries and succeeds", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { isProjectTrusted: () => true });
+    const failing = failCreateSessionOnce(runner);
+
+    try {
+      await assert.rejects(
+        runner.run("x = 1", "retry"),
+        /simulated creation failure/,
+        "the injected failure did not reach the caller",
+      );
+
+      const out = await runner.run("x = 1", "retry");
+      assert.match(out, /\[result\]\nNone/, `the retry did not succeed: ${out}`);
+
+      const state = await runner.run("x", "retry");
+      assert.match(state, /\[result\]\n1/, "the session the retry built did not persist");
+    } finally {
+      cleanup();
+      failing.restore();
+    }
+  });
+});
+
+// ── Test seams for the creation counter (#59) ───────────────────
+//
+// TypeScript `private` is a compile-time check: the method is an ordinary
+// prototype member at runtime, so an own-property wrapper on the instance
+// shadows it for the class body's `this.createSession(...)` calls. This is a
+// test-only seam — the production API grows no hooks for it.
+
+/** Wrap `createSession` so the test can count how many times it ran. */
+function countCreateSessions(runner: ReplRunner): { calls: () => number } {
+  const target = runner as unknown as {
+    createSession: (...args: unknown[]) => Promise<unknown>;
+  };
+  const original = target.createSession.bind(runner);
+  let calls = 0;
+  target.createSession = async (...args: unknown[]) => {
+    calls++;
+    return original(...args);
+  };
+  return { calls: () => calls };
+}
+
+/** Make the next `createSession` call reject, then behave normally again. */
+function failCreateSessionOnce(runner: ReplRunner): { restore: () => void } {
+  const target = runner as unknown as {
+    createSession: (...args: unknown[]) => Promise<unknown>;
+  };
+  const original = target.createSession.bind(runner);
+  let armed = true;
+  target.createSession = async (...args: unknown[]) => {
+    if (armed) {
+      armed = false;
+      throw new Error("simulated creation failure");
+    }
+    return original(...args);
+  };
+  return { restore: () => (target.createSession = original.bind(runner)) };
+}
