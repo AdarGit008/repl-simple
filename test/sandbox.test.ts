@@ -430,6 +430,46 @@ describe("runInSandbox — lineOffset runtime-error correction", () => {
   });
 });
 
+// ── lineOffset: the plain MontySyntaxError branch ────────────────
+//
+// `classifyStartError` corrects two shapes: the `MontyTypingError`
+// display-with-`invalid-syntax` render every syntax test above arrives
+// through, and a plain `MontySyntaxError`, which still reaches the feed from
+// paths that do not go through the type checker's diagnostic render. On
+// 0.0.21 the only such path reachable from the public API is input-name
+// validation: `feedStart` refuses an input whose name is not a valid Python
+// identifier by raising a native `SyntaxError`, which the bridge maps to
+// `MontySyntaxError` (measured). Its message is the bare heading —
+// `SyntaxError: Input name '...' not a valid identifier` — with no
+// ` --> file:line` location and no excerpt rows (the line information lives
+// in `tracebackText`, which this branch does not render), so there is no
+// line number to correct. The test pins what the branch must do with such
+// an error: keep kind `syntax`, pass the heading through uncorrupted
+// (`correctSyntaxErrorText` is a no-op on text with no locations), and leak
+// no prefix source.
+
+describe("runInSandbox — lineOffset on the plain MontySyntaxError branch", () => {
+  it("classifies an input-name validation failure as syntax, message intact, no prefix source", async () => {
+    const registry = new ToolRegistry();
+    // The validation failure fires at feed start, before any of this code
+    // runs; the prefix still guards the branch against leaking prefix source
+    // into whatever MontySyntaxError text survives the correction.
+    const result = await runInSandbox(
+      "PREFIX_MARKER_77 = 1\nPREFIX_MARKER_77 = 2\nPREFIX_MARKER_77 = 3\n1 + 1",
+      { registry },
+      { lineOffset: 3, inputs: { "not a name": "x" } },
+    );
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.equal(
+      result.error,
+      "SyntaxError: Input name 'not a name' not a valid identifier",
+      "the plain MontySyntaxError message passes through uncorrupted",
+    );
+    assert.doesNotMatch(result.error, /PREFIX_MARKER_77/, "no prefix source reaches the caller");
+  });
+});
+
 // ── Host tool execution ─────────────────────────────────────────
 
 describe("runInSandbox — host tool execution", () => {

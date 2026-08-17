@@ -314,6 +314,68 @@ describe("Session — lineOffset wiring (#77 issue test 3)", () => {
   });
 });
 
+// ── lineOffset through suspension and resume (#77) ──────────────
+//
+// `runInSandbox` corrects diagnostics on the resume paths too — the dispatch
+// loop and `resumeInSession` pass `runOpts.lineOffset` into
+// `classifyResumeError` at every resume. The session owns the offset
+// (`Session.run` computes it), so a resumed run whose remaining code raises
+// must get the same correction: user-relative line numbers, no preamble or
+// prior-snippet source. The resumed transcript is the same one `run()`
+// assembled (preamble + prior snippets + the suspended snippet), so
+// `Session.resume` must pass the offset `run()` would have computed.
+
+describe("Session — lineOffset through the suspended-resume path (#77)", () => {
+  // Unique markers, distinct from the issue-test ones above so a leak is
+  // attributable to this describe's parts.
+  const PREAMBLE_MARKER = "RESUME_PREAMBLE_MARKER_77";
+  const PRIOR_MARKER = "RESUME_PRIOR_SNIPPET_MARKER_77";
+
+  // 3 lines — the same stack shape as the issue test above.
+  const preamble = [
+    "# resume-path preamble",
+    `${PREAMBLE_MARKER} = "preamble source must never reach the caller"`,
+    "pre_offset = 1",
+  ].join("\n");
+
+  const gated: HostTool = {
+    name: "gated_resume",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  it("reports a runtime error raised after resume at the latest snippet's line", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) }, preamble);
+    // 2 lines; succeeds, so it stacks into the prefix of the suspended run.
+    ok(await session.run(`first = 1\n${PRIOR_MARKER} = "prior"`));
+
+    // Latest snippet: the gated call on line 1 suspends; line 2 raises once
+    // the resume approves it. Assembled position: line 7 (3 preamble + 2
+    // prior + 2 own).
+    suspended(await session.run('gated_resume("x")\ny = 1 / 0', { onApproval: () => "suspend" }));
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(
+      result.error,
+      /^ZeroDivisionError: division by zero$/m,
+      "the <type>: msg heading is preserved",
+    );
+    assert.match(
+      result.error,
+      /File "<python-input-0>", line 2, in <module>/,
+      "the raising frame is line 2 of the latest snippet, not the assembled line 7",
+    );
+    assert.ok(result.error.includes("y = 1 / 0"), "the surviving frame keeps its source preview");
+    assert.doesNotMatch(result.error, new RegExp(PREAMBLE_MARKER), "preamble source leaked");
+    assert.doesNotMatch(result.error, new RegExp(PRIOR_MARKER), "prior-snippet source leaked");
+  });
+});
+
 // ── Approval / Suspension ───────────────────────────────────────
 
 describe("Session — approval & suspension", () => {

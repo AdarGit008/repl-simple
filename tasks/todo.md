@@ -56,3 +56,17 @@
   - Verify: `npm test` (981/981 green — 976 baseline − 1 replaced + 6 new), `npm run check`,
     `npm run lint`, `npm run coverage` floors met
   - Files: `src/sandbox.ts`, `src/types.ts`, `test/sandbox.test.ts`, `test/rlm.test.ts`
+
+- [x] Task 8: Close the VERIFY-flagged test gaps (test-strengthening)
+  - Acceptance: a behavioral test covers stack + suspension + post-resume runtime error
+    through `Session.resume` — user-relative line, no preamble/prior-snippet source; the
+    test exposed a real bug (`Session.resume` never passed `lineOffset`, so post-resume
+    errors lost their corrected traceback) — fixed minimally in `src/session.ts` via a
+    shared `prefixLineCount()`; the plain `MontySyntaxError` branch of
+    `classifyStartError` is behaviorally exercised (forceable only via Monty's
+    input-name validation — message carries no line numbers, so the test pins kind +
+    uncorrupted heading + no prefix-source leak); the stale types test "RunOptions with
+    all fields" now includes `lineOffset`.
+  - Verify: `npm test` (983/983 green — 981 baseline + 2 new), `npm run check`
+  - Files: `src/session.ts`, `test/session.test.ts`, `test/sandbox.test.ts`,
+    `test/types.test.ts`
