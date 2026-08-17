@@ -1,110 +1,95 @@
-# Implementation Plan: Register the toolstore tools (#57)
+# Implementation Plan: coverage:update floors immune to instrument variance (#113)
 
 ## Overview
 
-Register `createToolStoreTools` in `ReplRunner.createSession` so the model can inspect and remove
-the preamble that auto-executes before its code. Make `list_saved_tools` / `read_tool` honest about
-what the session actually loaded (withheld #53, refused #54, skipped/unreadable #55), and wire the
-live registry's names into the #54/#56 shadowing gates. Source of truth: `SPEC.md`.
+Make `scripts/coverage.mjs` the owner of every floor in `coverage-baseline.json`. `--update`
+measures N=3 times, writes the per-file minimum, refuses to write when any file's spread exceeds
+`max(1.00 pp, one line)`, and prints the spread report. The plain `coverage` gate gains a one-line
+tolerance so it only fails on drops the instrument can actually resolve. The README's by-hand
+pinning rule is replaced by a description of the mechanism. Source of truth: `SPEC.md`.
 
 ## Architecture Decisions
 
-- **Order in `createSession`:** build bridge+builtin registry → compute `hostToolNames` (live
-  registry + `TOOLSTORE_TOOL_NAMES`) → load preamble (trusted) or read names (untrusted) → build
-  `PreambleStatus` from the outcome → create toolstore tools with `hostToolNames` + `preambleStatus`
-  → add to registry. The toolstore's own names must be in the load-time list *before* the tools
-  exist (a preamble `def save_tool` would shadow the registered tool).
-- **Static snapshot, honest messages.** `PreambleStatus` is a per-session snapshot (5 sets +
-  `trusted` flag). The tools derive every answer from it plus the current disk state; nothing
-  mutable is tracked, and the save/delete messages carry the "new sessions" semantics.
-- **Additive, back-compatible.** `preambleStatus?` on `ToolStoreOptions`; absent → today's behavior.
-  Existing tests must pass untouched.
+- **Pure core, thin orchestration.** All decision arithmetic lives in `scripts/coverage-core.ts`
+  (typed, strictly checked via import-following, unit-tested). `scripts/coverage.mjs` keeps only
+  I/O and process orchestration. Rationale: V8's variance cannot be forced deterministically in a
+  fixture, so the refusal/tolerance logic must be pinned at the unit level while the script itself
+  is verified empirically.
+- **Runner change:** `npm run coverage` / `coverage:update` become `tsx scripts/coverage.mjs` so
+  the script can import the `.ts` core. CI calls `npm run coverage` — no workflow edit needed.
+- **Update path:** measure 3× → per-file min + global min; a file missing from some (not all) runs
+  refuses; a spread above `max(1.00, 100/found)` pp refuses with file + range named; otherwise
+  write. The "still unfloored after update" check is unchanged.
+- **Gate path:** FAIL only when measured pct is more than one line (`100/found` pp) below the
+  floor. Manifest checks (floor absent from report, source file with no floor, UNMEASURED rows)
+  stay exact — the tolerance is for percentages only.
+- **Baseline shape unchanged** (`{ global, files }`), so the diff on `coverage-baseline.json`
+  shows exactly what the script decided.
 
 ## Task List
 
-### Phase 1: Toolstore foundation (unit-tested)
+### Phase 1: Decision core (unit-tested)
 
-- [ ] Task 1: `TOOLSTORE_TOOL_NAMES` + `PreambleStatus` type + `preambleStatus` option
-  - Acceptance: const exported and equal to the four names `createToolStoreTools` returns (pinned by
-    test); `ToolStoreOptions.preambleStatus?: PreambleStatus`; type exported from `src/index.ts`.
-  - Verify: `npx tsx --test test/toolstore.test.ts`; `npm run check`.
-  - Files: `src/toolstore.ts`, `src/index.ts`, `test/toolstore.test.ts`
-
-- [ ] Task 2: `list_saved_tools` reports loaded state
-  - Acceptance: with `preambleStatus`, output is the sorted union of disk + loaded names, plain for
-    loaded, `[not loaded: …]` per category (withheld / limit / refused / refused-whole / unreadable /
-    saved-after-start), `[loaded in this session — file deleted; gone from new sessions]` for
-    deleted-but-loaded; `(no saved tools)` when empty; without the option, output unchanged.
-  - Verify: new unit tests red→green; `npx tsx --test test/toolstore.test.ts`; `npm run check`.
-  - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
-
-- [ ] Task 3: `read_tool` honesty + non-regular-file refusal
-  - Acceptance: `lstat` first — non-regular file → `OSError` refusal (never a read); untrusted →
-    `PermissionError` refusal with no read; refused/skipped/unreadable → source with
-    `# NOTE: not loaded in this session …` header; loaded/plain/missing unchanged.
-  - Verify: new unit tests red→green; `npx tsx --test test/toolstore.test.ts`; `npm run check`.
-  - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
-
-- [ ] Task 4: `save_tool` / `delete_tool` honest messages
-  - Acceptance: save → "loads in new sessions — the current session's preamble is unchanged";
-    delete → "gone from new sessions; the current session keeps any copy it loaded". Existing
-    `includes`-based assertions keep passing.
-  - Verify: updated unit tests red→green; focused test; `npm run check`.
-  - Files: `src/toolstore.ts`, `test/toolstore.test.ts`
+- [ ] Task 1: `scripts/coverage-core.ts` + `test/coverage-core.test.ts` (TDD: RED → GREEN)
+  - Acceptance: exports `pct`, `combineRuns`, `spreadLimit`, `oneLineTolerance`, `belowFloor`;
+    `combineRuns` returns per-file `{ min, max, found }` (found = max across runs), per-file
+    `missingInSomeRuns` set, and `global` = min of run globals; `spreadLimit(found)` =
+    `max(1.00, 100/found)`; `belowFloor` fails only more than one line below the floor — the
+    issue's exact cases pinned (floor 100.00, measured 99.74, found 384 → pass; two lines → fail).
+  - Verify: `npx tsx --test test/coverage-core.test.ts`; `npm run check`; `npm run lint`.
+  - Files: `scripts/coverage-core.ts`, `test/coverage-core.test.ts`
 
 ### Checkpoint: Foundation
-- [ ] `npx tsx --test test/toolstore.test.ts` green; `npm run check` clean
+- [ ] Focused tests green; `npm run check` clean; `npm run lint` clean
 
-### Phase 2: ReplRunner wiring (integration-tested)
+### Phase 2: Script wiring
 
-- [ ] Task 5: register the tools in `createSession` with live `hostToolNames` + `PreambleStatus`
-  - Acceptance: all four tools resolve inside `repl` in a trusted session (list/read/delete/save
-    work); load-time `hostToolNames` includes bridge+builtin+toolstore names; `PreambleStatus` built
-    from the load outcome (or from `savedToolNames` when untrusted).
-  - Verify: new integration tests red→green; `npx tsx --test test/repl.test.ts`; `npm run check`.
-  - Files: `src/repl.ts`, `test/repl.test.ts`
-
-- [ ] Task 6: notice text updates (untrusted / refusal)
-  - Acceptance: `[preamble withheld]` notice keeps the NameError sentence and gains
-    `list_saved_tools()`/`read_tool()` guidance; `[preamble refused]` notice points at
-    `read_tool()`/`delete_tool()`; existing `/^\[preamble (withheld|refused)\]` and `/NameError/`
-    assertions still pass.
-  - Verify: updated notice assertions; `npx tsx --test test/repl.test.ts`; `npm run check`.
-  - Files: `src/repl.ts`, `test/repl.test.ts`
-
-- [ ] Task 7: end-to-end integration tests — list honesty, delete→new session, save_tool gate
-  - Acceptance: `list_saved_tools()` inside `repl` annotates withheld/refused/unreadable exactly as
-    executed; delete→list→read→new-session flow demonstrated; `save_tool` denies with no file
-    written and refuses shadowing code against live host names.
-  - Verify: new integration tests red→green; `npx tsx --test test/repl.test.ts`; `npm run check`.
-  - Files: `test/repl.test.ts`
+- [ ] Task 2: rewrite `scripts/coverage.mjs` update + gate paths; switch runner to tsx
+  - Acceptance: `--update` measures 3×, writes per-file minima + min global, prints the spread
+    report (every file whose runs differed, with range), refuses (exit 1, file + range named) on
+    spread > threshold or unstable loading; the plain run's FAIL check uses the one-line
+    tolerance and the report prints floors as before; manifest/unfloored/UNMEASURED behavior
+    unchanged; `package.json` runs both scripts via `tsx`.
+  - Verify: `node --help`-free: `npm run coverage` green on current baseline; `npm run check`;
+    `npm run lint`.
+  - Files: `scripts/coverage.mjs`, `package.json`
 
 ### Checkpoint: Wiring
-- [ ] `npx tsx --test test/repl.test.ts` green; `npm run check` clean
+- [ ] Plain gate green on the current baseline; update runs and writes
 
-### Phase 3: Docs
+### Phase 3: Documentation
 
-- [ ] Task 8: README + docs/project-trust.md
-  - Acceptance: README toolstore section states the tools resolve in every session, lists load
-    honesty, save_tool gating; project-trust.md "What this does not cover" no longer claims
-    `save_tool` is ungated or that `list_saved_tools` misleads in untrusted projects.
-  - Verify: read-through; `npm run lint`.
-  - Files: `README.md`, `docs/project-trust.md`
+- [ ] Task 3: README "Coverage floors" rewrite
+  - Acceptance: the by-hand pinning paragraph is gone; the section describes N=3 min-of-runs
+    writing, the refusal threshold, the spread report, and the one-line compare tolerance; no
+    other claim about the script survives that the script does not do.
+  - Verify: read-through against `scripts/coverage.mjs`; `npm run lint`.
+  - Files: `README.md`
+
+### Phase 4: Empirical verification and ship
+
+- [ ] Task 4: run the real pipeline, commit the script-written baseline
+  - Acceptance: `npm run coverage:update` completes (spread report shown; `src/truncate.ts`
+    floor is script-written — 99.74 if the machine samples the low, 100.00 otherwise, both safe
+    under the tolerance); **three consecutive plain `npm run coverage` runs pass**; `npm test`,
+    `npm run check`, `npm run build`, `npm run lint` all exit 0; `coverage-baseline.json` diff is
+    exactly what the script wrote; commits per task, issue referenced.
+  - Verify: full suite + gate ×3 + check + build + lint, exit codes recorded.
+  - Files: `coverage-baseline.json`
 
 ### Checkpoint: Complete
-- [ ] `npm test` green; `npm run check` clean; `npm run lint` clean
-- [ ] All five issue tests exist and pass; README accurate
-- [ ] Ready for review (Phase 5)
+- [ ] All SPEC.md success criteria met; ready for review
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Notice text changes break extension/repl tests | Med | Existing tests assert prefixes and `/NameError/` only — verified by grep before editing; full suite after Task 6 |
-| `read_tool` exposes the FIFO-hang / symlink-escape hazards | High | `lstat` refusal before any read (Task 3), unit-tested |
-| Registering tools changes type-stub surface inside `repl` | Low | Stubs render from the same `ToolRegistry`; existing sandbox tests cover stub rendering |
-| List format drift between spec and implementation | Med | Format pinned by unit tests per category |
+| #109's suite flake aborts a measurement | Low | `measure()` already refuses red-suite numbers; rerun the update |
+| `bashenv.ts` (84.21) varies beyond threshold on this machine | Med | Refusal is the designed behavior — investigate whether it is the one-line mechanism; record the finding rather than hand-writing |
+| One-line tolerance weakens the gate by one line per file | Low | Deliberate, specced (#132); the manifest checks that catch deleted test files are untouched |
+| `tsx` runner changes exit-code/stdio propagation | Low | tsx forwards exit codes; verified by running the gate |
+| Core `.ts` drifts from what the script needs | Low | Single consumer; strict tsc checks; unit tests pin behavior |
 
 ## Open Questions
 
-None blocking — see SPEC.md "Assumptions".
+None blocking — all decisions recorded in SPEC.md "Explicit decisions" and "Assumptions".

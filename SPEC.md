@@ -1,227 +1,160 @@
-# Spec: Register the toolstore tools — issue #57
+# Spec: coverage:update writes floors the instrument's variance can't turn red — issue #113
 
-> 6.5 — "Register the toolstore tools so the model can inspect what runs"
-> Parent: #52 (Bucket 6 — preamble supply chain) · Labels: `bug`, `bucket-6`
+> "coverage:update writes floors that the instrument's own variance can turn red"
+> Labels: `infra`, `test`, `chore` · Not filed under bucket 1 (the floors are correct as of #112; this
+> is about keeping them correct automatically).
 
 ## Objective
 
-The **read** side of the toolstore ships (`repl.ts` loads `.pi/code-tools/*.py` and executes it as a
-preamble on every run) and the **write** side is withheld: `createToolStoreTools` is never
-registered, so `read_tool`, `list_saved_tools`, `save_tool` and `delete_tool` are all `NameError`
-inside `repl`. Code executes on the model's behalf before its own code on every call — and the model
-cannot list it, read it, or delete it.
+`scripts/coverage.mjs --update` measures coverage **once** and writes that observation as the floor.
+Per-file coverage varies between identical runs of the same tree — V8's per-function range count is
+lost when coverage from several test processes is merged — so a floor written from a lucky high run
+fails later on an unrelated PR with no signal pointing at the cause. This has already cost one red
+build (`src/pool.ts` at `021b5af`, 97.51% vs 100.00%).
 
-The fix: register the four toolstore tools in `ReplRunner.createSession`, and make
-`list_saved_tools` / `read_tool` report **what is actually loaded in this session** — not merely what
-is on disk — so the withheld case (#53), the refused case (#54) and the skipped/unreadable cases
-(#55) are visible to the model that has to reason about them.
+**The fix is a mechanism, not a convention.** #105's by-hand rule ("a file that varies gets its floor
+set at the low observation") is unenforced and machine-dependent. The script must own the floor:
 
-**User:** a pi user who runs `repl` in a project that has (or gains) saved tools. **Success:** a
-misbehaving preamble can be discovered and removed entirely from inside `repl`, without editing
-files by hand; and no tool claims a file is running when the session is not running it.
+1. `--update` measures **N times** and writes the **per-file minimum**.
+2. `--update` **refuses to write** when a file's spread exceeds a threshold — blind `min` would bake
+   a badly slack floor into the baseline if a whole process's data were ever lost. Wide variance is
+   a thing to look at, not to average away.
+3. The **measured spread is printed**, so a file that starts varying becomes visible.
+4. The plain `coverage` gate gains a **one-line tolerance** so it only bites on drops the instrument
+   can actually resolve (the #132 correction to the original proposal's arithmetic).
+5. The README's by-hand rule is replaced by a description of what the script does.
 
-### Success criteria (testable)
-
-1. `list_saved_tools`, `read_tool` and `delete_tool` all resolve and work inside `repl`
-   (trusted project, tools on disk).
-2. What `list_saved_tools` reports matches what **actually executed**: the withheld case (#53),
-   the refused case (#54) and the skipped-entry case (#55) are all annotated, not silently listed
-   as loaded.
-3. `delete_tool` removes a tool, and it no longer executes in a **new** session (the current
-   session keeps the copy it loaded, and is told so).
-4. `save_tool` is gated inside `repl` — the #56 regression guard — and its write-time shadowing
-   check now sees the **live registry's** names (the wiring #56's SPEC.md listed as its residual
-   risk: the detector was inert in production until this issue passes `hostToolNames`).
-5. The README's tool list matches the tools that actually resolve inside `repl`, and
-   `docs/project-trust.md` no longer claims `save_tool` is ungated.
+**User:** anyone landing a change in this repo. **Success:** `coverage:update` followed by any number
+of plain `coverage` runs is green on the same tree, with no hand-tuned numbers anywhere.
 
 ## Explicit decisions (recorded, not reflexive)
 
-- **The tools are registered in every session, trusted or untrusted.** The issue says "alongside
-  the bridge and builtin tools", which are unconditional. In an untrusted session the preamble is
-  withheld as before, but `list_saved_tools()` now *works and says so*, `delete_tool()` works (it is
-  the recovery path), and `read_tool()` **refuses** — an untrusted project's files are never even
-  read (#53), and a registered `read_tool` that read them would silently repeal that.
-- **`list_saved_tools` reports loaded state, not just disk state.** It lists the union of names on
-  disk and names actually loaded, sorted, one per line. Loaded names are plain; every other name
-  carries a `[not loaded: <reason>]` suffix. The reasons: `project not trusted`,
-  `preamble limit reached`, `preamble refused — shadows a host tool`,
-  `preamble refused — nothing loaded` (benign siblings when #54 refused the whole batch),
-  `unreadable file`, and `saved after this session started`. A loaded tool whose file was deleted
-  mid-session reads `[loaded in this session — file deleted; gone from new sessions]`.
-- **`read_tool` annotates or refuses, never lies.** Withheld (untrusted) → `PermissionError`
-  refusal, no read. Refused/skipped/unreadable → source is returned with a leading
-  `# NOTE: not loaded in this session …` comment block. Loaded or plain → source as today.
-  Missing → `FileNotFoundError` as today. **New:** `read_tool` `lstat`s first and refuses anything
-  that is not a regular file — a FIFO named `x.py` would hang the tool call, and the loader (#55)
-  already refuses non-regular files on the same grounds.
-- **`save_tool` / `delete_tool` do not mutate the running session's preamble.** The preamble is
-  baked into the session at creation. The messages say so: `save_tool` reports the tool "loads in
-  new sessions", `delete_tool` reports the current session "keeps any copy it loaded". No mutable
-  per-session bookkeeping in the tools — the honest message is cheaper and cannot drift.
-- **`hostToolNames` for both gates = live registry names + `TOOLSTORE_TOOL_NAMES`.** The load-time
-  check (#54) must refuse a preamble that binds `save_tool` itself before those tools are
-  registered, and the write-time check (#56) must see the same list. `TOOLSTORE_TOOL_NAMES` is a
-  new exported constant in `toolstore.ts`; a unit test pins it to the names
-  `createToolStoreTools` actually returns, so the two cannot drift.
-- **Standalone callers are unchanged.** `preambleStatus` on `ToolStoreOptions` is optional; without
-  it, the four tools behave exactly as they do today (list = disk names, read = raw source,
-  save/delete messages are the only change, and those were already asserted with `includes`).
+- **N = 3.** The issue proposes 3 ("the low showed up once in six"); three full runs (~45 s each) is
+  an acceptable update cost and samples the known-variant files on most machines.
+- **Per-file minimum across N runs, global = minimum of the N per-run globals.** The global is
+  "reported, not a gate"; min-of-N keeps it consistent with the per-file philosophy.
+- **Refusal threshold = max(1.00 pp, one line).** One line of a file is `100/found` pp. The issue's
+  "~1 pp" is the term for big files; on a 42-line file the same benign instrument defect is 2.38 pp,
+  and refusing there would be a false positive. A spread **above** `max(1.00, 100/found)` pp refuses
+  the update with the file and its measured range named, exit 1. Exactly one line of spread always
+  passes; more than a line is "look at it, don't average it away".
+- **One-line compare tolerance, applied at gate time only.** A measured file fails only when it is
+  **more than one line** (`100/found` pp) below its floor. This is #132's alternative to the refusal
+  threshold, and both are kept: the threshold keeps floors honest, the tolerance makes the gate
+  resolve what the instrument can resolve — a one-line tail below the min-of-3 cannot go red, and
+  the hand-pinned 99.74 stops mattering even if this machine's min-of-3 lands on 100.00.
+- **The tolerance is for percentage comparisons only.** The manifest checks — a floored file absent
+  from the report, a source file with no floor — are structural, not measurements, and stay exact.
+- **A file present in some but not all N update runs refuses the update.** A file that loads
+  unstably is the instrument at its worst; writing a floor for it would be guessing.
+- **Decision logic lives in a typed, unit-tested module.** `scripts/coverage-core.ts` holds the pure
+  functions (`pct`, `combineRuns`, thresholds, `belowFloor`). `scripts/coverage.mjs` becomes thin
+  orchestration importing it, and `npm run coverage` / `coverage:update` run the script via `tsx`
+  (plain `node` cannot import `.ts`). CI already invokes `npm run coverage`, so it is unaffected.
+  `tsconfig.json` does not include `scripts/`, but tsc follows imports — the core gets strictly
+  checked without joining the built package (tsconfig.build.json emits only src/ + test/).
+- **`found` for threshold/tolerance purposes = the maximum LF across the N runs.** On an unchanged
+  tree LF is constant; max is the conservative choice if it ever is not.
 
 ## Tech Stack
 
-TypeScript (ESM, Node ≥ 22.19), `node:test` runner via `tsx`, Monty 0.0.21 sandbox, biome 2.5.8,
-tsc strict (`noUnusedLocals`, `noUnusedParameters`).
+Node ≥ 22.19 ESM, `node:test` via `tsx` (the suite runner), Node's `--experimental-test-coverage`
+with the lcov reporter, biome 2.5.8, tsc strict. No new dependencies.
 
 ## Commands
 
 ```
-Test (full):      npm test
-Test (focused):   npx tsx --test test/toolstore.test.ts
-Test (focused):   npx tsx --test test/repl.test.ts
-Typecheck:        npm run check        # tsc --noEmit
-Build:            npm run build        # tsc -p tsconfig.build.json
-Lint:             npm run lint         # biome check --error-on-warnings
+Gate:      npm run coverage              # measure once, compare against floors + tolerance
+Update:    npm run coverage:update       # measure 3×, write per-file minima or refuse
+Test:      npm test                      # full suite incl. new unit tests
+Focused:   npx tsx --test test/coverage-core.test.ts
+Check:     npm run check                 # tsc --noEmit (follows imports into scripts/)
+Lint:      npm run lint                  # biome check --error-on-warnings
+Build:     npm run build
 ```
 
 ## Project Structure
 
 ```
-src/toolstore.ts    createToolStoreTools — preambleStatus option, honest list/read, TOOLSTORE_TOOL_NAMES
-src/repl.ts         ReplRunner.createSession — register the tools, wire hostToolNames, build status,
-                    update the untrusted/refusal notices
-src/index.ts        export TOOLSTORE_TOOL_NAMES, type PreambleStatus
-test/toolstore.test.ts  unit tests: status-driven list/read behavior, non-regular-file refusal, name const
-test/repl.test.ts   integration tests: tools resolve, list matches what executed, delete→new session,
-                    save_tool gated with live shadowing check
-README.md           toolstore section — the tools resolve now; list/read honesty
-docs/project-trust.md  "What this does not cover" — both bullets are stale after this change
+scripts/coverage.mjs        → orchestration: measure loop, baseline read/write, refusal, reporting
+scripts/coverage-core.ts    → pure decision logic (NEW): pct, combineRuns, spreadLimit, belowFloor
+test/coverage-core.test.ts  → unit tests for the core (NEW)
+coverage-baseline.json      → { global, files: { path: pct } } — shape unchanged
+README.md                   → "Coverage floors" section rewritten to describe the mechanism
 ```
 
 ## Code Style
 
-Match existing conventions: JSDoc on every exported symbol, section-divider comment bars
-(`// ── Name ───`), `HostToolError("PythonType", msg)` for Python-facing failures, biome double
-quotes, 2-space indent, 100-col line width. Status annotations are built as plain strings, never
-thrown. Example (existing):
+The script is plain ESM with jsdoc block comments explaining *why* (the existing file is the model).
+The core module follows `src/` style: named exports, no default exports, strict types. Example:
 
 ```ts
-function validateToolName(name: unknown): string {
-  const s = requireString(name, "name");
-  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(s)) {
-    throw new HostToolError("ValueError", `invalid tool name '${s}': must be a valid Python identifier`);
-  }
-  return s;
+/** Line percentage, floored to 2dp so a baseline never sits above what was measured. */
+export function pct({ hit, found }: Counts): number {
+  if (!found) return 100;
+  return Math.floor((hit / found) * 10000) / 100;
 }
 ```
 
 ## Testing Strategy
 
-`node:test` + `node:assert/strict`. TDD: write failing tests first, per task.
-
-- **Unit** (`test/toolstore.test.ts`): `preambleStatus`-driven `list_saved_tools` annotations (each
-  category), `read_tool` refusal/notes, non-regular-file refusal, `TOOLSTORE_TOOL_NAMES` invariant.
-  Existing tests must pass untouched — the status option is additive.
-- **Integration** (`test/repl.test.ts`, through `ReplRunner` → real sandbox): all four tools
-  resolve in a trusted session; `list_saved_tools()` output inside `repl` matches what executed
-  for the withheld (#53), refused (#54) and unreadable (#55) cases; `delete_tool` end-to-end
-  (list → read → delete → new session does not run it); `save_tool` suspended on deny with no file
-  written, and refused at write time when the code shadows a **live** host tool.
-- **Regression:** full suite `npm test`, `npm run check`, `npm run lint` after each task.
+- **Unit tests** (`test/coverage-core.test.ts`, runs under `npm test`) cover the decision logic:
+  `pct` flooring; `combineRuns` minima/spread/global-min and the missing-in-some-runs flag;
+  `spreadLimit` = max(1.00, 100/found); `belowFloor` boundaries — the exact known cases from the
+  issue (floor 100.00, measured 99.74, found 384 → pass; two lines down → fail).
+- **Empirical verification of the script** (not in the unit suite — it spawns the whole suite):
+  run `coverage:update`, then three consecutive plain `coverage` runs, all green; the update
+  prints the spread table and the written floor for `src/truncate.ts` is script-owned.
+- The core is deliberately pure so the threshold/refusal arithmetic is pinned without needing to
+  *force* V8 variance in a fixture — that is not deterministic.
 
 ## Boundaries
 
-- **Always:** TDD (RED→GREEN), run focused tests + `npm run check` per increment, commit per
-  increment, full suite + lint before the final commit. Fail closed.
-- **Ask first:** nothing in this issue requires it.
-- **Never (out of scope):** register toolstore tools into the RLM loop; change the load/limits
-  machinery in `loadSavedTools`; change the grant model or approval machinery; change the
-  extension's tool declarations; remove or weaken the #53 "never even read" rule.
+- **Always:** run `npm test` and `npm run coverage` before committing; never hand-edit a floor in
+  `coverage-baseline.json` (the script owns it now); explain any deliberate floor change in the
+  commit message.
+- **Ask first:** (n/a this run — autonomous) changing N or the threshold values.
+- **Never:** lower a floor without running `coverage:update`; remove a failing test to make a floor
+  pass; add a file to `UNMEASURED_SOURCE_FILES` without its reason in the comment.
 
-## Assumptions (recorded; no human asked)
+## Success criteria (testable)
 
-1. The issue's test 2 names the withheld (#53) and skipped-entry (#55) cases; the refused case
-   (#54) and the limits case get the same treatment since they are the same class of lie.
-2. Annotation format is the `[not loaded: …]` suffix scheme above. A plain, unannotated line means
-   "loaded". This keeps the common trusted-and-healthy case identical to today's output.
-3. "Saved after this session started" is derived statically (on disk now, in no category at
-   creation), not tracked mutably. A tool saved mid-session in an untrusted project shows
-   `[not loaded: project not trusted]` via the `trusted` flag in `PreambleStatus`, not the
-   fallback bucket.
-4. `read_tool` refusal for untrusted projects uses `PermissionError` — it matches how the sandbox
-   surfaces a denied gated call, and it is what Python raises for exactly this situation.
-5. `PreambleStatus.refused` is a set of names; `read_tool`'s note does not repeat the shadowed
-   symbols (the session-creation notice already names them; duplicating the list in the type
-   would buy little).
-6. `refused` all-or-nothing invariant (loader returns `loaded: []` whenever `refused` is non-empty)
-   is relied on for the "nothing loaded" bucket; a unit test pins it.
+1. `coverage:update` completes and writes `coverage-baseline.json` from min-of-3; the spread report
+   prints every file whose measurements differed, with its range.
+2. A file whose spread exceeds `max(1.00, 100/found)` pp fails the update with its measured range
+   named — pinned by unit tests on the core (the script path is exercised by feeding the core
+   synthetic data; V8 variance cannot be forced deterministically).
+3. Three consecutive plain `npm run coverage` runs on the same tree pass after the update —
+   verified by running them, not assumed.
+4. `src/truncate.ts`'s floor is written by the script (99.74 if the machine samples the low, 100.00
+   if it does not — either is safe under the one-line tolerance), and the README's by-hand rule
+   paragraph is removed and replaced with the mechanism description.
+5. The manifest checks keep their exact behavior: floor-without-report, no-floor, and UNMEASURED
+   handling all fail exactly as today (existing behavior, re-verified by running the gate).
+6. `npm test`, `npm run check`, `npm run build`, `npm run lint` all clean (exit codes verified).
+
+## Assumptions (recorded; no human asked — autonomous run)
+
+1. N = 3 and threshold = max(1.00 pp, one line) are the reasonable readings of the issue's "~1 pp"
+   and "3 is probably enough"; both are single constants in the core and trivial to retune.
+2. Adopting **both** #132's alternatives (refusal threshold *and* one-line compare tolerance) is
+   intended: they protect different moments (writing vs. gating) and the comment presents them as
+   the two real options, not as mutually exclusive.
+3. Switching `npm run coverage`/`coverage:update` from `node` to `tsx` is in scope; the script's
+   behavior is unchanged, and CI (which calls `npm run coverage`) needs no edit.
+4. "Reproduced by the script" (DoD 3) means the script owns the number going forward; whether this
+   machine's min-of-3 samples the 99.74 low or the 100.00 high for `truncate.ts`, no hand pinning
+   remains.
+5. `bashenv.ts`'s floor (84.21) is treated as a real measurement, not variance — its spread is a
+   documented separate question on the issue; if the update observes it varying beyond threshold,
+   the refusal fires and the run records it rather than silently writing.
 
 ## Open Questions
 
-None blocking. #52 closes when this lands. The trace-visibility half (#46) and the RLM half stay
-open and out of scope.
+None blocking. Whether the #132 evidence should also be re-tested on the pool/bashenv files after
+this lands is a follow-up, not part of this change.
 
-## Residual risks (recorded for the ship report)
+## Not in scope
 
-- **`read_tool` becomes reachable code.** Before this change its FIFO-hang hazard was latent (the
-  tool was a `NameError` inside `repl`). The `lstat` refusal closes the hang; the symlink refusal
-  closes a path-jail bypass (a symlink whose target leaves the root would otherwise be readable
-  through a tool nobody gated).
-- **The current session's preamble is immutable.** `delete_tool` cannot stop a hostile preamble
-  already executing in the live session; the honest message and "start a new session" guidance are
-  the defence, and the session-cache semantics of #53 make new sessions cheap.
-
----
-
-## Post-review fixes (Phase 5 findings — recorded, not reflexive)
-
-Three independent reviewers (code-reviewer, security-auditor, test-engineer) converged on the
-following; each is fixed in a follow-up increment with tests:
-
-1. **Stale trust snapshot on inert trust flips (Critical).** `trustChangeDiscards` keeps the session
-   when the flip changes nothing, but the tools' `preambleStatus.trusted` stayed frozen → fail-open
-   reads in a now-untrusted project, fail-closed lies after untrust→trust. Fix: the tools consult a
-   **live** trust callback (`ToolStoreOptions.isTrusted`), the snapshot stays load-status-only.
-2. **Attacker-controlled filenames rendered unescaped** in list lines and the withheld/limit
-   notices — a crafted name forges a "not loaded" annotation for a file that is running. Fix:
-   `escapeNoticeName` moves to `toolstore.ts`, widens to C1/bidi, and applies to every disk-derived
-   name; non-identifier names are rendered quoted so a name can never read as an annotation.
-3. **`read_tool` TOCTOU**: lstat-then-readFile lets a swap to a FIFO (hang) or symlink (root escape)
-   through. Fix: single fd-based open with `O_NOFOLLOW | O_NONBLOCK`, `fstat` on the fd, trust
-   refusal **before** the open. The loader's read gets the same fd treatment.
-4. **Content staleness**: a loaded file overwritten after session start was read/listed as if the
-   new bytes were running. Fix: the loader records size+mtime per loaded file; `read_tool` and
-   `list_saved_tools` annotate `file changed since; the session runs the earlier copy`.
-5. **toolsDir symlink escape**: `.pi/code-tools` itself a symlink let the ungated `delete_tool`
-   remove files outside the root. Fix: every tool call resolves the real tools dir and refuses
-   when it escapes the real root (pathjail technique, toolstore wording).
-6. **Shadowing detector blind spots** (walrus, `exec`/`eval`, `globals()`/`vars()`, `__dict__`,
-   top-level `setattr`, `import *`) shared by both gates — the JSDoc's "load-time is the
-   authoritative control" was wrong (same function). Fix: walrus targets recorded; top-level
-   metaprogramming refuses **all** reserved names; consumer wording "defines" → "binds".
-7. **Lint gate failure on the committed tree** (biome format) — fixed, and lint exit code is
-   verified after every increment from now on.
-8. **Notice wording**: "start a new session" was ambiguous (`repl_reset` does not reload). Now
-   "run `repl` with a new `sessionId`"; save/delete messages say "sessions created after this one".
-
-### Residual risks after pass 2 (recorded for the ship report)
-
-- **Check-then-act races remain at the directory level** (containment resolve → mkdir/write/rm).
-  The file-level read and write races are closed via fd ops; a local process swapping `.pi` between
-  the resolve and the act can still redirect one call. Requires write access to the project tree —
-  documented, not closed.
-- **`validateToolName` accepts Windows device names** (`con`, `nul`, …) — pre-existing, Nit-level.
-- **Two commits share a message** (the tsc-fix and the test commit) — cosmetic, history kept.
-- **Detector remains a scan, not a parser** — alias-based metaprogramming (`from builtins import
-  exec as e`) and `match`/`case` captures are documented false negatives; both gates share them.
-  `del` and `;`-split metaprogramming are caught as of pass 2.
-- **Replayed toolstore results are snapshots** — a cached `save_tool`/`delete_tool` message replays
-  verbatim even if the disk changed since; the JSDoc warns, the messages say which *sessions* are
-  affected, and re-querying `list_saved_tools()` is the documented remedy.
-- **`Session.dump/load` half-contract**: the registry/preamble/toolstore view are not serialized;
-  `Session.load`'s JSDoc now documents exactly what a restoring caller must rebuild (fresh
-  `PreambleStatus` + identity, live `isTrusted`, re-derived preamble) and that `grantUses` restores
-  to the default. No production caller persists sessions yet (bucket 7).
-- **Notices render names escaped but unquoted** — a crafted name can still *look* like an
-  annotation inside a notice sentence (list lines are quoted). Accepted; notices name tools the
-  session already told the model not to trust.
+Fixing the V8/Node coverage-merge behavior itself (upstream defect); touching #109's mutant flake;
+changing the mutation-score gate; the CI matrix (floors stay a single Node 24/ubuntu job).
