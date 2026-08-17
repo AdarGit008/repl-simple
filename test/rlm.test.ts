@@ -110,6 +110,16 @@ describe("extractPythonCode()", () => {
       reply: "```python\nprint('first')\n```\nsome text\n```\nprint('second')\n```",
       expected: FENCE("print('second')"),
     },
+    {
+      name: "a fence inside a string is not a close",
+      reply: "```python\nprint('```')\nprint('done')\n```",
+      expected: FENCE("print('```')\nprint('done')"),
+    },
+    {
+      name: "a complete block survives a later unclosed fence",
+      reply: "```python\nprint('first')\n```\n```python\nprint('second')",
+      expected: FENCE("print('first')"),
+    },
     // Unfenced shapes.
     { name: "5.2.3 naked code (no fence)", reply: "print('hi')", expected: RAW("print('hi')") },
     { name: "5.2.5 empty reply", reply: "", expected: RAW("") },
@@ -125,6 +135,17 @@ describe("extractPythonCode()", () => {
     },
     { name: "9.3.6 emphasised answer", reply: "The answer is **42**.", expected: ANSWER("42") },
     { name: "9.3.6 answer: shorthand", reply: "Answer: 42", expected: ANSWER("42") },
+    { name: "9.3.6 decimal answer", reply: "The answer is 3.14.", expected: ANSWER("3.14") },
+    {
+      name: "9.3.6 wrappers strip to a fixpoint",
+      reply: "The answer is **\"hi\"**.",
+      expected: ANSWER("hi"),
+    },
+    {
+      name: "9.3.6 a hedged answer keeps its hedge verbatim",
+      reply: "The answer is 42, I think.",
+      expected: ANSWER("42, I think"),
+    },
     {
       name: "9.3.7 prose with trailing text is not a direct answer",
       reply: "I think the answer is 42. Let me submit.",
@@ -158,6 +179,7 @@ describe("extractPythonCode()", () => {
 describe("extractDirectAnswer()", () => {
   const CASES: Array<{ name: string; reply: string; expected: string | null }> = [
     { name: "recognises the answer at the end", reply: "The answer is 42.", expected: "42" },
+    { name: "recognises a decimal", reply: "The answer is 3.14.", expected: "3.14" },
     { name: "strips quotes and emphasis", reply: "The answer is '**hello**'.", expected: "hello" },
     { name: "rejects trailing prose", reply: "The answer is 42. Let me submit.", expected: null },
     { name: "rejects a reply without an anchor", reply: "Everything ran fine.", expected: null },
