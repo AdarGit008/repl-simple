@@ -1,70 +1,72 @@
-# Spec: Restore the unconditional `context` input — issue #72
+# Spec: Register the toolstore tools — issue #57
 
-> 9.2 — "The advertised configuration is a no-op"
-> Parent: #70 (Bucket 9 — RLM: fix, then converge) · Labels: `bug`, `bucket-9`
+> 6.5 — "Register the toolstore tools so the model can inspect what runs"
+> Parent: #52 (Bucket 6 — preamble supply chain) · Labels: `bug`, `bucket-6`
 
 ## Objective
 
-`runRlm` (`src/rlm.ts`) injects sandbox inputs **only when the caller passes `options.inputs`**.
-The shipped preamble (`repl/repl_server.py`) references the bare name `context` in its helper
-bodies, so the documented production configuration — `runRlm(question, { preamble })` with no
-`inputs` — fails Monty's type check with a ~4 KB, 12-error `unresolved-reference` diagnostic on
-**every** iteration. It is deterministic, so all ten iterations fail identically and the whole
-blob is re-sent as feedback each time (compounding #74's message growth). The reference
-implementation (`rlm_loop.ts`, `RLMLoop.run`) always injected `context: context ?? ""`; the
-`runRlm` port lost that.
+The **read** side of the toolstore ships (`repl.ts` loads `.pi/code-tools/*.py` and executes it as a
+preamble on every run) and the **write** side is withheld: `createToolStoreTools` is never
+registered, so `read_tool`, `list_saved_tools`, `save_tool` and `delete_tool` are all `NameError`
+inside `repl`. Code executes on the model's behalf before its own code on every call — and the model
+cannot list it, read it, or delete it.
 
-A second, related gap: a caller passing `inputs: { context, other_data }` gets an initial prompt
-that never mentions `other_data` — the data is present in the sandbox and invisible in the
-instructions, so the model cannot know it exists.
+The fix: register the four toolstore tools in `ReplRunner.createSession`, and make
+`list_saved_tools` / `read_tool` report **what is actually loaded in this session** — not merely what
+is on disk — so the withheld case (#53), the refused case (#54) and the skipped/unreadable cases
+(#55) are visible to the model that has to reason about them.
 
-The fix: **always declare `context`** (defaulting to `""`), regardless of whether the caller
-passes `inputs`, and **announce every input key** in the initial prompt. Scope: `src/rlm.ts` +
-`test/rlm.test.ts` only.
+**User:** a pi user who runs `repl` in a project that has (or gains) saved tools. **Success:** a
+misbehaving preamble can be discovered and removed entirely from inside `repl`, without editing
+files by hand; and no tool claims a file is running when the session is not running it.
 
-**User:** any caller of the documented RLM configuration. **Success:** the advertised
-configuration runs end to end; every input is declared and named for the model; a
-caller-supplied `context` overrides the default. This must precede #78: `rlm_loop.ts` is the
-only remaining working reference for the correct behaviour, and it is deleted there.
+### Success criteria (testable)
 
-### Success criteria (the issue's five tests)
-
-1. `runRlm` with the shipped `repl_server.py` preamble and **no** `inputs` succeeds — the exact
-   advertised configuration. The headline test; fails today.
-2. `context` is declared and readable in the sandbox when no `inputs` are passed (value `""`).
-3. A caller-supplied `context` reaches the sandbox and overrides the default. Kills M4
-   ("never forward `inputs` to sandbox", `docs/REVIEW.md:549`).
-4. Every key in `inputs` is named in the initial prompt — asserted on prompt content, not on
-   message count.
-5. A non-`context` input is both declared (readable in the sandbox) and announced.
+1. `list_saved_tools`, `read_tool` and `delete_tool` all resolve and work inside `repl`
+   (trusted project, tools on disk).
+2. What `list_saved_tools` reports matches what **actually executed**: the withheld case (#53),
+   the refused case (#54) and the skipped-entry case (#55) are all annotated, not silently listed
+   as loaded.
+3. `delete_tool` removes a tool, and it no longer executes in a **new** session (the current
+   session keeps the copy it loaded, and is told so).
+4. `save_tool` is gated inside `repl` — the #56 regression guard — and its write-time shadowing
+   check now sees the **live registry's** names (the wiring #56's SPEC.md listed as its residual
+   risk: the detector was inert in production until this issue passes `hostToolNames`).
+5. The README's tool list matches the tools that actually resolve inside `repl`, and
+   `docs/project-trust.md` no longer claims `save_tool` is ungated.
 
 ## Explicit decisions (recorded, not reflexive)
 
-- **One merge site, `context` always last.** In `runRlm`, build
-  `inputs = { ...runOptions.inputs, ...options.inputs }`, then set `inputs.context =
-  inputs.context ?? ""`. `options.inputs` keeps today's precedence over `runOptions.inputs`;
-  `context` defaults to `""` when absent from both. **Recorded deviation from the reference:**
-  `RLMLoop.run` overrode `runOpts.inputs.context` with the `run(task, context)` argument
-  (default `""`); the new code lets `runOptions.inputs.context` survive when `options.inputs`
-  has no `context`. The superset is harmless and "context is just an input that defaults to
-  `""`" is the simpler contract — `options.inputs` remains the canonical RLM-level source.
-- **The default `context` is announced too.** The merged map always contains `context`, so the
-  prompt always carries its header — the preamble ships `context_preview()`/`context_lines()`/
-  `context_length()`/`context_summary()`, and the model should know the variable exists even
-  when empty. Empty values render header-only (no empty code fence).
-- **`context` keeps its legacy header**, `# Context (available as \`context\` variable)`, and
-  the existing 5000-char head/tail preview. Other keys get
-  `# Input (available as \`name\` variable)` with the same preview treatment. The preview
-  policy itself is unchanged — message growth is #74's problem; this issue adds per-key
-  *naming*, not content duplication.
-- **Nothing else changes.** The declaration path already exists (`buildTypeCheckStubs` takes
-  input names; `feedStart` takes `inputs`) — the defect is purely what `runRlm` passes.
-  `sandbox.ts`, `rlm_loop.ts`, and `types.ts` stay untouched; `rlm_loop.ts` is #78's reference.
-- **`REPL_SERVER` lands in `test/rlm.test.ts` and is used.** Loaded via `readFileSync` exactly
-  as `test/repl_server.test.ts` does; tests 1–3 run it through real Monty workers, as the
-  file's existing tests already do. Closes the #23 handover row.
-- **M4 is killed by construction.** The new no-preamble tests read inputs in the sandbox, which
-  is precisely the mutation site M4 cuts; the aggregate floor still gates at `npm run mutation`.
+- **The tools are registered in every session, trusted or untrusted.** The issue says "alongside
+  the bridge and builtin tools", which are unconditional. In an untrusted session the preamble is
+  withheld as before, but `list_saved_tools()` now *works and says so*, `delete_tool()` works (it is
+  the recovery path), and `read_tool()` **refuses** — an untrusted project's files are never even
+  read (#53), and a registered `read_tool` that read them would silently repeal that.
+- **`list_saved_tools` reports loaded state, not just disk state.** It lists the union of names on
+  disk and names actually loaded, sorted, one per line. Loaded names are plain; every other name
+  carries a `[not loaded: <reason>]` suffix. The reasons: `project not trusted`,
+  `preamble limit reached`, `preamble refused — shadows a host tool`,
+  `preamble refused — nothing loaded` (benign siblings when #54 refused the whole batch),
+  `unreadable file`, and `saved after this session started`. A loaded tool whose file was deleted
+  mid-session reads `[loaded in this session — file deleted; gone from new sessions]`.
+- **`read_tool` annotates or refuses, never lies.** Withheld (untrusted) → `PermissionError`
+  refusal, no read. Refused/skipped/unreadable → source is returned with a leading
+  `# NOTE: not loaded in this session …` comment block. Loaded or plain → source as today.
+  Missing → `FileNotFoundError` as today. **New:** `read_tool` `lstat`s first and refuses anything
+  that is not a regular file — a FIFO named `x.py` would hang the tool call, and the loader (#55)
+  already refuses non-regular files on the same grounds.
+- **`save_tool` / `delete_tool` do not mutate the running session's preamble.** The preamble is
+  baked into the session at creation. The messages say so: `save_tool` reports the tool "loads in
+  new sessions", `delete_tool` reports the current session "keeps any copy it loaded". No mutable
+  per-session bookkeeping in the tools — the honest message is cheaper and cannot drift.
+- **`hostToolNames` for both gates = live registry names + `TOOLSTORE_TOOL_NAMES`.** The load-time
+  check (#54) must refuse a preamble that binds `save_tool` itself before those tools are
+  registered, and the write-time check (#56) must see the same list. `TOOLSTORE_TOOL_NAMES` is a
+  new exported constant in `toolstore.ts`; a unit test pins it to the names
+  `createToolStoreTools` actually returns, so the two cannot drift.
+- **Standalone callers are unchanged.** `preambleStatus` on `ToolStoreOptions` is optional; without
+  it, the four tools behave exactly as they do today (list = disk names, read = raw source,
+  save/delete messages are the only change, and those were already asserted with `includes`).
 
 ## Tech Stack
 
@@ -75,190 +77,151 @@ tsc strict (`noUnusedLocals`, `noUnusedParameters`).
 
 ```
 Test (full):      npm test
-Test (focused):   npx tsx --test test/rlm.test.ts
+Test (focused):   npx tsx --test test/toolstore.test.ts
+Test (focused):   npx tsx --test test/repl.test.ts
 Typecheck:        npm run check        # tsc --noEmit
 Build:            npm run build        # tsc -p tsconfig.build.json
 Lint:             npm run lint         # biome check --error-on-warnings
-Coverage floors:  npm run coverage
-Mutation floor:   npm run mutation     # stryker, contained in a memory-capped systemd scope
 ```
 
 ## Project Structure
 
 ```
-src/rlm.ts          runRlm — input merge (context always declared) + buildInitialPrompt
-                    (announces every input key)
-test/rlm.test.ts    REPL_SERVER load (new, used) + the five regression tests + a
-                    preview-truncation pin
-src/types.ts        (unchanged — RlmOptions.inputs already exists)
-src/sandbox.ts      (unchanged — already forwards runOpts.inputs to the type checker and feed)
+src/toolstore.ts    createToolStoreTools — preambleStatus option, honest list/read, TOOLSTORE_TOOL_NAMES
+src/repl.ts         ReplRunner.createSession — register the tools, wire hostToolNames, build status,
+                    update the untrusted/refusal notices
+src/index.ts        export TOOLSTORE_TOOL_NAMES, type PreambleStatus
+test/toolstore.test.ts  unit tests: status-driven list/read behavior, non-regular-file refusal, name const
+test/repl.test.ts   integration tests: tools resolve, list matches what executed, delete→new session,
+                    save_tool gated with live shadowing check
+README.md           toolstore section — the tools resolve now; list/read honesty
+docs/project-trust.md  "What this does not cover" — both bullets are stale after this change
 ```
 
 ## Code Style
 
-Repo conventions: biome formatting, double quotes, strict types, JSDoc on exported API and on
-non-obvious decisions, `// ── section ──` separators as in `src/rlm.ts`. The merge is four
-lines, not an abstraction:
+Match existing conventions: JSDoc on every exported symbol, section-divider comment bars
+(`// ── Name ───`), `HostToolError("PythonType", msg)` for Python-facing failures, biome double
+quotes, 2-space indent, 100-col line width. Status annotations are built as plain strings, never
+thrown. Example (existing):
 
 ```ts
-const inputs: Record<string, string> = {
-  ...(sandboxRunOpts.inputs ?? {}),
-  ...(options.inputs ?? {}),
-};
-sandboxRunOpts.inputs = { ...inputs, context: inputs.context ?? "" };
+function validateToolName(name: unknown): string {
+  const s = requireString(name, "name");
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(s)) {
+    throw new HostToolError("ValueError", `invalid tool name '${s}': must be a valid Python identifier`);
+  }
+  return s;
+}
 ```
 
 ## Testing Strategy
 
-`node:test` + `assert/strict`, same file and helpers (`mockLlmCodeGen`) as the existing RLM
-tests. The five new tests are **medium** (real Monty workers, deterministic canned LLM):
-sandbox-visible behaviour is asserted through run results, prompt behaviour through
-`llm.calls()[0]` message content. RED first, where applicable: 9.2.1, 9.2.2 and 9.2.5 failed
-against HEAD for the documented reason (typing error / missing key); 9.2.3, 9.2.4 and 9.2.6
-were green guards and pins — their job is to fail under the M4 mutant and the wrong fix, not
-under HEAD. No new dependencies; no mocking of `runInSandbox` — the whole point is that inputs
-survive into a real worker.
+`node:test` + `node:assert/strict`. TDD: write failing tests first, per task.
+
+- **Unit** (`test/toolstore.test.ts`): `preambleStatus`-driven `list_saved_tools` annotations (each
+  category), `read_tool` refusal/notes, non-regular-file refusal, `TOOLSTORE_TOOL_NAMES` invariant.
+  Existing tests must pass untouched — the status option is additive.
+- **Integration** (`test/repl.test.ts`, through `ReplRunner` → real sandbox): all four tools
+  resolve in a trusted session; `list_saved_tools()` output inside `repl` matches what executed
+  for the withheld (#53), refused (#54) and unreadable (#55) cases; `delete_tool` end-to-end
+  (list → read → delete → new session does not run it); `save_tool` suspended on deny with no file
+  written, and refused at write time when the code shadows a **live** host tool.
+- **Regression:** full suite `npm test`, `npm run check`, `npm run lint` after each task.
 
 ## Boundaries
 
-- **Always:** repo commands (`npm test`, `check`, `lint`, `build`) before commits; one logical
-  change per commit; spec updated when a recorded decision changes.
-- **Never:** new dependencies; touching `rlm_loop.ts` (owned by #78) or `sandbox.ts` plumbing;
-  README claims without tests (no README change is needed here).
-- **Ask first:** none applicable — autonomous run; all assumptions recorded below.
-
-## Success Criteria
-
-- The five tests exist, each was red against HEAD for the documented reason, and all are green.
-- M4 no longer survives (killed by the no-preamble input tests).
-- `REPL_SERVER` in `test/rlm.test.ts` is loaded **and used**, closing the #23 handover row.
-- The advertised configuration is demonstrated working end to end.
-- Full gates green: `npm test`, `npm run check`, `npm run lint`, `npm run build`,
-  `npm run coverage`, `npm run mutation`.
+- **Always:** TDD (RED→GREEN), run focused tests + `npm run check` per increment, commit per
+  increment, full suite + lint before the final commit. Fail closed.
+- **Ask first:** nothing in this issue requires it.
+- **Never (out of scope):** register toolstore tools into the RLM loop; change the load/limits
+  machinery in `loadSavedTools`; change the grant model or approval machinery; change the
+  extension's tool declarations; remove or weaken the #53 "never even read" rule.
 
 ## Assumptions (recorded; no human asked)
 
-1. Input precedence: `options.inputs` wins over `runOptions.inputs` (unchanged from today);
-   `context` defaults to `""` only when absent from both.
-2. The default `""` context is announced in the prompt (header-only) — intentional, per the
-   preamble's `context_*` helpers.
-3. Empty values of any input render header-only, never an empty code fence.
-4. Merge to `main` is deferred: this session pushes branch `issue-72-context-input` and opens
-   a PR; another session owns `main` for #57 and merging would collide with it.
-5. `npm run mutation` is runnable here (it uses a systemd scope; if containment fails, plain
-   `stryker run` is the fallback — recorded in the ship report either way).
+1. The issue's test 2 names the withheld (#53) and skipped-entry (#55) cases; the refused case
+   (#54) and the limits case get the same treatment since they are the same class of lie.
+2. Annotation format is the `[not loaded: …]` suffix scheme above. A plain, unannotated line means
+   "loaded". This keeps the common trusted-and-healthy case identical to today's output.
+3. "Saved after this session started" is derived statically (on disk now, in no category at
+   creation), not tracked mutably. A tool saved mid-session in an untrusted project shows
+   `[not loaded: project not trusted]` via the `trusted` flag in `PreambleStatus`, not the
+   fallback bucket.
+4. `read_tool` refusal for untrusted projects uses `PermissionError` — it matches how the sandbox
+   surfaces a denied gated call, and it is what Python raises for exactly this situation.
+5. `PreambleStatus.refused` is a set of names; `read_tool`'s note does not repeat the shadowed
+   symbols (the session-creation notice already names them; duplicating the list in the type
+   would buy little).
+6. `refused` all-or-nothing invariant (loader returns `loaded: []` whenever `refused` is non-empty)
+   is relied on for the "nothing loaded" bucket; a unit test pins it.
 
 ## Open Questions
 
-None. Scope boundaries with #74 (message growth) and #78 (convergence) recorded above.
+None blocking. #52 closes when this lands. The trace-visibility half (#46) and the RLM half stay
+open and out of scope.
 
-## Review remediation (post-build, five-axis self-review)
+## Residual risks (recorded for the ship report)
 
-### Correctness — no required changes
+- **`read_tool` becomes reachable code.** Before this change its FIFO-hang hazard was latent (the
+  tool was a `NameError` inside `repl`). The `lstat` refusal closes the hang; the symlink refusal
+  closes a path-jail bypass (a symlink whose target leaves the root would otherwise be readable
+  through a tool nobody gated).
+- **The current session's preamble is immutable.** `delete_tool` cannot stop a hostile preamble
+  already executing in the live session; the honest message and "start a new session" guidance are
+  the defence, and the session-cache semantics of #53 make new sessions cheap.
 
-- `src/rlm.ts:213-218` merge order matches the spec decision: `runOptions.inputs` first, then
-  `options.inputs` (today's precedence), then `context` defaulted to `""` — set last, so the
-  default can never override a caller's value.
-- `src/rlm.ts:85` the `if (value)` header-only path is exercised by 9.2.1/9.2.2 (default
-  `context: ""`), the >5000 preview path by 9.2.6 — every new branch has a test.
-- `src/rlm.ts:230` `sandboxRunOpts.inputs ?? {}` is defensive only; the assignment above is
-  unconditional.
+---
 
-### Readability — no required changes
+## Post-review fixes (Phase 5 findings — recorded, not reflexive)
 
-- The merge comment explains *why* (undeclared input = deterministic type-check failure), not
-  what. JSDoc on `buildInitialPrompt` matches behaviour.
+Three independent reviewers (code-reviewer, security-auditor, test-engineer) converged on the
+following; each is fixed in a follow-up increment with tests:
 
-### Architecture — no required changes
+1. **Stale trust snapshot on inert trust flips (Critical).** `trustChangeDiscards` keeps the session
+   when the flip changes nothing, but the tools' `preambleStatus.trusted` stayed frozen → fail-open
+   reads in a now-untrusted project, fail-closed lies after untrust→trust. Fix: the tools consult a
+   **live** trust callback (`ToolStoreOptions.isTrusted`), the snapshot stays load-status-only.
+2. **Attacker-controlled filenames rendered unescaped** in list lines and the withheld/limit
+   notices — a crafted name forges a "not loaded" annotation for a file that is running. Fix:
+   `escapeNoticeName` moves to `toolstore.ts`, widens to C1/bidi, and applies to every disk-derived
+   name; non-identifier names are rendered quoted so a name can never read as an annotation.
+3. **`read_tool` TOCTOU**: lstat-then-readFile lets a swap to a FIFO (hang) or symlink (root escape)
+   through. Fix: single fd-based open with `O_NOFOLLOW | O_NONBLOCK`, `fstat` on the fd, trust
+   refusal **before** the open. The loader's read gets the same fd treatment.
+4. **Content staleness**: a loaded file overwritten after session start was read/listed as if the
+   new bytes were running. Fix: the loader records size+mtime per loaded file; `read_tool` and
+   `list_saved_tools` annotate `file changed since; the session runs the earlier copy`.
+5. **toolsDir symlink escape**: `.pi/code-tools` itself a symlink let the ungated `delete_tool`
+   remove files outside the root. Fix: every tool call resolves the real tools dir and refuses
+   when it escapes the real root (pathjail technique, toolstore wording).
+6. **Shadowing detector blind spots** (walrus, `exec`/`eval`, `globals()`/`vars()`, `__dict__`,
+   top-level `setattr`, `import *`) shared by both gates — the JSDoc's "load-time is the
+   authoritative control" was wrong (same function). Fix: walrus targets recorded; top-level
+   metaprogramming refuses **all** reserved names; consumer wording "defines" → "binds".
+7. **Lint gate failure on the committed tree** (biome format) — fixed, and lint exit code is
+   verified after every increment from now on.
+8. **Notice wording**: "start a new session" was ambiguous (`repl_reset` does not reload). Now
+   "run `repl` with a new `sessionId`"; save/delete messages say "sessions created after this one".
 
-- All changes stay in `src/rlm.ts`, the owning layer; `rlm_loop.ts` untouched as #78's
-  reference; no new abstractions; no API surface change (`buildInitialPrompt` is private).
+### Residual risks after pass 2 (recorded for the ship report)
 
-### Security — FYI (no action)
-
-- `src/rlm.ts:83-91` input values are interpolated into the LLM prompt; the change extends the
-  existing `context` inlining to every input key. Not a new class: the RLM loop hands the
-  model the same data through the sandbox anyway, and inputs come from the extension's own
-  invoker, not remote users. Recorded, not fixed.
-
-### Performance — no required changes
-
-- One extra header line per input key; previews per key are capped by the same 5000-char
-  policy. The single-context case is byte-identical to before. Growth concerns belong to #74.
-
-## Review remediation round 2 (code-reviewer + security-auditor + test-engineer fan-out)
-
-### Addressed
-
-- **Rendering contracts pinned** (code-reviewer Required 1, test-engineer Low): 9.2.5 now
-  asserts the exact `# Context` / `# Input` headers; new 9.2.7 asserts the default empty
-  `context` renders header-only with no empty fence.
-- **Precedence deviation pinned** (code-reviewer Optional 2, test-engineer Medium): new 9.2.8
-  (`runOptions.inputs` survives when `options.inputs` is absent) and 9.2.9 (`options.inputs`
-  wins on the same key).
-- **Dead defensiveness removed** (code-reviewer Nit 4, security-auditor Nit): the
-  `sandboxRunOpts.inputs ?? {}` fallback is gone — `runInputs` is built once, defaulted once,
-  and passed to both the sandbox and the prompt.
-- **LLM-disclosure contract documented** (security-auditor Required 1):
-  `RlmOptions.inputs` JSDoc (`src/types.ts`) and the README's RLM section now state that every
-  input key and value is rendered into the LLM prompt and must never carry secrets.
-- **RED trail corrected** (test-engineer Low): SPEC testing-strategy wording and `tasks/todo.md`
-  Task 1 acceptance now say "red where applicable" with the actual red/green split; the first
-  test commit message amended to match.
-- **5000-char boundary pinned** (test-engineer Low): 9.2.6 now also asserts an exactly-5000-char
-  value renders whole and un-elided.
-
-### Deferred (recorded, not fixed)
-
-- **Aggregate prompt cap** (security-auditor Required 2): the 5000-char cap is per value; N
-  large inputs make an N×~5 KB initial prompt. This is #74's exact territory (message growth
-  across the whole loop) and gets a note on #74 rather than a bespoke cap here. The per-value
-  preview cap is pinned by 9.2.6.
-- **Input-name validation** (security-auditor Optional, code-reviewer Optional 3): names are
-  interpolated unescaped into the prompt header and the type-check stub. A
-  `/^[A-Za-z_][A-Za-z0-9_]*$/` check at the merge site would harden both paths; noted for the
-  next RLM change (#78 touches this area).
-- **Registry-scoping documentation** (security-auditor Optional): `RlmOptions.registry` should
-  warn that the RLM sub-model is an injection-exposed trust domain and only the three RLM
-  tools belong there. Doc-only; noted.
-
-## Ship report (phase 6 — go/no-go)
-
-### Go decision
-
-**GO — approved by code-reviewer (after Required 1, addressed), security-auditor (after
-Required 1-2, addressed/deferred), test-engineer (conditions met — M4 confirmed killed by the
-targeted mutation run below).** Gates: 772/772 tests, tsc strict clean, biome clean, build clean,
-coverage floors met ×3 (one transient floor dip observed only under full-mutation load; the flake
-band is documented in README, filed as #113). Targeted mutation on `src/rlm.ts` (248 mutants,
-86m53s, zero harness deaths): **61.29%** killed vs the 30.58% baseline — improved — and **M4 is
-killed**: both inputs-merge mutants (`src/rlm.ts:217,218`) and the `?? ""` default mutant
-(`:220`) are Killed. Survivors in the changed regions are cosmetic string/template literals
-(prompt wording, the `"user"` role) and pre-existing conditionals. The change is additive, no
-API surface change, no new dependencies, no I/O surface.
-
-### Rollback plan
-
-- **Trigger:** regression in RLM prompts or sandbox inputs reported after merge (e.g. #78
-  work sees divergent prompt shape; a caller's `runOptions.inputs` flow behaves differently).
-- **Step 1:** `git revert` the merge commit on `main` — the change is self-contained
-  (`src/rlm.ts` + `src/types.ts` docs + `README.md` + tests), reverts cleanly against #57's
-  preceding commits (no shared lines).
-- **Step 2:** verify `npm test` + `npm run check` on the revert.
-- **Time to rollback:** < 5 minutes (single commit, no data, no migration).
-
-### Residual risks (recorded)
-
-1. **Prompt shape delta for all callers** — every `runRlm` prompt now carries the `# Context`
-   header (default `""` context announced). Intentional, pinned by 9.2.7.
-2. **Aggregate prompt growth** — per-value caps only; deferred to #74 (note posted on the
-   issue, comment 5309340038).
-3. **Unescaped input names** — prompt header + type-check stub interpolation; validation
-   deferred, noted on #74.
-4. **Aggregate mutation floor not re-measured** — the full 3738-mutant run is ~46 h on this
-   host and mutation is not a CI gate; the targeted `src/rlm.ts` run covers the changed file
-   (M4 kill is the issue's DoD item).
-5. **Merge ordering with #57** — another session owns `main`; this branch is pushed and PR'd,
-   not merged. Rebase on the post-#57 `main` before merge (expected clean — disjoint files:
-   #57 touches toolstore/repl/README toolstore sections; this touches rlm/types/RREADME RLM
-   section only).
+- **Check-then-act races remain at the directory level** (containment resolve → mkdir/write/rm).
+  The file-level read and write races are closed via fd ops; a local process swapping `.pi` between
+  the resolve and the act can still redirect one call. Requires write access to the project tree —
+  documented, not closed.
+- **`validateToolName` accepts Windows device names** (`con`, `nul`, …) — pre-existing, Nit-level.
+- **Two commits share a message** (the tsc-fix and the test commit) — cosmetic, history kept.
+- **Detector remains a scan, not a parser** — alias-based metaprogramming (`from builtins import
+  exec as e`) and `match`/`case` captures are documented false negatives; both gates share them.
+  `del` and `;`-split metaprogramming are caught as of pass 2.
+- **Replayed toolstore results are snapshots** — a cached `save_tool`/`delete_tool` message replays
+  verbatim even if the disk changed since; the JSDoc warns, the messages say which *sessions* are
+  affected, and re-querying `list_saved_tools()` is the documented remedy.
+- **`Session.dump/load` half-contract**: the registry/preamble/toolstore view are not serialized;
+  `Session.load`'s JSDoc now documents exactly what a restoring caller must rebuild (fresh
+  `PreambleStatus` + identity, live `isTrusted`, re-derived preamble) and that `grantUses` restores
+  to the default. No production caller persists sessions yet (bucket 7).
+- **Notices render names escaped but unquoted** — a crafted name can still *look* like an
+  annotation inside a notice sentence (list lines are quoted). Accepted; notices name tools the
+  session already told the model not to trust.

@@ -1,11 +1,71 @@
-import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import { lstat, mkdir, open, readdir, rm, type FileHandle } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
 import { join, resolve, extname } from "node:path";
 import { requireString } from "./registry.js";
+import { createPathJail } from "./pathjail.js";
 import { HostToolError } from "./types.js";
 import type { HostTool } from "./types.js";
 
 // ── Options ──────────────────────────────────────────────────────
+
+/** The names `createToolStoreTools` returns, in registration order.
+ *
+ * `ReplRunner` must include these in the load-time shadowing gate **before**
+ * the tools exist in the registry — a preamble `def save_tool` would shadow
+ * the registered host tool exactly like any other — so the list lives here,
+ * next to the tools, and a unit test pins it to what `createToolStoreTools`
+ * actually returns (#57).
+ */
+export const TOOLSTORE_TOOL_NAMES = [
+  "save_tool",
+  "delete_tool",
+  "list_saved_tools",
+  "read_tool",
+] as const;
+
+/**
+ * What a session's preamble actually loaded, per tool name.
+ *
+ * The toolstore tools answer from this snapshot plus the current disk state,
+ * so `list_saved_tools` and `read_tool` never claim a file is running when
+ * the session is not running it (#57): withheld (#53), refused (#54),
+ * skipped or unreadable (#55) names are all visible to the model.
+ *
+ * Omitted from {@link ToolStoreOptions}, the tools behave as they did before
+ * #57: the list is the disk list and reads are raw — the honest reporting
+ * only exists when a caller supplies the session's view.
+ */
+export interface PreambleStatus {
+  /** Whether the preamble was eligible to load (project trusted at session creation). */
+  trusted: boolean;
+  /** Names actually loaded and executing in this session. */
+  loaded: ReadonlySet<string>;
+  /** Names on disk but withheld — the project was not trusted (#53). */
+  withheld: ReadonlySet<string>;
+  /** Names on disk but left out — preamble limits reached. */
+  skipped: ReadonlySet<string>;
+  /** Names on disk whose code shadows a host tool — the whole preamble was refused (#54). */
+  refused: ReadonlySet<string>;
+  /** Names on disk whose files could not be loaded (#55). */
+  unreadable: ReadonlySet<string>;
+  /**
+   * The size and mtime of each loaded file as the loader saw them.
+   *
+   * The snapshot records *names*; this records *which bytes* those names
+   * stood for. A file overwritten after session creation is still "loaded"
+   * by name — the session runs the old bytes — and `list_saved_tools` /
+   * `read_tool` annotate that instead of presenting the new bytes as what
+   * runs. Absent, changed-file detection is off (back-compat for callers
+   * that build the view by hand).
+   */
+  identity?: ReadonlyMap<string, PreambleFileIdentity>;
+}
+
+/** Size and mtime of one loaded file — enough to notice a rewrite, no hashing. */
+export interface PreambleFileIdentity {
+  size: number;
+  mtimeMs: number;
+}
 
 export interface ToolStoreOptions {
   /** Workspace root. Defaults to '.' if not set. */
@@ -25,6 +85,25 @@ export interface ToolStoreOptions {
    * owns the security decision.
    */
   hostToolNames?: readonly string[];
+  /**
+   * What the session's preamble actually loaded, for honest `list_saved_tools`
+   * and `read_tool` answers (#57). Omitted, the tools report disk state only.
+   */
+  preambleStatus?: PreambleStatus;
+  /**
+   * The live trust decision, read at every call.
+   *
+   * The snapshot above records what the session loaded at creation; this is
+   * the decision in force **now**. They differ exactly when a trust flip
+   * kept the session — `ReplRunner` does not rebuild a session whose preamble
+   * would not change, and the tools must follow the live decision anyway or
+   * `read_tool` would read a project that is no longer trusted (#57).
+   *
+   * Consulted by `read_tool`'s refusal and by the list's "project not
+   * trusted" bucket. Absent, the tools fall back to `preambleStatus.trusted`,
+   * and a standalone caller with neither gets today's ungated behavior.
+   */
+  isTrusted?: () => boolean;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -41,9 +120,83 @@ function validateToolName(name: unknown): string {
   return s;
 }
 
+/**
+ * Render a name from the tools directory for model-facing text.
+ *
+ * Filenames come from the directory listing and may contain newlines, ANSI
+ * escapes and bidi overrides — unescaped, a crafted name could forge notice
+ * lines or terminal sequences. Control characters become `\u{..}` escapes.
+ * C1 controls and Unicode bidi controls are escaped too: they render as
+ * nothing in most terminals while still reordering or hiding what follows.
+ */
+export function escapeNoticeName(name: string): string {
+  // No regex here: biome forbids control characters in regex literals
+  // (noControlCharactersInRegex), and the loop form is clearer anyway.
+  let out = "";
+  for (const c of name) {
+    const code = c.charCodeAt(0);
+    // 0x22 and 0x5c: a quote or backslash inside a quoted name would break
+    // the quoting and let the rest of the name read as an annotation.
+    const escaped =
+      code < 0x20 ||
+      code === 0x22 ||
+      code === 0x5c ||
+      code === 0x7f ||
+      (code >= 0x80 && code <= 0x9f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069);
+    out += escaped ? `\\u{${code.toString(16)}}` : c;
+  }
+  return out;
+}
+
+/**
+ * Render a disk name for a list line: plain for a valid identifier, quoted
+ * and escaped otherwise.
+ *
+ * A crafted name like `helper [not loaded: …]` would read as an annotation
+ * while its file is actually loaded — quoting names the toolstore could not
+ * have written itself keeps the two apart, and the quotes are also a cue
+ * that `save_tool`/`delete_tool` would refuse the name.
+ */
+function renderName(name: string): string {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name) ? name : `"${escapeNoticeName(name)}"`;
+}
+
 /** Resolve a tool file path from a name. */
 function toolPath(toolsDir: string, name: string): string {
   return join(toolsDir, `${name}.py`);
+}
+
+/**
+ * The tools directory, canonicalised and refused when it escapes the root.
+ *
+ * The per-entry checks bind only the **final** path component. A `.pi` or
+ * `.pi/code-tools` that is itself a symlink would silently redirect every
+ * tool — an ungated `delete_tool` deleting outside the project, a gated
+ * `save_tool` planting self-executing code in a sibling project — so each
+ * call resolves the real directory first and refuses it outside the real
+ * root (#57).
+ *
+ * The containment check itself is **the** jail in `pathjail.ts` — one
+ * implementation, per the repo's rule — with `mustExist: false` so a tools
+ * dir that does not exist yet is checked by what it would be created under.
+ * Only the wording below is toolstore-specific: the jail's own message is
+ * written for readers, and these tools also write and delete.
+ */
+async function containedToolsDir(toolsDir: string, root: string): Promise<string> {
+  const jail = createPathJail(root, { mustExist: false, allowAbsolute: true });
+  try {
+    return await jail.resolve(toolsDir);
+  } catch (err) {
+    if (err instanceof HostToolError && err.pythonType === "PermissionError") {
+      throw new HostToolError(
+        "PermissionError",
+        `refusing to touch saved tools: '${toolsDir}' resolves outside the project root`,
+      );
+    }
+    throw err;
+  }
 }
 
 // ── Shadowing detection ────────────────────────────────────────
@@ -82,16 +235,23 @@ function assignmentEquals(s: string): number[] {
  *
  * Detects the binding forms a saved tool could use to shadow a host tool:
  * `def`/`async def`, `class`, assignment (plain, annotated, tuple, chained),
- * `for … in`, `with/except … as`, `import … as`, and `from … import …`.
+ * walrus, `for … in`, `with/except … as`, `import … as`, `from … import …`,
+ * and — because the binding is invisible to a name scan — top-level
+ * `exec`/`eval`, `globals()`/`vars()`, `__dict__[…]`, `setattr(…)` and
+ * `import *`, which refuse **every** reserved name rather than guessing one.
  *
  * A **best-effort scan, not a parser** (#54 lists the forms; the write-time
  * gate is #56). It is conservative on false *positives* — a match refuses
  * even inside a triple-quoted string, which is the safe direction — but it
- * has false *negatives*: `exec(...)`, `globals()["name"] = …`, `setattr`,
- * walrus (`:=`), `del name`, `match`/`case` captures, and a plain
- * `import mod` (no alias) are not caught. Those are the load-time check's
- * job (#54), which runs over every `.py` in `.pi/code-tools` and is the
- * authoritative control; this write-time check only refuses what it can see.
+ * has false *negatives*: `match`/`case` captures, `setattr`/`exec` reached
+ * through an alias (`from builtins import exec as e`), and metaprogramming
+ * indented inside a function body. **Both gates run this same scan** — the
+ * load-time check (#54) is authoritative only in that it runs over every
+ * `.py` in `.pi/code-tools` regardless of how it got there, not in what it
+ * can see. Note: `exec`/`eval`/`globals`/`vars`/`setattr` are not importable
+ * in Monty 0.0.21, so the metaprogramming branch guards Python the language
+ * rather than the interpreter that runs today — the one live unbind, `del`,
+ * is caught above.
  * Comment lines are excluded for free — a binding form must start the line,
  * and `# def read_file` starts with `#`.
  *
@@ -117,11 +277,14 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
   // binds `read_file`. Joining can only merge statements, which cannot hide a
   // binding (a merged line is still scanned), and a join that would produce a
   // syntax error is one the sandbox refuses loudly anyway.
-  const joined = source.replace(/\\\r?\n/g, "");
+  const joined = source.replace(/\\[\r\n]+/g, "");
 
   // Split into logical statements on universal newlines and `;`. A `;` inside
   // a string over-splits, which only ever over-refuses — the safe direction.
   for (const line of joined.split(/\r\n|\r|\n/)) {
+    // Statements separated by `;` are all at the line's level: a top-level
+    // line's `;` pieces are top-level, and an indented line's pieces are not.
+    const topLevel = !/^[ \t]/.test(line);
     for (const raw of line.split(";")) {
       const s = raw.trim();
       if (s === "") continue;
@@ -135,6 +298,15 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
       const cls = /^class\s+([A-Za-z_]\w*)/.exec(s);
       if (cls) {
         record(cls[1]);
+        continue;
+      }
+
+      // `del read_file` unbinds the name for the whole session — the preamble
+      // runs first, and host tools resolve only for names Python has not
+      // bound, so a deleted name resolves to nothing, silently (#57 pass 2:
+      // the one live unbind in Monty 0.0.21 that nothing here caught).
+      if (/^del\s/.test(s)) {
+        for (const m of s.split("#")[0].matchAll(/[A-Za-z_]\w*/g)) record(m[0]);
         continue;
       }
 
@@ -164,6 +336,28 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         continue;
       }
 
+      // Module-level metaprogramming: the binding is invisible to this scan.
+      // `exec`/`eval` run arbitrary code in the current namespace, `globals()`
+      // and `vars()` hand it over by name, `__dict__[…]` and `setattr` mutate
+      // it, and `import *` binds an unknown set. A refusal cannot name the
+      // symbol, so every reserved name is recorded — the safe over-refusal,
+      // and the honest one, since the message says "binds" rather than
+      // "defines". Top-level (column 0) only: indented code belongs to a
+      // function body and runs in its locals when called, not at preamble
+      // time. Single-line `def f(): exec(…)` reaches the def branch above
+      // instead — correct, because that exec does not run at load time.
+      if (topLevel) {
+        const code = s.split("#")[0];
+        if (
+          /\b(?:exec|eval)\s*\(|\bglobals\s*\(\s*\)|\bvars\s*\(\s*\)|\b__dict__\s*\[|\bsetattr\s*\(|import\s+\*/.test(
+            code,
+          )
+        ) {
+          for (const reservedName of reserved) record(reservedName);
+          continue;
+        }
+      }
+
       const from = /^from\s+[\w.]+\s+import\s+(.*)$/.exec(s);
       if (from) {
         // `from m import f as read_file` binds the alias; `from m import read_file`
@@ -181,6 +375,11 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         }
         continue;
       }
+
+      // Walrus targets — `(read_file := …)` at statement start, or nested in
+      // an assignment value. Recorded additively, before the assignment
+      // branch, so `x = (bash := 1)` records `bash` as well as `x`.
+      for (const m of s.matchAll(/[A-Za-z_]\w*\s*:=/g)) record(m[0].replace(/\s*:=$/, ""));
 
       // Assignment. The statement must *begin* with a target expression — an
       // identifier, or one wrapped in parens/brackets or star-unpacked — so a
@@ -217,14 +416,21 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
  * Tools are stored as `.py` files in the configured tools directory
  * (default: `<root>/.pi/code-tools`). Agents use these to persist
  * reusable Python functions across sessions.
+ *
+ * Results are **snapshots**, and the session caches tool results for replay:
+ * a list taken before a save or delete stays what it was. Act on a fresh
+ * `list_saved_tools()` when the answer matters.
  */
 export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
   const reservedNames = new Set(options.hostToolNames ?? []);
+  // Live where the snapshot is frozen: the trust decision can change while
+  // the session lives, and the tools must follow it (see ToolStoreOptions).
+  const isTrustedNow = options.isTrusted ?? (() => options.preambleStatus?.trusted ?? true);
 
-  const ensureDir = async () => {
-    await mkdir(toolsDir, { recursive: true });
+  const ensureDir = async (dir: string) => {
+    await mkdir(dir, { recursive: true });
   };
 
   // ── save_tool ──────────────────────────────────────────────
@@ -259,24 +465,28 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     // self-persisting write with auto-execution, strictly worse than `write`
     // (#56).
     requiresApproval: true,
-    approvalNote: "the saved code executes automatically at the start of every future session",
+    approvalNote:
+      "the saved code executes automatically at the start of every future session in a trusted project",
     async execute(args) {
       const name = validateToolName(args.name);
       const code = requireString(args.code, "code");
       const description = requireString(args.description, "description");
+      const dir = await containedToolsDir(toolsDir, root);
 
       // Refuse to persist a tool that would shadow a host tool, rather than
-      // letting it bind the name on every later run (#54, #56).
+      // letting it bind the name on every later run (#54, #56). "binds", not
+      // "defines": the detector also refuses invisible bindings (exec, walrus),
+      // where "defines" would overstate what the scan can see.
       const shadowing = findShadowingBindings(code, reservedNames);
       if (shadowing.length > 0) {
         throw new HostToolError(
           "ValueError",
-          `cannot save tool '${name}': its code defines ${shadowing.map((n) => `'${n}'`).join(", ")}, ` +
+          `cannot save tool '${name}': its code binds ${shadowing.map((n) => `'${n}'`).join(", ")}, ` +
             `which would shadow a host tool`,
         );
       }
 
-      await ensureDir();
+      await ensureDir(dir);
 
       // Wrap with docstring comment
       const docComment = description
@@ -292,8 +502,50 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         "",
       ].join("\n");
 
-      await writeFile(toolPath(toolsDir, name), content, "utf-8");
-      return `Tool '${name}' saved.`;
+      // The write mirrors the read: one open with O_NOFOLLOW | O_NONBLOCK, an
+      // fstat on the fd, the write on the fd. O_NOFOLLOW refuses a file-level
+      // symlink whose target leaves the root (the dir guard above does not
+      // cover the final component), O_NONBLOCK turns a FIFO target into an
+      // immediate error instead of a hang, and writing the fd — not the path —
+      // closes the check-then-write race (#57 pass 2).
+      let target: FileHandle;
+      try {
+        target = await open(
+          toolPath(dir, name),
+          constants.O_WRONLY |
+            constants.O_CREAT |
+            constants.O_TRUNC |
+            constants.O_NOFOLLOW |
+            constants.O_NONBLOCK,
+        );
+      } catch (err) {
+        // ELOOP: a symlink target. ENXIO: a FIFO with no reader (O_WRONLY).
+        // EISDIR: a directory. All are "not a regular file" to the model.
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ELOOP" || code === "ENXIO" || code === "EISDIR") {
+          throw new HostToolError("OSError", `tool '${name}' cannot be saved: not a regular file`);
+        }
+        throw new HostToolError("OSError", (err as Error).message);
+      }
+      try {
+        const st = await target.stat();
+        if (!st.isFile()) {
+          throw new HostToolError("OSError", `tool '${name}' cannot be saved: not a regular file`);
+        }
+        await target.writeFile(content, "utf-8");
+      } finally {
+        await target.close();
+      }
+
+      // Trust-aware: in an untrusted project a new session withholds the file
+      // until the project is trusted — claiming it "loads in new sessions"
+      // unconditionally would be the lie this issue exists to remove.
+      return (
+        `Tool '${name}' saved.` +
+        (isTrustedNow()
+          ? " It loads in sessions created after this one — the current session's preamble is unchanged."
+          : " It will load in new sessions once this project is trusted.")
+      );
     },
   };
 
@@ -318,7 +570,8 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     returns: "str",
     async execute(args) {
       const name = validateToolName(args.name);
-      const path = toolPath(toolsDir, name);
+      const dir = await containedToolsDir(toolsDir, root);
+      const path = toolPath(dir, name);
 
       try {
         await rm(path, { force: false });
@@ -329,11 +582,92 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         throw new HostToolError("OSError", (err as Error).message);
       }
 
-      return `Tool '${name}' deleted.`;
+      return (
+        `Tool '${name}' deleted. It is gone from sessions created after this one; ` +
+        `the current session keeps any copy it loaded.`
+      );
     },
   };
 
   // ── list_saved_tools ───────────────────────────────────────
+
+  /**
+   * One list line for `name`: the name, and — when a session view exists —
+   * its load status, so a model never reads a plain list as "loaded" when
+   * the session is not running the file (#57).
+   *
+   * A plain, unannotated name means **loaded**. Everything else carries a
+   * `[not loaded: …]` suffix. The one exception is a tool the session did
+   * load whose file has since been deleted: it still runs here and is gone
+   * from new sessions, and the line says both.
+   */
+  function annotate(
+    name: string,
+    onDisk: boolean,
+    view: PreambleStatus,
+    dir: string,
+  ): Promise<string> {
+    const shown = renderName(name);
+    if (!view.loaded.has(name)) {
+      return Promise.resolve(`${shown} [not loaded: ${notLoadedReason(name, view)}]`);
+    }
+    if (!onDisk) {
+      return Promise.resolve(
+        `${shown} [loaded in this session — file deleted; gone from new sessions]`,
+      );
+    }
+    return identityStatus(name, shown, view, dir);
+  }
+
+  /**
+   * Whether the loaded file still holds the bytes the session loaded.
+   *
+   * Returns the plain name when it does, the changed-file annotation when it
+   * does not, and the deleted annotation when the stat cannot see it. Size
+   * and mtime are a rewrite detector, not a proof — an attacker who rewrites
+   * identical bytes with a restored mtime passes; hashing is deliberately not
+   * paid for on every list.
+   */
+  async function identityStatus(
+    name: string,
+    shown: string,
+    view: PreambleStatus,
+    dir: string,
+  ): Promise<string> {
+    const identity = view.identity?.get(name);
+    if (!identity) return shown;
+    try {
+      const st = await lstat(toolPath(dir, name));
+      if (st.size !== identity.size || st.mtimeMs !== identity.mtimeMs) {
+        return `${shown} [loaded in this session — file changed since; the session runs the earlier copy]`;
+      }
+      return shown;
+    } catch (err) {
+      // ENOENT means deleted; EACCES and friends mean the file is still there
+      // but its status is unreadable — "deleted" would fabricate a deletion
+      // from a permission error.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return `${shown} [loaded in this session — file deleted; gone from new sessions]`;
+      }
+      return `${shown} [loaded in this session — file status unreadable]`;
+    }
+  }
+
+  /** Why `name` did not load, derived from the session view and its invariants. */
+  function notLoadedReason(name: string, view: PreambleStatus): string {
+    if (view.refused.has(name)) return "preamble refused — shadows a host tool";
+    if (view.unreadable.has(name)) return "unreadable file";
+    if (view.skipped.has(name)) return "preamble limit reached";
+    // The live decision, not the snapshot: a tool that appears after an inert
+    // untrust flip is "not trusted", not "saved after this session started".
+    if (!isTrustedNow() || view.withheld.has(name)) return "project not trusted";
+    // Trusted and in no category: either a benign sibling of a refused
+    // preamble (the loader refuses the whole batch, #54) or a tool saved
+    // after this session started. The loader's invariant — `loaded` is
+    // empty whenever `refused` is not — tells them apart.
+    if (view.loaded.size === 0 && view.refused.size > 0) return "preamble refused — nothing loaded";
+    return "saved after this session started";
+  }
 
   const listSavedTools: HostTool = {
     name: "list_saved_tools",
@@ -341,26 +675,67 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     params: [],
     returns: "str",
     async execute(_args) {
-      await ensureDir();
-
+      const dir = await containedToolsDir(toolsDir, root);
+      // Listing never creates the directory: a read-only tool must not write
+      // into a project — least of all one that was never trusted (#57 pass 2).
       let entries: string[];
       try {
-        entries = await readdir(toolsDir);
-      } catch {
-        return "(no saved tools)";
+        entries = await readdir(dir);
+      } catch (err) {
+        // ENOENT is the only silent case — "no directory, no tools". Anything
+        // else (EACCES, ENOTDIR) is news: "(no saved tools)" would claim the
+        // directory is fine when the tools are merely invisible.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") entries = [];
+        else return `(cannot list saved tools: ${(err as Error).message})`;
+      }
+      const disk = new Set(entries.filter((e) => extname(e) === ".py").map((e) => e.slice(0, -3)));
+
+      const view = options.preambleStatus;
+      if (!view) {
+        const names = [...disk].sort();
+        if (names.length === 0) return "(no saved tools)";
+        return names.join("\n");
       }
 
-      const names = entries
-        .filter((e) => extname(e) === ".py")
-        .map((e) => e.slice(0, -3)) // strip .py
-        .sort();
-
-      if (names.length === 0) return "(no saved tools)";
-      return names.join("\n");
+      // The union, not just the disk: a tool deleted mid-session still
+      // executes in this one, and hiding it would claim it stopped.
+      const all = [...new Set([...disk, ...view.loaded])].sort();
+      if (all.length === 0) return "(no saved tools)";
+      return (await Promise.all(all.map((name) => annotate(name, disk.has(name), view, dir)))).join(
+        "\n",
+      );
     },
   };
 
   // ── read_tool ──────────────────────────────────────────────
+
+  /**
+   * The `# NOTE` header prepended to a source the session did not load.
+   *
+   * Returned rather than thrown: the model needs the code to fix it (a
+   * refused shadow, a skipped tool). Only the two reads that must not happen
+   * refuse — an untrusted project's files (never even read, #53) and a file
+   * that is not a regular file (a FIFO would hang the call, a symlink could
+   * leave the root, #55).
+   */
+  function readNote(name: string, view: PreambleStatus): string {
+    if (view.refused.has(name)) {
+      return (
+        "# NOTE: not loaded in this session — the preamble was refused because this code " +
+        "shadows a host tool"
+      );
+    }
+    if (view.unreadable.has(name)) {
+      return "# NOTE: not loaded in this session — the file could not be read when the session started";
+    }
+    if (view.skipped.has(name)) {
+      return "# NOTE: not loaded in this session — the preamble limit was reached";
+    }
+    if (view.loaded.size === 0 && view.refused.size > 0) {
+      return "# NOTE: not loaded in this session — the preamble was refused and nothing was loaded";
+    }
+    return "# NOTE: not loaded in this session — it was saved after this session started";
+  }
 
   const readTool: HostTool = {
     name: "read_tool",
@@ -375,15 +750,70 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     returns: "str",
     async execute(args) {
       const name = validateToolName(args.name);
-      const path = toolPath(toolsDir, name);
 
+      // The untrusted refusal comes first, before any filesystem contact: an
+      // untrusted session learns nothing about what is (or is not) on disk.
+      // The live decision decides, not the snapshot: a trust flip that kept
+      // the session (nothing to lose) must still close the gate.
+      const view = options.preambleStatus;
+      if (!isTrustedNow()) {
+        throw new HostToolError(
+          "PermissionError",
+          `tool '${name}' was not loaded — this project is not trusted, so its files are not read. ` +
+            "Trust the project in pi, then run `repl` with a new `sessionId` to load them.",
+        );
+      }
+
+      const dir = await containedToolsDir(toolsDir, root);
+      const path = toolPath(dir, name);
+
+      // One open, no name reuse after it: O_NOFOLLOW refuses a symlink (a
+      // target that leaves the project root would read outside it) and
+      // O_NONBLOCK turns a FIFO open into an immediate error instead of a
+      // hang — a swap between an lstat and a later readFile cannot race the
+      // fd, because the fd is what is read. The loader's lstat-first check
+      // would not have protected the read itself (#55 refused the static
+      // case; this closes the window).
+      let handle: FileHandle;
       try {
-        return await readFile(path, "utf-8");
+        handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
           throw new HostToolError("FileNotFoundError", `tool '${name}' does not exist`);
         }
+        // ELOOP: the final component is a symlink. ENXIO/EISDIR: a FIFO or
+        // directory. All are "not a regular file" to the model.
+        if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+          throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
+        }
         throw new HostToolError("OSError", (err as Error).message);
+      }
+
+      try {
+        // fstat, not lstat: the check must describe what the fd actually is,
+        // not what the path was a moment ago.
+        const st = await handle.stat();
+        if (!st.isFile()) {
+          throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
+        }
+        const content = await handle.readFile("utf-8");
+        if (!view || view.loaded.has(name)) {
+          // The name is loaded — but the bytes may not be what loaded. The
+          // session runs the old copy; presenting the new one unannotated
+          // would have the model reason about code that never ran.
+          const identity = view?.identity?.get(name);
+          if (identity && (st.size !== identity.size || st.mtimeMs !== identity.mtimeMs)) {
+            return (
+              "# NOTE: the file changed after this session loaded it — " +
+              "this session runs the earlier copy.\n\n" +
+              content
+            );
+          }
+          return content;
+        }
+        return `${readNote(name, view)}\n\n${content}`;
+      } finally {
+        await handle.close();
       }
     },
   };
@@ -431,6 +861,13 @@ export interface SavedToolsPreamble {
   preamble: string;
   /** Tool names in the preamble, in load order. */
   loaded: string[];
+  /**
+   * Size and mtime of each loaded file as this load saw it, keyed by name.
+   *
+   * The caller's tools use it to tell "still the bytes that loaded" from
+   * "rewritten since" — see {@link PreambleStatus.identity}.
+   */
+  loadedIdentity: ReadonlyMap<string, PreambleFileIdentity>;
   /**
    * Tool names present on disk but left out because a limit was reached.
    *
@@ -514,9 +951,20 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
+  // The same containment as the tools: a symlinked `.pi` must not let a
+  // hostile repo list another project's tool names into the model context
+  // (#57 pass 2 — this is the untrusted-notice path, zero trust required).
+  let dir: string;
+  try {
+    dir = await containedToolsDir(toolsDir, root);
+  } catch (err) {
+    if (err instanceof HostToolError && err.pythonType === "PermissionError") return [];
+    throw err;
+  }
+
   let entries: string[];
   try {
-    entries = await readdir(toolsDir);
+    entries = await readdir(dir);
   } catch {
     return []; // Directory doesn't exist — no tools to name
   }
@@ -568,13 +1016,42 @@ export async function loadSavedTools(
   const root = resolve(options.root);
   const toolsDir = options.toolsDir ?? join(root, ".pi", "code-tools");
 
-  const names = await savedToolNames({ root, toolsDir });
+  // Containment again, for the direct file access below: a symlinked `.pi`
+  // must not execute code from outside the project the user trusted
+  // (#57 pass 2). An escaping dir loads nothing — loud refusal is the tools'
+  // job; the loader's is to not execute what the user never trusted.
+  let dir: string;
+  try {
+    dir = await containedToolsDir(toolsDir, root);
+  } catch (err) {
+    if (err instanceof HostToolError && err.pythonType === "PermissionError") {
+      return {
+        preamble: "",
+        loaded: [],
+        loadedIdentity: new Map(),
+        skipped: [],
+        unreadable: [],
+        refused: [],
+      };
+    }
+    throw err;
+  }
+
+  const names = await savedToolNames({ root, toolsDir: dir });
   if (names.length === 0)
-    return { preamble: "", loaded: [], skipped: [], unreadable: [], refused: [] };
+    return {
+      preamble: "",
+      loaded: [],
+      loadedIdentity: new Map(),
+      skipped: [],
+      unreadable: [],
+      refused: [],
+    };
 
   const reservedNames = new Set(options.hostToolNames ?? []);
 
   const loaded: string[] = [];
+  const loadedIdentity = new Map<string, PreambleFileIdentity>();
   const skipped: string[] = [];
   const refused: RefusedTool[] = [];
   const unreadable: UnreadableTool[] = [];
@@ -587,7 +1064,17 @@ export async function loadSavedTools(
       continue;
     }
 
-    const path = join(toolsDir, `${name}.py`);
+    // Only names the toolstore itself could have written load. A hostile
+    // repo can plant `bad name.py` — and if it loads, it executes while
+    // `read_tool`/`delete_tool` (which validate the name) cannot address it:
+    // the recovery promise would be a lie. Skipped here, reported as
+    // unreadable, never executed (#57 pass 2).
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+      unreadable.push({ file: `${name}.py`, reason: "not a valid tool name" });
+      continue;
+    }
+
+    const path = join(dir, `${name}.py`);
 
     // Only regular files load, decided by lstat rather than discovered as an
     // EISDIR or a hang: a directory and a FIFO both pass the `.py` name
@@ -607,9 +1094,27 @@ export async function loadSavedTools(
     // The read can still fail — the entry may be deleted or swapped between
     // readdir and readFile, or be unreadable by permission. One bad entry
     // skips that entry, not the batch: the session must still be created.
+    // The read itself opens the fd with O_NOFOLLOW | O_NONBLOCK — a swap to
+    // a symlink or FIFO after the lstat above errors here instead of reading
+    // outside the root or hanging.
     let content: string;
+    let opened: Stats;
     try {
-      content = await readFile(path, "utf-8");
+      const handle = await open(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      try {
+        const st = await handle.stat();
+        if (!st.isFile()) throw new Error("not a regular file");
+        content = await handle.readFile("utf-8");
+        // The identity must describe the bytes read through THIS fd — the
+        // pre-open lstat above describes a path that may have been swapped
+        // since (#57 pass 2).
+        opened = st;
+      } finally {
+        await handle.close();
+      }
     } catch (err) {
       unreadable.push({ file: `${name}.py`, reason: (err as Error).message });
       continue;
@@ -634,6 +1139,7 @@ export async function loadSavedTools(
 
     bytes += size;
     loaded.push(name);
+    loadedIdentity.set(name, { size: opened.size, mtimeMs: opened.mtimeMs });
     sources.push(content);
   }
 
@@ -644,13 +1150,22 @@ export async function loadSavedTools(
   // unreadable entries from the same pass ride along: "nothing loaded" is the
   // whole truth either way. `skipped` stays `[]` by the #54 decision — the
   // limits are never evaluated when a preamble is refused.
-  if (refused.length > 0) return { preamble: "", loaded: [], skipped: [], unreadable, refused };
+  if (refused.length > 0)
+    return {
+      preamble: "",
+      loaded: [],
+      loadedIdentity: new Map(),
+      skipped: [],
+      unreadable,
+      refused,
+    };
 
-  if (loaded.length === 0) return { preamble: "", loaded: [], skipped, unreadable, refused };
+  if (loaded.length === 0)
+    return { preamble: "", loaded: [], loadedIdentity: new Map(), skipped, unreadable, refused };
 
   const header = [
     "# ── Loaded tools ──",
-    `# ${loaded.length} tool(s) from ${toolsDir}`,
+    `# ${loaded.length} tool(s) from ${dir}`,
     ...(skipped.length > 0
       ? [`# ${skipped.length} not loaded — preamble limit reached: ${skipped.join(", ")}`]
       : []),
@@ -660,6 +1175,7 @@ export async function loadSavedTools(
   return {
     preamble: [...header, ...sources.flatMap((s) => [s, ""])].join("\n"),
     loaded,
+    loadedIdentity,
     skipped,
     unreadable,
     refused,

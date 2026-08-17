@@ -2,8 +2,14 @@ import { Session, type GrantSummary } from "./session.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
-import { loadSavedTools, savedToolNames } from "./toolstore.js";
-import type { RefusedTool, UnreadableTool } from "./toolstore.js";
+import {
+  loadSavedTools,
+  savedToolNames,
+  createToolStoreTools,
+  TOOLSTORE_TOOL_NAMES,
+  escapeNoticeName,
+} from "./toolstore.js";
+import type { RefusedTool, UnreadableTool, PreambleStatus } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
 
@@ -241,16 +247,35 @@ export class ReplRunner {
     const notices: string[] = [];
     if (rebuiltId !== undefined) notices.push(trustChangedMessage(rebuiltId, false));
 
+    // The shadowing gates (#54 load, #56 write) must see every host-tool name
+    // the session will have — including the toolstore's own, which are not in
+    // the registry yet: a preamble `def save_tool` would shadow the registered
+    // tool exactly like a bridge or builtin name (#57).
+    const hostToolNames = [...registry.list().map((tool) => tool.name), ...TOOLSTORE_TOOL_NAMES];
+
     let preamble = "";
+    let preambleStatus: PreambleStatus;
     if (trusted) {
       // The reserved names are the live registry's — never a hardcoded list.
       // A file that binds one of them refuses the whole preamble (#54), and
       // the loader reports it with the offending file and symbols.
       const load = await loadSavedTools({
         root: this.cwd,
-        hostToolNames: registry.list().map((tool) => tool.name),
+        hostToolNames,
       });
       preamble = load.preamble;
+      // The tool names, for the honest tool answers: `refused`/`unreadable`
+      // carry `.py` file names, the status sets carry the names the tools and
+      // the model use.
+      preambleStatus = {
+        trusted: true,
+        loaded: new Set(load.loaded),
+        withheld: new Set(),
+        skipped: new Set(load.skipped),
+        refused: new Set(load.refused.map((r) => r.file.slice(0, -3))),
+        unreadable: new Set(load.unreadable.map((u) => u.file.slice(0, -3))),
+        identity: load.loadedIdentity,
+      };
       if (load.refused.length > 0) notices.push(refusalNotice(load.refused));
       if (load.unreadable.length > 0) notices.push(unreadableNotice(load.unreadable));
       if (load.skipped.length > 0) notices.push(limitNotice(load.skipped));
@@ -259,7 +284,29 @@ export class ReplRunner {
       // model needs the names or it will call a tool that is not defined and
       // get a NameError it cannot explain.
       const withheld = await savedToolNames({ root: this.cwd });
+      preambleStatus = {
+        trusted: false,
+        loaded: new Set(),
+        withheld: new Set(withheld),
+        skipped: new Set(),
+        refused: new Set(),
+        unreadable: new Set(),
+      };
       if (withheld.length > 0) notices.push(untrustedNotice(withheld));
+    }
+
+    // Registered in every session, trusted or untrusted (#57): the tools
+    // answer from the status above — listing what actually loaded, refusing
+    // reads the project never trusted — and the write-time shadowing check
+    // (#56) finally sees the live registry's names. The live trust callback
+    // keeps the read gate honest across trust flips that keep the session.
+    for (const tool of createToolStoreTools({
+      root: this.cwd,
+      hostToolNames,
+      preambleStatus,
+      isTrusted: this.isProjectTrusted,
+    })) {
+      registry.add(tool);
     }
 
     return {
@@ -279,19 +326,23 @@ export class ReplRunner {
 
 /** What the model is told when project trust withheld the saved tools. */
 function untrustedNotice(withheld: string[]): string {
+  // Names come from readdir — escape before rendering, as every notice does.
+  const names = withheld.map(escapeNoticeName).join(", ");
   return (
     `[preamble withheld] ${withheld.length} saved tool(s) in .pi/code-tools were not loaded ` +
-    `because this project is not trusted: ${withheld.join(", ")}. ` +
+    `because this project is not trusted: ${names}. ` +
     `They are not defined in this session — calling one raises NameError. ` +
-    `Trust the project in pi to load them, or paste the code you need.`
+    `list_saved_tools() shows what is on disk, and read_tool() refuses while the project ` +
+    `is untrusted. Trust the project in pi to load them, or paste the code you need.`
   );
 }
 
 /** What the model is told when the preamble limits dropped some tools. */
 function limitNotice(skipped: string[]): string {
+  const names = skipped.map(escapeNoticeName).join(", ");
   return (
     `[preamble truncated] ${skipped.length} saved tool(s) were not loaded because the ` +
-    `preamble size limit was reached: ${skipped.join(", ")}. ` +
+    `preamble size limit was reached: ${names}. ` +
     `They are not defined in this session — calling one raises NameError. ` +
     `Delete tools you no longer need with delete_tool.`
   );
@@ -300,21 +351,9 @@ function limitNotice(skipped: string[]): string {
 /**
  * Render a filename inside a model-facing notice.
  *
- * Filenames come from the directory listing and may contain newlines and
- * ANSI escapes — unescaped, a crafted name could forge notice lines or
- * terminal sequences. Control characters become `\u{..}` escapes.
+ * The shared escaper lives in `toolstore.ts` — `escapeNoticeName` — so the
+ * tools and every notice render attacker-controlled filenames the same way.
  */
-function escapeNoticeName(name: string): string {
-  // No regex here: biome forbids control characters in regex literals
-  // (noControlCharactersInRegex), and the loop form is clearer anyway.
-  let out = "";
-  for (const c of name) {
-    const code = c.charCodeAt(0);
-    out += code < 0x20 || code === 0x7f ? `\\u{${code.toString(16)}}` : c;
-  }
-  return out;
-}
-
 /**
  * What the model is told when the preamble was refused for shadowing (#54).
  *
@@ -326,14 +365,14 @@ function escapeNoticeName(name: string): string {
  */
 function refusalNotice(refused: RefusedTool[]): string {
   const offenders = refused
-    .map((r) => `${escapeNoticeName(r.file)} defines ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
+    .map((r) => `${escapeNoticeName(r.file)} binds ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
     .join("; ");
   return (
     `[preamble refused] No saved tools were loaded: ${offenders} — those names are host tools, ` +
     `and a preamble that shadows one is refused whole, never run in part. ` +
     `Calling a saved tool raises NameError in this session. ` +
-    `Rewrite or delete the offending file(s) under .pi/code-tools, ` +
-    `then start a new session to load the preamble.`
+    `Rewrite the offending file(s) — read_tool() shows the code, delete_tool() removes one — ` +
+    "then run `repl` with a new `sessionId` to load the preamble."
   );
 }
 
@@ -352,7 +391,7 @@ function unreadableNotice(unreadable: UnreadableTool[]): string {
     `[preamble unreadable] ${unreadable.length} saved tool file(s) could not be read and were ` +
     `not loaded: ${files}. They are not defined in this session — calling one raises ` +
     `NameError. Fix or remove the file(s) under .pi/code-tools, ` +
-    `then start a new session to load the preamble.`
+    "then run `repl` with a new `sessionId` to load the preamble."
   );
 }
 
