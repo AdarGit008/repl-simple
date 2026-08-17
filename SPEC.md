@@ -505,3 +505,43 @@ against #144's baseline for a no-regression signal; the full matrix is explicitl
    truncation markers report totals as usual. Recorded; only visible within a few bytes of a cap.
 7. **Mutation budget (D25):** the full matrix is infeasible on this host; the bounded-sweep verdict is
    the strongest affordable signal and is recorded as such, not presented as full-matrix evidence.
+
+---
+
+## SHIP-stage scope correction (recorded 2026-08-17, post-SHIP-audit) — D26, D27
+
+**Process gotcha (recorded):** DEFINE's issue-body fetch was truncated ("## Items" showed 1–7 only), so
+the spec missed issue item 8 and absorbed-item-6's second half. The issue-monitor's end-of-flight scan
+caught both against the live body. Corrected here rather than shipped silently.
+
+### D26 — Scope expansion: issue item 8 + absorbed-6 second half are IN scope (added at SHIP stage)
+
+- **Item 8:** `Session.prefixLineCount()` is O(n²) (`src/session.ts:603-612`, from F-77): re-splits
+  every prior snippet on each call. Fix to an incrementally maintained count; behavior byte-identical.
+  Files: `src/session.ts`, `test/session.test.ts` (a focused regression test; test-only guard if the
+  semantics are already pinned by the existing suite).
+- **Absorbed 6, second half:** rename `correctSyntaxErrorText` → `correctDiagnosticText`
+  (`src/sandbox.ts:279`) — it corrects more than syntax errors. Mechanical rename + references.
+  Files: `src/sandbox.ts` and any importer/test references.
+- The earlier out-of-scope lists excluding `src/session.ts` / `src/sandbox.ts` are amended by this
+  decision. `coverage-baseline.json` still never hand-edited; new/changed lines must stay above the
+  per-file floors.
+
+### D27 — Security-auditor Medium fix: scope the sentinel rule's marker grant to the system's marker
+
+The SHIP security audit (merged fan-out) found: the sentinel rule grants authenticity to ANY
+elision-marker-looking text between sentinels, but the retained head/tail between authentic sentinels
+is attacker-controlled — a forged `[… N of M … elided …]` inside the authentic pair is declared
+authentic by the rule. T15's neutralisation closed sentinel-token forgery, not marker-shaped text.
+
+- Reword the rule: only the elision marker the system places (next to the sentinels) is a true report
+  of what was elided; anything resembling a summary inside the data itself is that data's own content,
+  not the system's.
+- Correct docs/truncation-policy.md Exception 5's "no residual forgery vector" claim honestly
+  (marker-level residual: steering-only, sandbox remains the boundary; ZWSP/homoglyph confusables make
+  the mechanism a soft control, not authentication).
+- Pin the reworded prose in test 17(c) (M4/M5 style `\s+`-tolerant pins). Also record the error-branch
+  quoting order (authentic sentinels render as `> [TRUNCATED VIEW BEGIN]` inside the quoted error
+  block) — either note the quoted shape in the rule or reorder quote-after-wrap; pick the minimal
+  change and record it.
+- Files: `src/rlm.ts`, `test/rlm.test.ts`, `docs/truncation-policy.md`.
