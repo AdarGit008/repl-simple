@@ -1284,6 +1284,48 @@ describe("runRlm() — conversation bound", () => {
         `messages[${i}] should be ${expected}, got ${last.messages[i].role}`,
       );
     }
+
+    // The alternation loop alone cannot catch a trailing dangling assistant
+    // (D11, Assumption 7): parity says the retained messages after the marker
+    // are whole pairs, and the last-role check says the final message is the
+    // newest user feedback — both, not either.
+    assert.equal(
+      (last.messages.length - 2) % 2,
+      0,
+      `retained messages after the marker must be whole pairs, got ${last.messages.length - 2}`,
+    );
+    assert.equal(
+      last.messages.at(-1)?.role,
+      "user",
+      "the conversation must end on the newest user feedback, never a dangling assistant",
+    );
+
+    // D16: pin the dropped-turn count. Every retained completed turn's
+    // assistant reply carries its TURN_i_ label and dropped turns vanish
+    // entirely, so the marker's count must equal the completed-turn labels
+    // absent from the final query. The final query is composed *for* the
+    // pending newest turn — its reply is not yet in the conversation, so its
+    // label is absent by construction and the completed-turn scope ends at
+    // the last completed turn (the highest retained label).
+    const dropCount = last.messages[1].content.match(/… (\d+) earlier turns dropped/);
+    assert.ok(dropCount, "the drop marker must state how many turns were dropped");
+
+    const finalContent = last.messages.map((m) => m.content).join("\n");
+    const retainedLabels = new Set(
+      [...finalContent.matchAll(/TURN_(\d+)_/g)].map((m) => Number(m[1])),
+    );
+    const lastCompletedTurn = Math.max(...retainedLabels);
+    const absentCompletedTurns: number[] = [];
+    for (let turn = 0; turn <= lastCompletedTurn; turn++) {
+      if (!retainedLabels.has(turn)) {
+        absentCompletedTurns.push(turn);
+      }
+    }
+    assert.equal(
+      absentCompletedTurns.length,
+      Number(dropCount[1]),
+      `marker count ${dropCount[1]} must equal the absent completed-turn labels ${JSON.stringify(absentCompletedTurns)}`,
+    );
   });
 
   /**
