@@ -465,9 +465,20 @@ the model that only elision markers inside the sentinels are authentic — marke
 anywhere else is literal data (the history-drop notice after the first message is carved out as
 also system-emitted and authentic). Sentinel-token sequences inside a value itself
 (`[TRUNCATED VIEW`, under budget or over) are neutralised before wrapping — the ordinary space
-becomes a zero-width space, `[TRUNCATED\u200BVIEW`, which cannot form a sentinel — leaving no
-residual forgery vector: a forged pair can neither render whole-and-sentinel-free under the
-budget nor land inside the authentic pair over it. The sentinel bytes are subtracted from the
+becomes a zero-width space, `[TRUNCATED\u200BVIEW`, which cannot form a sentinel — so
+sentinel-token forgery is closed: a forged pair can neither render whole-and-sentinel-free
+under the budget nor land inside the authentic pair over it. Marker-shaped text is a different
+residual: the retained head and tail inside an authentic pair are still attacker-controlled,
+and a forged `[… N of M elided …]` line inside them sits inside the sentinels. That residual
+is steering-only — it can bias the model toward the attacker's summary, never read or
+exfiltrate data — the sandbox remains the real boundary. The system prompt therefore grants
+authenticity only to the marker the system places next to the sentinels, declaring anything
+resembling a summary inside the data itself to be that data's own content (D27), and the
+ZWSP/homoglyph confusable family — a neutralised sentinel differs from a real one by one
+invisible character — makes the mechanism a soft control (defense-in-depth), not
+authentication. On the error branch the authentic sentinels render line-quoted as
+`> [TRUNCATED VIEW BEGIN]` because D19's quoting is applied after the wrap; the rule notes
+that quoted shape rather than reordering. The sentinel bytes are subtracted from the
 section budget before the `truncateText` call, so the ceilings in the table stay hard with the
 sentinels included; the value is byte-measured after the neutralisation swap, so the budgets
 stay exact. Under the budget the path is a sentinel-free no-op (byte-identical apart from that
