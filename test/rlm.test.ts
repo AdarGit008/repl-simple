@@ -1992,6 +1992,117 @@ describe("runRlm() — conversation bound", () => {
     assert.equal(Number(dropped[1]), 2, "one pair for the budget, one for the marker");
   });
 
+  it("pins the running-total decrement in both drop loops — `+=` decimates (test 24)", async () => {
+    // C1/C2 (#145): the `-=` → `+=` mutants at src/rlm.ts:642 (budget loop)
+    // and :655 (marker loop) survived because with `+=` the total only grows,
+    // so the loops drop pairs until the `messages.length >= 5` guard stops
+    // them — and test 23's 7-message conversation lands that decimation on
+    // the same observable state as the correct path (count 2, [I, A2, F2]).
+    // The kill is a conversation where the correct path exits each loop via
+    // the BYTE condition, never the guard: `+=` then decimates to the guard
+    // (marker count 3, only [I, A3, F3] left) while `-=` stops early (marker
+    // count 2, [I, marker, A2, F2, A3, F3]).
+    //
+    // VERIFY's recipe — a 9-message conversation over budget by less than
+    // one pair's bytes — with one deviation: the budget loop drops exactly
+    // one pair and stops 16 bytes under the budget, while the drop marker is
+    // 103 bytes, so the marker's bytes do NOT fit the headroom. The marker
+    // loop then makes one marker-room drop and exits via the byte condition
+    // with five messages remaining (103 > 16, but 103 < 16 + A1 + F1). The
+    // deviation is what kills the SECOND mutant: with a marker-fitting
+    // headroom the marker-loop body never executes and its `+=` stays
+    // unobservable. Sizes are re-derived from the observed messages, so the
+    // construction holds under every mutant.
+    const callRecords: Array<{
+      systemPrompt: string;
+      messages: Array<{ role: string; content: string }>;
+    }> = [];
+    const llm: LlmClient & {
+      calls(): Array<{ systemPrompt: string; messages: Array<{ role: string; content: string }> }>;
+    } = {
+      async query(systemPrompt, messages) {
+        callRecords.push({
+          systemPrompt,
+          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        });
+        if (callRecords.length === 1) return silentPaddedReply(40 * 1024, "T24_A0");
+        if (callRecords.length === 2) return silentPaddedReply(96 * 1024, "T24_A1");
+        if (callRecords.length === 3) {
+          // Query 3 carries [I, A0, F0, A1, F1]. Size A2 so turn 3's
+          // seven-message conversation totals exactly 192 KiB — comfortably
+          // under budget, so nothing is dropped before the kill point.
+          const msgs = callRecords[2].messages;
+          const bytes = (i: number) => Buffer.byteLength(msgs[i].content, "utf8");
+          const a2 = 192 * 1024 - bytes(0) - bytes(1) - bytes(3) - 3 * bytes(2);
+          return silentPaddedReply(a2, "T24_A2");
+        }
+        if (callRecords.length === 4) {
+          // Query 4 carries the seven 192 KiB messages. Size A3 so turn 4's
+          // nine-message conversation lands (A0 + F0) − 16 bytes over the
+          // budget: less than one pair, so the budget loop drops exactly one
+          // pair and stops 16 bytes under — headroom far smaller than the
+          // 103-byte drop marker.
+          const msgs = callRecords[3].messages;
+          const bytes = (i: number) => Buffer.byteLength(msgs[i].content, "utf8");
+          const a3 = 64 * 1024 + bytes(1) - 16;
+          return silentPaddedReply(a3, "T24_A3");
+        }
+        if (callRecords.length === 5) return '```python\nSUBMIT("done")\n```';
+        return "";
+      },
+      calls() {
+        return callRecords;
+      },
+    };
+    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
+    const registry = new ToolRegistry(tools);
+
+    const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 6 });
+
+    assert.equal(result.status, "ok", "the run must complete through the kill point");
+    const calls = llm.calls();
+    assert.equal(calls.length, 5);
+    // Construction guard: the budget is crossed only at the 9-message kill
+    // point — the first three turns keep every message, marker-free.
+    assert.equal(calls[3].messages.length, 7, "turn 3 must keep all seven messages");
+    assert.doesNotMatch(
+      calls[3].messages.map((m) => m.content).join("\n"),
+      /earlier turns dropped/,
+      "no marker may appear before the kill point",
+    );
+
+    // The kill point, observed at query 5: one pair for the budget, one for
+    // the marker's room — the two newest pairs survive whole. Under either
+    // `+=` mutant the loops instead decimate to the length guard: the final
+    // conversation is [I, marker(3), A3, F3] — four messages, count 3.
+    const final = calls[4].messages;
+    assert.deepEqual(
+      final.map((m) => m.role),
+      ["user", "user", "assistant", "user", "assistant", "user"],
+      "after the two drops: initial message, marker, two newest whole pairs",
+    );
+    assert.match(final[1].content, /earlier turns dropped/);
+    const dropped = final[1].content.match(/… (\d+) earlier turns dropped/);
+    assert.ok(dropped, "the drop marker must state the count");
+    assert.equal(Number(dropped[1]), 2, "one pair for the budget, one for the marker");
+    assert.equal(final.at(-1)?.role, "user", "the conversation must end on the newest feedback");
+    assert.ok(
+      final[2].content.includes("T24_A2") && final[4].content.includes("T24_A3"),
+      "the two newest turns must survive whole",
+    );
+    assert.ok(
+      !final
+        .map((m) => m.content)
+        .join("\n")
+        .includes("T24_A0"),
+      "the oldest turns must be gone",
+    );
+    assert.ok(
+      conversationBytes(final) <= 256 * 1024,
+      `the final conversation must stay ≤ 256 KiB including the marker, got ${conversationBytes(final)} bytes`,
+    );
+  });
+
   it("keeps a just-under-budget conversation whole and marker-free (test 12)", async () => {
     // The complement of the strict boundary: ~100 bytes under the budget,
     // nothing may be dropped and no marker may appear.

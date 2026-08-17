@@ -13,3 +13,4 @@
 - [x] T11 — Reword the TextEncoder framing honestly (D14): src/rlm.ts JSDoc + docs Exception 3
 - [x] T12 — Rename the q binding to questionText + docs line 390 reword (D23)
 - [x] T13 — Close VERIFY gaps: H1 test 14 both-ends + elided-count pins, H2 assistant-reply boundary/magnitude pin (test 22), H3 marker-overshoot loop execution (test 23), M4 docs rows + sentinel exception + #145 paragraph, M5 input-name regex boundary cases, L1 test 7 comment
+- [x] T14 — Kill the running-total `-=`→`+=` mutants at rlm.ts:642/655 (C1/C2) with test 24: 9-message kill point where the correct path exits each loop via the byte condition and `+=` decimates to the length guard (marker count 3 vs 2, [I, marker, A2, F2, A3, F3] kept)
