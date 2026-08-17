@@ -1,49 +1,49 @@
-# Ship report — flight F-144 (issue #144: 9.10 — Cap result.error and the question in the RLM feedback loop)
+# F-77 SHIP Report — merge of review / verify / spec sources + final evidence
 
-Branch: `issue-144-cap-error-question` (7 commits ahead of flight base `34da5c5`; unmerged, not pushed at write time)
-Commits: `01e5c6a` SPEC · `9fb8916` plan · `018e51a` T1 · `e905ce8` T2 · `527244e` T3 · `35b16cd` review · `this` ship
+## Gates table
 
-## What was built
+| Gate | Expected | Measured (ship audit) | Verdict |
+|---|---|---|---|
+| `npm test` | 986/986 | **986 pass / 0 fail / 0 skipped** | ✅ PASS |
+| `npm run check` (tsc) | clean | clean | ✅ PASS |
+| `npm run coverage` | all floors hold | all floors met (rlm 97.44, sandbox 97.65, session 98.70, rlm_loop 98.36, types 100) | ✅ PASS |
+| `npm run lint` (biome) | clean | clean, 49 files | ✅ PASS |
+| Commits `791096a..HEAD` | one logical change each | 11 commits (9.7a-9.7i + 2 docs), repo style, no stray files | ✅ PASS |
+| Dependencies | none added | package.json / package-lock.json diffs empty | ✅ PASS |
+| Secrets in diff | none | scan clean | ✅ PASS |
+| Prompt addition | static, no interpolation | verified literal template, no `${}` in added block | ✅ PASS |
+| Task list | all checked | all 10 tasks `[x]` | ✅ PASS |
 
-| Task | Change | Tests |
-|------|--------|-------|
-| T1 | `buildFeedback` caps `result.error` ≤ 16 KiB (50/50 head+tail) via shared `truncateText`, recovery "Catch the exception and print the full traceback to see more." (D7) | 8 |
-| T2 | `buildInitialPrompt` caps `question` ≤ 64 KiB (50/50) via `truncateText`, recovery "The question was truncated. Answer from the part shown and state the assumption if ambiguous." (D8) | 9 |
-| T3 | `docs/truncation-policy.md` budget table extended with both caps; stale "error uncapped" non-goal scoped down to `errorKind` | — |
+## Source-of-truth merge
 
-All tasks RED→GREEN: test 8 RED at 100 KiB vs 16 KiB ceiling; test 9 RED at 131072 vs 65536 bytes. Full suite 950/950 (deterministic, run twice); `tsc --noEmit`, build, biome all clean; coverage floors hold (`src/rlm.ts` 97.40% vs 95.94% floor; baseline untouched). Both new tests have under-budget no-op halves proving byte-identical pass-through.
+- **tasks/review.md** (Phase 5 code review): REQUEST CHANGES — Required finding (README claimed offset-corrected diagnostics while `RLMLoop` still leaked) fixed by Task 10a; Optional regex hardening fixed by Task 10b. Nits and FYIs recorded as residual.
+- **tasks/verify-77.md** (Phase 4, 3 rounds): Round 1 NO-GO (typing diagnostics still shifted — SPEC premise false) fixed by Task 7; MEDIUM gaps fixed by Task 8 (which exposed and fixed a real pre-existing `Session.resume()` bug); Round 3 gates re-run by coder.
+- **SPEC.md D1-D4**: all honored. D1 mechanics incl. typing-path correction and #144 cap preserved; D2 truth-telling contract adopted; D3 literals intact; D4 json route declined-with-record.
 
-## Gate results
+## Security verdict
 
-- **VERIFY** (fresh context): full matrix green ×2 runs — no fixes needed, no blockers. Diff scope `34da5c5..HEAD` = exactly the 6 expected files; no `Buffer`/`byteLength` in `src/rlm.ts` (test 6 invariant). Bounded ~19-min partial mutation sweep of `src/rlm.ts`: 48/451 mutants tested, ≈89.6% detected, no regression signal; full sweep infeasible on this 8-core host (repo's own `docs/mutation-testing.md` warning) — recorded as a limitation.
-- **REVIEW** (fresh context, five-axis): verdict **approve** — 0 blockers, 0 majors, 6 minor, 5 nit (`tasks/review.md`, commit `35b16cd`).
-- **SHIP fan-out** (parallel, independent, read-only):
-  - code-reviewer: **SHIP** — D7/D8/D9 implemented verbatim against SPEC; budget math sound (worst-case `messages[0]` ≈ 97 KiB < 256 KiB).
-  - security-auditor: **SHIP** — 0 critical/high/medium; 3 low + 2 info (all pre-existing or defense-in-depth).
-  - test-engineer: **SHIP** — tests 8/9 are genuine prove-it tests (verified failing against base `34da5c5`), deterministic (98/98 in ~3.0s), coverage-floor risk nil.
+**SAFE — strictly less model-visible source exposure, no new attack surface.**
+- Transform is line-wise string surgery over Monty-rendered diagnostic text; rows at/≤ offset dropped, never emitted with non-positive numbers; the 16 KiB #144 cap still applies on corrected text.
+- Prompt addition is static text; no user data interpolated → no prompt-injection surface.
+- No auth / secrets / payments / destructive ops / deploys in the diff; no new dependencies.
+- Hidden text never gates approval decisions (approvals key on tool name/args).
+- **High-risk stop condition (auth/secrets/destructive/payments/deploys): CONFIRMED NOT APPLICABLE.**
 
-## Risk assessment (doubt-driven check)
+## Decision
 
-Stop-condition review: no auth, secrets, destructive migrations, payments, or deploys in this change — high-risk/irreversible trigger **not met**; no doubt-driven drill required. Closest risks (all recorded below as follow-ups): forged truncation markers (LOW — model misdirection only, sandbox remains enforcement boundary); budget DoS via pathological assistant replies (LOW — pre-existing Assumption 4, now the only uncapped prompt path).
+**🟢 GO — merge to main** (pending user confirmation at the Phase 6 human gate).
 
-## Decision: **GO**
+## Rollback plan
 
-Merge-ready. Rollback plan: nothing is deployed; the branch is the artifact. If a regression surfaces after merge: (1) revert the merge commit on main — each task is a separate commit so T1/T2/T3 can be reverted independently; (2) as last resort, roll back `src/rlm.ts` and `test/rlm.test.ts` to `34da5c5` (`git checkout 34da5c5 -- src/rlm.ts test/rlm.test.ts`), which restores pre-flight behavior exactly; (3) no data migrations or external state are involved, so rollback has no side effects.
+**Rollback unit = branch `issue/77-line-offset-continuity`** (nothing on main yet):
+1. Preferred (pre-merge): don't merge — nothing to undo.
+2. If merged without squash: revert in reverse order — `c9e0b1f` (9.7i) → `b1558af` (docs) → `0681c38` (9.7h) → `4ee8388` (9.7g) → `9e39c96` (9.7f) → `12f0b67` (9.7e) → `204224f` (9.7d) → `357319d` (9.7c) → `87aae68` (9.7b) → `2b15370` (9.7a) → `5757ce1` (docs). Each commit is one logical change. If squash-merged, revert that single commit.
+3. Behavioral kill-switch built in: `lineOffset?` is additive and defaults to absent — after revert no caller passes it, sandbox renders as-is, existing callers get exact current behavior. No migrations/schema/env/config touched.
 
-## Residual risks & post-ship follow-ups (from fan-out, not blocking)
+## Residual risks (recorded, not shipped)
 
-1. **Authenticate truncation markers** (security LOW): attacker text is indistinguishable from real `[… X of Y elided …]` markers. Sentinel-delimited markers + a system-prompt note would make them self-authenticating. → #145 (or new issue).
-2. **Cap or fail on pathological assistant replies** (`src/rlm.ts:599`, security LOW): the last uncapped prompt path; a prompt-injection-induced multi-MiB reply is carried in every subsequent query. → #145.
-3. **Delimit error/stdout sections in feedback** (`src/rlm.ts:352`, security LOW): an exception message containing `\nstdout:` can forge a fake stdout line. Indent/quote or `###` headers. → #145.
-4. **Sanitize input names** (`src/rlm.ts:281`, security INFO): input keys interpolated unescaped into the prompt header — a backtick/newline key injects prompt structure. One-line fix. → #145 (this is also the #72-deferral note from F-74 monitor Item 3).
-5. **Test-strength gaps** (test-engineer): boundary tests at exactly/just-over budget; "uses the full budget" assertions (a silent 8 KiB cap would still pass today); head/tail shape assertion; composition test (huge question + inputs). → #145.
-6. **Naming** (review minor): `ERROR_MAX_BYTES` breaks the `FEEDBACK_` prefix convention (`src/rlm.ts:28`). → #145.
-7. Cosmetic: `const { text: q }` single-letter binding (`src/rlm.ts:300`); docs/truncation-policy.md "four rows / one implementation" sentence now stale after adding rows five and six (`docs/truncation-policy.md:390`). → #145.
-
-## Merge notes (important)
-
-`origin/main` advanced 5 commits (#110, #150) after this flight branched from `34da5c5`. Overlap is **editorial-only**: SPEC.md, tasks/plan.md, tasks/todo.md. **Zero overlap** in `src/rlm.ts`, `test/rlm.test.ts`, `docs/truncation-policy.md` (the code merges clean). On merge, resolve the three planning-doc conflicts by taking this flight's versions (they are the F-144 spec-of-record; the other flights' versions live in their own commits). Supervisor decision (recorded): no rebase — verify against flight base.
-
-## Open-issues recommendations
-
-See `tasks/monitor-report.md` (flight monitor). The monitor's final report carries the exact wording to update #144 (DoD checkboxes), #145 (absorb follow-ups 1–7 above), #77/#70 cross-references, and any newly discovered gotchas.
+1. `correctRuntimeError` re-implements Monty's traceback renderer — re-measure on the next monty bump.
+2. `Session.prefixLineCount()` O(n²) over a session's lifetime (negligible today).
+3. Multi-block typing diagnostic under offset unpinned (transform handles it by construction).
+4. Runtime `endLine` correction unrendered (cosmetic).
+5. Nit: `correctSyntaxErrorText` → `correctDiagnosticText` (it serves typing too).
