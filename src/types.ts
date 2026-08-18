@@ -233,11 +233,16 @@ import type { SpendBudget } from "./budget.js";
  *
  * Injected by the caller — repl-simple has no LLM dependency of its own.
  * Tests use a mock that returns canned responses from an array.
+ *
+ * `signal` is the caller's abort: implementations that support cancellation
+ * should honour it so an aborted run stops being billed; the loop also races
+ * against it as a safety net for clients that ignore it (#75).
  */
 export interface LlmClient {
   query(
     systemPrompt: string,
     messages: Array<{ role: "user" | "assistant"; content: string }>,
+    signal?: AbortSignal,
   ): Promise<string>;
 }
 
@@ -280,7 +285,7 @@ export interface RlmOptions {
    * no budget logic runs and `RlmResult.budget` is absent (D5).
    */
   budget?: number | SpendBudget;
-  /** Abort signal — checked between iterations. */
+  /** Abort signal — honoured during the LLM query, the sandbox run, and between iterations (#75). */
   signal?: AbortSignal;
   /** Callback invoked after each iteration completes. */
   onIteration?: (iteration: RlmIteration) => void;
@@ -318,9 +323,11 @@ export interface RlmBudgetReport {
 export interface RlmResult {
   /**
    * "ok" when SUBMIT was called, "max_iterations" when the loop exhausted,
-   * "budget_exhausted" when the spend budget degraded the run (D4).
+   * "budget_exhausted" when the spend budget degraded the run (D4), "aborted"
+   * when the caller's signal fired mid-run — the loop returns what it
+   * completed rather than throwing (#75).
    */
-  status: "ok" | "max_iterations" | "budget_exhausted";
+  status: "ok" | "max_iterations" | "budget_exhausted" | "aborted";
   /** The answer string (from SUBMIT, or best-effort extraction). */
   answer: string;
   /** All iterations executed. */

@@ -1,33 +1,50 @@
-# Review — post-merge micro-flight F-145b (close #145's two open items, D28/D29)
+# Review — issue #75: abort returns what it completed
 
-Five-axis review of `main..HEAD` on `issue-145-post-merge-items` (6 commits) by the code-reviewer
-persona (fresh context).
+Five-axis review of the working-tree diff (`SPEC.md` D30–D35 source of truth) by the code-reviewer
+persona (fresh context). Reviewed code only: `src/rlm.ts`, `src/sandbox.ts`, `src/types.ts`,
+`test/rlm.test.ts`.
 
-## Verdict: REQUEST CHANGES → single Important finding fixed in the review-fix commit (`b9ea5b9`); code itself approved as-is
+## Verdict: REQUEST CHANGES → one Important finding (misattributed mutation comment) fixed; code approved
 
 ### Critical Issues
 None.
 
 ### Important Issues (fixed)
-- **Doc-anachronism (SPEC.md:533, tasks/monitor-report.md:106, tasks/monitor-watch.md:640):** the D29
-  mechanical rename swept **dated historical passages** narrating the 2026-08-17 blocked state —
-  making them read "`correctDiagnosticText` exists only on main", which was false at that historical
-  moment. Fixed by restoring the old identifier with "since renamed …" annotations; the D29 grep
-  audit now treats historical references as legitimate.
+- **Misattributed "kills M2" comment (test/rlm.test.ts:638-639, and SPEC.md:169).** Test A aborts via
+  `onIteration`, so the **post-run** check returns `aborted`; A does **not** kill M2 (loop-top
+  `if(false)`) — with M2 applied, A still passes. The sole M2 killer is **F** (already-aborted signal →
+  asserts `0` queries / `0` budget charged, which break if the loop-top check is neutered); the
+  post-run check is uniquely pinned by **E**. Fixed: test A's comment now states the correct
+  attribution (A = aggregate contract; F = loop-top/M2; E = post-run), and SPEC.md's mutation line now
+  names F/E/D/G correctly. A future maintainer deleting F must know it is the loop-top check's only
+  guard.
 
-### Suggestions (recorded)
-- Test comment constant corrected (1275 → 1830 for N=60) in the review-fix commit.
-- Optional `preambleLineCount()` / `appendSnippet()` helpers to make the counter invariant
-  unbreakable rather than merely observable — deferred (guard tests already pin every site).
-- tasks/plan.md replaced wholesale by the micro-flight plan (intended — SPEC remains the decision
-  source of truth).
+### Suggestions (recorded, one applied)
+- **Same-tick abort/error race** (src/rlm.ts catch): a genuine LLM error rejecting in the same tick as
+  an abort is folded into `"aborted"` by design. Applied a one-line comment so a future reader does not
+  "fix" it with a fragile `isAbortError` predicate (which the SPEC already rejected — see D35).
+- Loose cast `(r as { errorKind?: string })` in test E (rlm.test.ts:804) — matches the file's existing
+  pattern, no `any`; left as-is.
+- Test E's `calls.length === 1` rides the 250 ms grace race — documented in SPEC Assumption 5,
+  deterministic in-run; flagged for attention only if flakiness ever appears.
 
 ### What's Done Well
-- Byte-identical by construction (every site reuses the exact `split("\n").length` expression).
-- All 5 mutation sites accounted for; counter is derived state, not serialized (no schema change).
-- Split-call-count test well-scoped (reference-identity watch set, `finally` restore, 3× headroom).
-- Rename hygiene in code/tests perfect; zero stale references outside dated passages.
+- `aborted()` closure (rlm.ts:860-866) centralizes the three return sites; reads `iterations`/`budget`
+  at call time (no stale capture) and reuses `extractBestAnswer` + `budgetReport` unchanged.
+- D35's "`signal.aborted` is the whole story" is robust — no fragile error-string/`instanceof`
+  predicate; `else throw err` correctly re-throws non-abort rejections (pinned by G).
+- Sandbox `finally` (sandbox.ts:1244-1250) mirrors `withHostDeadline`; guard matches the add-site;
+  no abort-path change (the `{once}` listener auto-removes on fire; `finally` is a no-op there) and it
+  clears a secondary never-firing-listener leak for already-aborted signals.
+- F and G are non-tautological and well-targeted (F uniquely pins "no charge/no query on pre-abort";
+  G uniquely pins the re-throw, killing the catch `if(true)` mutant).
+- No internal `RlmResult.status` consumer switches exhaustively, so `"aborted"` needs no new case.
 
 ### Verification Story
-- Session tests 67/67 locally; VERIFY 1038/1038 ×2 deterministic, tsc/build/lint/coverage green,
-  pin-bite proofs green. No new security surface (pure integer arithmetic, behavior-neutral rename).
+- Suite 1045/1045 ×2 deterministic; `tsc --noEmit`/build/lint clean; coverage floors met (rlm.ts
+  98.52, sandbox.ts 97.66 — both above floor).
+- Bounded mutation sweep (`--mutate` changed sites): **22/22 changed-site mutants detected** (21
+  Killed + 1 Timeout), M2 dead; `rlm.ts` file score 58.66 → 64.53. The 61 remaining rlm.ts survivors
+  are all pre-existing `boundConversation` mutants (lines 766-777), unrelated to #75.
+- No new security surface: the `finally` is race-free (`abort()` dispatch is synchronous, so no
+  listener fires post-removal); passing the caller's signal into a caller-injected client leaks nothing.

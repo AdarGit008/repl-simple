@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
 import { estimateTokens, SpendBudget } from "../src/budget.js";
-import type { LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
+import type { HostTool, LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
 import {
@@ -302,21 +302,31 @@ describe("extractDirectAnswer()", () => {
 /** Create a mock LlmClient that returns code from a canned array. */
 function mockLlmCodeGen(codes: string[]): {
   llm: LlmClient & {
-    calls(): Array<{ systemPrompt: string; messages: Array<{ role: string; content: string }> }>;
+    calls(): Array<{
+      systemPrompt: string;
+      messages: Array<{ role: string; content: string }>;
+      signal?: AbortSignal;
+    }>;
   };
 } {
   const callRecords: Array<{
     systemPrompt: string;
     messages: Array<{ role: string; content: string }>;
+    signal?: AbortSignal;
   }> = [];
   let i = 0;
   const llm: LlmClient & {
-    calls(): Array<{ systemPrompt: string; messages: Array<{ role: string; content: string }> }>;
+    calls(): Array<{
+      systemPrompt: string;
+      messages: Array<{ role: string; content: string }>;
+      signal?: AbortSignal;
+    }>;
   } = {
-    async query(systemPrompt, messages) {
+    async query(systemPrompt, messages, signal?: AbortSignal) {
       callRecords.push({
         systemPrompt,
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        signal,
       });
       return codes[i++] ?? "";
     },
@@ -561,7 +571,7 @@ describe("runRlm()", () => {
     assert.ok(recorded[0].result);
   });
 
-  it("5.3.10 abort signal", async () => {
+  it("5.3.10 abort signal — resolves with status 'aborted', does not throw", async () => {
     const { llm } = mockLlmCodeGen([
       "```python\nprint('iteration 0')\n```",
       "```python\nprint('iteration 1')\n```",
@@ -574,7 +584,7 @@ describe("runRlm()", () => {
 
     const controller = new AbortController();
 
-    const resultPromise = runRlm("test", {
+    const result = await runRlm("test", {
       llmClient: llm,
       registry,
       maxIterations: 10,
@@ -584,14 +594,8 @@ describe("runRlm()", () => {
       },
     });
 
-    await assert.rejects(resultPromise, (e: unknown) => {
-      const err = e as Error & { name?: string };
-      return (
-        err.name === "AbortError" ||
-        err.message.includes("abort") ||
-        err.message.includes("AbortError")
-      );
-    });
+    assert.equal(result.status, "aborted");
+    assert.equal(result.iterations.length, 1);
   });
 
   it("5.3.11 preamble injection", async () => {
@@ -614,6 +618,236 @@ describe("runRlm()", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "11");
     assert.equal(result.iterations.length, 1);
+  });
+});
+
+// ── Abort semantics (#75) ───────────────────────────────────────
+
+describe("runRlm() — abort", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("abort at iteration 2 of 5 returns an aborted result with two iterations (issue test 1)", async () => {
+    // Pins the aggregate "abort returns what it completed" contract: two
+    // completed iterations are returned, never thrown away. The abort fires
+    // in onIteration, so it is the post-run check that catches it here — F is
+    // the test that uniquely pins the loop-top check (M2), E the post-run one.
+    const codes = Array.from(
+      { length: 5 },
+      (_, i) => `\`\`\`python\nprint('iteration ${i}')\n\`\`\``,
+    );
+    const { llm } = mockLlmCodeGen(codes);
+
+    const controller = new AbortController();
+    let completed = 0;
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+      onIteration: () => {
+        completed++;
+        if (completed === 2) controller.abort();
+      },
+    });
+
+    assert.equal(result.status, "aborted");
+    assert.equal(result.iterations.length, 2);
+  });
+
+  it("salvages the best answer from completed iterations (issue test 2)", async () => {
+    // extractBestAnswer scans backwards: iteration 1 produced no output
+    // ("None"), iteration 0 produced "42" — the salvage must return it.
+    const { llm } = mockLlmCodeGen(["```python\nx = 42\nx\n```", "```python\nprint('more')\n```"]);
+
+    const controller = new AbortController();
+    let completed = 0;
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+      onIteration: () => {
+        completed++;
+        if (completed === 2) controller.abort();
+      },
+    });
+
+    assert.equal(result.status, "aborted");
+    assert.equal(result.answer, "42");
+    assert.equal(result.iterations.length, 2);
+  });
+
+  it("leaves no abort listeners on the caller's signal after 8 iterations (issue test 3)", async () => {
+    // The signal is never aborted here, so `{ once: true }` listeners never
+    // auto-remove — add/remove pairing is exact and the count is the truth.
+    const codes = Array.from({ length: 8 }, (_, i) => `\`\`\`python\nprint('i${i}')\n\`\`\``);
+    const { llm } = mockLlmCodeGen(codes);
+
+    const controller = new AbortController();
+    const signal = controller.signal;
+    let abortListeners = 0;
+    const addEventListener = signal.addEventListener.bind(signal);
+    const removeEventListener = signal.removeEventListener.bind(signal);
+    Object.defineProperty(signal, "addEventListener", {
+      value: (
+        type: string,
+        fn: Parameters<AbortSignal["addEventListener"]>[1],
+        opts?: Parameters<AbortSignal["addEventListener"]>[2],
+      ) => {
+        if (type === "abort") abortListeners++;
+        return addEventListener(type, fn, opts);
+      },
+    });
+    Object.defineProperty(signal, "removeEventListener", {
+      value: (
+        type: string,
+        fn: Parameters<AbortSignal["removeEventListener"]>[1],
+        opts?: Parameters<AbortSignal["removeEventListener"]>[2],
+      ) => {
+        if (type === "abort") abortListeners--;
+        return removeEventListener(type, fn, opts);
+      },
+    });
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 8,
+      signal,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.iterations.length, 8);
+    assert.equal(abortListeners, 0, `leaked ${abortListeners} abort listeners`);
+  });
+
+  it("passes the signal to llmClient.query and a client that honours it is cancelled (issue test 4)", async () => {
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    let cancelled = false;
+
+    const llm: LlmClient = {
+      async query(_systemPrompt, _messages, signal?: AbortSignal) {
+        observedSignal = signal;
+        return new Promise<string>((_resolve, reject) => {
+          const onAbort = () => {
+            cancelled = true;
+            reject(new DOMException("The operation was aborted", "AbortError"));
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    };
+
+    const resultPromise = runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+    });
+
+    // Let the query start before aborting.
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+
+    const result = await resultPromise;
+
+    assert.equal(observedSignal, controller.signal, "query must receive the signal");
+    assert.ok(cancelled, "a client that honours the signal must observe cancellation");
+    assert.equal(result.status, "aborted");
+    assert.equal(result.iterations.length, 0, "no iteration ran after the cancelled query");
+  });
+
+  it("surfaces a partial iteration when aborted mid-sandbox-run (issue test 5)", async () => {
+    // The aborting tool fires the signal from inside the dispatch loop, so the
+    // sandbox returns a partial `errorKind:"aborted"` result (stdout + the
+    // in-flight call) — the loop must return it, not discard the iteration.
+    const controller = new AbortController();
+    let invocations = 0;
+    const abortingTool: HostTool = {
+      name: "slow",
+      description: "Aborts on first call",
+      params: [],
+      returns: "str",
+      execute: async () => {
+        invocations++;
+        if (invocations === 1) controller.abort();
+        await new Promise((resolve) => setImmediate(resolve));
+        return `slow:${invocations}`;
+      },
+    };
+    const registry = new ToolRegistry([
+      ...createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" }),
+      abortingTool,
+    ]);
+    const { llm } = mockLlmCodeGen(["```python\nprint('start')\na = slow()\n```"]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry,
+      maxIterations: 1,
+      signal: controller.signal,
+    });
+
+    assert.equal(result.status, "aborted");
+    assert.equal(result.iterations.length, 1);
+    const r = result.iterations[0].result;
+    assert.equal(r.status, "error");
+    assert.equal(
+      (r as { errorKind?: string }).errorKind,
+      "aborted",
+      "the partial run must be surfaced as aborted, not fed back",
+    );
+    assert.ok(r.stdout.includes("start"), "partial stdout must survive");
+    assert.equal(r.calls.length, 1, "the in-flight tool call must be traced before the abort");
+  });
+
+  it("an already-aborted signal returns aborted before any LLM call or budget charge (kills M2)", async () => {
+    // The loop-top check is the only abort site reachable before the first
+    // query: with it neutered (M2: `if (false)`), the loop proceeds to charge
+    // the budget and call the client before the query catch fires.
+    const controller = new AbortController();
+    controller.abort();
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("x")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+      budget: 100000,
+    });
+
+    assert.equal(result.status, "aborted");
+    assert.equal(result.iterations.length, 0);
+    assert.equal(llm.calls().length, 0, "no LLM query may run after an abort");
+    assert.equal(
+      result.budget?.consumed,
+      0,
+      "no budget may be charged for a run that never started",
+    );
+    assert.equal(result.budget?.limited, false, "abort is not budget exhaustion");
+  });
+
+  it("a non-abort LLM error re-throws, not misreported as aborted", async () => {
+    const llm: LlmClient = {
+      async query() {
+        throw new Error("network down");
+      },
+    };
+
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 }),
+      /network down/,
+    );
   });
 });
 

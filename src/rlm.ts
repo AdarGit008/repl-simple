@@ -854,10 +854,21 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   // Cumulative number of whole turns dropped by the conversation bound (D3).
   let droppedTurns = 0;
 
+  // One shape for every abort return: salvage the best completed answer and
+  // report the tracked budget as not-exhausted (abort is a caller action, not
+  // a budget stop — D35).
+  const aborted = (): RlmResult => ({
+    status: "aborted",
+    answer: extractBestAnswer(iterations),
+    iterations,
+    ...(budget ? { budget: budgetReport(budget, false) } : {}),
+  });
+
   for (let i = 0; i < maxIterations; i++) {
-    // Abort check between iterations
+    // Abort check between iterations: an aborted run returns what it completed
+    // instead of throwing (#75, D30).
     if (options.signal?.aborted) {
-      throw new DOMException("The operation was aborted", "AbortError");
+      return aborted();
     }
 
     // Charge the budget before the call so a run never overspends; a call
@@ -874,11 +885,27 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       }
     }
 
-    // 1. Call LLM (with abort race)
-    const llmResponse = await raceAgainstSignal(
-      llmClient.query(systemPrompt, messages),
-      options.signal,
-    );
+    // 1. Call LLM (with abort race). The signal is handed to the client so it
+    // can actually cancel; the race is the safety net for clients that ignore
+    // it (#75, D32). An abort resolves the loop with what it completed.
+    let llmResponse: string;
+    try {
+      llmResponse = await raceAgainstSignal(
+        llmClient.query(systemPrompt, messages, options.signal),
+        options.signal,
+      );
+    } catch (err) {
+      // The signal is the whole story: every abort source (loop-top, the
+      // race, a client honouring the signal) leaves `signal.aborted` true.
+      // Any other rejection re-throws — a real LLM error must not be
+      // misreported as an abort (#75, D30). A genuine LLM error that rejects
+      // in the same tick as an abort is folded into "aborted" by design: the
+      // caller asked to stop, and the salvage still returns what landed.
+      if (options.signal?.aborted) {
+        return aborted();
+      }
+      throw err;
+    }
 
     // 2. Extract the payload: a fenced block, a direct answer, or the
     // raw reply treated as code. A direct answer is executed as a
@@ -912,6 +939,14 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     };
     iterations.push(iteration);
     options.onIteration?.(iteration);
+
+    // An abort that landed during this iteration — mid-sandbox-run (partial
+    // errorKind:"aborted" result) or racing a completed run — surfaces here
+    // with the iteration included (#75, D34). The SUBMIT check below only runs
+    // when the signal is not aborted.
+    if (options.signal?.aborted) {
+      return aborted();
+    }
 
     // 6. Check for SUBMIT
     //

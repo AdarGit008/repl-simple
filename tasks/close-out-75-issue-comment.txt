@@ -1,0 +1,23 @@
+Closing — abort now returns what it completed instead of throwing.
+
+**What changed**
+
+- `runRlm` returns `{ status: "aborted", answer, iterations }` at three sites (loop-top, LLM-query
+  catch, post-run) instead of throwing `DOMException("AbortError")` (D30/D34). Non-abort LLM
+  rejections re-throw; the catch checks `signal.aborted` only, no fragile error-string predicate (D35).
+- `RlmResult.status` gains `"aborted"`; salvage reuses `extractBestAnswer` (D31).
+- `LlmClient.query(systemPrompt, messages, signal?)` — the loop passes the caller's signal so a
+  well-behaved client cancels the in-flight request (D32). Interface change flagged on #78.
+- `runInSandbox` removes its `onAbort` listener in a `finally` — fixes the per-iteration leak on the
+  caller-owned signal (D33).
+
+**DoD**
+
+- Five issue tests (A–E) red before the fix, green after — plus F/G added at VERIFY to close mutation
+  survivors. Suite 1043 → 1045, deterministic ×2.
+- Mutation M2 (`loop-top if(false)`) no longer survives: bounded sweep of the changed sites detected
+  22/22 changed-site mutants (21 Killed + 1 Timeout).
+- `LlmClient.query` accepts a signal; interface change noted on #78 (comment above).
+- Listener count returns to zero — asserted by test C (instance spy), not assumed.
+
+Evidence: `SPEC.md` (D30–D35) · `tasks/plan.md` · `tasks/review.md` · `tasks/ship-report.md`.

@@ -1,0 +1,18 @@
+Flag from the #75 flight (not blocking #78 — just a heads-up for when you reshape these types).
+
+`LlmClient.query` now takes an optional `signal?: AbortSignal` (`src/types.ts`):
+
+```ts
+export interface LlmClient {
+  query(
+    systemPrompt: string,
+    messages: Array<{ role: "user" | "assistant"; content: string }>,
+    signal?: AbortSignal,
+  ): Promise<string>;
+}
+```
+
+`runRlm` passes `options.signal` through so a cancellation-honouring implementation can actually stop
+an in-flight request (and stop being billed). Back-compatible: fewer-arg implementations remain
+assignable (verified at `tsc --noEmit` / `test/types.test.ts`). The loop still races the signal as a
+safety net for clients that ignore it.
