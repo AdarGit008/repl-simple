@@ -1026,6 +1026,7 @@ describe("runRlm() — context input", () => {
 // source never reaches it.
 
 describe("runRlm() — preamble lineOffset wiring", () => {
+  // D19 quoting is presentation; F-77's excerpt contract is preserved on the unquoted text.
   /** Registry with the three RLM tools, wired to no-op callbacks. */
   function rlmRegistry(): ToolRegistry {
     return new ToolRegistry(
@@ -1058,7 +1059,7 @@ describe("runRlm() — preamble lineOffset wiring", () => {
     assert.equal(result.iterations.length, 2);
     const feedback = lastMessage(llm.calls()[1]);
     assert.match(feedback, / --> rlm\.py:1:/, "the diagnostic location is the model's line 1");
-    assert.match(feedback, /^\s*1 \| 1 \+$/m, "the excerpt line is the model's line 1");
+    assert.match(unquoted(feedback), /^\s*1 \| 1 \+$/m, "the excerpt line is the model's line 1");
   });
 
   it("feeds back no preamble source (issue test 2)", async () => {
@@ -1112,7 +1113,11 @@ describe("runRlm() — preamble lineOffset wiring", () => {
     const feedback = lastMessage(llm.calls()[1]);
     assert.match(feedback, /Fix the type error/, "the typing kind survives to the advice");
     assert.match(feedback, / --> rlm\.py:1:/, "the diagnostic location is the model's line 1");
-    assert.match(feedback, /^\s*1 \| x: int = 'oops'$/m, "the excerpt line is the model's line 1");
+    assert.match(
+      unquoted(feedback),
+      /^\s*1 \| x: int = 'oops'$/m,
+      "the excerpt line is the model's line 1",
+    );
     assert.ok(!feedback.includes(token), "preamble source must not reach the model");
   });
 
@@ -1140,9 +1145,12 @@ describe("runRlm() — preamble lineOffset wiring", () => {
     const stdoutIdx = rest.indexOf("\nstdout:");
     assert.ok(stdoutIdx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
     const errorSection = rest.slice(0, stdoutIdx);
+    // D19 quoting is presentation, not payload: measure the ceiling on the
+    // unquoted value, mirroring test 8's over-budget half.
+    const errorPayload = unquoted(errorSection);
     assert.ok(
-      Buffer.byteLength(errorSection, "utf8") <= 16 * 1024,
-      `Error section is ${Buffer.byteLength(errorSection, "utf8")} bytes`,
+      Buffer.byteLength(errorPayload, "utf8") <= 16 * 1024,
+      `Error section is ${Buffer.byteLength(errorPayload, "utf8")} bytes`,
     );
     assert.match(
       errorSection,
