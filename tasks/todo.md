@@ -1,6 +1,6 @@
 # F-87 Task List
 
-- [ ] Task 1: `SpendBudget` + `estimateTokens` in `src/budget.ts`
+- [x] Task 1: `SpendBudget` + `estimateTokens` in `src/budget.ts`
   - Acceptance: `estimateTokens(text)` returns `ceil(TextEncoder byte length / 4)` (empty string →
     0; a known string → a pinned token count). `class SpendBudget` exposes `limit`/`consumed`/
     `remaining` getters and `tryCharge(tokens): boolean` — `false` (no charge) when `tokens < 0`
