@@ -14,7 +14,7 @@
     `npm run lint`
   - Files: `src/budget.ts` (new), `test/budget.test.ts` (new)
 
-- [ ] Task 2: Type surface — `RlmOptions.budget`, `RlmResult` budget report, exports
+- [x] Task 2: Type surface — `RlmOptions.budget`, `RlmResult` budget report, exports
   - Acceptance: `RlmOptions.budget?: number | SpendBudget` (type-imported from `./budget.js`).
     `RlmResult.status` is `"ok" | "max_iterations" | "budget_exhausted"`; new exported interface
     `RlmBudgetReport { limit: number; consumed: number; limited: boolean }` and

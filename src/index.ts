@@ -17,8 +17,15 @@ export type {
   RlmOptions,
   RlmResult,
   RlmIteration,
+  RlmBudgetReport,
 } from "./types.js";
 export { HostToolError } from "./types.js";
+
+// ── Spend budget ────────────────────────────────────────────────
+// The shared, observable spend budget (D2/D3). `estimateTokens` is the single
+// swap point if a real tokenizer ever lands; `SpendBudget` is the mutable pool
+// siblings share.
+export { SpendBudget, estimateTokens } from "./budget.js";
 
 // ── Registry ────────────────────────────────────────────────────
 export {

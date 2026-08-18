@@ -14,7 +14,12 @@ import {
   type RunResult,
   type RunErrorKind,
   type ToolCallTrace,
+  type LlmClient,
+  type RlmOptions,
+  type RlmResult,
 } from "../src/types.js";
+import { SpendBudget, estimateTokens, type RlmBudgetReport } from "../src/index.js";
+import { ToolRegistry } from "../src/registry.js";
 
 // ── HostToolError (runtime-testable) ───────────────────────────
 
@@ -294,5 +299,70 @@ describe("RunErrorKind", () => {
     assert.equal(kinds.length, 4);
     assert.equal(kinds[0], "syntax");
     assert.equal(kinds[3], "aborted");
+  });
+});
+
+// ── RLM budget surface (D3/D7) ─────────────────────────────────
+// Compile-time pins: a type-only change is caught by `npm run check` (tsc),
+// not by the runtime assertions below. The index re-export checks are the
+// runtime part of the pin.
+
+describe("RlmResult budget report", () => {
+  it("accepts 'budget_exhausted' status with a budget report", () => {
+    const report: RlmBudgetReport = { limit: 100, consumed: 42, limited: true };
+    const result: RlmResult = {
+      status: "budget_exhausted",
+      answer: "best effort",
+      iterations: [],
+      budget: report,
+    };
+    assert.equal(result.status, "budget_exhausted");
+    assert.equal(result.budget?.limit, 100);
+    assert.equal(result.budget?.consumed, 42);
+    assert.equal(result.budget?.limited, true);
+  });
+
+  it("accepts 'max_iterations' with a limited: false report", () => {
+    const result: RlmResult = {
+      status: "max_iterations",
+      answer: "partial",
+      iterations: [],
+      budget: { limit: 10, consumed: 10, limited: false },
+    };
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.budget?.limited, false);
+  });
+
+  it("omits budget when none is configured", () => {
+    const result: RlmResult = { status: "ok", answer: "done", iterations: [] };
+    assert.equal(result.budget, undefined);
+  });
+});
+
+describe("RlmOptions budget", () => {
+  const llmClient: LlmClient = { query: async () => "" };
+  const registry = new ToolRegistry();
+
+  it("accepts a number budget (fresh per run)", () => {
+    const opts: RlmOptions = { llmClient, registry, budget: 1000 };
+    assert.equal(opts.budget, 1000);
+  });
+
+  it("accepts a SpendBudget instance (shared, mutated in place)", () => {
+    const shared = new SpendBudget(500);
+    const opts: RlmOptions = { llmClient, registry, budget: shared };
+    assert.equal(opts.budget, shared);
+    assert.ok(opts.budget instanceof SpendBudget);
+  });
+});
+
+describe("index re-exports", () => {
+  it("exports estimateTokens and SpendBudget as values", () => {
+    assert.equal(typeof estimateTokens, "function");
+    assert.equal(estimateTokens(""), 0);
+    const budget = new SpendBudget(10);
+    assert.equal(budget.limit, 10);
+    assert.equal(budget.consumed, 0);
+    assert.equal(budget.remaining, 10);
   });
 });
