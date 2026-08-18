@@ -1,4 +1,5 @@
-import type { RlmIteration, RlmOptions, RlmResult, RunResult } from "./types.js";
+import type { RlmBudgetReport, RlmIteration, RlmOptions, RlmResult, RunResult } from "./types.js";
+import { estimateTokens, SpendBudget } from "./budget.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
 import {
@@ -417,6 +418,36 @@ export function buildFeedback(result: RunResult): string {
   return `Output: ${output}${stdoutSection}`;
 }
 
+// ── Spend budget ─────────────────────────────────────────────────
+//
+// The shared, observable spend budget (D3/D4). Every LLM call is charged
+// *before* it runs — the per-call cost is the system prompt plus every
+// message content, measured in estimated tokens — so a run never overspends.
+// The estimator lives in budget.ts; rlm.ts never measures bytes itself (D8).
+
+/** Estimated-token cost of one LLM call: the precomputed prompt plus every message. */
+function callCost(
+  systemPromptTokens: number,
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+): number {
+  return (
+    systemPromptTokens + messages.reduce((sum, message) => sum + estimateTokens(message.content), 0)
+  );
+}
+
+/**
+ * The spend report attached to a result when a budget was configured.
+ * `limited` names the stopping cause: `true` only for `budget_exhausted`
+ * (D4); `"ok"` and `"max_iterations"` report the tracked budget as
+ * `limited: false`. Absent budget → `undefined`, so no `budget` field.
+ */
+function budgetReport(
+  budget: SpendBudget | undefined,
+  limited: boolean,
+): RlmBudgetReport | undefined {
+  return budget ? { limit: budget.limit, consumed: budget.consumed, limited } : undefined;
+}
+
 // ── Main API ─────────────────────────────────────────────────────
 
 /**
@@ -511,6 +542,21 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   const systemPrompt = options.systemPrompt ?? DEFAULT_RLM_SYSTEM_PROMPT;
   const iterations: RlmIteration[] = [];
 
+  // Build the spend budget once, before the loop (D3): a number mints a fresh
+  // per-run budget; an instance is shared and mutated in place, so siblings
+  // passing the same instance compete for one pool; absent means no budget
+  // logic at all (D5).
+  const budget: SpendBudget | undefined =
+    options.budget instanceof SpendBudget
+      ? options.budget
+      : options.budget !== undefined
+        ? new SpendBudget(options.budget)
+        : undefined;
+
+  // The system prompt is constant across iterations, so its token cost is
+  // computed once here instead of re-encoded on every charge.
+  const systemPromptTokens = estimateTokens(systemPrompt);
+
   // Build sandbox options
   const sandboxOpts: SandboxOptions = { registry };
 
@@ -545,6 +591,20 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     // Abort check between iterations
     if (options.signal?.aborted) {
       throw new DOMException("The operation was aborted", "AbortError");
+    }
+
+    // Charge the budget before the call so a run never overspends; a call
+    // that fits is charged in full, one that cannot fit degrades (D4).
+    if (budget) {
+      const cost = callCost(systemPromptTokens, messages);
+      if (!budget.tryCharge(cost)) {
+        return {
+          status: "budget_exhausted",
+          answer: extractBestAnswer(iterations),
+          iterations,
+          budget: budgetReport(budget, true),
+        };
+      }
     }
 
     // 1. Call LLM (with abort race)
@@ -602,7 +662,13 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     // occur here.
     const submitted = result.calls.some((c) => c.tool === "SUBMIT" && c.ok);
     if (submitted && result.status === "ok") {
-      return { status: "ok", answer: result.output, iterations };
+      const report = budgetReport(budget, false);
+      return {
+        status: "ok",
+        answer: result.output,
+        iterations,
+        ...(report ? { budget: report } : {}),
+      };
     }
 
     // 7. Append iteration to conversation
@@ -622,5 +688,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
 
   // Max iterations exhausted
   const lastAnswer = extractBestAnswer(iterations);
-  return { status: "max_iterations", answer: lastAnswer, iterations };
+  const report = budgetReport(budget, false);
+  return {
+    status: "max_iterations",
+    answer: lastAnswer,
+    iterations,
+    ...(report ? { budget: report } : {}),
+  };
 }

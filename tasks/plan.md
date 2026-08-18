@@ -1,70 +1,74 @@
-# Implementation Plan: F-77 — Line-offset correction + honest continuity contract
+# Implementation Plan: F-87 — Shared RLM spend budget
 
 ## Overview
 
-Fix #77's two defects in the RLM loop: (1) diagnostics fed back to the model carry line numbers
-shifted by the ~90-line RLM preamble and embed preamble source; (2) prompts imply session continuity
-while every iteration runs in a fresh sandbox. Per SPEC.md D1-D4: correct offsets in `sandbox.ts`
-via a new `RunOptions.lineOffset`, wire both callers (`rlm.ts`, `session.ts`), and rewrite the RLM
-prompt to state the fresh-sandbox-per-iteration contract.
+Give the RLM loop a shared, observable spend budget. #87's premise is that no limit composes into a
+ceiling across a fan-out: `maxIterations` bounds one loop, `maxDepth` bounds height, #74 bounds one
+conversation — nothing counts total spend. This flight builds the budget **mechanism** (a shared,
+mutable `SpendBudget` + a deterministic token estimator) and wires it into `runRlm` at the
+single-loop level, then proves the crux — **siblings share one pool** — by passing one `SpendBudget`
+instance across multiple `runRlm` calls. The actual `rlm_query` fan-out wiring is #78's scope and is
+deferred (D1), with the hand-off recorded for #78.
 
 ## Architecture Decisions
 
-- **D1** — `lineOffset?: number` on the sandbox `RunOptions`; `sandbox.ts` is the single correction
-  site (syntax errors: textual line-number correction + prefix-excerpt stripping; runtime errors:
-  structured `traceback()` frames, offset-adjusted, prefix frames dropped, survivors re-rendered;
-  typing errors: same correction as syntax — the "already line-correct" premise was disproved in
-  VERIFY and fixed in Task 7).
-- **D2** — Continuity contract = fresh sandbox per iteration; prompts rewritten to say so. True
-  continuity declined: `MontyRepl.feed()` supports only `{mount}` (no `externalFunctions`), and the
-  host-tool bridge is external-function-based.
-- **D3** — Prompt edits preserve the section-header literals that #78's coupled tests locate.
-- **D4** — `displayDiagnostics('json')` declined (recorded decision at `sandbox.ts:1067-1073`
-  stands; typing diagnostics are already correct).
-- #144's 16 KiB error cap in `buildFeedback` is preserved — correction happens upstream of it.
+Condensed from SPEC.md (the canonical record):
+
+- **D1** — Budget mechanism in `runRlm` now; fan-out *wiring* (pass the shared instance through
+  `rlm_query`) waits for #78 step 4. No nesting port here.
+- **D2** — Unit = **estimated tokens**: `estimateTokens(text) = ceil(utf8bytes(text) / 4)`, measured
+  with `TextEncoder`. Portable (#87's preference), deterministic and tokenizer-independent
+  (reconciles `docs/truncation-policy.md` Non-goal — truncation stays byte-based; the spend budget
+  is a separate control).
+- **D3** — API: `src/budget.ts` (`estimateTokens`, `class SpendBudget` with `limit`/`consumed`/
+  `remaining` + `tryCharge(tokens): boolean`); `RlmOptions.budget?: number | SpendBudget`;
+  `RlmResult.status` gains `"budget_exhausted"`; `RlmResult.budget?: { limit, consumed, limited }`.
+- **D4** — Charge before each LLM call; on unaffordable → degrade (return best answer +
+  `budget.limited: true`), never throw. `limited: false` on `"ok"`/`"max_iterations"`.
+- **D5** — No budget ⇒ unchanged (test 5); the budget must not become a mandatory ceiling.
+- **D6** — `SpendBudget` constructor rejects non-finite/negative; `0` is valid (degrades immediately).
+- **D7** — Additive `RlmResult` changes compose with #75/#76/#78 (no collision).
+- **D8** — Estimator in `src/budget.ts`; `src/rlm.ts` never references `Buffer`/`byteLength`
+  (test 6).
 
 ## Task List
 
-### Phase 1: Sandbox-level correction
+### Phase 1: Foundation — the budget object
 
-- [ ] **Task 1:** `lineOffset` in `RunOptions` + syntax-error correction (subtract offset, strip
-      prefix excerpt lines) in `sandbox.ts`.
-- [ ] **Task 2:** Runtime-error correction via `MontyRuntimeError.traceback()` frames (offset +
-      prefix-frame drop + re-render); message fallback when frames are unavailable.
+- [ ] **Task 1:** `SpendBudget` + `estimateTokens` in `src/budget.ts` with unit tests.
 
-### Checkpoint A: Sandbox core
-- [ ] Full suite green; focused sandbox tests green; `npm run check` green.
+### Checkpoint A: Budget module
+- [ ] `npm test` (focused `test/budget.test.ts` + full suite green), `npm run check`, `npm run lint`.
 
-### Phase 2: Wire the callers
+### Phase 2: Contract — the type surface
 
-- [ ] **Task 3:** RLM passes `lineOffset` = actual preamble line count; issue tests 1+2
-      (line 1 reported as line 1; no preamble token in fed-back diagnostic).
-- [ ] **Task 4:** `Session.run` passes `lineOffset` = preamble + prior-snippet line count;
-      issue test 3 (stacking case).
+- [ ] **Task 2:** `RlmOptions.budget`, `RlmResult.status` + `budget` report, `RlmBudgetReport`, and
+      index.ts exports.
 
-### Checkpoint B: Both consumers wired
-- [ ] Full suite green; coverage floors green (`npm run coverage`).
+### Checkpoint B: Types compile and are pinned
+- [ ] `npm test`, `npm run check` green.
 
-### Phase 3: Continuity contract
+### Phase 3: Wiring — `runRlm` charges and degrades
 
-- [ ] **Task 5:** Rewrite RLM prompt + feedback wording to state the fresh-sandbox-per-iteration
-      contract; issue test 4 asserts the prompt says so and continuity-implying wording is gone;
-      D3 section literals intact.
+- [ ] **Task 3:** Wire the budget into `runRlm` (charge, degrade, report) + the five issue tests.
 
 ### Checkpoint C: Complete
-- [ ] All four issue tests pass on Monty 0.0.21; full suite, `check`, `coverage`, `lint` green.
+- [ ] All five issue tests + `test/budget.test.ts` green; `npm test`, `npm run check`, `npm run lint`,
+      `npm run coverage` green (floors met).
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Textual syntax-error correction is fragile (Monty message format) | Med | Pinned Monty 0.0.21; tests cover prefix sizes 1/3/7 and the real ~90-line preamble; reviewer checks format assumptions |
-| Runtime traceback re-render breaks existing tests that assert error text shape | Med | Keep the existing `Error: <type>: msg` heading shape; change only the traceback portion; full-suite gate each task |
-| Prompt edits break #78's literal-matching tests (D3) | Med | Preserve section-header literals verbatim; full-suite gate |
-| Correction accidentally bypasses #144's 16 KiB cap | Low | Correction is upstream of `buildFeedback`; T3 verification re-asserts the cap |
-| Sandbox changes affect non-RLM callers (REPL path) | Low | `lineOffset` defaults to absent = current behavior; full suite covers the REPL path |
+| `runRlm` byte-counting trips test 6 (`Buffer`/`byteLength` grep) | Med | Estimator lives in `src/budget.ts` using `TextEncoder`; `rlm.ts` imports it (D8). Full-suite gate re-asserts. |
+| New `RlmResult.status` member surprises a consumer's exhaustive switch | Low | Additive union member; `status` is a string union already extended by #75/#78; existing tests check equality, not exhaustiveness. |
+| "Siblings share one pool" unprovable without nesting | Med | Proven via a shared `SpendBudget` across two `runRlm` calls (D1) + a unit test of shared-instance semantics. |
+| Estimator `/4` constant drifts from a real tokenizer's count | Low | Deterministic and pinned by test; `estimateTokens` is the single swap point if a tokenizer ever lands. |
+| Pre-charge on an aborted call | Low | Abort path throws and reports nothing; charge is moot there. |
+| `RlmResult` field collision with #75/#76/#78 | Low | All additive (new status member + optional field); recorded for those flights (D7). |
 
 ## Open Questions
 
-- None blocking (autonomous run). Carried forward: true continuity once Monty's `FeedOptions`
-  supports `externalFunctions` — issue-monitor's final report will place this on #70/#77.
+- Fan-out wiring through `rlm_query` — deferred to #78 step 4 (hand-off recorded for #78).
+- Provenance of the budget-limited answer — plain `status` + `budget.limited` here; #76 enriches later.
+- `/4` bytes-per-token is an approximation — documented, single swap point.

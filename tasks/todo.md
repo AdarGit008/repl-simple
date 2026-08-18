@@ -1,95 +1,45 @@
-# F-77 Task List
+# F-87 Task List
 
-- [x] Task 1: `lineOffset` in `RunOptions` + syntax-error correction in `sandbox.ts`
-  - Acceptance: `RunOptions.lineOffset?: number` exists (default absent); a syntax error in
-    user code appended after an N-line prefix is reported at the user's line number (N subtracted);
-    rendered diagnostic contains no excerpt lines from the prefix (lines ≤ offset stripped).
-  - Verify: `npm test` (focused sandbox tests green, full suite green), `npm run check`
-  - Files: `src/types.ts`, `src/sandbox.ts`, `test/sandbox.test.ts`
+- [x] Task 1: `SpendBudget` + `estimateTokens` in `src/budget.ts`
+  - Acceptance: `estimateTokens(text)` returns `ceil(TextEncoder byte length / 4)` (empty string →
+    0; a known string → a pinned token count). `class SpendBudget` exposes `limit`/`consumed`/
+    `remaining` getters and `tryCharge(tokens): boolean` — `false` (no charge) when `tokens < 0`
+    or the charge would exceed `limit`, otherwise increments `consumed` and returns `true`. The
+    constructor throws on non-finite or negative `limit`; `0` is accepted. `test/budget.test.ts`
+    covers: estimator determinism (incl. empty → 0), `tryCharge` refusing overspend and negative,
+    `remaining`/`consumed`/`limit` observability, constructor validation (negative, `NaN`,
+    `Infinity`), and shared-instance semantics (two chargers on one instance compete for one
+    `remaining` pool).
+  - Verify: `npm test` (focused `test/budget.test.ts` green, full suite green), `npm run check`,
+    `npm run lint`
+  - Files: `src/budget.ts` (new), `test/budget.test.ts` (new)
 
-- [x] Task 2: Runtime-error correction via `traceback()` frames in `sandbox.ts`
-  - Acceptance: runtime error frames have `lineOffset` subtracted from `line`/`endLine`; frames
-    with `line <= lineOffset` (prefix frames) are dropped, `sourceLine` previews included; the
-    fed-back diagnostic contains no preamble source; existing `Error: <type>: msg` heading shape
-    preserved; message fallback when frames unavailable.
-  - Verify: `npm test` (focused sandbox tests green, full suite green), `npm run check`
-  - Files: `src/sandbox.ts`, `test/sandbox.test.ts`
+- [x] Task 2: Type surface — `RlmOptions.budget`, `RlmResult` budget report, exports
+  - Acceptance: `RlmOptions.budget?: number | SpendBudget` (type-imported from `./budget.js`).
+    `RlmResult.status` is `"ok" | "max_iterations" | "budget_exhausted"`; new exported interface
+    `RlmBudgetReport { limit: number; consumed: number; limited: boolean }` and
+    `RlmResult.budget?: RlmBudgetReport`. `src/index.ts` exports `SpendBudget` and `estimateTokens`
+    (values) and the `RlmBudgetReport` type. A `test/types.test.ts` pin asserts the new status
+    member and the `budget` field shape. Existing tests stay green (no behavior change yet).
+  - Verify: `npm test` (full suite green), `npm run check`, `npm run lint`
+  - Files: `src/types.ts`, `src/index.ts`, `test/types.test.ts`
 
-- [x] Task 3: RLM passes `lineOffset` (actual preamble line count) — issue tests 1+2
-  - Acceptance: `runInSandbox` call in `rlm.ts` passes `lineOffset` computed from the preamble
-    string actually used (never hardcoded); syntax error on the model's line 1 is reported as
-    line 1; fed-back diagnostic contains no known preamble token; #144's 16 KiB error cap still
-    applies to corrected text.
-  - Verify: `npm test` (focused rlm tests green, full suite green), `npm run check`
+- [x] Task 3: Wire the budget into `runRlm` + the five issue tests
+  - Acceptance: `runRlm` builds a budget from `options.budget` (number → fresh `SpendBudget`;
+    instance → used and mutated in place; absent → no budget logic). Before each LLM call (after
+    the abort check), compute `cost = estimateTokens(systemPrompt) + Σ estimateTokens(m.content)`;
+    when a budget is configured and `!budget.tryCharge(cost)`, return
+    `{ status: "budget_exhausted", answer: extractBestAnswer(iterations), iterations,
+    budget: { limit, consumed, limited: true } }` (no throw). The `"ok"` (SUBMIT) and
+    `"max_iterations"` returns attach `budget: { limit, consumed, limited: false }` when configured.
+    `src/rlm.ts` never references `Buffer`/`byteLength` (test 6 stays green). Add the five issue
+    tests to `test/rlm.test.ts`: (1) small budget stops before `maxIterations` with
+    `status: "budget_exhausted"`; (2) two `runRlm` calls sharing one `SpendBudget` — the second
+    sees the first's spend (`budget.consumed` is cumulative, second is `limited`); (3) a budget too
+    small for the first call returns a result (never throws) with `budget.limited: true`; (4)
+    `result.budget.consumed === Σ estimateTokens` over the mock's recorded calls; (5) omitting
+    `budget` yields `status` in `"ok" | "max_iterations"`, no `budget` field, existing assertions
+    unchanged.
+  - Verify: `npm test` (full suite green, ~8–10 new tests), `npm run check`, `npm run lint`,
+    `npm run coverage` (floors met)
   - Files: `src/rlm.ts`, `test/rlm.test.ts`
-
-- [x] Task 4: `Session.run` passes `lineOffset` (preamble + prior snippets) — issue test 3
-  - Acceptance: under `Session`, a diagnostic on line K of the latest snippet is reported as
-    line K (offset = preamble + stacked prior snippets); no earlier-snippet or preamble source in
-    the fed-back diagnostic; REPL-path tests stay green.
-  - Verify: `npm test` (focused session tests green, full suite green), `npm run check`
-  - Files: `src/session.ts`, `test/session.test.ts`
-
-- [x] Task 5: Rewrite RLM prompt + feedback wording to state the fresh-sandbox contract — issue test 4
-  - Acceptance: the RLM system prompt (and any feedback wording) states that each iteration runs
-    in a fresh sandbox with no state carried over; continuity-implying wording ("session",
-    "ongoing", "persist") is gone from RLM-facing text; D3 section-header literals preserved and
-    the coupled existing tests stay green; test asserts the prompt says so.
-  - Verify: `npm test` (focused rlm tests green, full suite green), `npm run check`
-  - Files: `src/rlm.ts`, `test/rlm.test.ts`
-
-- [x] Task 6: Fixup — blank excerpt lines survive the syntax-error correction
-  - Acceptance: `correctSyntaxErrorText`'s excerpt regex also matches blank excerpt lines
-    (`N |` with no text after the pipe — Monty renders them without the trailing space); a blank
-    excerpt line in the prefix region (line ≤ lineOffset) is stripped, one in the user region is
-    renumbered (gutter padding preserved); the 6 existing syntax-correction tests stay green.
-  - Verify: `npm test` (976/976 green — 973 baseline + 3 new), `npm run check`, `npm run lint`
-  - Files: `src/sandbox.ts`, `test/sandbox.test.ts`
-
-- [x] Task 7: Correct the typing-diagnostic path (VERIFY blocking finding)
-  - Acceptance: `classifyStartError` applies `correctSyntaxErrorText` to pure typing diagnostics
-    too (same ` --> file:line:col` / `<n> |` render; caret/continuation rows pass through); a
-    location/excerpt line whose number ≤ offset is dropped, never emitted with a non-positive
-    number; false "typing is already line-correct" comments corrected in `src/sandbox.ts` and
-    `src/types.ts`; bogus test replaced with real-prefix + control tests; RLM-level typing
-    feedback test pins line 1 and no preamble source.
-  - Verify: `npm test` (981/981 green — 976 baseline − 1 replaced + 6 new), `npm run check`,
-    `npm run lint`, `npm run coverage` floors met
-  - Files: `src/sandbox.ts`, `src/types.ts`, `test/sandbox.test.ts`, `test/rlm.test.ts`
-
-- [x] Task 8: Close the VERIFY-flagged test gaps (test-strengthening)
-  - Acceptance: a behavioral test covers stack + suspension + post-resume runtime error
-    through `Session.resume` — user-relative line, no preamble/prior-snippet source; the
-    test exposed a real bug (`Session.resume` never passed `lineOffset`, so post-resume
-    errors lost their corrected traceback) — fixed minimally in `src/session.ts` via a
-    shared `prefixLineCount()`; the plain `MontySyntaxError` branch of
-    `classifyStartError` is behaviorally exercised (forceable only via Monty's
-    input-name validation — message carries no line numbers, so the test pins kind +
-    uncorrupted heading + no prefix-source leak); the stale types test "RunOptions with
-    all fields" now includes `lineOffset`.
-  - Verify: `npm test` (983/983 green — 981 baseline + 2 new), `npm run check`
-  - Files: `src/session.ts`, `test/session.test.ts`, `test/sandbox.test.ts`,
-    `test/types.test.ts`
-
-- [x] Task 9: Document the fresh-sandbox contract in the README (docs-only)
-  - Acceptance: the README's RLM Loop section states the contract shipped in the prompt
-    (Task 5) — each iteration runs in a fresh sandbox; no variables, imports, or state carry
-    over between iterations; each snippet must be self-contained; the #77 lineOffset behavior
-    is recorded briefly (diagnostics fed back are offset-corrected, line numbers refer to the
-    model's own code, no preamble source shown). No src/ or test/ changes.
-  - Verify: `npm test` (983/983 green, no code change), own diff read for minimality
-  - Files: `README.md`
-
-- [x] Task 10: Review fixes — RLMLoop lineOffset wiring + location-regex digit-collision
-  - Acceptance (10a): `RLMLoop.executeCode` (src/rlm_loop.ts) passes `lineOffset` computed
-    from the preamble string actually used (`preamble.split("\n").length`, same truthiness
-    convention as the assembly site in the file), mirroring the rlm.ts wiring — never
-    hardcoded; tests pin a syntax error on the model's line 1 reported as line 1 with an
-    N-line preamble, no preamble source (unique marker absent) in the fed-back diagnostic,
-    and the `[error: kind]` feedback shape survives.
-  - Acceptance (10b): `correctSyntaxErrorText`'s location regex hardened to
-    `^(\s*--> .+:)(\d+)(:\d+.*)$` (greedy prefix) so a digit-ending scriptName
-    (` --> file0:3:4`) captures the line number, not the filename's trailing digits;
-    regression test via the public `RunOptions.scriptName`.
-  - Verify: `npm test` (986/986 green — 983 baseline + 3 new), `npm run check`, `npm run lint`
-  - Files: `src/rlm_loop.ts`, `src/sandbox.ts`, `test/rlm_loop.test.ts`, `test/sandbox.test.ts`
