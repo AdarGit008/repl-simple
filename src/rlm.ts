@@ -425,14 +425,13 @@ export function buildFeedback(result: RunResult): string {
 // message content, measured in estimated tokens — so a run never overspends.
 // The estimator lives in budget.ts; rlm.ts never measures bytes itself (D8).
 
-/** Estimated-token cost of one LLM call: the prompt plus every message. */
+/** Estimated-token cost of one LLM call: the precomputed prompt plus every message. */
 function callCost(
-  systemPrompt: string,
+  systemPromptTokens: number,
   messages: Array<{ role: "user" | "assistant"; content: string }>,
 ): number {
   return (
-    estimateTokens(systemPrompt) +
-    messages.reduce((sum, message) => sum + estimateTokens(message.content), 0)
+    systemPromptTokens + messages.reduce((sum, message) => sum + estimateTokens(message.content), 0)
   );
 }
 
@@ -554,6 +553,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         ? new SpendBudget(options.budget)
         : undefined;
 
+  // The system prompt is constant across iterations, so its token cost is
+  // computed once here instead of re-encoded on every charge.
+  const systemPromptTokens = estimateTokens(systemPrompt);
+
   // Build sandbox options
   const sandboxOpts: SandboxOptions = { registry };
 
@@ -593,13 +596,13 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     // Charge the budget before the call so a run never overspends; a call
     // that fits is charged in full, one that cannot fit degrades (D4).
     if (budget) {
-      const cost = callCost(systemPrompt, messages);
+      const cost = callCost(systemPromptTokens, messages);
       if (!budget.tryCharge(cost)) {
         return {
           status: "budget_exhausted",
           answer: extractBestAnswer(iterations),
           iterations,
-          budget: { limit: budget.limit, consumed: budget.consumed, limited: true },
+          budget: budgetReport(budget, true),
         };
       }
     }

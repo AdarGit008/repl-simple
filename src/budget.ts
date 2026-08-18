@@ -12,14 +12,22 @@
  */
 const BYTES_PER_TOKEN = 4;
 
+/** Module-level encoder, reused across calls instead of allocated per call. */
+const textEncoder = new TextEncoder();
+
 /**
  * Deterministic token estimate: UTF-8 bytes ÷ 4, rounded up.
  *
  * Measured with `TextEncoder` — the library stays tokenizer-independent, and
  * `src/rlm.ts` never hand-rolls byte measurement (D8).
+ *
+ * This is a deterministic *lower bound* (a soft ceiling): real tokenizers emit
+ * more tokens than `bytes / 4` for non-ASCII, emoji, and CJK text (up to ~1
+ * token per byte worst case), so callers needing a hard spend bound should
+ * apply their own margin for non-English content.
  */
 export function estimateTokens(text: string): number {
-  return Math.ceil(new TextEncoder().encode(text).length / BYTES_PER_TOKEN);
+  return Math.ceil(textEncoder.encode(text).length / BYTES_PER_TOKEN);
 }
 
 /**
