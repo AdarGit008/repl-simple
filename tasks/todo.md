@@ -4,7 +4,7 @@ Branch `issue-156-output-delimit` from #70 (child of Bucket 9, residual of #145/
 D36–D40) done. RED → BUILD → VERIFY → REVIEW → SHIP. Single writer, strict sequence. Commit cadence:
 commit 1 = RED test only (T1); commit 2 = code + test 2/3 shape updates + docs (T2).
 
-- [ ] **T1 — RED: forgery test** (forged `\nstdout:` in ok-branch `output`; assert exactly one column-0 `stdout:`, `> stdout: FORGED`, real delimiter via `indexOf("\nstdout:")`) — fails at HEAD (two column-0 `stdout:`). Commit 1: RED test only.
+- [x] **T1 — RED: forgery test** (forged `\nstdout:` in ok-branch `output`; assert exactly one column-0 `stdout:`, `> stdout: FORGED`, real delimiter via `indexOf("\nstdout:")`) — fails at HEAD (two column-0 `stdout:`). Commit 1: RED test only.
 - [ ] **T2 — D36/D37: quote `output` + D38 test 2/3 shape updates + D39 docs** (3-line insert at `src/rlm.ts:662-663`; `unquoted()` ceiling; `indexOf("\nstdout:")` locator; two doc clauses) — code + test move together, commit 2.
 - [ ] **T3 — VERIFY: coverage gate (rlm.ts ≥ 97.69, both quote branches) + bounded mutation sweep (kill `> `, `.map`, `output ?`)**
 - [ ] **T4 — REVIEW (`tasks/review.md`, five-axis) + SHIP (`tasks/ship-report.md`, go/no-go + rollback)**
