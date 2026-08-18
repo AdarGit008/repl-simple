@@ -1703,7 +1703,7 @@ describe("buildFeedback() — feedback byte caps", () => {
       calls: [],
     });
 
-    const marker = "\nstdout:";
+    const marker = "\nstdout:\n";
     const idx = feedback.indexOf(marker);
     assert.ok(idx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
     const stdoutSection = feedback.slice(idx + marker.length);

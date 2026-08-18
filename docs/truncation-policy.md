@@ -440,8 +440,8 @@ its own elided reply from anywhere (policy Q3), while `iterations[].llmResponse`
 reply for the caller; truncated views are sentinel-delimited (Exception 5); error and output lines are
 `> `-quoted so a forged `stdout:` line cannot pass as the real delimiter (D19, D36); input names are
 validated against a Python-identifier pattern before any query (D20); the drop marker's label
-derives from the budget via `formatSize` ("256.0KB"); the quoted error section renders ≤ 2× its
-value budget (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
+derives from the budget via `formatSize` ("256.0KB"); the quoted error and output sections render ≤ 2× their
+value budgets (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
 vector); and the aggregate input-preview cut is
 block-level elision over whole per-value previews (D15), so no cut can split a fence or a header.
 

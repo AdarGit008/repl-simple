@@ -93,11 +93,12 @@ by the `> ` prefix bytes after quoting. Change it to measure `unquoted(outputSec
 test 8 pattern for the error branch. The `elided` and recovery-clause matches keep testing the raw
 (quoted) section, unchanged.
 
-**test 3 update (`:1693`)**: its locator `indexOf("stdout:\n")` is ambiguous after quoting — a forged
-`stdout:` line renders `> stdout:\n`, which still contains the substring `stdout:\n`. Switch to
-`indexOf("\nstdout:")`: the forged line is preceded by `> ` (a space), never a bare `\n`, so the
-leading newline unambiguously selects the real delimiter. test 3's data (`output:"None"`) is
-unaffected by quoting (D37 empty no-op), so only the locator moves.
+**test 3 update (`:1693`)**: switch its locator from `indexOf("stdout:\n")` to the full delimiter
+`indexOf("\nstdout:\n")` (leading newline + delimiter). This is **defensive robustness**, not
+quote-compensation: test 3's data is empty output (`output:"None"` → D37 empty no-op), so nothing
+is quoted and the old `"stdout:\n"` locator was never ambiguous for this test. Anchoring on the
+leading newline gives anti-forgery symmetry with the new test's locator, and including the trailing
+`\n` excludes the delimiter entirely, keeping the measured stdout content at 32767 bytes.
 
 Both updates are required for the full suite to stay green with the code change — they are not
 optional polish; they move with the code in one commit per the issue's DoD ("code + test move
@@ -205,7 +206,7 @@ in the same commit so the suite stays green end-to-end:
 |---|---|---|
 | NEW — forged `\nstdout:` inside `output` (ok branch) → exactly one column-0 `stdout:`, forged line `> stdout: FORGED`, real `real` follows `\nstdout:` | D36, D37 | **RED** (HEAD renders two column-0 `stdout:`) |
 | test 2 (`:1662`) — 16 KiB output ceiling measured via `unquoted()` (presentation vs payload) | D36 | **update, same commit** (raw-section ceiling would overrun by `> ` bytes) |
-| test 3 (`:1693`) — locator `indexOf("\nstdout:")` instead of `indexOf("stdout:\n")` | D37 | **update, same commit** (old locator matches a quoted forged line) |
+| test 3 (`:1693`) — locator `indexOf("\nstdout:\n")` instead of `indexOf("stdout:\n")` | D37 | **update, same commit** (defensive: anchors on the leading newline; empty output means the old locator was never ambiguous) |
 
 The `unquoted()` helper (`:56-61`) is reused verbatim for any payload-length assertion — it already
 documents itself as "presentation, not payload" and is the established pattern from test 8.
