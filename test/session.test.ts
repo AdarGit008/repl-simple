@@ -428,6 +428,87 @@ describe("Session — prefixLineCount is incrementally maintained (#145 D28)", (
   });
 });
 
+// ── prefixLineTotal counter-site pins (#145 D28 guards) ─────────
+//
+// Three of the five `prefixLineTotal` update sites produce a count no test
+// reads as a line number: the `resume()` ok-branch append, the `reset()`
+// re-seed, and the `load()` accumulation. Each is correct by inspection, but
+// a mutation that neuters one (`+=` → `=`, or a dropped re-seed/accumulation)
+// leaves the suite green because every existing round-trip test asserts only
+// output strings. These guards drive each site through a *subsequent
+// erroring run* and assert the offset the running total yields: a syntax
+// error on line 2 of the latest snippet must be reported as line 2, never
+// the assembled line. Guards — GREEN immediately.
+
+describe("Session — prefixLineTotal counter-site pins (#145 D28 guards)", () => {
+  // 3 lines — every test below stacks snippets on top of this preamble.
+  const preamble = ["# pin preamble", "pin_offset = 1", "pin_offset += 1"].join("\n");
+
+  it("(a) resume()'s ok-branch append feeds the next run's lineOffset", async () => {
+    const gated: HostTool = {
+      name: "gated_pin_resume",
+      description: "Needs approval",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `approved: ${args.x}`,
+    };
+    const session = new Session({ registry: new ToolRegistry([gated]) }, preamble);
+
+    // 2 prior lines stack into the prefix (total 5).
+    ok(await session.run("first = 1\nsecond = 2"));
+
+    // A 2-line snippet suspends on line 1; approving resumes and appends it
+    // (total 7). If resume's append is neutered to `=`, the total becomes 2.
+    suspended(
+      await session.run('gated_pin_resume("x")\nresumed = 1', { onApproval: () => "suspend" }),
+    );
+    ok(await session.resume({ onApproval: () => true }));
+
+    // Subsequent erroring run: the syntax error is on line 2 of the latest
+    // snippet — assembled line 3 + 2 + 2 + 2 = 9, so lineOffset must be 7.
+    const result = await session.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/);
+    assert.match(result.error, /^2 \| 1 \+$/m);
+  });
+
+  it("(b) reset() re-seeds the count from the preamble", async () => {
+    const session = new Session({ registry: new ToolRegistry() }, preamble);
+
+    // Stack a 2-line snippet so the total (5) no longer equals the preamble (3).
+    ok(await session.run("first = 1\nsecond = 2"));
+
+    session.reset();
+
+    // After reset only the preamble (3 lines) is the prefix. The syntax error
+    // is on line 2 of the latest snippet — assembled line 3 + 2 = 5, so
+    // lineOffset must be 3, not the pre-reset 5 nor a neutered 0.
+    const result = await session.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/);
+    assert.match(result.error, /^2 \| 1 \+$/m);
+  });
+
+  it("(c) load() accumulates restored snippet lines into the count", async () => {
+    const s1 = new Session({ registry: new ToolRegistry() }, preamble);
+    ok(await s1.run("first = 1\nsecond = 2")); // 2 lines → total 5
+    ok(await s1.run("third = 3\nfourth = 4")); // 2 lines → total 7
+
+    const restored = Session.load(s1.dump(), { registry: new ToolRegistry() }, preamble);
+
+    // The restored prefix is preamble (3) + two 2-line snippets (4) = 7. The
+    // syntax error is on line 2 of the latest snippet — assembled line 9.
+    const result = await restored.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/);
+    assert.match(result.error, /^2 \| 1 \+$/m);
+  });
+});
+
 // ── Approval / Suspension ───────────────────────────────────────
 
 describe("Session — approval & suspension", () => {
