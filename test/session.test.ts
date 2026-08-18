@@ -376,6 +376,139 @@ describe("Session — lineOffset through the suspended-resume path (#77)", () =>
   });
 });
 
+// ── prefixLineCount is incrementally maintained (#145 D28) ─────────
+//
+// `Session.prefixLineCount` used to re-split the preamble and every prior
+// snippet on each `run()`/`resume()`, so a session's N runs cost O(n²)
+// split calls. #145 item 8 replaces that with a running total maintained on
+// append/reset/load. This test observes the split-call count on the strings
+// the session owns: the O(n²) version grows quadratically with N, the
+// incremental one stays linear (bounded by a small multiple of N).
+
+describe("Session — prefixLineCount is incrementally maintained (#145 D28)", () => {
+  it("does not re-split every prior snippet on each run", async () => {
+    const preamble = "# preamble\n# second preamble line";
+    const session = new Session({ registry: new ToolRegistry() }, preamble);
+
+    // The strings `prefixLineCount` splits are exactly the ones we own here:
+    // the preamble and each code string handed to `run()`. Watching them by
+    // reference counts *its* splits without noise from the sandbox, which
+    // only ever sees the joined transcript (a different string).
+    const watched = new Set<string>([preamble]);
+
+    const N = 60;
+    const codes: string[] = [];
+    for (let i = 0; i < N; i++) {
+      const code = `x${i} = ${i}`;
+      codes.push(code);
+      watched.add(code);
+    }
+
+    const originalSplit = String.prototype.split as unknown as (...args: unknown[]) => string[];
+    let splitCount = 0;
+    String.prototype.split = function (this: string, ...args: unknown[]): string[] {
+      if (watched.has(this)) splitCount += 1;
+      return originalSplit.apply(this, args);
+    };
+
+    try {
+      for (const code of codes) {
+        ok(await session.run(code));
+      }
+    } finally {
+      String.prototype.split = originalSplit;
+    }
+
+    // Linear: at most a small constant multiple of N. The O(n²) version
+    // performs N(N+1)/2 splits on these strings (1830 for N=60).
+    assert.ok(
+      splitCount <= 3 * N,
+      `expected split calls to stay linear, got ${splitCount} for ${N} runs`,
+    );
+  });
+});
+
+// ── prefixLineTotal counter-site pins (#145 D28 guards) ─────────
+//
+// Three of the five `prefixLineTotal` update sites produce a count no test
+// reads as a line number: the `resume()` ok-branch append, the `reset()`
+// re-seed, and the `load()` accumulation. Each is correct by inspection, but
+// a mutation that neuters one (`+=` → `=`, or a dropped re-seed/accumulation)
+// leaves the suite green because every existing round-trip test asserts only
+// output strings. These guards drive each site through a *subsequent
+// erroring run* and assert the offset the running total yields: a syntax
+// error on line 2 of the latest snippet must be reported as line 2, never
+// the assembled line. Guards — GREEN immediately.
+
+describe("Session — prefixLineTotal counter-site pins (#145 D28 guards)", () => {
+  // 3 lines — every test below stacks snippets on top of this preamble.
+  const preamble = ["# pin preamble", "pin_offset = 1", "pin_offset += 1"].join("\n");
+
+  it("(a) resume()'s ok-branch append feeds the next run's lineOffset", async () => {
+    const gated: HostTool = {
+      name: "gated_pin_resume",
+      description: "Needs approval",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `approved: ${args.x}`,
+    };
+    const session = new Session({ registry: new ToolRegistry([gated]) }, preamble);
+
+    // 2 prior lines stack into the prefix (total 5).
+    ok(await session.run("first = 1\nsecond = 2"));
+
+    // A 2-line snippet suspends on line 1; approving resumes and appends it
+    // (total 7). If resume's append is neutered to `=`, the total becomes 2.
+    suspended(
+      await session.run('gated_pin_resume("x")\nresumed = 1', { onApproval: () => "suspend" }),
+    );
+    ok(await session.resume({ onApproval: () => true }));
+
+    // Subsequent erroring run: the syntax error is on line 2 of the latest
+    // snippet — assembled line 3 + 2 + 2 + 2 = 9, so lineOffset must be 7.
+    const result = await session.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/);
+    assert.match(result.error, /^2 \| 1 \+$/m);
+  });
+
+  it("(b) reset() re-seeds the count from the preamble", async () => {
+    const session = new Session({ registry: new ToolRegistry() }, preamble);
+
+    // Stack a 2-line snippet so the total (5) no longer equals the preamble (3).
+    ok(await session.run("first = 1\nsecond = 2"));
+
+    session.reset();
+
+    // After reset only the preamble (3 lines) is the prefix. The syntax error
+    // is on line 2 of the latest snippet — assembled line 3 + 2 = 5, so
+    // lineOffset must be 3, not the pre-reset 5 nor a neutered 0.
+    const result = await session.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/);
+    assert.match(result.error, /^2 \| 1 \+$/m);
+  });
+
+  it("(c) load() accumulates restored snippet lines into the count", async () => {
+    const s1 = new Session({ registry: new ToolRegistry() }, preamble);
+    ok(await s1.run("first = 1\nsecond = 2")); // 2 lines → total 5
+    ok(await s1.run("third = 3\nfourth = 4")); // 2 lines → total 7
+
+    const restored = Session.load(s1.dump(), { registry: new ToolRegistry() }, preamble);
+
+    // The restored prefix is preamble (3) + two 2-line snippets (4) = 7. The
+    // syntax error is on line 2 of the latest snippet — assembled line 9.
+    const result = await restored.run("ok = 1\n1 +");
+    err(result);
+    assert.equal(result.errorKind, "syntax");
+    assert.match(result.error, / --> <repl>:2:/);
+    assert.match(result.error, /^2 \| 1 \+$/m);
+  });
+});
+
 // ── Approval / Suspension ───────────────────────────────────────
 
 describe("Session — approval & suspension", () => {

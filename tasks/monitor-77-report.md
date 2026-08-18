@@ -11,7 +11,7 @@ line 1 → ` --> rlm.py:91:1`. Cost: a NO-GO verify round + Task 7 + a replaced 
 flight-start staleness comment on #77 (id 5318877797) carries the same false half-premise.
 
 - **#77 comment:** correct the staleness block — typing diagnostics get the same `lineOffset`
-  correction as syntax (`classifyStartError` → `correctSyntaxErrorText`).
+  correction as syntax (`classifyStartError` → `correctDiagnosticText`).
 - **#70 gotcha:** "Typing diagnostics are NOT line-correct under any caller-assembled prefix; do
   not re-derive this."
 
@@ -37,7 +37,7 @@ flight-start staleness comment on #77 (id 5318877797) carries the same false hal
 - `prefixLineCount()` O(n²) → **#145 new item 8**.
 - Multi-block typing diagnostic unpinned → #70 test-strength note.
 - Runtime `endLine` unrendered → #77 landing comment (cosmetic).
-- Rename `correctSyntaxErrorText` → `correctDiagnosticText` → **#145 item 6 extension**.
+- Rename to `correctDiagnosticText` → **#145 item 6 extension**.
 
 ## Discovery 5 — Continuity settled; #77's "Under #40" section is now closed
 

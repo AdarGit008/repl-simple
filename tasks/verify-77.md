@@ -12,7 +12,7 @@ Gates: `npm test` 976/976 · `npm run check` PASS · `npm run coverage` all floo
 
 ## Round 2 (post-fix, HEAD 0681c38): GO
 
-Fixes landed: Task 7 (typing path corrected via `correctSyntaxErrorText`; ≤-offset rows skipped not clamped; false-premise comments/JSDoc corrected; bogus test replaced; RLM-level typing-feedback test), Task 8 (resumeInSession test exposed and fixed a real bug — `Session.resume()` lost lineOffset; plain `MontySyntaxError` branch test via input-name validation; types test updated).
+Fixes landed: Task 7 (typing path corrected via `correctDiagnosticText`; ≤-offset rows skipped not clamped; false-premise comments/JSDoc corrected; bogus test replaced; RLM-level typing-feedback test), Task 8 (resumeInSession test exposed and fixed a real bug — `Session.resume()` lost lineOffset; plain `MontySyntaxError` branch test via input-name validation; types test updated).
 
 Gates: `npm test` **983/983** · `npm run check` PASS · `npm run coverage` all floors (rlm 97.44, sandbox 97.65, session 98.70, types 100) · lint PASS.
 
