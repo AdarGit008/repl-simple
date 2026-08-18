@@ -1683,8 +1683,8 @@ describe("buildFeedback() — feedback byte caps", () => {
     assert.ok(feedback.startsWith(prefix), `unexpected feedback shape: ${feedback.slice(0, 100)}`);
     const outputSection = feedback.slice(prefix.length);
     assert.ok(
-      Buffer.byteLength(outputSection, "utf8") <= 16 * 1024,
-      `Output section is ${Buffer.byteLength(outputSection, "utf8")} bytes`,
+      Buffer.byteLength(unquoted(outputSection), "utf8") <= 16 * 1024,
+      `Output section is ${Buffer.byteLength(unquoted(outputSection), "utf8")} bytes`,
     );
     assert.match(outputSection, /elided/, "the truncation marker must state what went");
     assert.match(outputSection, /Assign the value to a name and slice it/);
@@ -1703,7 +1703,7 @@ describe("buildFeedback() — feedback byte caps", () => {
       calls: [],
     });
 
-    const marker = "stdout:\n";
+    const marker = "\nstdout:";
     const idx = feedback.indexOf(marker);
     assert.ok(idx >= 0, `stdout section missing: ${feedback.slice(0, 100)}`);
     const stdoutSection = feedback.slice(idx + marker.length);
