@@ -1241,6 +1241,12 @@ export async function runInSandbox(
     // with no reason to be in a `try` (#36).
     if (err instanceof SandboxUnavailableError) return runError("unavailable", err.message, acc);
     throw err;
+  } finally {
+    // Not tidiness: a listener left on a caller-owned signal outlives every
+    // run that shares it, and its closure retains `acc` (and therefore
+    // stdout) — one leak per iteration (#75, D33). `withHostDeadline`
+    // removes its own listener; this one must too.
+    if (runOpts?.signal) runOpts.signal.removeEventListener("abort", onAbort);
   }
 }
 
