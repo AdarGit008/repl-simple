@@ -208,6 +208,13 @@ export class Session {
   // ── State ──────────────────────────────────────────────────
 
   private snippets: string[] = [];
+  /**
+   * Running total of lines in the assembled prefix: the preamble plus every
+   * snippet appended to {@link snippets}. Incremented on each successful
+   * `run()`/`resume()` append and reset in `reset()`/`load()`, so
+   * {@link prefixLineCount} is O(1) (#145, D28).
+   */
+  private prefixLineTotal = 0;
   /** Ordered list of all tool calls from successful snippets. */
   private callCacheEntries: CacheEntry[] = [];
   private sandboxOptions: SandboxOptions;
@@ -231,6 +238,10 @@ export class Session {
   constructor(sandboxOptions: SandboxOptions, preamble?: string, options: SessionOptions = {}) {
     this.sandboxOptions = sandboxOptions;
     this.preamble = preamble;
+    // Seed the running prefix-line total with the preamble; each snippet is
+    // added as it is appended (see run/resume), so the total never needs a
+    // re-scan of the whole list (#145, D28).
+    this.prefixLineTotal = preamble ? preamble.split("\n").length : 0;
 
     const uses = options.grantUses ?? DEFAULT_GRANT_USES;
     if (!Number.isInteger(uses) || uses < 1) {
@@ -344,6 +355,7 @@ export class Session {
     if (result.status === "ok") {
       // Success: add snippet, append new entries, filter trace
       this.snippets.push(code);
+      this.prefixLineTotal += code.split("\n").length;
       this.callCacheEntries.push(...newEntries);
       return withDiscardNotice(this.filterCachedCalls(result, priorEntryCount), discarded);
     } else if (result.status === "suspended") {
@@ -448,6 +460,7 @@ export class Session {
       // Append cached tool calls (including the suspended call's result)
       this.callCacheEntries.push(...newEntries);
       this.snippets.push(suspendedCode);
+      this.prefixLineTotal += suspendedCode.split("\n").length;
       return result;
     } else if (result.status === "suspended") {
       // Suspended again on a later gated call
@@ -490,6 +503,7 @@ export class Session {
   reset(): GrantSummary[] {
     const revoked = this.outstandingGrants();
     this.snippets = [];
+    this.prefixLineTotal = this.preamble ? this.preamble.split("\n").length : 0;
     this.callCacheEntries = [];
     this.suspended = null;
     this.suspendedCode = null;
@@ -575,6 +589,11 @@ export class Session {
 
     const session = new Session(sandboxOptions, preamble);
     session.snippets = obj.snippets ?? [];
+    // The constructor seeded the preamble's lines; add the restored snippets'
+    // lines so the running total matches the split-based count byte-for-byte.
+    for (const snippet of session.snippets) {
+      session.prefixLineTotal += snippet.split("\n").length;
+    }
     session.callCacheEntries = obj.callCache ?? [];
 
     if (obj.suspended && obj.suspendedCode) {
@@ -605,13 +624,14 @@ export class Session {
    * one `run()` assembled for the suspended snippet, and `snippets` cannot
    * have changed since — the run that suspended never appended its snippet,
    * and any later `run()` discards the pending suspension before touching
-   * the list (#129). Computed from the parts, never hardcoded (#77).
+   * the list (#129). Maintained as a running total — seeded with the
+   * preamble at construction, added to on each append, and reset where the
+   * snippet list is rebuilt (`reset()`, `load`) — rather than re-split from
+   * the parts on every call (#77, #145 D28). The returned number is
+   * byte-identical to the split-based count.
    */
   private prefixLineCount(): number {
-    let total = 0;
-    if (this.preamble) total += this.preamble.split("\n").length;
-    for (const snippet of this.snippets) total += snippet.split("\n").length;
-    return total;
+    return this.prefixLineTotal;
   }
 
   /**

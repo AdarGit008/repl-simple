@@ -376,6 +376,58 @@ describe("Session — lineOffset through the suspended-resume path (#77)", () =>
   });
 });
 
+// ── prefixLineCount is incrementally maintained (#145 D28) ─────────
+//
+// `Session.prefixLineCount` used to re-split the preamble and every prior
+// snippet on each `run()`/`resume()`, so a session's N runs cost O(n²)
+// split calls. #145 item 8 replaces that with a running total maintained on
+// append/reset/load. This test observes the split-call count on the strings
+// the session owns: the O(n²) version grows quadratically with N, the
+// incremental one stays linear (bounded by a small multiple of N).
+
+describe("Session — prefixLineCount is incrementally maintained (#145 D28)", () => {
+  it("does not re-split every prior snippet on each run", async () => {
+    const preamble = "# preamble\n# second preamble line";
+    const session = new Session({ registry: new ToolRegistry() }, preamble);
+
+    // The strings `prefixLineCount` splits are exactly the ones we own here:
+    // the preamble and each code string handed to `run()`. Watching them by
+    // reference counts *its* splits without noise from the sandbox, which
+    // only ever sees the joined transcript (a different string).
+    const watched = new Set<string>([preamble]);
+
+    const N = 60;
+    const codes: string[] = [];
+    for (let i = 0; i < N; i++) {
+      const code = `x${i} = ${i}`;
+      codes.push(code);
+      watched.add(code);
+    }
+
+    const originalSplit = String.prototype.split as unknown as (...args: unknown[]) => string[];
+    let splitCount = 0;
+    String.prototype.split = function (this: string, ...args: unknown[]): string[] {
+      if (watched.has(this)) splitCount += 1;
+      return originalSplit.apply(this, args);
+    };
+
+    try {
+      for (const code of codes) {
+        ok(await session.run(code));
+      }
+    } finally {
+      String.prototype.split = originalSplit;
+    }
+
+    // Linear: at most a small constant multiple of N. The O(n²) version
+    // performs N(N+1)/2 splits on these strings (1275 for N=60).
+    assert.ok(
+      splitCount <= 3 * N,
+      `expected split calls to stay linear, got ${splitCount} for ${N} runs`,
+    );
+  });
+});
+
 // ── Approval / Suspension ───────────────────────────────────────
 
 describe("Session — approval & suspension", () => {
