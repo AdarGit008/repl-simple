@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
+import { estimateTokens, SpendBudget } from "../src/budget.js";
 import type { LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
@@ -1734,5 +1735,170 @@ describe("runRlm() — a SUBMIT call that failed to resolve", () => {
       .messages.map((m) => m.content)
       .join("\n");
     assert.match(feedback, /got multiple values for argument 'answer'/, `got: ${feedback}`);
+  });
+});
+
+// ── Spend budget (D4/D5) ────────────────────────────────────────
+//
+// The shared spend budget wired into `runRlm`: a number mints a fresh per-run
+// budget, an instance is shared and mutated in place, and absence means no
+// budget logic at all. Consumption is estimated tokens (UTF-8 bytes ÷ 4,
+// rounded up) — recomputed here over the mock's recorded calls to prove the
+// loop charges exactly what it sends.
+
+describe("runRlm() — spend budget", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  /** Estimated-token cost of one recorded call (mirrors the loop's charge). */
+  function recordedCost(call: {
+    systemPrompt: string;
+    messages: Array<{ role: string; content: string }>;
+  }): number {
+    return (
+      estimateTokens(call.systemPrompt) +
+      call.messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    );
+  }
+
+  it("1. a small budget stops the loop before maxIterations", async () => {
+    const explore = "```python\nprint('still working...')\n```";
+    const codes = [explore, explore, explore, explore, explore];
+
+    // Probe the per-call costs once without a budget, then size the budget to
+    // exactly two iterations so the third charge must degrade.
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 5 });
+    const calls = probe.calls();
+    const twoIterations = recordedCost(calls[0]) + recordedCost(calls[1]);
+
+    const { llm } = mockLlmCodeGen(codes);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: twoIterations,
+    });
+
+    assert.equal(result.status, "budget_exhausted");
+    assert.equal(result.budget?.limited, true);
+    assert.equal(result.iterations.length, 2);
+    assert.ok(result.iterations.length < 5);
+  });
+
+  it("2. siblings sharing one SpendBudget pool: the second sees the first's spend", async () => {
+    const submit = ['```python\nSUBMIT("done")\n```'];
+
+    // Size the shared pool to exactly one call: the first run consumes it
+    // whole, the second cannot charge at all — proving the pool is shared,
+    // not minted fresh per run.
+    const { llm: probe } = mockLlmCodeGen(submit);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 5 });
+    const cost0 = recordedCost(probe.calls()[0]);
+
+    const shared = new SpendBudget(cost0);
+
+    const { llm: first } = mockLlmCodeGen(submit);
+    const firstResult = await runRlm("q", {
+      llmClient: first,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: shared,
+    });
+    assert.equal(firstResult.status, "ok");
+    assert.equal(firstResult.budget?.limited, false);
+    assert.equal(firstResult.budget?.consumed, cost0);
+
+    const { llm: second } = mockLlmCodeGen(submit);
+    const secondResult = await runRlm("q", {
+      llmClient: second,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: shared,
+    });
+
+    assert.equal(secondResult.status, "budget_exhausted");
+    assert.equal(secondResult.budget?.limited, true);
+    // The second run reports the shared pool's cumulative spend — the first
+    // run's charge is still there, and no fresh budget was minted.
+    assert.equal(secondResult.budget?.consumed, cost0);
+    assert.ok((secondResult.budget?.consumed ?? 0) >= (firstResult.budget?.consumed ?? 0));
+  });
+
+  it("3. exhaustion degrades, never throws — a zero budget returns a result", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 0,
+    });
+
+    assert.equal(result.status, "budget_exhausted");
+    assert.equal(result.budget?.limited, true);
+    assert.deepEqual(result.iterations, []);
+    assert.equal(result.answer, "(no answer)");
+    assert.equal(llm.calls().length, 0, "the LLM must never be called");
+  });
+
+  it("4. reports consumption equal to the sum of the recorded calls' estimates", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nprint("exploring...")\n```',
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.ok(expected > 0, "the mock must have been called");
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("5. omitting budget leaves the result budget-less (unchanged)", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.budget, undefined);
+    assert.ok(!("budget" in result), "no budget field may be present");
+  });
+
+  it("6. a configured budget that never exhausts reports limited: false on max_iterations", async () => {
+    const explore = "```python\nprint('still working...')\n```";
+    const { llm } = mockLlmCodeGen([explore, explore, explore]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+    assert.equal(result.budget?.limit, 1_000_000);
+    assert.ok((result.budget?.consumed ?? 0) > 0, "the tracked spend must be reported");
   });
 });

@@ -24,7 +24,7 @@
   - Verify: `npm test` (full suite green), `npm run check`, `npm run lint`
   - Files: `src/types.ts`, `src/index.ts`, `test/types.test.ts`
 
-- [ ] Task 3: Wire the budget into `runRlm` + the five issue tests
+- [x] Task 3: Wire the budget into `runRlm` + the five issue tests
   - Acceptance: `runRlm` builds a budget from `options.budget` (number → fresh `SpendBudget`;
     instance → used and mutated in place; absent → no budget logic). Before each LLM call (after
     the abort check), compute `cost = estimateTokens(systemPrompt) + Σ estimateTokens(m.content)`;
