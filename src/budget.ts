@@ -61,12 +61,12 @@ export class SpendBudget {
   /**
    * Charge `tokens` against the budget.
    *
-   * Returns `false` — and charges nothing — when `tokens` is negative or the
-   * charge would exceed `limit`. Otherwise adds to `consumed` and returns
-   * `true`.
+   * Returns `false` — and charges nothing — when `tokens` is non-finite,
+   * negative, or the charge would exceed `limit`. Otherwise adds to `consumed`
+   * and returns `true`.
    */
   tryCharge(tokens: number): boolean {
-    if (tokens < 0 || this.consumedValue + tokens > this.limitValue) {
+    if (!Number.isFinite(tokens) || tokens < 0 || this.consumedValue + tokens > this.limitValue) {
       return false;
     }
     this.consumedValue += tokens;

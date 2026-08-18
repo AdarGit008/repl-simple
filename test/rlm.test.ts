@@ -1791,6 +1791,19 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.budget?.limited, true);
     assert.equal(result.iterations.length, 2);
     assert.ok(result.iterations.length < 5);
+
+    // The degrade path still returns a best-effort answer from the recorded
+    // iterations (the last successful stdout) — proving extractBestAnswer ran
+    // on exhaustion with non-empty iterations.
+    assert.equal(result.answer, "still working...\n");
+
+    // Exactly exhausted: consumed equals the limit and equals the sum of the
+    // recorded costs over only the charged (affordable) calls — the third
+    // unaffordable call is never charged.
+    assert.equal(result.budget?.consumed, result.budget?.limit);
+    assert.equal(llm.calls().length, 2, "the third unaffordable call must not be charged");
+    const chargedCost = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, chargedCost);
   });
 
   it("2. siblings sharing one SpendBudget pool: the second sees the first's spend", async () => {
@@ -1900,5 +1913,16 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.budget?.limited, false);
     assert.equal(result.budget?.limit, 1_000_000);
     assert.ok((result.budget?.consumed ?? 0) > 0, "the tracked spend must be reported");
+  });
+
+  it("7. a non-finite or negative budget number is rejected by SpendBudget's constructor", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    for (const bad of [-1, NaN]) {
+      await assert.rejects(
+        runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5, budget: bad }),
+        /SpendBudget limit must be a finite, non-negative number/,
+      );
+    }
   });
 });

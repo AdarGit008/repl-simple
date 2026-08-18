@@ -77,6 +77,29 @@ describe("SpendBudget.tryCharge", () => {
     assert.equal(b.remaining, 10);
   });
 
+  it("tryCharge refuses a non-finite charge (NaN) without mutating consumed", () => {
+    const b = new SpendBudget(10);
+    assert.equal(b.tryCharge(NaN), false);
+    assert.equal(b.consumed, 0);
+    assert.equal(b.remaining, 10);
+  });
+
+  for (const bad of [Infinity, -Infinity]) {
+    it(`tryCharge refuses non-finite ${String(bad)} without mutating consumed`, () => {
+      const b = new SpendBudget(10);
+      assert.equal(b.tryCharge(bad), false);
+      assert.equal(b.consumed, 0);
+      assert.equal(b.remaining, 10);
+    });
+  }
+
+  it("tryCharge(0) is a valid no-op that charges nothing", () => {
+    const b = new SpendBudget(10);
+    assert.equal(b.tryCharge(0), true);
+    assert.equal(b.consumed, 0);
+    assert.equal(b.remaining, 10);
+  });
+
   it("exactly exhausting the limit is allowed, then refused", () => {
     const b = new SpendBudget(10);
     assert.equal(b.tryCharge(10), true);
