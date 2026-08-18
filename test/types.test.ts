@@ -119,9 +119,11 @@ describe("Interface shapes (compile-time)", () => {
       maxStdoutBytes: 50000,
       scriptName: "<repl>",
       limits: { maxDurationSecs: 30 },
+      lineOffset: 90,
     };
     assert.equal(opts.maxStdoutBytes, 50000);
     assert.equal(opts.scriptName, "<repl>");
+    assert.equal(opts.lineOffset, 90);
     assert.notEqual(opts.limits, "unbounded");
     assert.equal((opts.limits as RunLimits).maxDurationSecs, 30);
   });

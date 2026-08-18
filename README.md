@@ -37,6 +37,11 @@ success. See [#59](https://github.com/AdarGit008/repl-simple/issues/59).
 
 `RLMLoop` runs a code-gen → execute loop: LLM writes Python, sandbox runs it, results fed back until `SUBMIT(answer)`.
 
+Each iteration runs in a fresh sandbox — no variables, imports, or state carry over between
+iterations, so each snippet must be self-contained. Diagnostics fed back to the model are
+offset-corrected: line numbers refer to the model's own code, and no preamble source is shown
+([#77](https://github.com/AdarGit008/repl-simple/issues/77)).
+
 `runRlm` declares every `inputs` entry as a sandbox variable and **announces each in the LLM prompt** —
 `context` is always declared and defaults to `""`; values render head-and-tail beyond 5000 chars.
 Because every input reaches the model, `inputs` must never carry secrets.

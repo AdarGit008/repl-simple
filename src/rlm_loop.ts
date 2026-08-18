@@ -262,9 +262,15 @@ export class RLMLoop {
     const preamble = this.options.preamble;
     const fullCode = preamble ? `${preamble}\n${code}` : code;
     const sandboxOpts: SandboxOptions = { registry };
-    const runOpts: RunOptions | undefined = inputs
+    let runOpts: RunOptions | undefined = inputs
       ? { ...this.options.runOpts, inputs }
       : this.options.runOpts;
+    if (preamble) {
+      // The preamble is the prefix the sandbox numbers its diagnostics from,
+      // so the loop owns the offset: computed from the preamble string
+      // actually used, never a hardcoded constant (#77, D1).
+      runOpts = { ...runOpts, lineOffset: preamble.split("\n").length };
+    }
     return await runInSandbox(fullCode, sandboxOpts, runOpts);
   }
 

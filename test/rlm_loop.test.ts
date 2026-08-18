@@ -842,6 +842,62 @@ describe("RLMLoop — preamble", () => {
   });
 });
 
+// ── Preamble lineOffset wiring (#77) ────────────────────────────
+//
+// The loop assembles `preamble + "\n" + code`, so the sandbox numbers every
+// diagnostic from the top of the preamble. The loop must tell the sandbox how
+// many lines it prepended (`RunOptions.lineOffset`), computed from the
+// preamble string actually used — the model's line 1 is line 1, and preamble
+// source never reaches it (the same contract rlm.ts shipped in Task 3).
+
+describe("RLMLoop — preamble lineOffset wiring", () => {
+  const baseOpts: RLMLoopOptions = {
+    registry: new ToolRegistry(),
+    llmQuery: async () => "",
+    generateCode: async () => "",
+  };
+
+  // A 3-line preamble whose last line carries a unique marker directly above
+  // the model's code in the assembled script — the first thing a diagnostic
+  // excerpt leaks when the offset is missing (a number-only fix leaves it in).
+  const PREAMBLE = ["PREAMBLE_77 = 1", "PREAMBLE_77 = 2", "PREAMBLE_MARKER_77 = 3"].join("\n");
+
+  /** The error feedback for iteration 1 — the user message of the second
+   *  generateCode call, formatted by formatErrorResult. */
+  function errorFeedback(msgs: RlmMessage[][]): string {
+    const feedback = msgs[1].find((m) => m.role === "user" && m.content.includes("[error:"));
+    assert.ok(feedback, "error feedback should reach the model on retry");
+    return feedback.content;
+  }
+
+  it("reports a syntax error on the model's line 1 as line 1", async () => {
+    const { fn: gen, messages } = recordingCode("1 +", 'SUBMIT("fixed")');
+    const loop = new RLMLoop({ ...baseOpts, preamble: PREAMBLE, generateCode: gen });
+    const result = await loop.run("task");
+    okResult(result);
+    assert.equal(result.answer, "fixed");
+
+    const feedback = errorFeedback(messages());
+    assert.match(feedback, /\[error: syntax\]/, "the error-feedback shape survives");
+    assert.match(feedback, / --> <repl>:1:/, "the diagnostic location is the model's line 1");
+    assert.match(feedback, /^1 \| 1 \+$/m, "the excerpt line is the model's line 1");
+  });
+
+  it("feeds back no preamble source", async () => {
+    const { fn: gen, messages } = recordingCode("1 +", 'SUBMIT("fixed")');
+    const loop = new RLMLoop({ ...baseOpts, preamble: PREAMBLE, generateCode: gen });
+    const result = await loop.run("task");
+    okResult(result);
+    assert.equal(result.answer, "fixed");
+
+    const feedback = errorFeedback(messages());
+    assert.ok(
+      !feedback.includes("PREAMBLE_MARKER_77"),
+      `preamble source must not reach the model:\n${feedback}`,
+    );
+  });
+});
+
 // ── System prompt ───────────────────────────────────────────────
 
 describe("RLMLoop — system prompt", () => {

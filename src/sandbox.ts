@@ -21,6 +21,7 @@ import {
   MontySyntaxError,
   MontyTypingError,
   MountDir,
+  type Frame,
   type MontySession,
   NameLookupSnapshot,
   type PrintCallback,
@@ -160,8 +161,13 @@ function runError(kind: RunErrorKind, error: string, acc: DispatchAccumulators):
  * is gone, not merely errored, and a caller that resumes or retries against it
  * is working with nothing.
  */
-function classifyResumeError(err: unknown, acc: DispatchAccumulators): RunError {
-  if (err instanceof MontyRuntimeError) return runError(runtimeKind(err), err.message, acc);
+function classifyResumeError(
+  err: unknown,
+  acc: DispatchAccumulators,
+  lineOffset?: number,
+): RunError {
+  if (err instanceof MontyRuntimeError)
+    return runError(runtimeKind(err), correctRuntimeError(err, lineOffset), acc);
   if (err instanceof MontyCrashedError) return runError("crashed", crashMessage(err), acc);
   throw err;
 }
@@ -206,6 +212,13 @@ function runtimeKind(err: MontyRuntimeError): RunErrorKind {
  * misunderstood. `MontySyntaxError` still arrives from the paths that do not
  * type-check, such as stub validation.
  *
+ * When `lineOffset` is set, the rendering is corrected here: line numbers
+ * are made relative to the caller's code and prefix excerpt lines are dropped
+ * (see `correctSyntaxErrorText`). That covers typing diagnostics too —
+ * `typeCheckStubs` removes only the stub file's contribution out-of-band, so
+ * the prefix the caller assembled around the code still shifts every typing
+ * diagnostic exactly as it shifts syntax ones.
+ *
  * The reported text is `display()`, not `message`. `MontyTypingError`'s
  * constructor keeps only the **first line** of the rendered diagnostics as its
  * message — so `message` drops every diagnostic after the first, and drops the
@@ -215,14 +228,145 @@ function runtimeKind(err: MontyRuntimeError): RunErrorKind {
  * told: two unresolved names would report one, with no indication of the
  * other.
  */
-function classifyStartError(err: unknown, acc: DispatchAccumulators): RunError {
-  if (err instanceof MontySyntaxError) return runError("syntax", err.message, acc);
+function classifyStartError(
+  err: unknown,
+  acc: DispatchAccumulators,
+  lineOffset?: number,
+): RunError {
+  if (err instanceof MontySyntaxError)
+    return runError("syntax", correctSyntaxErrorText(err.message, lineOffset), acc);
   if (err instanceof MontyTypingError) {
     const diagnostics = err.display();
     const kind = diagnostics.includes("error[invalid-syntax]") ? "syntax" : "typing";
-    return runError(kind, diagnostics, acc);
+    return runError(kind, correctSyntaxErrorText(diagnostics, lineOffset), acc);
   }
-  return classifyResumeError(err, acc);
+  return classifyResumeError(err, acc, lineOffset);
+}
+
+/**
+ * Correct a rendered Monty diagnostic (syntax or typing) for code assembled
+ * with a prefix.
+ *
+ * The sandbox parses the script the caller assembled — for the RLM loop,
+ * `preamble + "\n" + code` — so an error reports line numbers counted
+ * from the top of the prefix and echoes prefix source lines as context. The
+ * correction makes every line number relative to the caller's own code and
+ * drops prefix excerpt lines entirely, which is the half a number-only fix
+ * misses: prefix source must never reach the model.
+ *
+ * Typing diagnostics need it for the same reason: `typeCheckStubs` removes
+ * only the stub file's contribution out-of-band, not the prefix the caller
+ * assembled, so the RLM preamble still shifts the `"full"` typing render —
+ * the same ` --> file:line:col` and `<n> |` shapes this function rewrites
+ * (measured).
+ *
+ * The transform is line-wise over the format Monty 0.0.21 renders for
+ * `typeCheckFormat: "full"` (measured): each diagnostic block is a header
+ * line, an ` --> <file>:<line>:<col>` location line, a `  |` gutter, excerpt
+ * lines of the shape `<n> | <source>` (number right-aligned in a gutter
+ * padded to the widest line number shown), caret lines (`  |    ^`), and a
+ * closing gutter line. Blank source lines render as `<n> |` with no text
+ * after the pipe, so the excerpt shape also accepts zero trailing
+ * characters. Header, caret and gutter lines pass through verbatim,
+ * so the `error[invalid-syntax]: <msg>` heading shape is preserved.
+ *
+ * A row whose line number is at or before the offset is a prefix position:
+ * excerpt lines there are dropped, and a location line there is dropped too
+ * rather than emitted with a non-positive number.
+ *
+ * A no-op when the offset is absent or not positive.
+ */
+function correctSyntaxErrorText(text: string, lineOffset?: number): string {
+  if (lineOffset === undefined || !Number.isFinite(lineOffset) || lineOffset <= 0) {
+    return text;
+  }
+  const offset = Math.floor(lineOffset);
+  const corrected: string[] = [];
+  for (const line of text.split("\n")) {
+    // Excerpt line (blank source lines render without the trailing space,
+    // so zero characters after the pipe are allowed too). Drop it when it
+    // shows prefix source, else renumber in place, preserving the gutter
+    // width (the number stays right-aligned).
+    const excerpt = /^(\s*)(\d+)( \|.*)$/.exec(line);
+    if (excerpt) {
+      const n = Number(excerpt[2]);
+      if (n <= offset) continue;
+      corrected.push(
+        `${excerpt[1]}${String(n - offset).padStart(excerpt[2].length, " ")}${excerpt[3]}`,
+      );
+      continue;
+    }
+    // Location line. Only the line number moves; the column is unaffected.
+    // A location inside the prefix is dropped like its excerpt — emitting
+    // `:0:` or a negative number would send the model after a line that does
+    // not exist in its code. The greedy prefix pins the line number as the
+    // digits after the final colon of the filename — a name ending in digits
+    // (` --> file0:3:4`) must not donate its trailing digits to the capture.
+    const location = /^(\s*--> .+:)(\d+)(:\d+.*)$/.exec(line);
+    if (location) {
+      const n = Number(location[2]);
+      if (n <= offset) continue;
+      corrected.push(`${location[1]}${n - offset}${location[3]}`);
+      continue;
+    }
+    corrected.push(line);
+  }
+  return corrected.join("\n");
+}
+
+/**
+ * Correct a rendered runtime error for code assembled with a prefix.
+ *
+ * The sandbox executes the script the caller assembled — prefix included —
+ * so a runtime error's traceback frames are numbered against the assembled
+ * script and carry `sourceLine` previews that can show prefix source.
+ * `MontyRuntimeError.traceback()` exposes those frames structured (measured
+ * on 0.0.21: filename, line, column, endLine, endColumn, functionName,
+ * sourceLine, outermost first). When `lineOffset` is set, the correction
+ * re-renders the traceback from the frames: `lineOffset` is subtracted from
+ * every `line`/`endLine`, frames inside the prefix (`line <= lineOffset`) are
+ * dropped together with their previews, and the survivors are rendered below
+ * the untouched `<type>: msg` heading — the heading is the historical
+ * rendering (`err.message`) and existing callers and tests rely on its shape;
+ * only the traceback portion changes.
+ *
+ * Falls back to the bare message — the historical behavior — when the error
+ * carries no frames (`traceback()` is empty for interpreter-raised ceilings
+ * such as `TimeoutError`, measured), when every frame lies inside the prefix
+ * (nothing survives to render), or when the offset is absent or not positive.
+ */
+function correctRuntimeError(err: MontyRuntimeError, lineOffset?: number): string {
+  if (lineOffset === undefined || !Number.isFinite(lineOffset) || lineOffset <= 0) {
+    return err.message;
+  }
+  const frames = err.traceback();
+  if (frames.length === 0) return err.message;
+  const offset = Math.floor(lineOffset);
+  const survivors: Frame[] = [];
+  for (const frame of frames) {
+    if (frame.line <= offset) continue;
+    survivors.push({ ...frame, line: frame.line - offset, endLine: frame.endLine - offset });
+  }
+  if (survivors.length === 0) return err.message;
+  const lines = [err.message, "Traceback (most recent call last):"];
+  for (const frame of survivors) {
+    lines.push(
+      `  File "${frame.filename}", line ${frame.line}, in ${frame.functionName ?? "<module>"}`,
+    );
+    if (frame.sourceLine !== undefined) {
+      // Mirrors monty's own rendering: the preview is trimmed of leading
+      // whitespace, and the caret is aligned by compensating for the trim.
+      const leading = frame.sourceLine.length - frame.sourceLine.trimStart().length;
+      const preview = frame.sourceLine.trimStart();
+      lines.push(`    ${preview}`);
+      if (!preview.startsWith("raise") && frame.column > 0 && frame.endColumn > frame.column) {
+        const column = Math.max(1, frame.column - leading);
+        const width = Math.max(1, frame.endColumn - frame.column);
+        lines.push(`    ${" ".repeat(column - 1)}${"~".repeat(width)}`);
+      }
+    }
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -809,7 +953,7 @@ async function runDispatchLoop(
         // `NameError: SENTINEL` (#66). There is no sentinel to leak now.
         current = tool ? await current.resume(name) : await current.resume();
       } catch (err) {
-        return classifyResumeError(err, acc);
+        return classifyResumeError(err, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -843,7 +987,7 @@ async function runDispatchLoop(
       try {
         current = await snapshot.resumeAuto();
       } catch (err) {
-        return classifyResumeError(err, acc);
+        return classifyResumeError(err, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -855,7 +999,7 @@ async function runDispatchLoop(
       try {
         current = await snapshot.resumeNotFound();
       } catch (err) {
-        return classifyResumeError(err, acc);
+        return classifyResumeError(err, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -885,7 +1029,7 @@ async function runDispatchLoop(
           ),
         );
       } catch (resumeErr) {
-        return classifyResumeError(resumeErr, acc);
+        return classifyResumeError(resumeErr, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -927,7 +1071,7 @@ async function runDispatchLoop(
             pythonError("PermissionError", `tool '${tool.name}' requires approval`),
           );
         } catch (err) {
-          return classifyResumeError(err, acc);
+          return classifyResumeError(err, acc, runOpts?.lineOffset);
         }
         continue;
       }
@@ -983,7 +1127,7 @@ async function runDispatchLoop(
       try {
         current = await snapshot.resumeError(pythonError(pythonType, message));
       } catch (resumeErr) {
-        return classifyResumeError(resumeErr, acc);
+        return classifyResumeError(resumeErr, acc, runOpts?.lineOffset);
       }
       continue;
     }
@@ -1002,7 +1146,7 @@ async function runDispatchLoop(
     try {
       current = await snapshot.resume(returnValue);
     } catch (err) {
-      return classifyResumeError(err, acc);
+      return classifyResumeError(err, acc, runOpts?.lineOffset);
     }
     // Loop back for next pause point
   }
@@ -1083,7 +1227,7 @@ export async function runInSandbox(
                 mount,
               });
             } catch (err) {
-              return classifyStartError(err, acc);
+              return classifyStartError(err, acc, runOpts?.lineOffset);
             }
             return await runDispatchLoop(current, registry, runOpts, acc);
           }),
@@ -1196,7 +1340,7 @@ async function resumeInSession(
   try {
     snapshot = await session.loadSnapshot(suspended.snapshot, loadOpts);
   } catch (err) {
-    return classifyStartError(err, acc);
+    return classifyStartError(err, acc, runOpts?.lineOffset);
   }
   if (!(snapshot instanceof FunctionSnapshot)) {
     // A dump taken anywhere but at a gated call. `resumeSuspended` is only
@@ -1299,7 +1443,7 @@ async function resumeInSession(
         ? await snapshot.resumeError(resumeWith.raise)
         : await snapshot.resume(resumeWith.returnValue);
   } catch (err) {
-    return classifyResumeError(err, acc);
+    return classifyResumeError(err, acc, runOpts?.lineOffset);
   }
 
   // Continue via shared dispatch loop
