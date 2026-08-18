@@ -556,3 +556,41 @@ authentic by the rule. T15's neutralisation closed sentinel-token forgery, not m
   block) — either note the quoted shape in the rule or reorder quote-after-wrap; pick the minimal
   change and record it.
 - Files: `src/rlm.ts`, `test/rlm.test.ts`, `docs/truncation-policy.md`.
+
+---
+
+## Post-merge micro-flight — close #145's two open items (recorded 2026-08-18) — D28, D29
+
+F-145 merged (PR #157, commit `b6392e5`); the D26 blocker is lifted — both targets now exist on main.
+This micro-flight implements them and closes #145. Branch: `issue-145-post-merge-items`.
+
+### D28 — Issue item 8: `Session.prefixLineCount()` O(n²) → incrementally maintained count
+
+- **Verified at HEAD:** `src/session.ts:610` `private prefixLineCount(): number` re-splits every prior
+  snippet on each call; called from `run()` (`:308`) and `resume()` (`:425`) to compute `lineOffset`.
+- **Fix:** maintain a running prefix-line total (add each new snippet's line count on append; reset on
+  `reset()`/`load`/`dump` paths that rebuild the snippet list). Returned numbers must be byte-identical
+  to the split-based implementation for every existing call sequence — the F-77 `lineOffset` contract
+  (tests in `test/session.test.ts`, "lineOffset wiring" describe) is the named guard.
+- **Test:** RED via split-call-count observation (stub `String.prototype.split`, count invocations
+  across N sequential `run`/`resume` calls; the O(n²) version's count grows quadratically, the
+  incremental one's does not). Test-only change; no source API changes.
+- **Files:** `src/session.ts`, `test/session.test.ts`.
+
+### D29 — Absorbed-6 second half: rename `correctSyntaxErrorText` → `correctDiagnosticText`
+
+- **Verified at HEAD:** `src/sandbox.ts:279` (function), called at `:237` (syntax path) and `:241`
+  (typing path), JSDoc reference at `:217`. Mechanical rename + all repo references (grep the whole
+  repo — src, test, docs, tasks artifacts).
+- **Test:** none new — `tsc --noEmit` + the full suite are the named guards (a missed call site fails
+  to compile; a missed doc reference is caught by the grep audit).
+- **Files:** `src/sandbox.ts` + any reference sites found by grep.
+
+### Scope / boundaries
+
+- In scope: the two files above + their test files + SPEC/tasks planning docs.
+- Out of scope: everything else — esp. no `src/rlm.ts` changes (D10–D27 final state), no
+  `coverage-baseline.json` edits, no dependency changes.
+- Gates: `npm test` ×2 deterministic, `npm run check`, `npm run build`, `npm run lint`,
+  `npm run coverage` (all per-file floors incl. F-77's session.ts 98.65 / sandbox.ts 97.39).
+- After merge: close #145 with a closing comment; tick the #78 carry-forward rename note.
