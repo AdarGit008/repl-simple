@@ -1,49 +1,86 @@
-# F-77 SHIP Report — merge of review / verify / spec sources + final evidence
+# Ship report — flight F-145 (issue #145 "9.11 — Post-ship RLM message-growth polish")
 
-## Gates table
+Branch: `issue-145-rlm-polish` · 24 commits ahead of `origin/main` (base `791096a`; origin/main
+advanced to `e796174` — F-77 — during the flight, intentionally not rebased; merge strategy: resolve
+planning-doc collisions per SPEC/plan, code union is disjoint from F-77's session/types work).
 
-| Gate | Expected | Measured (ship audit) | Verdict |
-|---|---|---|---|
-| `npm test` | 986/986 | **986 pass / 0 fail / 0 skipped** | ✅ PASS |
-| `npm run check` (tsc) | clean | clean | ✅ PASS |
-| `npm run coverage` | all floors hold | all floors met (rlm 97.44, sandbox 97.65, session 98.70, rlm_loop 98.36, types 100) | ✅ PASS |
-| `npm run lint` (biome) | clean | clean, 49 files | ✅ PASS |
-| Commits `791096a..HEAD` | one logical change each | 11 commits (9.7a-9.7i + 2 docs), repo style, no stray files | ✅ PASS |
-| Dependencies | none added | package.json / package-lock.json diffs empty | ✅ PASS |
-| Secrets in diff | none | scan clean | ✅ PASS |
-| Prompt addition | static, no interpolation | verified literal template, no `${}` in added block | ✅ PASS |
-| Task list | all checked | all 10 tasks `[x]` | ✅ PASS |
+## Decision: GO
 
-## Source-of-truth merge
+No high-risk or irreversible work in this flight (no auth, secrets, migrations, payments, deploys,
+dependency changes — auditor-confirmed). Doubt-driven risk check: the only flagged risk class is
+prompt-steering residuals inside a defense-in-depth mechanism; the real security boundary (sandbox +
+approval-gated registry) is untouched.
 
-- **tasks/review.md** (Phase 5 code review): REQUEST CHANGES — Required finding (README claimed offset-corrected diagnostics while `RLMLoop` still leaked) fixed by Task 10a; Optional regex hardening fixed by Task 10b. Nits and FYIs recorded as residual.
-- **tasks/verify-77.md** (Phase 4, 3 rounds): Round 1 NO-GO (typing diagnostics still shifted — SPEC premise false) fixed by Task 7; MEDIUM gaps fixed by Task 8 (which exposed and fixed a real pre-existing `Session.resume()` bug); Round 3 gates re-run by coder.
-- **SPEC.md D1-D4**: all honored. D1 mechanics incl. typing-path correction and #144 cap preserved; D2 truth-telling contract adopted; D3 literals intact; D4 json route declined-with-record.
+## What was built (D10–D27)
 
-## Security verdict
+| Decision | Item | Landed |
+|---|---|---|
+| D10 | drop-marker label derived from `MAX_CONVERSATION_BYTES` via `formatSize` | T4 + test 5 regex / test 6 grep |
+| D11/D16 | test 5 parity + last-role + dropped-turn count (completed-turns scope, build-corrected) | T2 |
+| D12 | O(n²)→O(n) running byte total in `boundConversation`, byte-identical | T10, guarded by tests 1/4/5/24 |
+| D13 | boundary guard tests 10–13 (exact-at, no-hang, just-under, error stdout cap) | T1 |
+| D14 | honest TextEncoder framing (src token-ban safe, docs may name Buffer) | T11 |
+| D15 | per-value 5 KiB input previews + block-level aggregate elision (fence-split) | T5 + test 14 |
+| D17 | sentinel-delimited truncation markers + system-prompt rule (7 call sites) | T6 + test 17 |
+| D18 | assistant-reply cap 256 KiB, raw `llmResponse` preserved | T7 + test 16 |
+| D19 | error-line `> ` quoting, real `\nstdout:` unforgeable | T8 + test 18 |
+| D20 | input-name regex + 35-keyword denylist at the merge choke point | T9 + test 15 |
+| D21 | cap-strength pins (composition, boundary pairs, 50/50 shape) | T3, tests 19–21 |
+| D22 | `ERROR_MAX_BYTES` → `FEEDBACK_ERROR_MAX_BYTES` | T10 |
+| D23 | `questionText` binding + docs:390 whole-table sentence | T12 |
+| D24 | question-as-input follow-up — deferred, recorded (needs a home) | SPEC |
+| D25 | bounded mutation strategy, honestly recorded | VERIFY |
+| D26 | item 8 + absorbed-6b — **BLOCKED** (F-77-era code absent from branch base; remain open on #145) | recorded |
+| D27 | sentinel-rule marker grant scoped to the system's marker (audit Medium) | T19 |
 
-**SAFE — strictly less model-visible source exposure, no new attack surface.**
-- Transform is line-wise string surgery over Monty-rendered diagnostic text; rows at/≤ offset dropped, never emitted with non-positive numbers; the 16 KiB #144 cap still applies on corrected text.
-- Prompt addition is static text; no user data interpolated → no prompt-injection surface.
-- No auth / secrets / payments / destructive ops / deploys in the diff; no new dependencies.
-- Hidden text never gates approval decisions (approvals key on tool name/args).
-- **High-risk stop condition (auth/secrets/destructive/payments/deploys): CONFIRMED NOT APPLICABLE.**
+## Gates (VERIFY rounds 1–5)
 
-## Decision
+- Suite: **967/967 ×2 deterministic**, zero flakes (final round; grew 963→967 through T13–T19).
+- Static: `tsc --noEmit`, `tsc build`, biome lint — clean.
+- Coverage: all 16 per-file floors met; `src/rlm.ts` **98.65%** vs 95.94% floor; baseline untouched.
+- Mutation: bounded sweep over changed call sites (D25), guard **PASS**; all named-site survivors
+  killed across rounds (C1/C2 by test 24; M4/M5 + three D27 prose pins by test 17(c)); rlm.ts-only
+  61.9% population, **non-comparable** to #144's 89.6% (different populations — recorded, see
+  monitor report §1.5).
 
-**🟢 GO — merge to main** (pending user confirmation at the Phase 6 human gate).
+## Review / audit fan-out
+
+- **code-reviewer (Phase 5):** REQUEST CHANGES at review time — 0 Critical, 4 Important (I1–I4:
+  sentinel-rule vs drop-marker incoherence, rule miswording, sentinel-token forgery residual, keyword
+  gap) — **all fixed in T15**, plus suggestions S1/S2/S4/S5 landed and S3/S6–S8 recorded with routing.
+- **test-engineer (Phase 4 + rounds):** all gates green; H1–H3/M4/M5/L1 closed (T13/T16); C1/C2
+  killed (T14); D27 pins live (round 5).
+- **security-auditor (Phase 6):** 0 Critical, 0 High, 1 Medium (marker grant inside authentic pairs
+  + docs overclaim), 3 Low, 3 Info — Medium **fixed in T19 (D27)**; Low/Info routed (#77/#78/#87/#145
+  close notes). Verdict: nothing blocks GO.
 
 ## Rollback plan
 
-**Rollback unit = branch `issue/77-line-offset-continuity`** (nothing on main yet):
-1. Preferred (pre-merge): don't merge — nothing to undo.
-2. If merged without squash: revert in reverse order — `c9e0b1f` (9.7i) → `b1558af` (docs) → `0681c38` (9.7h) → `4ee8388` (9.7g) → `9e39c96` (9.7f) → `12f0b67` (9.7e) → `204224f` (9.7d) → `357319d` (9.7c) → `87aae68` (9.7b) → `2b15370` (9.7a) → `5757ce1` (docs). Each commit is one logical change. If squash-merged, revert that single commit.
-3. Behavioral kill-switch built in: `lineOffset?` is additive and defaults to absent — after revert no caller passes it, sandbox renders as-is, existing callers get exact current behavior. No migrations/schema/env/config touched.
+- **Trigger:** post-merge regression in RLM runs (the extension is the consumer; `runRlm` behavior is
+  the blast radius).
+- **Steps:** (1) `git revert <merge-commit>` on main (each task is one commit, so bisect to the
+  offending task is possible); (2) verify with `npm test`; (3) if a single task is at fault, revert
+  only that commit.
+- **Time to rollback:** < 5 min (single repo, no infra).
+- **No data migrations, no schema, no persisted state changes** — rollback is purely code.
 
-## Residual risks (recorded, not shipped)
+## Residual risks (non-blocking, all routed — exact wording in tasks/monitor-report.md)
 
-1. `correctRuntimeError` re-implements Monty's traceback renderer — re-measure on the next monty bump.
-2. `Session.prefixLineCount()` O(n²) over a session's lifetime (negligible today).
-3. Multi-block typing diagnostic under offset unpinned (transform handles it by construction).
-4. Runtime `endLine` correction unrendered (cosmetic).
-5. Nit: `correctSyntaxErrorText` → `correctDiagnosticText` (it serves typing too).
+1. Item 8 (`Session.prefixLineCount` O(n²)) + absorbed-6b rename — **remain open on #145**; fix
+   post-merge on main (F-77-era code; blocked on this branch, verified).
+2. Marker-shaped text inside authentic sentinel pairs — steering-only residual; sandbox remains the
+   boundary; docs Exception 5 now records it honestly.
+3. D19 ok-branch `Output:` forgery — recorded, → #77/#78.
+4. Question-as-input follow-up (D24) — needs a home (#78 or dedicated) before #145 closes.
+5. S3/S5/S7/S8 (silent-drop insurance, custom-systemPrompt rule loss, unquoted() drift, file growth)
+   — recorded with routing.
+6. Merge collision with F-77 (`e796174`): planning-doc overlap only per review; code union disjoint
+   — but F-77 rewrote `src/session.ts`/`src/sandbox.ts`/`src/rlm.ts` lineOffset wiring; the merge must
+   run the full suite after resolution. No rebase was attempted by design (recorded decision).
+
+## Open-issues recommendations
+
+Delegated to the monitor's final report (`tasks/monitor-report.md` — advisory): #145 closing record
+(§1.1–1.7), #77 ledger corroboration (§2), #78 convergence constraints (§3), #87 budget inputs (§4),
+#70 epic status (§5), #69 scope update (§6), three new-issue candidates (§7), and process hygiene
+notes (§8). Apply before closing #145.

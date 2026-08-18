@@ -261,7 +261,13 @@ export interface RlmOptions {
   registry: ToolRegistry;
   /** Python preamble injected before user code (e.g. repl_server.py). */
   preamble?: string;
-  /** System prompt for the LLM. Defaults to DEFAULT_RLM_SYSTEM_PROMPT. */
+  /**
+   * System prompt for the LLM. Defaults to `DEFAULT_RLM_SYSTEM_PROMPT`.
+   * Note: a caller-supplied prompt replaces the default wholesale — the
+   * sentinel-authentication rule (D17) lives only in the default, so a
+   * custom prompt drops that rule while `truncateWithSentinels` wrapping
+   * still happens. Callers who override it should restate the rule.
+   */
   systemPrompt?: string;
   /** Max RLM iterations before giving up. Default: 10. */
   maxIterations?: number;
@@ -280,9 +286,10 @@ export interface RlmOptions {
   onIteration?: (iteration: RlmIteration) => void;
   /**
    * Inputs declared in the sandbox and **announced to the LLM**: every key
-   * and value is rendered into the initial prompt (head/tail preview beyond
-   * 5000 chars per value). Never pass secrets or data the model must not
-   * see — the model reads these values from the prompt and from sandbox code.
+   * and value is rendered into the initial prompt (5 KiB head/tail preview
+   * per value with an elision marker beyond that). Never pass secrets or
+   * data the model must not see — the model reads these values from the
+   * prompt and from sandbox code.
    * `context` is always declared and defaults to `""` when absent.
    */
   inputs?: Record<string, string>;

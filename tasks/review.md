@@ -1,36 +1,77 @@
-# F-77 Review — code-reviewer report (`791096a..HEAD`, 10 commits, pre-fix)
+# Review — flight F-145 (issue #145 "9.11 — Post-ship RLM message-growth polish")
 
-**Verdict:** REQUEST CHANGES — narrowly. The correction machinery, wiring, tests, and docs culture are excellent; one documentation claim in this very diff is false for the class it's documented under (RLMLoop), and the underlying defect has no tracked follow-up.
+Five-axis review of the full branch diff (`origin/main..HEAD`, base 791096a, 17 commits at review time)
+by the code-reviewer persona (fresh context). Branch: `issue-145-rlm-polish`.
 
-## Required
+## Verdict (at review time): REQUEST CHANGES → all Important findings addressed by T15 (commit 7e17677); no re-review needed per ship fan-out merge
 
-- **`README.md:39-41` + `src/rlm_loop.ts:268`** — The docs commit claims "Diagnostics fed back to the model are offset-corrected" in the section introduced by `RLMLoop`, but `RLMLoop.executeCode` prepends the preamble and never sets `lineOffset`. RLMLoop callers still get shifted line numbers **and preamble source leaked** — the exact #77 defect, unfixed and untracked. Fix one of two ways before merge: (preferred, 3 lines + tests) wire it in `executeCode`, mirroring `src/rlm.ts:566-572`: `runOpts.lineOffset = preamble ? preamble.split("\n").length : 0`, plus a test in `test/rlm_loop.test.ts`; or qualify the README sentence and file the RLMLoop follow-up issue. → **Resolved by Task 10a (preferred fix taken).**
+## Review Summary
 
-## Optional
+The branch delivers all 16 decisions (D10–D25) cleanly — the D15 two-level elision is arithmetically
+exact, the D12 refactor is byte-identical to base, and the test battery (10–24) is the strongest in
+the suite's history. No Criticals. The D17 sentinel rule — the branch's headline security mechanism —
+was incoherent in two ways (it declared the system's own D3 drop marker "literal data", and its
+wording misdescribed what sits between sentinels), and D20's validation accepted Python keywords its
+own rationale says should fail early. All four Important findings were cheap, one-site fixes (T15).
 
-- **`src/sandbox.ts:306`** — Location regex `/^(\s*--> .*?)(\d+)(:\d+.*)$/` mis-captures a filename ending in digits immediately before the colon (` --> file0:14:3` captures `0`). Unreachable with today's `scriptName`s; one character hardens it: `^(\s*--> .+:)(\d+)(:\d+.*)$`. → **Resolved by Task 10b with a regression test.**
-- **`src/sandbox.ts:336-376`** — `correctRuntimeError` hand-rolls Python traceback rendering; a second implementation of Monty's renderer that can drift on a version bump. The "measured on 0.0.21" comments acknowledge this. No action now; re-measure on the next monty upgrade.
-- **`src/session.ts:606-612`** — `prefixLineCount()` re-splits every prior snippet per call — O(n²) cumulative over a session's lifetime. Negligible next to sandbox startup; incrementally maintained counter only if sessions ever get thousands of snippets.
+### Critical Issues
+None.
 
-## Nit
+### Important Issues (all addressed in T15)
+- **I1** `src/rlm.ts:255` + `:661` — the sentinel rule made the D3 drop marker "literal data" by its
+  own definition. Fix: carve-out sentence appended ("The history-drop notice placed after the first
+  message is also system-emitted and authentic."), pinned in test 17(c).
+- **I2** `src/rlm.ts:253-254` — the rule misdescribed between-sentinel text ("has been elided" is
+  false; it is the retained head+tail view). Reworded to "is a truncated view — portions of it have
+  been elided and are summarised by a marker".
+- **I3** `src/rlm.ts:145-166` — the sentinel scheme did not close forgery; it re-based it: (a)
+  under-budget attacker values could render a forged sentinel pair whole and sentinel-free; (b)
+  over-budget attacker text lands inside the authentic pair where the rule declares every marker
+  authentic. Fix: `truncateWithSentinels` now neutralises sentinel-token sequences inside the value
+  before wrapping (`value.replaceAll("[TRUNCATED VIEW", "[TRUNCATED\u200BVIEW")`, byte-measured after
+  the swap so budgets stay exact) + two RED test cases. Docs Exception 5 updated: no residual forgery
+  vector remains.
+- **I4** `src/rlm.ts:119,703-707` — D20's regex accepted Python keywords (`class`, `def`, `None`,
+  `True`, `import`, …) whose downstream type-check failure is exactly what D20's rationale claims to
+  reject before any query. Fix: module-const `INPUT_NAME_KEYWORDS` (35 hard keywords, Python's
+  `keyword.kwlist`; soft keywords deliberately excluded) checked at the merge site with a distinct
+  message + `class` row in test 15's boundary matrix.
 
-- **`src/sandbox.ts:279`** — `correctSyntaxErrorText` is also the typing-diagnostics path; the name undersells it. `correctDiagnosticText` would match its actual role.
-- **`src/session.ts:328-332, 424-429`** — `Session` silently overrides a caller-supplied `lineOffset`. Correct behavior (session owns the prepending) and commented; a note on `RunOptions.lineOffset` in `src/types.ts` would prevent caller confusion.
+### Suggestions
+- **S1** `SPEC.md:184` duplicated sentence — de-duplicated in T15.
+- **S2** docs: quoted error section renders ≤ 2× its value budget — recorded in T15.
+- **S3** `src/rlm.ts:206` `if (payload <= 0) return ""` silently drops the input section; unreachable
+  at current budgets; recorded, deferred (insurance if budgets ever shrink below the reserve).
+- **S4** `src/rlm.ts:233-238` reserve/newline coupling — comment added in T15.
+- **S5** `DEFAULT_RLM_SYSTEM_PROMPT` is default-only — caller-supplied `options.systemPrompt` silently
+  drops the sentinel rule while wrapping still happens. JSDoc + docs Exception 5 note added in T15.
+- **S6** Test coupling inventory for #78 (record, not fix): tests 20/21/22 pin the effective-payload
+  boundary (`maxBytes − SENTINEL_OVERHEAD_BYTES`); tests 5/23/24, 8/13/18, 9/19/21 pin `256\.0KB`,
+  `\nstdout:`, `> `, `# Question\n`, `\n\n# Context`, the `\n\nWrite Python code…` trailer and the
+  `/inputs elided/` marker line. Tests 10/12/23/24 self-derive sizes from observed messages (robust);
+  the static literals are the churn surface for #78's convergence rework.
+- **S7** `test/rlm.test.ts` `unquoted()` helper strips `> ` from legitimate content lines too —
+  measurement-only drift, negligible, noted.
+- **S8** File size `src/rlm.ts` 616→815 justified — constants, contract comments, two small helpers;
+  extracting prompt-section elision to a module is a #78 candidate, not now (test 6's greps/import
+  assertions are tuned to the current layout).
 
-## FYI
+### What's Done Well
+- `elideInputBlocks` is arithmetically exact — the 32 KiB ceiling holds including sentinels in every
+  block ordering (reserve-at-widest marker, 4-newline reserve exact).
+- D12 is genuinely byte-identical to base `boundConversation` (marker-strip-before-total order, strict
+  `>` boundary, marker-loop re-measurement, `droppedTurns === 0` early return all preserved).
+- Tests 23/24 are the best work in the diff — mutation-kill constructions that re-derive all sizes
+  from observed messages and kill both `-=`→`+=` mutants with a 9-message kill point that exits via
+  the byte condition, not the length guard.
+- Discipline: prove-it guards GREEN at HEAD first (T1–T3), RED tests paired with fixes in-commit,
+  policy Q3 respected at every recovery clause, D14's honesty without the banned tokens, exact scope
+  (7 files, `src/truncate.ts` untouched).
 
-- **Behavior change:** Session resume-path runtime errors now include a re-rendered traceback where previously only the bare `<type>: msg` heading was fed back (Session always sets lineOffset now). Existing tests use tolerant match patterns; richer text is an improvement — noting for downstream consumers that parse error text exactly.
-- **The ≤-offset drop guard is the right call.** Emitting `:0:` or negative numbers points the model at nonexistent lines; prefix excerpt rows have no user-code mapping. The degenerate case (caller overstating the offset → header-only diagnostic) is pinned by a test and is an acceptable caller-bug failure mode.
-
-## What's Done Well
-
-- Central insight right and tested: a number-only fix is half a fix — tests pin that prefix *source* never reaches the caller (issue tests 2/3 use tokens derived from real strings, surviving preamble edits).
-- Offset arithmetic correct in all edge cases checked by hand: preamble ending in `"\n"` (split counts the trailing empty element, matching the joined blank line), empty-string preamble (truthiness checks match between assembly and offset), k-part join sum (each part's split length accounts for the separator). No off-by-one found.
-- The resume invariant holds: `run()` discards pending suspension before touching `snippets`, so `prefixLineCount()` at `resume()` equals the value the suspending `run()` used — the exact bug the verifier caught (9.7h) is covered by a test that would fail on its return.
-- Honest engineering process: the SPEC/plan commit corrects the disproved "typing is already line-correct" premise; D3 honored (prompt addition inserted at the top only); biome clean; commit messages follow the repo's `9.x — … (#n)` style, one logical change each.
-- Security: strictly less exposure. The transform removes preamble/snippet source (previously leaked), adds only synthetic filenames (`<python-input-0>` — no host paths), the prompt addition is static text with no user interpolation (no injection surface). Nothing the transform hides gates an approval decision (those use tool name/args, not diagnostic text).
-
-## Verification Story
-
-- All 25+ new tests read: behavioral integration tests against the real Monty worker, covering absent-offset passthrough, over-large offsets, blank-line gutter shapes, multi-block syntax, multi-frame tracebacks, host-tool resume, both fallbacks. Spot-run: the 32 new lineOffset/fresh-sandbox tests — 32/32 pass.
-- biome on all changed files clean; regex edge cases probed directly against real render shapes; cap ordering confirmed (correction → `buildFeedback`'s 16 KiB `truncateText`, re-asserted by the new cap test); `Frame` shape confirmed against `@pydantic/monty@0.0.21`.
+### Verification Story (at review time)
+- Tests reviewed: all of `test/rlm.test.ts` (tests 10–24 + edits to 5/6/8/9.2.6), full `src/rlm.ts`,
+  `truncate.ts` Truncator semantics, base `boundConversation` for D12 equivalence.
+- Build verified: focused suite 113/113 green locally; VERIFY's 966/966 ×2 + tsc/lint/coverage/mutation
+  gates green.
+- Security checked: D17/D19/D20 analyzed at every call site; no secrets, no new deps, no injection
+  regression.

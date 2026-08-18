@@ -1,194 +1,227 @@
-# Monitor report — flight F-144 (issue #144 "9.10 — Cap result.error and the question in the RLM feedback loop")
+# Monitor report — flight F-145 (issue #145 "9.11 — Post-ship RLM message-growth polish")
 
-Final consolidated monitor report. Flight is **COMPLETE — GO** (ship commit `e9ba441`
-"9.10 — ship report: GO (#144)"; `tasks/FLIGHT_DONE` touched 19:20). Branch
-`issue-144-cap-error-question` is 7 commits ahead of flight base `34da5c5`, unmerged at write
-time. Advisory only — no issue was edited by this monitor.
+End-of-flight issue-monitor report (advisory only — no issue was edited). Branch `issue-145-rlm-polish`,
+24 commits ahead of `origin/main` at report time (base `791096a`). **Note:** origin/main advanced to
+`e796174` (F-77 merged) *during* this flight; the branch was not rebased (see D26 blocker below).
 
-Commits: `01e5c6a` SPEC · `9fb8916` plan · `018e51a` T1 (error cap) · `e905ce8` T2 (question cap)
-· `527244e` T3 (policy doc) · `35b16cd` review (approve) · `e9ba441` ship (GO).
-
-Artifacts read: `tasks/monitor-watch.md` (F-144 Items 1–13, Polls 1–15), `tasks/review.md`,
-`tasks/ship-report.md`, `tasks/plan.md`, `SPEC.md` (via watch quotes), `git log` branch +
-`origin/main`. Watch log is the append-only discovery record; this report re-expresses its items
-as exact issue-edit wording plus placement.
-
-**Flight results (context for all wording below):** error cap 16 KiB (`ERROR_MAX_BYTES`,
-50/50 head+tail, `status === "error"` branch only, real traceback recovery), question cap 64 KiB
-(`QUESTION_MAX_BYTES`, 50/50, deliberately weak recovery — Q3), both via the shared `truncateText`.
-Tests 8/9 genuine prove-it (verified failing against base), each with byte-identical no-op half.
-VERIFY 950/950 ×2, tsc/lint/build clean, src/rlm.ts 97.40% vs 95.94% floor, bounded mutation
-sweep 48/451 mutants ≈89.6% detected (supervisor decision — full sweep infeasible, see B4).
-REVIEW approve (0 blockers, 6 minor, 5 nit). SHIP fan-out 3×SHIP (2 LOW + 3 INFO security, all
-pre-existing or defense-in-depth). No blockers anywhere.
+**Flight results:** D10–D25 + D26/D27 implemented; tests 10–24 added (15 new `it` blocks) plus edits
+to tests 5/6/8/9.2.6/17(c); sentinel-delimited markers (D17), assistant-reply cap (D18), error-line
+quoting (D19), input-name validation + keyword denylist (D20), block-level input elision (D15),
+running byte total (D12). VERIFY 967/967 ×2 across five rounds; review REQUEST CHANGES → I1–I4 fixed
+in T15; security audit Medium fixed in T19 (D27); all named-site mutation survivors killed
+(T14/T16/T19 pins).
 
 ---
 
-## A. Edits to issue #144 itself (still open; branch unmerged — apply before merge/close)
+## 1. Issue #145 (9.11 polish) — the primary target
 
-### A1. DoD box → replace the three bullets with the close-out record
+### 1.1 D16 assertion-scope defect (spec-authoring gotcha)
 
-Replace the current DoD bullets with:
+**Wording to append (gotcha block next to the D16 item):**
+> **Gotcha — dropped-count assertions must scope to completed turns.** The original D16 wording
+> ("assert the marker count equals the number of `TURN_i_` labels 0–9 absent from the final query")
+> was **unsatisfiable at HEAD** and was build-corrected mid-flight (commit `4b3e677`): absent labels
+> were {0,1,9} = 3 while the marker counted 2 — the newest turn's label is absent *by construction*
+> because the final query is composed *for* the pending turn. Correct scope: **completed turns only**
+> (labels 0 … last-completed-turn), which gives {0,1} = 2 == 2. Any future assertion comparing a
+> marker count against absent labels must exclude the pending newest turn.
 
-> - [x] An oversized `result.error` cannot push any iteration's conversation over 256 KiB — the
->   `Error: ` feedback section is ≤ 16 KiB via `truncateText` (`ERROR_MAX_BYTES = 16 * 1024`,
->   50/50 head+tail), recovery `"Catch the exception and print the full traceback to see more."`
->   (test 8; RED at ~100 KiB → GREEN).
-> - [x] An oversized question cannot appear uncapped in `messages[0]` — the `# Question` section
->   is ≤ 64 KiB via `truncateText` (`QUESTION_MAX_BYTES = 64 * 1024`), recovery `"The question
->   was truncated. Answer from the part shown and state the assumption if ambiguous."`
->   (test 9; RED at 131072 B → GREEN).
-> - [x] Both paths RED→GREEN tested (tests 8 and 9, each with an over-budget and a byte-identical
->   under-budget no-op half); `truncateText` remains the only truncation implementation (test 6
->   untouched; no `Buffer`/`byteLength` in `src/rlm.ts`).
->
-> **Reading note:** bullet 1 means *no new uncapped path*, not an unconditional ≤ 256 KiB
-> invariant — the conversation bound is best-effort at HEAD (`boundConversation` drops only at
-> ≥ 5 messages; a > 256 KiB assistant reply is kept transiently, docs Exception 4; the drop
-> marker itself can overshoot). Worst case after this flight: `messages[0]` ≤ 64 KiB question
-> + ≤ 32 KiB input preview + headers ≈ 97 KiB; error iteration ≤ 16 KiB error + ≤ 32 KiB stdout.
+### 1.2 "Five truncateText call sites" is stale — six at flight start, seven after D18
 
-### A2. "## Do" → append the chosen budgets so nobody re-derives them
+**Correction (replace "all five `truncateText` call sites"):**
+> **Correction:** "five call sites" was an F-144-era undercount — the two stdout sites (error branch
+> and ok branch) were counted as one. At flight start there were **six** (input preview, question,
+> error-branch stdout, error, ok-branch output, ok-branch stdout), and D18 added the **seventh**: the
+> assistant-reply copy at step 7 of `runRlm`. All seven now route through one `truncateWithSentinels`
+> helper; the D15 block-level aggregate marker is wrapped manually (it is not a `truncateText` call).
 
-> **Budgets chosen by the #144 flight** (the body says "error-appropriate" / "generous" without
-> numbers — recorded fire-and-forget, SPEC Assumptions 1–2): error = **16 KiB** (equal to
-> `output`'s cap); question = **64 KiB** (sized so a maxed initial prompt cannot alone cross the
-> 256 KiB conversation bound). Both use the value shape (50/50 head+tail). The question's recovery
-> clause is deliberately weaker because the question is **not sandbox-accessible** — the marker
-> may not advertise a route it cannot honour (policy Q3, same rule as the `_` binding).
+### 1.3 #145's DoD box drift — closing record
 
-### A3. Gotchas block → append
+**Wording (replace the unchecked DoD box):**
+> - [x] Items 1–7 and absorbed 1–7 landed as SPEC D10–D23 (tests 10–24, 15 new `it` blocks, plus edits
+>   to tests 5/6/8/9.2.6; T13–T16/T19 closed VERIFY/review/audit gaps).
+> - [x] Per the DoD's "where one is named" clause, two items landed with **suite guards, not new named
+>   tests**: item 3 (D12 running byte total — guarded by tests 1/4/5/24) and item 5 (D14 TextEncoder
+>   reword — guarded by test 6's source greps + full suite). Absorbed 6 (D22) and 7 (D23) likewise.
+> - [x] Suite 967/967 ×2 deterministic; tsc/lint/build clean; src/rlm.ts 98.65% vs 95.94% floor.
+> - [x] Mutation: **bounded sweep only** (D25, flagged deviation — full matrix ≈ 32.9 CPU-hours,
+>   infeasible on the 8-core host). Population non-comparable with #144's; see §1.5.
+> - [ ] **Item 8 (`Session.prefixLineCount()` O(n²)) — NOT implemented (blocked, see §1.7).** Stays
+>   open as the sole outstanding item.
+> - [ ] **Absorbed 6 second half (`correctSyntaxErrorText` → `correctDiagnosticText`) — NOT
+>   implemented (blocked, see §1.7).** Re-home to #78 or a post-merge follow-up.
 
-> 1. **Template coupling:** tests 8 and 9 locate their sections by the literals `Error: ` /
->    `\nstdout:` and `# Question\n` / `\n\n# Context` (the `# Context` boundary exists only
->    because `runRlm` always injects `context: ""`, `src/rlm.ts:569-570`). Together with F-74's
->    test 7, any prompt-template rewording now breaks tests 7, 8 and 9 on string-matching alone.
-> 2. **Scope fact:** `result.error` exists only on error results (`src/types.ts:163-165`); the
->    error cap sits on the `status === "error"` branch only — ok/suspended paths never pay it.
-> 3. **Line drift by flight end:** the body's sites were accurate at start (error `src/rlm.ts:313`,
->    question `:276`) but moved during the flight (error cap `:343-347`, question cap `:300-304`).
->    Re-verify against HEAD before any future work (see #77).
+### 1.4 D20 keyword denylist — do not regress
 
-### A4. Orphan handoff → move SPEC open question 1 to #145 before closing #144
+**Wording (append to absorbed item 4):**
+> **Landed beyond the one-line regex (review I4):** the merge-site validation is the regex **plus** a
+> 35-entry hard-keyword denylist (`INPUT_NAME_KEYWORDS`, Python's `keyword.kwlist`). Soft keywords
+> (`match`, `case`, `type`) are **deliberately excluded** — valid identifiers. Distinct error message
+> for the keyword path; test 15's boundary matrix includes a `class` row. "Simplifying" to regex-only
+> or adding soft keywords regresses the decision.
 
-The note "a future issue could pass the full question as an input so it becomes sliceable" lives
-only in this flight's SPEC.md and dies with the branch. Append it to #145 (wording in B3 below).
+### 1.5 Mutation story — how to record "did not regress" honestly
 
----
+**Wording (replace the "Mutation re-run" paragraph):**
+> **Mutation re-run (F-145 result):** full matrix infeasible (~32.9 CPU-hours on the 8-core host) —
+> flagged deviation, D25. This flight ran a **bounded sweep over the changed call sites only**
+> (rlm.ts-only population), **61.9% detected**; #144's 89.6% covered a **different population**
+> (48/451 mutants) — **the two numbers are not comparable; never present 61.9% vs 89.6% as a
+> regression.** The honest no-regression evidence is per-mutant: survivors C1/C2 (`-=`→`+=` in both
+> drop loops) killed by test 24 (T14); prose mutants M4/M5 + three D27 sentences pinned by test 17(c)
+> (T16/T19). Future flights must record population (mutants tested / total per file), mode (bounded vs
+> full), duration, and per-survivor disposition — not a bare percentage.
 
-## B. Edits to #145 (9.11 polish — absorb the #144 follow-ups)
+### 1.6 Residuals and absorbed-item statuses (record on #145)
 
-### B1. Append a "## Absorbed from the #144 flight" block (ship follow-ups 1–7, re-expressed)
+> 1. **D24 question-as-input follow-up — deferred, needs a home** (today only in SPEC open question 1).
+>    Re-home to #78 or a dedicated issue before #145 closes.
+> 2. **ok-branch stdout forgery — recorded, not fixed (D19 residual).** `Output: …\nstdout:\n…` shares
+>    the forged-`\nstdout:` vector; test 3's locator couples to the ok-branch shape; the `> `-quote
+>    remedy applies. Route: #77/#78.
+> 3. **S3:** `payload <= 0` → `return ""` in `elideInputBlocks` silently drops the input section —
+>    unreachable at current budgets; insurance only. Recorded, deferred.
+> 4. **S5:** caller-supplied `options.systemPrompt` replaces the default wholesale and drops the
+>    sentinel rule while wrapping still happens. Documented in `src/types.ts` + docs Exception 5.
+> 5. **S7:** test `unquoted()` helper strips `> ` from legitimate content lines too — measurement-only
+>    drift, negligible, noted.
+> 6. **S8:** `src/rlm.ts` 616→~830 lines, justified; extracting prompt-section elision is a **#78
+>    candidate** (test 6's greps/import assertions are tuned to the current layout).
+> 7. **Item 4's "error-path stdout cap" needed a test only** — the cap has been live since #74; test
+>    13 pins it.
+> 8. **Marker label is now "256.0KB"** (`formatSize`); test 6 gains a `/256KB/` grep so the label can
+>    never be re-hardcoded.
+> 9. **D17 is a soft control, not authentication** (security audit): ZWSP/homoglyph confusables and
+>    marker-shaped text inside authentic pairs remain steering-only residuals; the sandbox is the real
+>    boundary. Docs Exception 5 carries the honest record (corrected in T19).
+> 10. **Error-branch sentinels render line-quoted** (`> [TRUNCATED VIEW BEGIN]`) — quoting is applied
+>     after wrapping; the rule notes the shape (T19 chose the note over the reorder because
+>     quote-then-wrap would shift the effective-budget pins in tests 20/21/22).
 
-> 1. **Authenticate truncation markers** (security LOW): attacker-controlled text is
->    indistinguishable from real `[… X of Y elided …]` markers; sentinel-delimited markers plus a
->    system-prompt note would make them self-authenticating (all five `truncateText` call sites).
-> 2. **Cap or fail on pathological assistant replies** (`src/rlm.ts:599`, security LOW): the last
->    uncapped prompt path — a prompt-injection-induced multi-MiB reply is carried in every
->    subsequent query (the F-74 Assumption 4 edge, still open after #144).
-> 3. **Delimit error/stdout sections in feedback** (`src/rlm.ts:352`, security LOW): an exception
->    message containing `\nstdout:` can forge a fake stdout line; indent/quote or `###` headers.
-> 4. **Sanitize input names** (`src/rlm.ts:281`, security INFO): input keys are interpolated
->    unescaped into the prompt header — a backtick/newline key injects prompt structure.
->    One-line fix: `/^[A-Za-z_][A-Za-z0-9_]*$/` at the merge site. *(This is the #72-deferral note
->    that previously lived only on #74's comment thread — now homed.)*
-> 5. **Test-strength gaps for the new caps** (test-engineer): boundary tests at exactly/just-over
->    budget; "uses the full budget" assertions — the current tests pin ceiling + marker +
->    recovery, so a silent 8 KiB cap or a head-only cut would still pass (the 16/64 KiB magnitudes
->    and the 50/50 head+tail shape are not independently pinned); composition test (huge question
->    + huge inputs together).
-> 6. **Naming:** rename `ERROR_MAX_BYTES` → `FEEDBACK_ERROR_MAX_BYTES` (`src/rlm.ts:28`) and
->    revisit the `FEEDBACK_` prefix convention across the budget-constant block.
-> 7. **Doc/cosmetic:** `const { text: q }` → full-name binding (`src/rlm.ts:300`);
->    `docs/truncation-policy.md:390` — "The four `#29`/`#34` rows…" is now stale/ambiguous after
->    the two #144 rows were added directly above it; reword so the single-implementation sentence
->    covers the whole table.
+### 1.7 D26 blocker — item 8 and absorbed-6b are F-77-era code, absent from this branch (verified)
 
-### B2. Note on existing #145 items (do not duplicate)
-
-The #144 review re-confirmed the F-74 items already on this issue as still open — reword
-Exception 3's `TextEncoder` framing (item 5), tighten test 5's pair-parity (item 2), running byte
-total in `boundConversation` (item 3), derive the marker's "256KB" label (item 1), boundary tests
-(item 4 — B1.5 above extends it with the two new call sites), fence-split (item 6). No changes
-needed to their wording.
-
-### B3. Append the question-as-input follow-up (from #144 SPEC open question 1)
-
-> **Question-as-input follow-up (from #144's SPEC open question 1):** pass the full question as an
-> input so it becomes sandbox-sliceable in Python; that would let `QUESTION_RECOVERY` be
-> strengthened later (today it is deliberately weak — policy Q3: the question is not
-> sandbox-accessible). Changes the input contract; deliberate scope call for this issue or a
-> follow-up.
-
-### B4. Mutation note
-
-> **Mutation re-run:** #144's VERIFY ran a bounded sweep only (48/451 mutants, ~19 min, ≈89.6%
-> detected; full sweep infeasible on an 8-core host — see `docs/mutation-testing.md`). If this
-> flight touches truncate-adjacent code, re-run the full matrix before relying on the score.
+**Wording (append as a "Post-merge follow-ups" block):**
+> **Blocked at SHIP (verified):** F-77 (issue #77's flight) merged to main as `e796174` **after** this
+> branch was cut (merge-base `791096a`). Item 8's target `Session.prefixLineCount()` and the
+> absorbed-6b rename target `correctSyntaxErrorText` exist only in F-77's code on main
+> (`src/session.ts:610`, `src/sandbox.ts` post-F-77) — **neither exists on the branch**. Porting F-77
+> into this branch at SHIP stage was rejected (four-file merge churn into a finished flight).
+> **Item 8 and absorbed-6b remain OPEN after this branch merges** — fix them on main where the
+> targets exist (both are perf/rename, zero interaction with D10–D25). A RED is achievable for item 8
+> post-merge via split-call-count observation.
 
 ---
 
-## C. Cross-references
+## 2. Issue #77 (line-number drift ledger)
 
-### C1. #77 (line-number drift) → append a corroborating data point
-
-> #144 corroboration: the #144 flight re-verified its issue body against HEAD before starting and
-> found it **accurate** (error `src/rlm.ts:313`, question `:276`), then watched both sites move
-> during the flight (error cap `:343-347`, question cap `:300-304`). The re-verify-never-chase
-> discipline held both ways. Also: `origin/main` advanced 5 commits (#110/#150 flights) during
-> F-144 with **zero code overlap** — only planning-doc conflicts at merge.
-
-### C2. #70 (Bucket 9 epic) → update the #144 line
-
-After `#144  9.10 — cap result.error and the question in the RLM loop   ← from #74 residuals`:
-
-> — **landed** (F-144, 7 commits, ship GO: error 16 KiB / question 64 KiB via `truncateText`,
-> tests 8/9; 950/950 ×2; review approve). Residual follow-ups (marker auth, assistant-reply cap,
-> error/stdout delimiting, input-name sanitize, test strength, naming, docs) absorbed by #145.
-
-### C3. (Optional) #78 (convergence) → template-coupling note
-
-> **Template-coupling note (from #144):** tests 7 (F-74), 8 and 9 (F-144) locate prompt sections
-> by the literals `# Input (available as …`, `Error: `/`\nstdout:`, `# Question\n`/`\n\n# Context`.
-> If this flight's prompt-template convergence changes any header wording, all three tests break
-> on string-matching alone.
+**Append to the corroboration chain (after the "#144 corroboration" block):**
+> **#145 corroboration (F-145 start, HEAD `791096a`):** half the issue body's citations were
+> F-74/F-144-branch-era and drifted by flight start (item 1 `:396`→430-431 +34; item 3 `:426-444`→
+> 448-486 +22/+42; item 5 `:57-62`→76-85 +19/+24; item 6 `:264-273`→279-297 +15/+24; item 2
+> `test:1200-1207`→1231-1256 +31/+48; absorbed 3 `:352`→348 −4). All were re-verified at edit time and
+> landed correctly — third data point proving every bucket-9 issue must carry "re-verify line numbers
+> against HEAD before starting".
 
 ---
 
-## D. Consolidation table (item → source → home → severity)
+## 3. Issue #78 (convergence — the biggest downstream consumer)
 
-| # | Discovery (quotable) | Source | Home | Severity |
-|---|---|---|---|---|
-| 1 | Stale F-74 `FLIGHT_DONE` sentinel present at flight start; a naive "sentinel ⇒ complete" check misfires | watch P1 I1 | process — SHIP must `rm -f` before recreating; monitor checks mtime | process |
-| 2 | Issue lines accurate at start (313/276) but moved by flight end (343-347/300-304) | watch P1, review.md | #77 C1 | knowledge |
-| 3 | DoD bullet 1's unconditional "cannot push over 256 KiB" is known-false at HEAD (best-effort bound); flight read it as "no new uncapped path" | watch P1 I3, P14 I5 | #144 A1 | med — misreading costs a red test |
-| 4 | Issue said "error-appropriate"/"generous"; SPEC fixed 16/64 KiB (Assumptions 1–2, fire-and-forget) | watch P14 I5 | #144 A2 | med — re-derivation cost |
-| 5 | `QUESTION_RECOVERY` deliberately weak (Q3); SPEC open question 1 (question-as-input) orphaned once #144 closes | watch P14 I6 | #145 B3; #144 A4 | med — orphaned follow-up |
-| 6 | Tests 8/9 add two template-literal couplings (`\nstdout:`, `\n\n# Context`) to the F-74 test-7 gotcha | watch P14 I7; review nits | #144 A3 + #145 B1.5 + #78 C3 | low–med |
-| 7 | `origin/main` advanced 5 commits (#110/#150) mid-flight; overlap editorial-only (SPEC/plan/todo); zero code overlap | watch P15 I9; review Merge notes | ship-report merge notes (done) + #77 C1 | gotcha at merge |
-| 8 | Supervisor decisions: no rebase; bounded mutation sweep (48/451, ~19 min, ≈89.6%) | watch P15 I10-11; ship report | recorded in ship report + #145 B4 | knowledge |
-| 9 | `ERROR_MAX_BYTES` breaks the `FEEDBACK_` prefix convention (`src/rlm.ts:28`) | review readability minor | #145 B1.6 | nit |
-| 10 | Tests pin ceiling+marker, not the 16/64 KiB magnitudes or 50/50 shape; no boundary tests (spill threshold hit only by 6×/2× oversize) | review correctness minors 1–2 | #145 B1.5 | med — silent 8 KiB cap would pass |
-| 11 | `docs/truncation-policy.md:390` "four rows" sentence stale/ambiguous after rows 5–6 added | review readability nit; ship f/u 7 | #145 B1.7 | low |
-| 12 | Ship fan-out follow-ups 1–5: marker auth, pathological assistant reply, error/stdout delimiting, input-name sanitize (the old #72 orphan — now homed), test strength | ship report | #145 B1.1–5 | low (security LOWs; input-name was a med orphan, now homed) |
-| 13 | Verification facts: 950/950 ×2; 97.40% vs 95.94% floor; tests 8/9 proven failing against base; no-op halves byte-identical | ship report | none (record) | context |
+**3.1 Template-coupling inventory (replace the existing F-144 note):**
+> **Template-coupling inventory after #145 (the complete churn surface):** static literals pinned by
+> tests: `256\.0KB` (tests 5/23/24); `\nstdout:` + `> ` prefix (8/13/18); `# Question\n` and
+> `\n\n# Context` (9/19/21 — the `# Context` boundary exists only because `runRlm` always injects
+> `context: ""`); the `\n\nWrite Python code to answer the question.` trailer (14/19); the
+> `# Input (available as \`…\` variable)` header and `/inputs elided/` marker (14/19); sentinel
+> literals `[TRUNCATED VIEW BEGIN]/END` + neutralised `[TRUNCATED\u200BVIEW` (17); the
+> effective-payload boundary `maxBytes − SENTINEL_OVERHEAD_BYTES` (20/21/22); system-prompt prose pins
+> (17(c): M4/M5 + three D27 sentences). Tests 10/12/23/24 self-derive sizes from observed messages
+> (robust). **Any convergence rewording must update each pinned test in the same commit.**
 
-Severity legend: **med** = costs a future flight rework / a red test / an orphaned note;
-**low** = test strength, naming, docs ambiguity; **gotcha** = would break a future flight if
-unknown; **process** = flight-hygiene, not a repo defect.
+**3.2 The merged prompt must carry the sentinel rule:**
+> **Carry forward from #145:** `DEFAULT_RLM_SYSTEM_PROMPT` now contains the sentinel-authentication
+> rule (truncated-view description, scoped marker grant, history-drop carve-out, error-branch quoting
+> note). A rebuilt prompt that **omits the rule silently disables D17's marker-authentication while
+> `truncateWithSentinels` wrapping still happens** — the same failure mode as S5. The merged
+> `buildSystemPrompt` must carry the rule verbatim; test 17(c) pins its prose.
+
+**3.3 Deferred renames/extractions:**
+> (a) `correctSyntaxErrorText` → `correctDiagnosticText` (F-77-era, blocked on #145's branch — do it
+> here); (b) extracting prompt-section elision out of `src/rlm.ts` (~830 lines) is a #78 candidate
+> (S8 — test 6's greps are tuned to the current layout).
 
 ---
 
-## E. How to prevent rediscovery (for the user/driver, in order)
+## 4. Issue #87 (global spend budget)
 
-1. Edit #144 per A1–A4 **before merging/closing** it (branch still unmerged).
-2. Append the B1–B4 block to #145 — follow-ups 1–7, the question-as-input note, and the mutation
-   caveat; the existing F-74 items on #145 stay untouched (B2 confirms they are still open).
-3. Append C1 to #77 and C2 to #70; optionally C3 to #78.
-4. Process fixes: SHIP must `rm -f tasks/FLIGHT_DONE` before recreating it (F-144 started with
-   F-74's stale sentinel); keep reading issues via `gh issue view --json` (classic-Projects
-   deprecation); keep the monitor-watch append-only discipline.
-5. Known gotchas honored this flight — none were rediscovered: test 6's `Buffer`/`byteLength`
-   ban (test 6 untouched), line drift re-verified against HEAD (#77), gh `--json` workaround,
-   "256KB" vs "256 KiB" wording, `boundConversation` <5-message edge, O(n²) re-encode,
-   test-7 template coupling. All seven already live on #74/#145 from the F-74 report.
+**Append:**
+> **Inputs from #145 for the worked example:** the per-conversation 256 KiB bound is **best-effort,
+> not a hard ceiling** — drops only at ≥ 5 messages, a single over-budget assistant reply is kept
+> transiently (docs Exception 4), the drop marker's own bytes can overshoot, and the D18 cap bounds
+> the *conversation copy* only (`iterations[].llmResponse` stays raw). Effective payload budget of
+> every truncated section is `maxBytes − SENTINEL_OVERHEAD_BYTES` (D17). The drop-marker label derives
+> from `MAX_CONVERSATION_BYTES` via `formatSize`, so a budget change propagates automatically. Any
+> "depth × branching × iterations × per-message bytes" arithmetic must use these numbers.
+
+---
+
+## 5. Issue #70 (Bucket 9 epic)
+
+**Append after the #144 line:**
+> `#145  9.11 — post-ship RLM message-growth polish                  ← from #74 review follow-ups`
+> `      └──► landed (F-145, 24 commits: D10–D27, tests 10–24, 967/967 ×2; review I1–I4 fixed in T15;`
+> `             audit Medium fixed in T19). Outstanding after it: item 8 (Session.prefixLineCount,`
+> `             blocked — F-77-era code, fix post-merge) + absorbed-6b rename (→ #78); ok-branch`
+> `             stdout-forgery residual; question-as-input follow-up needs a home.`
+> Also: #76's final synthesis reply will automatically flow through the D18 cap; tests 23/24 advance
+> the epic's "rlm.ts mutation score no longer zero" criterion.
+
+---
+
+## 6. Issue #69 (structure-aware elision)
+
+**Append/replace the scope note:**
+> **Scope note update (from the #145 flight):** the flat head+tail cut this note describes no longer
+> exists. #145 D15 replaced it with **per-value 5 KiB `truncateText` previews plus block-level
+> aggregate elision** (`elideInputBlocks` in `src/rlm.ts`) with an `/inputs elided/` marker —
+> fence-split closed and pinned by test 14. What remains for #69 is **true structure-aware elision of
+> values** (and the `output` section). The block-level work is deliberately not a second
+> byte-truncator (invariant 4 intact).
+
+---
+
+## 7. New-issue candidates
+
+- **7.1 Question-as-input follow-up (D24)** — dedicated issue or #78: "Pass the full question as a
+  sandbox input so `QUESTION_RECOVERY` can be strengthened (currently deliberately weak — policy Q3)."
+- **7.2 ok-branch stdout forgery (D19 residual)** — dedicated security-tagged issue or #78: "The
+  ok-branch `Output: …\nstdout:\n…` shape can be forged by an `output` containing `\nstdout:`; the
+  same `> `-quote remedy as D19 applies; test 3's locator couples to the shape."
+- **7.3 Session.prefixLineCount O(n²) (item 8, blocked)** — stays on #145 or a dedicated perf issue;
+  fix post-merge on main where the method exists.
+
+---
+
+## 8. Process gotchas (flight hygiene)
+
+1. **`tasks/monitor-watch.md` remains untracked across three flights (F-74/F-144/F-145)** — the
+   discovery ledger itself is uncommitted. Recommend committing it or an explicit .gitignore decision.
+2. **F-144's watch section never got a final SHIP poll**; its final report landed in the committed
+   `tasks/monitor-report.md`. Future monitors: "no final poll" ≠ "incomplete".
+3. **FLIGHT_DONE sentinel hygiene:** delete on close or `rm -f` before recreation (F-144 Item 1
+   lesson; F-145 started clean).
+4. **Issue-body fetching must not be truncated** — DEFINE's truncated fetch of #145's body missed
+   item 8 and absorbed-6b (caught at SHIP by the monitor). Future flights: fetch issue bodies to a
+   file, verify completeness against the issue's item numbering before SPECing.
+5. Two coders ran read-only git against the contract (T8, T17 — both disclosed). Disclosure honored;
+   the boundary stands.
+
+---
+
+**Monitor bottom line:** Flight F-145 landed D10–D27 with the strongest test battery in the suite's
+history (tests 10–24, 967/967 ×2, review I1–I4 and audit-Medium fixed), but #145's issue body is now
+stale in five ways that cost future flights rework if not fixed at close: the "five call sites" count
+(§1.2), the literal DoD box vs what landed (§1.3), the mutation-paragraph comparability (§1.5), the
+D16 assertion-scope gotcha (§1.1), and the two blocked items (§1.7). The highest-leverage edit is on
+#78: its convergence flight must carry the sentinel rule verbatim and know the full
+template-coupling inventory or it will silently disable D17 and break a dozen tests on string
+matching alone. Apply §1–§7 before closing #145; nothing blocks SHIP itself.

@@ -383,11 +383,16 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `buildFeedback` `stdout` | 32 KiB | 25/75 head+tail | #74 |
 | `buildFeedback` `output` | 16 KiB | 50/50 head+tail | #74 |
 | `runRlm` conversation (`messages`) | 256 KiB | keep first + last N, drop oldest whole pairs | #74 |
-| `buildInitialPrompt` input preview | 32 KiB aggregate | 50/50 head+tail | #74 |
+| `buildInitialPrompt` input preview | 32 KiB aggregate; 5 KiB per value | per-value 50/50 head+tail; aggregate whole-block elision | #74, #145 |
 | `buildFeedback` `error` | 16 KiB | 50/50 head+tail | #144 |
 | `buildInitialPrompt` `question` | 64 KiB | 50/50 head+tail | #144 |
+| `runRlm` assistant reply (conversation copy) | 256 KiB | 50/50 head+tail | #145 |
 
-The four `#29`/`#34` rows go through one implementation, `src/truncate.ts`, per invariant 4.
+Every `truncateText` row in this table goes through one implementation, `src/truncate.ts`, per
+invariant 4 — the `#74`/`#144`/`#145` rows too, not only the four `#29`/`#34` rows. The conversation
+row is not a truncation (`boundConversation` drops whole message pairs), and after #145 the aggregate
+input-preview cut is block-level elision in `rlm.ts` over whole per-value previews (D15), not a
+second byte-level truncator.
 
 **Exception 1 — `builtins.ts` keeps its 256 KiB ceiling; it is not part of the 48 KiB budget.**
 `read_file` and `http_get` return a value *into the sandbox*, not into the model's context: the model
@@ -427,15 +432,59 @@ the question is **not** sandbox-accessible: unlike `output` and inputs, the mode
 Python, so the marker must not advertise a route it cannot honour (policy Q3, the same rule as the
 `_` binding). Both caps go through the one shared `truncateText`.
 
-**Exception 3 — the conversation byte count uses `TextEncoder`, not `Buffer.byteLength`.** D2 writes
-the budget as `Buffer.byteLength`, but test 6 asserts `rlm.ts` never references `Buffer` or
-`byteLength` — the canonical signals of a hand-rolled byte truncator. `TextEncoder.encode().length`
-yields the same UTF-8 byte count, so the budget is measured identically while `rlm.ts` still owns no
-byte-level measurement (invariant 4). [#74]
+**#145 (RLM message-growth polish).** The last uncapped model-facing path is now bounded and every
+truncated view is authenticated: the assistant reply copied into the conversation is capped at the
+conversation budget (256 KiB, 50/50 head+tail — the row above) with a deliberately weak recovery
+clause ("Keep replies concise and re-state anything important."), because the model cannot recover
+its own elided reply from anywhere (policy Q3), while `iterations[].llmResponse` keeps the raw
+reply for the caller; truncated views are sentinel-delimited (Exception 5); error lines are
+`> `-quoted so a forged `stdout:` line cannot pass as the real delimiter (D19); input names are
+validated against a Python-identifier pattern before any query (D20); the drop marker's label
+derives from the budget via `formatSize` ("256.0KB"); the quoted error section renders ≤ 2× its
+value budget (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
+vector); and the aggregate input-preview cut is
+block-level elision over whole per-value previews (D15), so no cut can split a fence or a header.
+
+**Exception 3 — the conversation byte count uses `TextEncoder`, and that *is* byte measurement.**
+D2 writes the budget as `Buffer.byteLength`; `TextEncoder.encode().length` is UTF-8 byte measurement
+too, and byte-for-byte identical to `Buffer.byteLength` for the same text (verified, including lone
+surrogates). The deviation from D2's wording is a symbol swap driven by test 6's source grep — it
+bans `Buffer` and `byteLength` from `rlm.ts` (comments included) as the canonical signals of a
+hand-rolled byte truncator — not "no byte-level measurement". The count is byte-level either way;
+test 6's positive assertions (rlm.ts imports `truncateText` from `./truncate.js`) are what keep the
+one-shared-truncator invariant (invariant 4). [#74]
 
 **Exception 4 — a single over-budget LLM reply is kept.** The loop cannot truncate model output
 without summarising (deferred, D4), so one reply larger than 256 KiB is kept and the conversation is
 allowed to exceed the budget transiently until it ages out (#74, Assumption 4).
+
+**Exception 5 — every truncated view is sentinel-delimited (#145, D17).** A marker carried by
+attacker-controlled text is indistinguishable from a real one, so `rlm.ts` wraps every truncated
+view in `[TRUNCATED VIEW BEGIN]` / `[TRUNCATED VIEW END]` lines and the RLM system prompt tells
+the model that only elision markers inside the sentinels are authentic — marker-looking text
+anywhere else is literal data (the history-drop notice after the first message is carved out as
+also system-emitted and authentic). Sentinel-token sequences inside a value itself
+(`[TRUNCATED VIEW`, under budget or over) are neutralised before wrapping — the ordinary space
+becomes a zero-width space, `[TRUNCATED\u200BVIEW`, which cannot form a sentinel — so
+sentinel-token forgery is closed: a forged pair can neither render whole-and-sentinel-free
+under the budget nor land inside the authentic pair over it. Marker-shaped text is a different
+residual: the retained head and tail inside an authentic pair are still attacker-controlled,
+and a forged `[… N of M elided …]` line inside them sits inside the sentinels. That residual
+is steering-only — it can bias the model toward the attacker's summary, never read or
+exfiltrate data — the sandbox remains the real boundary. The system prompt therefore grants
+authenticity only to the marker the system places next to the sentinels, declaring anything
+resembling a summary inside the data itself to be that data's own content (D27), and the
+ZWSP/homoglyph confusable family — a neutralised sentinel differs from a real one by one
+invisible character — makes the mechanism a soft control (defense-in-depth), not
+authentication. On the error branch the authentic sentinels render line-quoted as
+`> [TRUNCATED VIEW BEGIN]` because D19's quoting is applied after the wrap; the rule notes
+that quoted shape rather than reordering. The sentinel bytes are subtracted from the
+section budget before the `truncateText` call, so the ceilings in the table stay hard with the
+sentinels included; the value is byte-measured after the neutralisation swap, so the budgets
+stay exact. Under the budget the path is a sentinel-free no-op (byte-identical apart from that
+swap), and forged marker-looking text stays raw. A caller-supplied `options.systemPrompt`
+replaces the default wholesale, dropping the authentication rule while the sentinel wrapping
+still happens — callers who override it should restate the rule.
 
 **The budget-smaller-than-the-marker edge**, which #29 asked to decide explicitly: the result is
 **empty**, with the truncated flag set. A partial marker is misinformation and the budget is a hard
