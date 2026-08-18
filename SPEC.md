@@ -1,175 +1,251 @@
-# Spec: #77 — Line numbers are shifted by +~90, and the sandbox is not continuous
+# Spec: #87 — No global spend budget across nested RLM fan-out
 
-Flight: F-77 · Branch: `issue/77-line-offset-continuity` · Base: `791096a` (main, 9.10)
+Flight: F-87 · Branch: `issue/87-rlm-budget` · Base: `e796174` (main, 9.10)
 
 ## Objective
 
-Fix the two defects of issue #77 in the RLM loop so that the sandbox experience matches what the
-prompts describe:
+Give the RLM loop a **shared, observable spend budget** so that a tree of nested
+investigations (once it exists) competes for one pool instead of each branch getting a fresh,
+uncoordinated allowance. Today the three existing limits compose into a product, not a ceiling:
 
-1. **Line-offset corruption** — `runInSandbox` executes `preamble + "\n" + code`, so syntax errors
-   (and runtime traceback frames) report line numbers shifted by the preamble's line count and embed
-   excerpt lines from preamble source the model never wrote. The model is asked to fix lines that do
-   not exist in its code.
-2. **Implied-but-absent continuity** — every RLM iteration runs in a fresh sandbox while the system
-   prompt and feedback are written as though the model works in an ongoing session. A model that
-   believes iteration 1's variables persist writes iteration 2 assuming them and burns iterations on
-   spurious `NameError`s.
+- `maxIterations` bounds **one** loop (`src/rlm.ts:510`),
+- `maxDepth`/`depth` bounds a tree's **height** (`src/rlm_loop.ts:33-38`, not present in `runRlm`),
+- #74's conversation bound caps **one** conversation's growth (`src/rlm.ts:426`).
 
-Success = the model sees only its own code in diagnostics, with line numbers relative to its code,
-and is told the truth about state persistence. The four issue tests (below) pass on shipped
-Monty 0.0.21.
+None counts total spend. The fix is a shared budget object threaded through every LLM call, with
+degrade-on-exhaustion (return the best available answer, marked budget-limited) and consumption
+reported on `RlmResult`.
 
-## Verified staleness block (re-verify discipline, #74/#144 precedent)
+## Verified staleness block (re-verify discipline, #74/#144/#77 precedent)
 
-Verified against HEAD `791096a` on 2026-08-17 before planning. #77's body refs:
+Issue #87's body references, re-verified against HEAD `e796174` by the Step-0 issue-monitor scan
+before planning:
 
-| #77 body ref | Claim | Verdict @ HEAD |
+| #87 body ref | Claim | Verdict @ HEAD |
 |---|---|---|
-| `rlm.ts:222-224` | rebuilds `preamble + "\n" + code`, feeds `result.error` verbatim | **STALE.** Rebuild now at `src/rlm.ts:563-564`, run at `:567`. The verbatim-feedback half was superseded by #144: `buildFeedback` caps `result.error` at 16 KiB (`src/rlm.ts:343-347`). The cap stays. |
-| `rlm.ts:251` | still concatenates `preamble + code` | **STALE location**, defect present: now `src/rlm.ts:563-564` (~90-line RLM preamble prepended). |
-| `rlm.ts:227` | fresh `runInSandbox` per iteration | **STALE location**, defect present: call at `src/rlm.ts:567`, loop at `:541`; no `feedRun` anywhere in `src/`; each iteration is a fresh session. H3 remains open. |
-| `session.ts:166` | preamble + prior snippets stack | **STALE location.** Stacking site is `Session.run()` at `src/session.ts:296-299` (`parts.push(...this.snippets, code)`). |
-| `RunOptions` | Do-item: add `lineOffset` | **Still open** — no `lineOffset` in `src/types.ts`. |
-| "+103 lines" | shift figure | **Superseded by #40**: `typeCheckStubs` now travels out-of-band (`src/sandbox.ts:1053-1065`), removing the +13 type-check contribution. Remaining shift ≈ RLM preamble length (~90). The `sandbox.ts:425-435` comment records the type-check half as fixed at HEAD. |
-| "runtime errors carry no line info" | | **Superseded by Monty 0.0.21**: `MontyRuntimeError.traceback()` returns structured `Frame[]` (`line`, `endLine`, `column`, `endColumn`, `sourceLine`). Runtime traceback frames ARE affected by the shift. |
-| "both plausibly dissolve under #40" | | **Half-true.** `typeCheckStubs` landed — but it removes only the stub-file contribution; the caller-assembled preamble still shifts typing diagnostics (disproved the "typing is line-correct" premise in VERIFY — measured `rlm.py:91:1` for model line 1 — and corrected it in Task 7). `typeCheckFormat: 'json'` did NOT land — `src/sandbox.ts:1067-1073` pins `"full"` with a recorded decision (echo is "the more useful one for a model rewriting its own code"). `feedRun`/continuity did NOT land — no `feedRun` in `src/`. |
+| "nested RLM fan-out" / `rlm_query` spawns nested RLM | the fan-out to budget exists | **STALE as stated.** Nesting (`maxDepth`/`depth`, `rlm_query` → nested `RLMLoop`) exists **only** in `src/rlm_loop.ts:33-38,212-251` (the object #78 deletes). `runRlm` (`src/rlm.ts`) has **no** nesting, `rlm_query`, `maxDepth`, or `createRLMTools` usage. |
+| "Blocked by: #78 — nesting does not exist until #78 step 4" | blocker | **CONFIRMED.** #78 is open and blocked by #75, #76 (the other four of #71-#76 are closed). Neither RLM path is reachable from the shipped extension (`extensions/repl-extension.ts` registers only `repl`/`repl_resume`/`repl_reset`/`repl_abandon`). |
+| "Report consumption in `RlmResult`" | field to add | **CONFIRMED open.** `RlmResult` at `src/types.ts:283-289` has only `status: "ok" \| "max_iterations"`, `answer`, `iterations`. |
+| "Tokens are the most portable and the easiest to test" | unit choice | **Recorded decision below (D2).** Reconciles `docs/truncation-policy.md:340` Non-goal "Token-based budgets. Bytes are cheap, deterministic and tokenizer-independent." |
+| `docs/actionable-items.md` A7 `[H8]` / `docs/REVIEW.md` §5 H8 | source of the finding | **CONFIRMED.** `docs/actionable-items.md:253` and `docs/REVIEW.md:498`. |
 
 ## Decisions (autonomous run — assumptions recorded, no clarifying questions)
 
-### D1 — Line-offset correction mechanics
+### D1 — Scope: the budget mechanism lands in `runRlm` now; the fan-out *wiring* waits for #78
 
-- **Add `lineOffset?: number` to the sandbox `RunOptions`** (`src/types.ts`): the number of lines
-  prepended before the caller's code in the assembled script. `0`/absent = no prefix (default,
-  behavior unchanged for existing callers).
-- **Apply correction in `sandbox.ts`**, the single place that renders diagnostics:
-  - **Syntax errors** (raised at parse/compile of the assembled script): subtract `lineOffset` from
-    every line number in the rendered diagnostic, and **drop excerpt lines whose line number is
-    ≤ `lineOffset`** (prefix source must never reach the model).
-  - **Typing errors**: NOT line-correct at HEAD — `typeCheckStubs` removes only the stub-file
-    contribution; the caller-assembled preamble still shifts them (measured end-to-end in VERIFY).
-    They get the **same correction** as syntax errors (`correctSyntaxErrorText`, Task 7).
-    `typeCheckFormat: "full"` stays: the recorded decision at `src/sandbox.ts:1067-1073` stands;
-    D4 documents why the `displayDiagnostics('json')` route from #77's "Do" is declined.
-  - **Runtime errors**: use `MontyRuntimeError.traceback()` frames when available — subtract
-    `lineOffset` from `frame.line`/`frame.endLine`, drop frames with `line ≤ lineOffset` (and their
-    `sourceLine` previews), re-render the surviving traceback for feedback. Fall back to the existing
-    message path when frames are unavailable.
-- **RLM passes `lineOffset`** = the line count of the RLM preamble it prepends (computed from the
-  preamble string actually used, never a hardcoded constant). **`Session.run` passes
-  `lineOffset`** = preamble + prior-snippet line count (test 3 covers the stacking case).
-- #144's 16 KiB `result.error` cap in `buildFeedback` is **preserved** — correction happens upstream
-  of the cap; the cap must still hold on corrected text (a correction must not re-open #144).
+#87 is blocked on #78 because the nesting it budgets does not exist in `runRlm`. This flight
+**does not port nesting** — that is #78's scope, and porting it here would create a merge conflict
+with the convergence #78 is planning (the issue-monitor's whole mandate is that work is not
+rediscovered or duplicated). Instead:
 
-### D2 — Continuity contract: fresh sandbox per iteration, prompts told the truth
+- Build the shared budget object as a first-class, independently testable module, and wire it into
+  `runRlm` at the single-loop level (budget option → charge every LLM call → degrade on exhaustion
+  → report consumption).
+- Prove the **shared-pool semantics** — the crux of the issue (test 2) — through a shared
+  `SpendBudget` instance passed to *multiple* `runRlm` calls: the second call sees the first's
+  spend, because both mutate the same object. A caller-driven fan-out (two `runRlm` invocations
+  sharing one budget) is exactly the "siblings share one pool" property, testable today without
+  `rlm_query`.
+- When #78 step 4 ports nesting, the wiring is one line: the `rlm_query` handler passes the same
+  `SpendBudget` instance into the nested `runRlm` call. This flight records that hand-off in the
+  final issue-monitor report so #78 does not rediscover it.
 
-- **True continuity is declined this flight.** `MontyRepl.feed()` (Monty 0.0.21's continuity
-  primitive) accepts only `{ mount }` — **no `externalFunctions`, no start/resume loop** (verified in
-  `node_modules/@pydantic/monty/index.d.ts`, `FeedOptions`). The sandbox's host-tool bridge
-  (`llm_query`, `rlm_query`, `SUBMIT`, Pi read/grep/find/ls, gated bash/edit/write) runs entirely on
-  external functions. Making state persist across iterations would require rearchitecting the tool
-  bridge or upstream Monty changes — out of scope for a bucket-9 step; recorded for a future issue.
-- **Contract: each RLM iteration executes in a fresh sandbox.** No variables, imports, or
-  intermediate results persist between iterations. Each snippet must be self-contained; anything
-  iteration N+1 needs must be re-declared or recomputed (or carried in the conversation).
-- **The system prompt and feedback wording are rewritten to state this contract plainly** — no
-  "session", "ongoing", or other continuity-implying wording remains in the RLM-facing text. This is
-  the "prompts match reality" branch of #77's Do ("if not [continuous], the prompt says so and a test
-  asserts the prompt says so").
+### D2 — Budget unit: **estimated tokens, derived from UTF-8 bytes**
 
-### D3 — Prompt-coupling constraint (from #78's template-coupling note)
+`estimateTokens(text) = ceil(utf8Bytes(text) / 4)`, where `utf8Bytes` is measured with
+`TextEncoder` (never `Buffer.byteLength` — see D8). Reasoning recorded, per #87's "say why":
 
-`DEFAULT_RLM_SYSTEM_PROMPT` (`src/rlm.ts:89-101`) edits **must preserve the section-header literals**
-that coupled tests locate: `# Input (available as …`, `Error: `/`\nstdout:`, `# Question\n` /
-`\n\n# Context`. Continuity wording is added without touching those literals; the full suite is the
-gate (tests 7/8/9 in the RLM suites must stay green).
+- **Tokens** are the portable unit callers and models actually think in, and the one #87 names.
+  Currency needs per-model pricing that drifts; wall time is non-deterministic and untestable.
+- **Estimated, not counted**, because repl-simple has no tokenizer and must not gain one — the
+  `LlmClient` is injected precisely to keep this library LLM-agnostic (`src/types.ts:145-158`). A
+  real tokenizer would add a dependency and per-model variance.
+- **Byte-derived, so deterministic and tokenizer-independent**, which is exactly the property
+  `docs/truncation-policy.md`'s Non-goal defends. This is a *reconciliation*, not an override:
+  truncation remains byte-based; the spend budget is a separate, higher-level control whose
+  estimator preserves determinism by deriving from UTF-8 bytes. The `/4` constant is a documented
+  approximation (≈4 bytes/token for typical English code/prose), pinned by test so callers can
+  predict their own cost.
 
-### D4 — Why `displayDiagnostics('json')` is declined
+### D3 — Budget API shape
 
-#77's "Do" suggests structured JSON diagnostics. Declined for typing errors: (a) the shift IS corrected
-structurally-not-needed — the "full" render shares the syntax render's ` --> file:line:col` /
-`N | excerpt` format, so the line-wise offset correction (Task 7) covers typing without parsing JSON;
-(b) the
-`"full"` echo is a recorded, argued decision (sandbox.ts:1067-1073) and more useful to a model
-rewriting its own code; (c) JSON would require re-implementing a renderer to get model-facing text
-back. Structured access IS adopted where it exists and helps: `MontyRuntimeError.traceback()` frames
-for runtime errors (D1). Recorded so the json route is not silently skipped.
+- New module `src/budget.ts`:
+  - `estimateTokens(text: string): number` — the deterministic estimator (exported, so callers
+    managing a budget can predict cost, and tests can recompute it).
+  - `class SpendBudget` — a **shared, mutable** budget object:
+    - `constructor(limit: number)` — rejects non-finite or negative `limit`.
+    - `get limit`, `get consumed`, `get remaining` — observability.
+    - `tryCharge(tokens: number): boolean` — `false` (and no charge) when `tokens < 0` or the
+      charge would exceed `limit`; otherwise adds to `consumed` and returns `true`.
+  - Both exported from `src/index.ts`.
+- `RlmOptions.budget?: number | SpendBudget` (`src/types.ts`):
+  - `number` → a fresh per-run `SpendBudget` (default behavior for the common single-run case).
+  - `SpendBudget` instance → used and mutated **in place**; siblings passing the same instance
+    share one pool. `consumed` therefore reflects the pool's cumulative spend, not one run's.
+- `RlmResult` (`src/types.ts`) gains:
+  - `status: "ok" | "max_iterations" | "budget_exhausted"` (additive union member).
+  - `budget?: RlmBudgetReport` where `RlmBudgetReport = { limit: number; consumed: number;
+    limited: boolean }`. Present **only** when a budget was configured.
+
+### D4 — Charge and degrade semantics (`src/rlm.ts`)
+
+- Before each LLM call, compute `cost = estimateTokens(systemPrompt) + Σ estimateTokens(m.content)`
+  over the messages the call will actually send. Charge happens **before** the call so the run never
+  overspends (a call that fits is charged in full; the abort path throws and reports nothing, so a
+  pre-charge on an aborted call is moot).
+- If `!budget.tryCharge(cost)`: **degrade, never throw** — return
+  `{ status: "budget_exhausted", answer: extractBestAnswer(iterations), iterations,
+  budget: { limit, consumed, limited: true } }`.
+- On the normal `"ok"` (SUBMIT) and `"max_iterations"` returns, attach
+  `budget: { limit, consumed, limited: false }` when a budget is configured — the budget is always
+  reported, `limited` distinguishes the stopping cause.
+
+### D5 — No budget configured ⇒ behaviour unchanged (issue test 5)
+
+When `RlmOptions.budget` is omitted, `status` stays `"ok" | "max_iterations"`, `budget` is absent,
+and no charge/limit logic runs. The budget must never become a mandatory ceiling that surprises
+existing callers.
+
+### D6 — Validation
+
+`budget: number` must be finite and `>= 0` (thrown otherwise, in `SpendBudget`'s constructor).
+`0` is well-defined: nothing may run, so the loop degrades immediately with `budget.limited: true`
+and `iterations: []` — a legitimate, testable degenerate case. `SpendBudget` instances are used as
+passed (their constructor already validated them).
+
+### D7 — `RlmResult` coordination (no collision with open siblings)
+
+The additions are **additive**: a new union member `"budget_exhausted"` and an optional `budget`
+field. They compose with — and do not block or conflict with — #75 (adds `"aborted"` status),
+#76 (adds provenance), and #78 step 6 (completing `RlmResult`'s fields). Recorded so those flights
+do not rediscover the shape.
+
+### D8 — Token estimator lives in `src/budget.ts`, not `rlm.ts`
+
+Test 6 (`test/rlm.test.ts:1382-1383`) asserts `src/rlm.ts` must not reference `Buffer` or
+`byteLength` (it must never hand-roll byte truncation). `estimateTokens` lives in `src/budget.ts`
+and uses `TextEncoder`; `rlm.ts` imports it and never measures bytes itself. The full-suite gate
+re-asserts this.
+
+## Worked example (DoD — pre-fix worst case vs post-fix ceiling)
+
+Pre-fix: `maxDepth = 3`, branching factor `B = 5`, `maxIterations = 10`. The tree has
+`1 + 5 + 25 + 125 = 156` nodes; each runs up to 10 LLM calls ⇒ **≈1,560 LLM calls**, each growing
+with the conversation (bounded per-conversation at 256 KiB by #74, but **nothing bounds the sum**).
+Depth is height, not spend; the worst case is the *product* of three limits none of which was chosen
+with the others in mind.
+
+Post-fix: a single shared budget `B_total` caps the **total** tokens across all 156 nodes. When it
+is exhausted, every outstanding branch degrades to its best-effort answer (marked budget-limited)
+rather than throwing. The ceiling is `B_total` — a bound, not another limit to multiply — up to the
+granularity of one call (a call that fits is charged in full).
+
+Fresh-sandbox overhead (F-77/#77 note): every iteration re-declares its imports and variables, so
+per-iteration token cost includes that re-declaration, and offset-corrected tracebacks shape the
+feedback text each iteration feeds back. A caller sizing `B_total` must factor both.
 
 ## Tech Stack
 
-- TypeScript 5.9, Node ≥ 22.19, ESM (`"type": "module"`)
-- Monty 0.0.21 (`@pydantic/monty`) — sandbox interpreter (reinstalled via `npm ci` at flight start;
-  node_modules had been stale at 0.0.18)
-- Tests: `tsx --test` (node:test); coverage: `scripts/coverage.mjs` with floors; mutation: Stryker
-  (bounded sweep only); lint/format: biome
+TypeScript (ESM, `node >= 22.19.0`), `@pydantic/monty` 0.0.21 (sandbox), `typebox` (extension
+schemas), `tsx` (test runner), `node:test` + `node:assert/strict` (tests), Biome (lint/format),
+Stryker (mutation), `@earendil-works/pi-coding-agent` (extension host). No LLM dependency — the
+`LlmClient` is injected.
 
 ## Commands
 
 ```
-Build:  npm run build
-Check:  npm run check          # tsc --noEmit
-Test:   npm test               # tsx --test test/*.test.ts (951 tests at baseline)
-Cov:    npm run coverage       # floors enforced by coverage-baseline.json
-Lint:   npm run lint           # biome check --error-on-warnings
+Test:            npm test
+Typecheck:       npm run check
+Build:           npm run build
+Lint:            npm run lint
+Format:          npm run format
+Coverage:        npm run coverage        # floors in coverage-baseline.json
+Mutation:        npm run mutation         # Stryker + mutation-guard
 ```
 
 ## Project Structure
 
 ```
-src/rlm.ts          RLM loop, preamble assembly, feedback building (consumer of lineOffset)
-src/sandbox.ts      runInSandbox, diagnostic rendering (applies lineOffset)
-src/session.ts      Session.run — snippet stacking (second consumer of lineOffset)
-src/types.ts        RunOptions, RunResult, RunError (lineOffset lives here)
-test/rlm.test.ts    RLM loop tests (offset, prompt-contract tests land here)
-test/sandbox.test.ts, test/session.test.ts   offset-correction tests land here
-docs/               flight docs (verify-77.md, review-77.md, ship-77.md at the end)
-tasks/              plan.md, todo.md (this flight)
+src/rlm.ts        → runRlm — the canonical RLM loop (budget wired here)
+src/budget.ts     → SpendBudget + estimateTokens (NEW this flight)
+src/types.ts      → RlmOptions.budget, RlmResult.status + budget report
+src/index.ts      → public exports (SpendBudget, estimateTokens re-exported)
+test/rlm.test.ts  → runRlm integration tests (5 issue tests + budget behavior)
+test/budget.test.ts → SpendBudget + estimateTokens unit tests (NEW)
+docs/             → policy docs (truncation-policy.md untouched this flight)
+tasks/            → plan.md, todo.md, flight reports
 ```
 
 ## Code Style
 
-Follow the existing repo style (biome, tabs, single quotes, trailing commas, type-only imports).
-The preamble line count must be computed from the preamble string actually used, never hardcoded.
-No new dependencies.
+Follow the existing `src/rlm.ts` conventions: JSDoc on every non-obvious decision, `// ── Section ──`
+banners, constants in UPPER_SNAKE with a doc comment stating the ceiling and why. Example (budget):
+
+```ts
+// ── Spend budget ──────────────────────────────────────────────
+/** Deterministic token estimate: UTF-8 bytes ÷ 4, rounded up. */
+export function estimateTokens(text: string): number {
+  return Math.ceil(new TextEncoder().encode(text).length / BYTES_PER_TOKEN);
+}
+```
+
+Biome-enforced; run `npm run lint` before reporting.
 
 ## Testing Strategy
 
-RED → GREEN per task; full suite + `npm run check` after every green; coverage floors via
-`npm run coverage` must stay green (the instrument's variance — see #105/#113 — must not be used to
-excuse a drop). The four #77 tests:
+`node:test` + `assert/strict`, one test file per source module. The mock LLM
+(`test/rlm.test.ts` `mockLlmCodeGen`) records `{ systemPrompt, messages }` per call, which is what
+lets test 4 recompute consumption and assert it equals the recorded prompts' `estimateTokens` sum.
 
-1. **Offset test (syntax)** — a syntax error on line 1 of the model's code is reported as line 1
-   when executed through `runInSandbox` with the RLM-style preamble; `lineOffset` corrects the
-   number.
-2. **No-preamble-source test** — the fed-back diagnostic contains no preamble source: assert the
-   absence of a known preamble token (the part a number-only fix misses).
-3. **Session stacking test** — the same holds under `Session`, where prior snippets stack:
-   diagnostic line numbers are relative to the latest snippet, and no earlier-snippet/preamble
-   source appears.
-4. **Continuity-contract test** — the RLM system prompt states the fresh-sandbox-per-iteration
-   contract; the test asserts the prompt says so (and asserts no continuity-implying wording
-   survives). Prompt-section literals from D3 still present (existing tests 7/8/9 remain green).
+Issue #87's five tests, mapped to this flight's scope:
+
+1. **Budget stops the loop, not depth** — a single `runRlm` with a small budget stops at fewer
+   iterations than `maxIterations` when the budget exhausts (`status: "budget_exhausted"`,
+   `budget.limited: true`). The multi-branch fan-out version waits for #78's nesting port (D1).
+2. **Siblings share one pool** — two `runRlm` calls sharing one `SpendBudget` instance: the second
+   sees the first's spend (its `budget.consumed` includes the first's charges; a budget sized for
+   one run leaves the second `budget.limited`). Plus a unit test: two chargers on one `SpendBudget`
+   compete for the same `remaining`.
+3. **Exhaustion degrades, never throws** — a budget too small for even the first call returns a
+   result (not an exception), marked `budget.limited`, with a best-effort answer.
+4. **Consumption reported and matches the mock** — `result.budget.consumed === Σ estimateTokens`
+   over every recorded call that actually ran (before exhaustion).
+5. **No budget ⇒ unchanged** — omitting `budget` yields `status` in `"ok" | "max_iterations"`, no
+   `budget` field, and no change to existing assertions.
+
+Plus `test/budget.test.ts` unit tests: estimator determinism (incl. empty string → 0), `tryCharge`
+refuses overspend and negative, `remaining`/`consumed`/`limit` observability, constructor rejects
+non-finite/negative, and shared-instance semantics (the D1 crux, in isolation).
+
+Coverage floors and mutation score stay green (existing `npm run coverage` / `npm run mutation`
+gates). The full suite currently passes at 986 tests (F-77 baseline) — the flight adds, not removes.
 
 ## Boundaries
 
-- **Always:** run tests + check before finishing a task; commit per task via the orchestrator;
-  preserve the #144 error-cap; preserve the `typeCheckFormat: "full"` decision; keep prompt-section
-  literals intact.
-- **Ask first (N/A this run — autonomous):** adding dependencies, upstream Monty changes.
-- **Never:** hardcode the preamble line count; strip the cap; rewrite the whole RLM prompt (only
-  the continuity wording); touch unrelated buckets (pool, toolstore, packaging).
+- **Always:** write the failing test first (RED) then the minimal code (GREEN); run `npm test`,
+  `npm run check`, `npm run lint` (and `npm run coverage` where named) before reporting each task;
+  one task per commit.
+- **Ask first:** nothing — this run is autonomous (assumptions recorded in Decisions).
+- **Never:** port nesting into `runRlm` (that is #78's scope, D1); use `Buffer`/`byteLength` in
+  `src/rlm.ts` (D8); change the byte basis of `docs/truncation-policy.md`; add a tokenizer or any
+  new runtime dependency; commit secrets; use `git add -A` (stage exactly the reported paths).
 
 ## Success Criteria
 
-- [ ] All four tests exist and pass on Monty 0.0.21 (951 baseline + new tests, 0 failures).
-- [ ] `npm run check`, `npm run coverage` floors, `npm run lint` green.
-- [ ] Corrected diagnostics still flow through #144's 16 KiB error cap.
-- [ ] The continuity contract (D2) is documented in the prompt text and in `docs/truncation-policy.md`
-      or README where RLM behavior is described (whichever currently describes it — checked in VERIFY).
-- [ ] Staleness block posted to issue #77 (done at flight start, below).
+- [ ] All five issue tests pass (D4/D5 mapping above), plus the `test/budget.test.ts` unit tests.
+- [ ] `npm test`, `npm run check`, `npm run lint` green; coverage floors and mutation score green.
+- [ ] `RlmResult` reports `{ limit, consumed, limited }`; `budget_exhausted` is a real, reachable
+      status; `"ok"`/`"max_iterations"` carry `limited: false` when a budget is configured.
+- [ ] No budget configured ⇒ existing behavior byte-for-byte unchanged (test 5).
+- [ ] The budget unit (estimated tokens) and its reasoning are recorded here (D2), and the worked
+      example above is ready to append to issue #87 (final issue-monitor report carries it).
 
 ## Open Questions
 
-- None blocking. Carried forward to a future issue: true continuity via `MontyRepl.feed` is
-  impossible while `FeedOptions` lacks `externalFunctions` — record as a gotcha on #70/#77's thread
-  (issue-monitor's final report will place it).
+- **Nesting port (deferred to #78).** The actual `rlm_query` fan-out wiring into `runRlm` — one
+  line: pass the shared `SpendBudget` into the nested `runRlm` — lands with #78 step 4. This flight
+  leaves it out and records the hand-off.
+- **Provenance (#76).** The budget-limited answer's provenance is a plain `status` +
+  `budget.limited` flag here; #76's richer provenance field will label it further when it lands.
+- **Estimator constant.** `/4` bytes-per-token is an approximation; if a future flight adopts a real
+  tokenizer, `estimateTokens` is the single swap point.
