@@ -6,7 +6,7 @@ sequence (independent files — order fixed for single-writer commits). Scaled p
 
 ## Tasks
 
-- [ ] **T1 — `Session.prefixLineCount()` O(n²) → incremental (D28)**
+- [x] **T1 — `Session.prefixLineCount()` O(n²) → incremental (D28)**
   - Objective: running prefix-line total; byte-identical numbers; F-77 `lineOffset` contract intact.
   - Scope: `src/session.ts`, `test/session.test.ts`.
   - RED: split-call-count test (stub `String.prototype.split`; N sequential runs → quadratic count
@@ -14,12 +14,12 @@ sequence (independent files — order fixed for single-writer commits). Scaled p
   - Verify: `npx tsx --test test/session.test.ts`; `npm test`; `npm run check`; `npm run build`;
     `npm run lint`; `npm run coverage`.
 
-- [ ] **T2 — rename `correctSyntaxErrorText` → `correctDiagnosticText` (D29)**
+- [x] **T2 — rename to `correctDiagnosticText` (D29)**
   - Objective: mechanical rename + every repo reference (grep src/ test/ docs/ tasks/ — incl.
     `tasks/monitor-77-report.md` if it names the function).
   - Scope: `src/sandbox.ts` + reference sites.
-  - Guard: no new test; `tsc --noEmit` + full suite + grep audit (`grep -rn correctSyntaxErrorText`
-    must return nothing).
+  - Guard: no new test; `tsc --noEmit` + full suite + grep audit (no stale reference to the
+    pre-rename identifier may remain).
   - Verify: same gates as T1.
 
 ## Risks

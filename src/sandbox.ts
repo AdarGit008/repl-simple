@@ -214,7 +214,7 @@ function runtimeKind(err: MontyRuntimeError): RunErrorKind {
  *
  * When `lineOffset` is set, the rendering is corrected here: line numbers
  * are made relative to the caller's code and prefix excerpt lines are dropped
- * (see `correctSyntaxErrorText`). That covers typing diagnostics too —
+ * (see `correctDiagnosticText`). That covers typing diagnostics too —
  * `typeCheckStubs` removes only the stub file's contribution out-of-band, so
  * the prefix the caller assembled around the code still shifts every typing
  * diagnostic exactly as it shifts syntax ones.
@@ -234,11 +234,11 @@ function classifyStartError(
   lineOffset?: number,
 ): RunError {
   if (err instanceof MontySyntaxError)
-    return runError("syntax", correctSyntaxErrorText(err.message, lineOffset), acc);
+    return runError("syntax", correctDiagnosticText(err.message, lineOffset), acc);
   if (err instanceof MontyTypingError) {
     const diagnostics = err.display();
     const kind = diagnostics.includes("error[invalid-syntax]") ? "syntax" : "typing";
-    return runError(kind, correctSyntaxErrorText(diagnostics, lineOffset), acc);
+    return runError(kind, correctDiagnosticText(diagnostics, lineOffset), acc);
   }
   return classifyResumeError(err, acc, lineOffset);
 }
@@ -276,7 +276,7 @@ function classifyStartError(
  *
  * A no-op when the offset is absent or not positive.
  */
-function correctSyntaxErrorText(text: string, lineOffset?: number): string {
+function correctDiagnosticText(text: string, lineOffset?: number): string {
   if (lineOffset === undefined || !Number.isFinite(lineOffset) || lineOffset <= 0) {
     return text;
   }

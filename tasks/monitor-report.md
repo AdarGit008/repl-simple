@@ -48,7 +48,7 @@ in T15; security audit Medium fixed in T19 (D27); all named-site mutation surviv
 >   infeasible on the 8-core host). Population non-comparable with #144's; see §1.5.
 > - [ ] **Item 8 (`Session.prefixLineCount()` O(n²)) — NOT implemented (blocked, see §1.7).** Stays
 >   open as the sole outstanding item.
-> - [ ] **Absorbed 6 second half (`correctSyntaxErrorText` → `correctDiagnosticText`) — NOT
+> - [ ] **Absorbed 6 second half (`correctDiagnosticText` rename) — NOT
 >   implemented (blocked, see §1.7).** Re-home to #78 or a post-merge follow-up.
 
 ### 1.4 D20 keyword denylist — do not regress
@@ -103,7 +103,7 @@ in T15; security audit Medium fixed in T19 (D27); all named-site mutation surviv
 **Wording (append as a "Post-merge follow-ups" block):**
 > **Blocked at SHIP (verified):** F-77 (issue #77's flight) merged to main as `e796174` **after** this
 > branch was cut (merge-base `791096a`). Item 8's target `Session.prefixLineCount()` and the
-> absorbed-6b rename target `correctSyntaxErrorText` exist only in F-77's code on main
+> absorbed-6b rename target `correctDiagnosticText` exist only in F-77's code on main
 > (`src/session.ts:610`, `src/sandbox.ts` post-F-77) — **neither exists on the branch**. Porting F-77
 > into this branch at SHIP stage was rejected (four-file merge churn into a finished flight).
 > **Item 8 and absorbed-6b remain OPEN after this branch merges** — fix them on main where the
@@ -145,7 +145,7 @@ in T15; security audit Medium fixed in T19 (D27); all named-site mutation surviv
 > `buildSystemPrompt` must carry the rule verbatim; test 17(c) pins its prose.
 
 **3.3 Deferred renames/extractions:**
-> (a) `correctSyntaxErrorText` → `correctDiagnosticText` (F-77-era, blocked on #145's branch — do it
+> (a) `correctDiagnosticText` (F-77-era, blocked on #145's branch — do it
 > here); (b) extracting prompt-section elision out of `src/rlm.ts` (~830 lines) is a #78 candidate
 > (S8 — test 6's greps are tuned to the current layout).
 

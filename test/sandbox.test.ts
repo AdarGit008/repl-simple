@@ -467,7 +467,7 @@ describe("runInSandbox — lineOffset runtime-error correction", () => {
 // in `tracebackText`, which this branch does not render), so there is no
 // line number to correct. The test pins what the branch must do with such
 // an error: keep kind `syntax`, pass the heading through uncorrupted
-// (`correctSyntaxErrorText` is a no-op on text with no locations), and leak
+// (`correctDiagnosticText` is a no-op on text with no locations), and leak
 // no prefix source.
 
 describe("runInSandbox — lineOffset on the plain MontySyntaxError branch", () => {

@@ -520,7 +520,7 @@ caught both against the live body. Corrected here rather than shipped silently.
   every prior snippet on each call. Fix to an incrementally maintained count; behavior byte-identical.
   Files: `src/session.ts`, `test/session.test.ts` (a focused regression test; test-only guard if the
   semantics are already pinned by the existing suite).
-- **Absorbed 6, second half:** rename `correctSyntaxErrorText` → `correctDiagnosticText`
+- **Absorbed 6, second half:** rename to `correctDiagnosticText`
   (`src/sandbox.ts:279`) — it corrects more than syntax errors. Mechanical rename + references.
   Files: `src/sandbox.ts` and any importer/test references.
 - The earlier out-of-scope lists excluding `src/session.ts` / `src/sandbox.ts` are amended by this
@@ -530,7 +530,7 @@ caught both against the live body. Corrected here rather than shipped silently.
 **BUILD blocker (verified 2026-08-17):** T17 found NEITHER target exists on this branch. F-77
 (issue #77's flight) merged to `origin/main` as `e796174` **after** this branch was cut — our
 merge-base with main is still `791096a`. `prefixLineCount` exists only on main (`src/session.ts:610`
-post-F-77) along with its `lineOffset` wiring; `correctSyntaxErrorText` exists only on main's
+post-F-77) along with its `lineOffset` wiring; `correctDiagnosticText` exists only on main's
 `sandbox.ts`. Porting F-77's session/types/sandbox/rlm `lineOffset` work into this branch to make the
 fixes implementable would be a full flight merge touching four files this flight must not churn at
 SHIP stage. **Disposition: item 8 and absorbed-6b remain OPEN on #145 as post-merge follow-ups**
@@ -577,7 +577,7 @@ This micro-flight implements them and closes #145. Branch: `issue-145-post-merge
   incremental one's does not). Test-only change; no source API changes.
 - **Files:** `src/session.ts`, `test/session.test.ts`.
 
-### D29 — Absorbed-6 second half: rename `correctSyntaxErrorText` → `correctDiagnosticText`
+### D29 — Absorbed-6 second half: rename to `correctDiagnosticText`
 
 - **Verified at HEAD:** `src/sandbox.ts:279` (function), called at `:237` (syntax path) and `:241`
   (typing path), JSDoc reference at `:217`. Mechanical rename + all repo references (grep the whole
