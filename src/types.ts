@@ -226,6 +226,7 @@ export type RunResult = (RunOk | RunError | RunSuspended) & {
 // ── RLM types ────────────────────────────────────────────────────
 
 import type { ToolRegistry } from "./registry.js";
+import type { SpendBudget } from "./budget.js";
 
 /**
  * LLM client for generating Python code in RLM loops.
@@ -270,6 +271,15 @@ export interface RlmOptions {
   systemPrompt?: string;
   /** Max RLM iterations before giving up. Default: 10. */
   maxIterations?: number;
+  /**
+   * Spend budget for this run, in estimated tokens (D3).
+   *
+   * A `number` is a fresh per-run `SpendBudget`; a `SpendBudget` instance is
+   * used and mutated **in place**, so siblings passing the same instance share
+   * one pool and `consumed` reflects the pool's cumulative spend. Omitted →
+   * no budget logic runs and `RlmResult.budget` is absent (D5).
+   */
+  budget?: number | SpendBudget;
   /** Abort signal — checked between iterations. */
   signal?: AbortSignal;
   /** Callback invoked after each iteration completes. */
@@ -287,14 +297,36 @@ export interface RlmOptions {
   runOptions?: RunOptions;
 }
 
+/**
+ * Spend-budget report attached to an `RlmResult` when a budget was configured.
+ *
+ * Present only when `RlmOptions.budget` was set (D3); `limited` distinguishes
+ * the stopping cause: `true` means the run degraded on budget exhaustion
+ * (`status: "budget_exhausted"`), `false` means the budget was tracked but
+ * never hit (`status: "ok" | "max_iterations"`).
+ */
+export interface RlmBudgetReport {
+  /** Total spend ceiling, in estimated tokens. */
+  limit: number;
+  /** Cumulative spend charged, in estimated tokens. */
+  consumed: number;
+  /** True when the run stopped because the budget was exhausted. */
+  limited: boolean;
+}
+
 /** RLM loop result. */
 export interface RlmResult {
-  /** "ok" when SUBMIT was called, "max_iterations" when loop exhausted. */
-  status: "ok" | "max_iterations";
+  /**
+   * "ok" when SUBMIT was called, "max_iterations" when the loop exhausted,
+   * "budget_exhausted" when the spend budget degraded the run (D4).
+   */
+  status: "ok" | "max_iterations" | "budget_exhausted";
   /** The answer string (from SUBMIT, or best-effort extraction). */
   answer: string;
   /** All iterations executed. */
   iterations: RlmIteration[];
+  /** Spend-budget report — present only when a budget was configured. */
+  budget?: RlmBudgetReport;
 }
 
 /**
