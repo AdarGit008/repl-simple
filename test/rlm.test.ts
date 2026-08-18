@@ -2162,6 +2162,24 @@ describe("buildFeedback() — feedback byte caps", () => {
     const after = feedback.slice(idx + delimiter.length);
     assert.equal(after.trim(), "real", "the real stdout must follow the delimiter");
   });
+
+  it("renders the empty-output ok branch as a no-op, with nothing between Output: and the delimiter (test 26, #156 D37)", () => {
+    // D37 (#156): when `output` is empty (`result.output === "None"` plus a
+    // real stdout), `quotedOutput` stays `""` — the ok branch must not emit a
+    // spurious `> ` before the real delimiter. This pins the empty else-branch
+    // of `const quotedOutput = output ? … : ""`; test 3 asserts only the stdout
+    // section (cap/elided/recovery), never the `Output: ` prefix.
+    const feedback = buildFeedback({
+      status: "ok",
+      output: "None",
+      outputTruncated: false,
+      stdout: "real",
+      stdoutTruncated: false,
+      calls: [],
+    });
+
+    assert.equal(feedback, "Output: \nstdout:\nreal");
+  });
 });
 
 // ── Conversation bound (D2/D3) ──────────────────────────────────

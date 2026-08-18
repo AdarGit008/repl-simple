@@ -135,15 +135,20 @@ Out of scope (flag): the error branch of `buildFeedback` (already D19 — untouc
 - Mutation: bounded sweep over the changed sites only (full matrix ≈ 32.9 CPU-hours, infeasible —
   per #145's D25 precedent). Record population/mode/duration; never compare two percentages across
   different populations. Expected kill sites: the `> ` prefix and the `.map` are pinned by the new
-  test's `> stdout: FORGED` and column-0 assertions; the `output ?` conditional is pinned by test 3
-  (empty) vs the new test (non-empty); the `\n` split/join is pinned by the byte-ceiling and
+  test's `> stdout: FORGED` and column-0 assertions; the `output ?` conditional is NOT pinned by
+  test 3 — test 3 asserts only the stdout section, never the empty branch — and it is unpinned by
+  any test until now (Stryker 9.6.1 does not mutate ternary conditions, so it cannot be
+  mutation-proven); the empty else-branch (`""`) is now pinned by test 26; the `\n` split/join is
+  pinned by the byte-ceiling and
   column-0 assertions.
 
 ## Assumptions (recorded — fire-and-forget, no human asked)
 
 1. **Empty-output no-op (D37).** `output === ""` renders `Output: ` unchanged (no spurious `> `).
    Reversing this — quoting the empty line for strict D19 symmetry, rendering `Output: > ` — is a
-   one-line change if a human prefers it; test 3's data (`output:"None"`) already pins the no-op.
+   one-line change if a human prefers it; test 3 does NOT pin the no-op — it asserts only the
+   stdout section, never the `Output: ` prefix or the empty branch — the new test (test 26, #156
+   D37) now pins it.
 2. **`> `-quote over `###` headers (D36).** Chosen on the issue's own recommendation plus D19
    symmetry; headers would be a divergent second mechanism for the same vector. Recorded, not asked.
 3. **test 2's byte-ceiling update is in scope** even though the issue's VERIFIED FACTS named only
@@ -210,9 +215,10 @@ ok-branch quote branches (non-empty via the new test, empty via test 3) must be 
 the floor.
 
 Mutation: bounded sweep over the changed sites only. The `> ` prefix and `.map` are uniquely pinned
-by the new test (column-0 count + `> stdout: FORGED`); the `output ?` conditional is pinned by
-test 3 (empty) vs the new test (non-empty). Population/mode/duration recorded; no cross-population
-percentage comparison.
+by the new test (column-0 count + `> stdout: FORGED`); the `output ?` conditional is NOT pinned by
+test 3 — test 3 asserts only the stdout section — and cannot be mutation-proven (Stryker 9.6.1
+does not mutate ternary conditions); its empty else-branch is now pinned by test 26.
+Population/mode/duration recorded; no cross-population percentage comparison.
 
 ## Boundaries
 
@@ -237,9 +243,10 @@ percentage comparison.
 5. **Gates:** `npm run check` + `npm run build` + `npm run lint` exit 0.
 6. **Coverage:** `npm run coverage` green — rlm.ts ≥ 97.69 (baseline), both ok-branch quote
    branches exercised.
-7. **Mutation:** bounded sweep over changed sites — the quote prefix, the `.map`, and the
-   `output ?` conditional are killed; no regression; population/mode/duration recorded, no
-   cross-population percentage comparison.
+7. **Mutation:** bounded sweep over changed sites — the quote prefix and the `.map` are killed;
+   the `output ?` conditional is not mutated by Stryker 9.6.1 (ternary conditions) and so cannot
+   be killed, but its empty else-branch is now pinned by test 26; no regression;
+   population/mode/duration recorded, no cross-population percentage comparison.
 8. **Scope:** no file outside the in-scope list is touched; the error branch, `src/truncate.ts`,
    and the never-list remain intact.
 
