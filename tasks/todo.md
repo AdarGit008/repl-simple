@@ -1,22 +1,19 @@
-# Tasks — issue #75: abort returns what it completed
+# Tasks — issue #156: delimit the ok-branch `Output:` section against stdout forgery
 
-Branch `issue-75-abort-iterations` from `main` `8529f24`. DEFINE (SPEC D30–D35) done. RED → BUILD →
-VERIFY → REVIEW → SHIP. Single writer, strict sequence.
+Branch `issue-156-output-delimit` from #70 (child of Bucket 9, residual of #145/D19). DEFINE (SPEC
+D36–D40) done. RED → BUILD → VERIFY → REVIEW → SHIP. Single writer, strict sequence. Commit cadence:
+commit 1 = RED test only (T1); commit 2 = code + test 2/3 shape updates + docs (T2).
 
-- [x] **T1 — RED: six tests** (flip 5.3.10 + issue tests A–E; `mockLlmCodeGen` records signal)
-      — all fail at HEAD; kills-M2 candidate A.
-- [x] **T2 — D30/D31: return aborted (loop-top + query catch), `"aborted"` status union**
-- [x] **T3 — D32: `LlmClient.query(systemPrompt, messages, signal?)` + pass-through**
-- [x] **T4 — D33: `runInSandbox` finally-removal of the leaked `onAbort` listener**
-- [x] **T5 — D34: post-run abort check surfaces the partial iteration**
-- [x] **T6 — VERIFY: full gates ×2 (1045/1045) + bounded mutation sweep (M2 dead; 22/22 changed-site mutants detected)**
-- [x] **T7 — REVIEW (`tasks/review.md`) + SHIP (`tasks/ship-report.md`) + #78 flag on the interface change**
+- [ ] **T1 — RED: forgery test** (forged `\nstdout:` in ok-branch `output`; assert exactly one column-0 `stdout:`, `> stdout: FORGED`, real delimiter via `indexOf("\nstdout:")`) — fails at HEAD (two column-0 `stdout:`). Commit 1: RED test only.
+- [ ] **T2 — D36/D37: quote `output` + D38 test 2/3 shape updates + D39 docs** (3-line insert at `src/rlm.ts:662-663`; `unquoted()` ceiling; `indexOf("\nstdout:")` locator; two doc clauses) — code + test move together, commit 2.
+- [ ] **T3 — VERIFY: coverage gate (rlm.ts ≥ 97.69, both quote branches) + bounded mutation sweep (kill `> `, `.map`, `output ?`)**
+- [ ] **T4 — REVIEW (`tasks/review.md`, five-axis) + SHIP (`tasks/ship-report.md`, go/no-go + rollback)**
 
-## Checkpoint (after T5)
-- [x] Six tests green; `npm test` ×2 deterministic (1043/1043); `check`/`build`/`lint`/`coverage` all exit 0.
+## Checkpoint (after T2)
+- [ ] New test green; test 18 (error-branch forgery) untouched green; `npm test` ×2 deterministic; `check`/`build`/`lint`/`coverage` all exit 0.
 
-## DoD (from #75)
-- [x] All five issue tests exist, red before the fix, green after.
-- [x] M2 no longer survives.
-- [x] `LlmClient.query` accepts a signal; interface change noted on #78.
-- [x] Listener count returns to zero — asserted (test C), not assumed.
+## DoD (from #156)
+- [ ] Forgery test added RED first, green after.
+- [ ] Code + test 3 update (and test 2) land in the same commit.
+- [ ] Ok-branch `output` quoted — forged `\nstdout:` renders `> stdout:` and never at column 0.
+- [ ] Coverage floor (rlm.ts ≥ 97.69) and mutation score stay green.
