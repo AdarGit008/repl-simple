@@ -103,7 +103,8 @@ in T15; security audit Medium fixed in T19 (D27); all named-site mutation surviv
 **Wording (append as a "Post-merge follow-ups" block):**
 > **Blocked at SHIP (verified):** F-77 (issue #77's flight) merged to main as `e796174` **after** this
 > branch was cut (merge-base `791096a`). Item 8's target `Session.prefixLineCount()` and the
-> absorbed-6b rename target `correctDiagnosticText` exist only in F-77's code on main
+> absorbed-6b rename target `correctSyntaxErrorText` (since renamed to `correctDiagnosticText`,
+> D29) existed only in F-77's code on main
 > (`src/session.ts:610`, `src/sandbox.ts` post-F-77) — **neither exists on the branch**. Porting F-77
 > into this branch at SHIP stage was rejected (four-file merge churn into a finished flight).
 > **Item 8 and absorbed-6b remain OPEN after this branch merges** — fix them on main where the

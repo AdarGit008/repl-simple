@@ -637,7 +637,8 @@ fixed in T19). FLIGHT_DONE sentinel created; delete on close (F-144 Item 1 lesso
 - **Source:** T17 dispatch (SHIP-stage), verified by orchestrator against origin/main.
 - **Quotable:** origin/main advanced to `e796174` (F-77 "9.7 — Line numbers are shifted… (#77)")
   **during** this flight; merge-base remains `791096a`. `prefixLineCount` exists only at main
-  `src/session.ts:610`; `correctDiagnosticText` only on main's `src/sandbox.ts`. Neither exists on
+  `src/session.ts:610`; `correctSyntaxErrorText` (since renamed `correctDiagnosticText`, D29) only
+  on main's `src/sandbox.ts`. Neither exists on
   the branch — DEFINE had scoped them out from a truncated issue-body fetch, and the re-scope (D26)
   found the targets unreachable without porting all of F-77.
 - **Why it matters:** concurrent flights on one repo → issue bodies can reference code that does not

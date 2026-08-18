@@ -420,7 +420,7 @@ describe("Session — prefixLineCount is incrementally maintained (#145 D28)", (
     }
 
     // Linear: at most a small constant multiple of N. The O(n²) version
-    // performs N(N+1)/2 splits on these strings (1275 for N=60).
+    // performs N(N+1)/2 splits on these strings (1830 for N=60).
     assert.ok(
       splitCount <= 3 * N,
       `expected split calls to stay linear, got ${splitCount} for ${N} runs`,
