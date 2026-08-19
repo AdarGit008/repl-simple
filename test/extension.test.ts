@@ -229,6 +229,31 @@ describe("repl extension — clampModelLimits", () => {
       else process.env.REPL_MAX_DURATION_SECS = prior;
     }
   });
+
+  it("a raised operator env is still spec-capped", () => {
+    // The `Math.min(specCap, cfg)` constant-side branch: an operator knob raised
+    // above the spec caps must NOT raise the ceiling past 300 s / 1024 MiB.
+    const priorMem = process.env.REPL_MAX_MEMORY_MB;
+    const priorDur = process.env.REPL_MAX_DURATION_SECS;
+    process.env.REPL_MAX_MEMORY_MB = "2048";
+    process.env.REPL_MAX_DURATION_SECS = "1000";
+    try {
+      assert.deepEqual(clampModelLimits(undefined, 2048), { maxMemory: 1024 * MIB });
+      assert.deepEqual(clampModelLimits(1000, undefined), { maxDurationSecs: 300 });
+    } finally {
+      if (priorMem === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+      else process.env.REPL_MAX_MEMORY_MB = priorMem;
+      if (priorDur === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+      else process.env.REPL_MAX_DURATION_SECS = priorDur;
+    }
+  });
+
+  it("boundary equality against the derived default ceiling", () => {
+    // No env override, so the derived ceilings are the sandbox defaults
+    // (30 s / 512 MiB). A value equal to the ceiling is honoured, not clamped down.
+    assert.deepEqual(clampModelLimits(30, undefined), { maxDurationSecs: 30 });
+    assert.deepEqual(clampModelLimits(undefined, 512), { maxMemory: 512 * MIB });
+  });
 });
 
 // ── The repl tool wires the clamp into ReplRunner.run ────────────
