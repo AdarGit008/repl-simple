@@ -1,69 +1,49 @@
-# Implementation Plan: issue #33 — Plumb signal and limits through the extension and ReplRunner
-
-Source of truth: `SPEC.md` (D1–D7). The signal half is already shipped (D1); this plan covers the
-missing `limits` forwarding, the model-boundary clamp, and the abort-semantics pinning.
+# Implementation Plan: issue #176 — Derive the clamp ceilings from the operator's limits
 
 ## Overview
 
-Five tasks, strictly ordered. T1 adds the `limits` parameter to `ReplRunner` (foundation). T2 builds
-the clamp and exposes two clamped params on the `repl` tool (depends on T1). T3 and T4 pin the two
-abort behaviours the issue demands but the suite does not yet cover. T5 is the documentation/DoD
-reconciliation pass. Every task is RED-first; the full suite must be green after each.
+The `repl` tool's model-facing clamp (`clampModelLimits` in `extensions/repl-extension.ts`) uses
+hardcoded ceilings (`MAX_MODEL_DURATION_SECS = 300`, `MAX_MODEL_MEMORY_MIB = 1024`). Because the
+sandbox fills only *unset* knobs from `limitsConfig()`, an extension-supplied value overrides the
+operator's `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` — a prompt-injected model can amplify
+past the operator's bound. Fix: derive each ceiling as `min(specCap, limitsConfig() effective
+value)` and integerize the byte conversion. See `SPEC.md` (D1–D6) for the decisions.
 
 ## Architecture Decisions
 
-- **`ReplRunner` stays a faithful library** — it accepts `limits?: RunLimits | "unbounded"` and
-  forwards verbatim; it never clamps and never strips `"unbounded"` (D2). The clamp is the
-  extension's job because that is where untrusted model input enters.
-- **Clamp lives in the extension as a pure helper** (`clampModelLimits`) so it is unit-testable
-  without driving the whole tool `execute` path (D3, Assumption from SPEC).
-- **Abort semantics are pinned, not changed** — transcript rollback is already the behaviour; T3
-  documents and tests it rather than reworking `Session.run` (D4).
-- **`_signal` stays on the two synchronous tools** — renaming would trip `noUnusedParameters`;
-  the `_`-prefix is the correct idiom for a fixed-arity unused param (D5).
+- **Ceiling = `min(specCap, limitsConfig() value)`** (D1). Spec caps stay as the absolute upper
+  bound; `limitsConfig()` supplies the operator's value or the sandbox default. Default model
+  ceiling tightens to 30 s / 512 MiB (deliberate, recorded in SPEC.md D1).
+- **Floor the byte conversion** (D2): `Math.floor(memoryMiB * BYTES_PER_MIB)`.
+- **Fix is entirely at the model boundary** (D4): `src/sandbox.ts` untouched; import `limitsConfig`
+  from `../src/sandbox.js` (D5).
+- **Two sequential tasks**, each a self-contained RED→GREEN→verify increment with a clean rollback
+  point: T1 (integerize) is independent; T2 (derive ceilings) builds on it and updates the stale
+  fixed-cap assertions.
 
 ## Task List
 
-### Phase 1 — Foundation
+### Phase 1: Integerize the byte conversion
+- [ ] **Task 1** — Floor `maxMemory` bytes; RED test for `0.1` MiB → `104857`.
 
-- [ ] **T1 — Forward `limits` through `ReplRunner.run`/`resume` (D2)**
+### Checkpoint: integerize landed
+- [ ] Focused test green; full suite green; `check`/`build`/`lint` clean.
 
-### Checkpoint: Foundation
-- [ ] `npx tsx --test test/repl.test.ts` green; full suite green; `npm run check` + `npm run build` clean.
+### Phase 2: Derive the ceilings
+- [ ] **Task 2** — Derive both ceilings from `limitsConfig()`; update the four stale fixed-cap tests.
 
-### Phase 2 — Model boundary
-
-- [ ] **T2 — Clamp helper + expose clamped `maxDurationSecs`/`maxMemory` on the `repl` tool (D3)**
-
-### Checkpoint: Model boundary
-- [ ] `npx tsx --test test/extension.test.ts test/repl.test.ts` green; full suite green.
-
-### Phase 3 — Abort behaviour
-
-- [ ] **T3 — Session-state-after-abort: document + assert transcript rollback (D4)**
-- [ ] **T4 — End-to-end abort through the real extension path (D7 test 1)**
-
-### Checkpoint: Abort behaviour
-- [ ] Both new abort tests present and green; full suite green.
-
-### Phase 4 — Documentation / DoD
-
-- [ ] **T5 — Scope-boundary description + `_signal` reconciliation (D5, D6)**
-
-### Checkpoint: Complete
-- [ ] Four issue tests exist and pass; `npm test` + `npm run check` + `npm run build` + `npm run lint` clean.
-- [ ] Ready for VERIFY (test-engineer) and REVIEW (code-reviewer).
+### Checkpoint: complete
+- [ ] Issue acceptance met (env var is the true ceiling); all tests green; ready for review.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Test 1 (abort e2e) reveals signal does **not** stop later host calls despite being plumbed | Med | T4 in-scope: coder fixes the small gap; spec D1 does not forbid a fix if a genuine defect is found |
-| Driving `execute` in-test is heavy (approval dialog, ctx) | Low | T2/T4 may split into helper-unit + param-through tests; the split is recorded in the task summary |
-| Clamp constants drift from `sandbox.ts` defaults | Low | Caps (300 s / 1024 MiB) are spec-fixed; coder reads the live defaults and only *confirms* them, never changes them |
-| Test 3 is a tautology (asserts its own stub) | Med | T1's test must capture the actual `RunOptions` object passed and assert on its fields, not on a value the test itself supplied |
+| Default model ceiling tightens (300→30 s, 1024→512 MiB) — functional regression vs #33 | Med | Deliberate, security-correct (SPEC.md D1); surfaced to review and the user in the ship decision |
+| Env leaks between tests in `test/extension.test.ts` | Low | Save/restore env in `try/finally` or before/after hooks (D3) |
+| `limitsConfig()` import drags heavy sandbox deps into the extension | Low | Extension already transitively imports sandbox via `ReplRunner`; no new boundary (D5) |
+| #177 later re-hardcodes 300/1024 | Med | Close-out note (D6); issue-monitor final report flags it |
 
 ## Open Questions
 
-- None blocking — see SPEC "Open questions / risks" (resume-limits symmetry, clamp-test split,
-  side-effect non-assertion are all recorded there as decisions, not blockers).
+None blocking (SPEC.md "Open questions").
