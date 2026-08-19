@@ -1,7 +1,7 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ReplRunner } from "../src/repl.js";
-import type { ApprovalRequest, ApprovalDecision } from "../src/types.js";
+import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
 
 /**
  * Approval mode. The user's decision about how much they want to be asked.
@@ -71,6 +71,54 @@ function approvalTimeoutMs(): number | undefined {
   // An unparseable value is a typo, not a request to remove the bound.
   if (!Number.isFinite(parsed)) return DEFAULT_APPROVAL_TIMEOUT_MS;
   return parsed > 0 ? parsed : undefined;
+}
+
+// ── Model limit clamp (D3) ───────────────────────────────────────
+//
+// The extension is the model boundary: it is where untrusted model input
+// enters, so a model-supplied limit is clamped, never trusted. `ReplRunner`
+// stays a faithful library and forwards whatever it is given (D2) — the clamp
+// lives here, as a pure helper so it is unit-testable without driving the
+// sandbox. Caps are spec-fixed: `300` s is the host wall-clock default (the
+// model can never out-run the host-side fail-safe) and `1024` MiB is 2× the
+// memory default.
+
+/** Ceiling on a model-supplied `maxDurationSecs`. */
+const MAX_MODEL_DURATION_SECS = 300;
+/** Ceiling on a model-supplied `maxMemory`, in MiB. */
+const MAX_MODEL_MEMORY_MIB = 1024;
+/** Bytes per MiB — `RunLimits.maxMemory` speaks bytes, the model speaks MiB. */
+const BYTES_PER_MIB = 1_048_576;
+
+/**
+ * Clamp a model-supplied limit to a ceiling, or omit it.
+ *
+ * Upper bound only: a shorter/smaller request is honoured, never raised. A
+ * value that is not a positive finite number (`≤0`, `NaN`, `Infinity`, or
+ * non-numeric) is omitted so the sandbox's fail-safe default applies — the
+ * model saying nothing and the model saying nonsense must mean the same thing.
+ */
+function clampCeiling(value: unknown, cap: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.min(value, cap);
+}
+
+/**
+ * Build the `RunLimits` for a `repl` call from the two model-exposed knobs.
+ *
+ * `maxDurationSecs` is clamped to {@link MAX_MODEL_DURATION_SECS}; `maxMemory`
+ * is in MiB here, clamped to {@link MAX_MODEL_MEMORY_MIB} and converted to
+ * bytes. Both are omitted when not a positive finite number. The result is
+ * always an object, never `"unbounded"` — that escape hatch is the library's,
+ * not the model's (D2/D3).
+ */
+export function clampModelLimits(maxDurationSecs?: unknown, maxMemoryMiB?: unknown): RunLimits {
+  const limits: RunLimits = {};
+  const duration = clampCeiling(maxDurationSecs, MAX_MODEL_DURATION_SECS);
+  if (duration !== undefined) limits.maxDurationSecs = duration;
+  const memoryMiB = clampCeiling(maxMemoryMiB, MAX_MODEL_MEMORY_MIB);
+  if (memoryMiB !== undefined) limits.maxMemory = memoryMiB * BYTES_PER_MIB;
+  return limits;
 }
 
 /** Extension registration surface — the subset of pi's API this file uses. */
@@ -244,13 +292,29 @@ export default function (pi: ReplExtensionApi) {
         "Variables, imports, and function definitions persist across calls with the " +
         "same sessionId. File system, shell, and HTTP tools are available as Python " +
         "functions. If the session has a tool call waiting for approval, running new " +
-        "code discards it — call repl_resume first if you still want that call.",
+        "code discards it — call repl_resume first if you still want that call. " +
+        "Cancelling a repl call stops it between tool calls, but a pure-Python loop " +
+        "with no pause points runs until the duration limit (maxDurationSecs).",
       parameters: Type.Object({
         code: Type.String({ description: "Python code to execute." }),
         sessionId: Type.Optional(
           Type.String({
             description:
               "Session identifier. Reuse to persist variables across calls. Default: 'default'.",
+          }),
+        ),
+        maxDurationSecs: Type.Optional(
+          Type.Number({
+            description:
+              "Maximum interpreter compute time in seconds, capped at 300. " +
+              "Omitted uses the sandbox default (30).",
+          }),
+        ),
+        maxMemory: Type.Optional(
+          Type.Number({
+            description:
+              "Maximum sandbox heap in MiB, capped at 1024. " +
+              "Omitted uses the sandbox default (512 MiB).",
           }),
         ),
       }),
@@ -261,6 +325,7 @@ export default function (pi: ReplExtensionApi) {
           params.sessionId ?? "default",
           makeOnApproval(ctx, signal),
           signal,
+          clampModelLimits(params.maxDurationSecs, params.maxMemory),
         );
         return { content: [{ type: "text" as const, text }], details: {} };
       },
@@ -309,6 +374,9 @@ export default function (pi: ReplExtensionApi) {
           Type.String({ description: "Session to reset. Default: 'default'." }),
         ),
       }),
+      // _signal stays underscored: reset is synchronous and non-abortable, so a signal
+      // is meaningless here, and noUnusedParameters makes the _-prefix the correct idiom
+      // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const sessionId = params.sessionId ?? "default";
         const { existed, revoked } = getRunner(ctx).reset(sessionId);
@@ -359,6 +427,9 @@ export default function (pi: ReplExtensionApi) {
           }),
         ),
       }),
+      // _signal stays underscored: abandon is synchronous and non-abortable, so a signal
+      // is meaningless here, and noUnusedParameters makes the _-prefix the correct idiom
+      // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const r = getRunner(ctx);
         const sessionId = params.sessionId ?? "default";

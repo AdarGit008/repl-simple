@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE } from "../extensions/repl-extension.js";
+import {
+  APPROVE_CHOICE,
+  DENY_CHOICE,
+  LATER_CHOICE,
+  clampModelLimits,
+} from "../extensions/repl-extension.js";
+import { ReplRunner } from "../src/repl.js";
 
 /**
  * Tests for `extensions/repl-extension.ts` — the only file a consumer of this
@@ -115,6 +121,31 @@ describe("repl extension — parameter schemas", () => {
     assert.deepEqual(repl.parameters.required, ["code"]);
   });
 
+  it("repl also takes optional maxDurationSecs and maxMemory, capped", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl, "repl did not register");
+
+    assert.equal(repl.parameters.properties.maxDurationSecs?.type, "number");
+    assert.equal(repl.parameters.properties.maxMemory?.type, "number");
+    // Still only `code` is required — the limits are optional and defaulted.
+    assert.deepEqual(repl.parameters.required, ["code"]);
+    // The descriptions must name the caps, or the model is told it may ask
+    // for more than the clamp will grant.
+    assert.match(repl.parameters.properties.maxDurationSecs?.description ?? "", /300/);
+    assert.match(repl.parameters.properties.maxMemory?.description ?? "", /1024/);
+  });
+
+  it("documents the cancellation boundary in the repl description (D6)", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl, "repl did not register");
+
+    // The description must promise only what the implementation can deliver:
+    // cancellation applies at tool-call pause points, never inside a
+    // pure-Python loop, where only maxDurationSecs bounds the run.
+    assert.match(repl.description, /stops it between tool calls/);
+    assert.match(repl.description, /pure-Python loop with no pause points/);
+  });
+
   it("the other three take sessionId (optional) and require nothing", async () => {
     const tools = await loadTools();
 
@@ -133,6 +164,110 @@ describe("repl extension — parameter schemas", () => {
         `${name} must not require any parameter`,
       );
     }
+  });
+});
+
+// ── Model limit clamp (D3) ───────────────────────────────────────
+//
+// The extension is the model boundary, so a model-supplied limit is clamped,
+// never trusted. `clampModelLimits` is a pure helper so it is tested directly
+// rather than only through the sandbox path.
+
+describe("repl extension — clampModelLimits", () => {
+  const MIB = 1_048_576;
+
+  it("clamps an above-cap maxDurationSecs to 300", () => {
+    assert.deepEqual(clampModelLimits(10_000, undefined), { maxDurationSecs: 300 });
+  });
+
+  it("clamps an above-cap maxMemory to 1024 MiB, in bytes", () => {
+    assert.deepEqual(clampModelLimits(undefined, 2048), { maxMemory: 1024 * MIB });
+  });
+
+  it("honours shorter/smaller requests — the clamp is a ceiling, not a floor", () => {
+    assert.deepEqual(clampModelLimits(5, 128), { maxDurationSecs: 5, maxMemory: 128 * MIB });
+  });
+
+  it("leaves a value exactly at the cap untouched", () => {
+    assert.deepEqual(clampModelLimits(300, 1024), { maxDurationSecs: 300, maxMemory: 1024 * MIB });
+  });
+
+  it("clamps a just-above-cap duration and converts fractional MiB exactly", () => {
+    assert.deepEqual(clampModelLimits(301, undefined), { maxDurationSecs: 300 });
+    assert.deepEqual(clampModelLimits(undefined, 0.5), { maxMemory: 524288 });
+  });
+
+  it("omits values that are not positive finite numbers", () => {
+    assert.deepEqual(clampModelLimits(0, -1), {});
+    assert.deepEqual(clampModelLimits(NaN, Infinity), {});
+    assert.deepEqual(clampModelLimits("10", null), {});
+    assert.deepEqual(clampModelLimits(undefined, undefined), {});
+  });
+});
+
+// ── The repl tool wires the clamp into ReplRunner.run ────────────
+
+describe("repl extension — the repl tool passes clamped limits (never 'unbounded')", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-clamp-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  /**
+   * Capture the `limits` argument the extension hands `ReplRunner.run`, with
+   * the sandbox path stubbed out. This pins what reaches the runner — the seam
+   * where an "unbounded" or an un-clamped value would show up — without
+   * driving a real sandbox execution.
+   */
+  async function runWithLimits(params: Record<string, unknown>): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const originalRun = ReplRunner.prototype.run;
+    ReplRunner.prototype.run = (async (
+      _code: string,
+      _sessionId: string | undefined,
+      _onApproval: unknown,
+      _signal: AbortSignal | undefined,
+      limits: unknown,
+    ) => {
+      seen.push(limits);
+      return "[result]\n1";
+    }) as unknown as typeof ReplRunner.prototype.run;
+
+    try {
+      const repl = (await loadTools()).find((t) => t.name === "repl");
+      assert.ok(repl, "repl did not register");
+      await repl.execute("clamp-1", params, undefined, undefined, {
+        cwd,
+        isProjectTrusted: () => true,
+        hasUI: true,
+        ui: { select: async () => APPROVE_CHOICE },
+      });
+    } finally {
+      ReplRunner.prototype.run = originalRun;
+    }
+    return seen;
+  }
+
+  it("clamps an above-cap request before it reaches the runner", async () => {
+    const seen = await runWithLimits({ code: "1 + 1", maxDurationSecs: 10_000, maxMemory: 2048 });
+    assert.deepEqual(seen, [{ maxDurationSecs: 300, maxMemory: 1024 * 1_048_576 }]);
+  });
+
+  it("never emits 'unbounded', even with no limits supplied", async () => {
+    const seen = await runWithLimits({ code: "1 + 1" });
+    assert.equal(seen.length, 1);
+    assert.notEqual(seen[0], "unbounded");
+    assert.deepEqual(seen[0], {});
+  });
+
+  it("honours a below-cap request un-raised", async () => {
+    const seen = await runWithLimits({ code: "1 + 1", maxDurationSecs: 5, maxMemory: 128 });
+    assert.deepEqual(seen, [{ maxDurationSecs: 5, maxMemory: 128 * 1_048_576 }]);
   });
 });
 
@@ -1026,5 +1161,67 @@ describe("repl extension — project trust gates the preamble (#53)", () => {
 
     assert.equal(readFileSync(join(cwd, "pwned.txt"), "utf8"), "owned");
     assert.doesNotMatch(result.content[0].text, /preamble withheld/);
+  });
+});
+
+// ── End-to-end abort between gated host calls (D7 test 1) ────────
+//
+// The signal is already plumbed end to end (`ReplRunner.run` → `Session.run` →
+// sandbox), and the `#49` tests above abort at the approval *dialog* before any
+// host tool has run. This pins the other half of the abort contract: an abort
+// that lands **between pause points** — after a gated host tool has executed
+// and returned, before a later gated call runs — stops the later call from
+// ever being dispatched.
+//
+// The abort is raised inside the approval callback for the FIRST gated call
+// (that callback is a pause point), which then approves the call in flight.
+// The sandbox notices `signal.aborted` at the top of its next dispatch-loop
+// iteration — after the first `write` has executed and resumed Python — and
+// returns `aborted` before the second `write` reaches the gate. The assertion
+// is the side-effect counter, not the status string: one approval asked, the
+// first file written, the second file absent.
+
+describe("repl extension — abort between gated host calls (D7 test 1)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-abort-mid-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("stops a later gated call once the run is aborted after the first returns", async () => {
+    const runner = new ReplRunner(cwd);
+
+    const controller = new AbortController();
+    const prompts: string[] = [];
+    const out = await runner.run(
+      "write('first.txt', 'one')\nwrite('second.txt', 'two')",
+      "abort-mid",
+      async (req) => {
+        prompts.push(req.tool);
+        // Abort at the first pause point, approve the call in flight, and let
+        // the loop notice the abort on its next iteration — after the first
+        // write has executed and returned.
+        controller.abort();
+        return true;
+      },
+      controller.signal,
+    );
+
+    // The discriminating assertions are the side effects, not the status: the
+    // first gated call really ran, the second never reached the approval gate
+    // (let alone executed).
+    assert.deepEqual(prompts, ["write"], "the second gated call was dispatched to the gate");
+    assert.equal(readFileSync(join(cwd, "first.txt"), "utf8"), "one", "the first call never ran");
+    assert.equal(
+      existsSync(join(cwd, "second.txt")),
+      false,
+      "the second gated call executed despite the abort",
+    );
+    // Context, not the assertion itself: the run reports the abort.
+    assert.match(out, /\[error: aborted\]/);
   });
 });

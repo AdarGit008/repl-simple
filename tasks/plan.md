@@ -1,76 +1,69 @@
-# Implementation Plan: issue #78 — Converge on `runRlm` and delete `rlm_loop.ts`
+# Implementation Plan: issue #33 — Plumb signal and limits through the extension and ReplRunner
 
-Source of truth: `SPEC.md` (decisions D48–D60). This plan decomposes the spec into 8
-dependency-ordered tasks. Flight pattern: DEFINE (done) → BUILD (T1–T8, RED-first) → VERIFY
-(test-engineer) → REVIEW (code-reviewer) → SHIP (security-auditor). Single writer, one coder per
-task, one commit per task.
+Source of truth: `SPEC.md` (D1–D7). The signal half is already shipped (D1); this plan covers the
+missing `limits` forwarding, the model-boundary clamp, and the abort-semantics pinning.
 
 ## Overview
 
-Make `runRlm` (`src/rlm.ts`) the single RLM implementation and delete `rlm_loop.ts` (`RLMLoop`),
-folding in the capabilities only `RLMLoop` had: registry-built prompt, self-registered RLM tools with
-a name-collision guard, nesting with `maxDepth` downgrade, and `status:"error"`. The public import
-surface for `runRlm`/`LlmClient`/`RlmResult`/… is preserved; `RLMLoop` and its types are removed.
+Five tasks, strictly ordered. T1 adds the `limits` parameter to `ReplRunner` (foundation). T2 builds
+the clamp and exposes two clamped params on the `repl` tool (depends on T1). T3 and T4 pin the two
+abort behaviours the issue demands but the suite does not yet cover. T5 is the documentation/DoD
+reconciliation pass. Every task is RED-first; the full suite must be green after each.
 
-## Architecture decisions (see SPEC D48–D60)
+## Architecture Decisions
 
-- **D48** `runRlm` is canonical; `rlm_loop.ts` deleted (no deprecation shim).
-- **D49** RLM types (`LlmClient`, `RlmIteration`, `RlmOptions`, `RlmResult`) move from `types.ts`
-  into `rlm.ts`; the `types.ts → registry.js`/`budget.js` type-only inversion is removed; re-export
-  from `index.ts` unchanged.
-- **D51** `runRlm` **self-registers** its RLM tools (`llm_query` → `llmClient`, `rlm_query` → nested
-  `runRlm`/downgrade, `SUBMIT`) via `createRLMTools`, merges them into the sandbox registry, and
-  **throws** on a name collision with the caller's registry (port of `RLMLoop`'s constructor check).
-- **D50** the merged system prompt is **registry-built** (stubs + python-tool rules) and carries the
-  F-77 fresh-sandbox wording and the D17 sentinel rule **verbatim**, naming all three RLM tools.
-- **D52** nesting: `maxDepth?` (default 1) / `depth?` (default 0); at the limit `rlm_query` downgrades
-  to `llm_query`; otherwise it spawns a nested `runRlm`; the child **inherits the parent's context**.
-- **D53/D54** `status:"error"` + `error?: string` return an `llmClient` throw as a result; keep
-  `answerSource` verbatim (D41).
-- **D55** `getReplPreamble` → `src/preamble.ts` (same `repl/repl_server.py` path resolution).
-- **D56/D57/D59** delete `rlm_loop.ts` + its test, fold the unique cases into `rlm.test.ts`, update
-  the barrel and README; no further rename.
-- **D58** defaults pin behaviour: `maxIterations`→10 (M1), `scriptName`→`"rlm.py"` (M21).
+- **`ReplRunner` stays a faithful library** — it accepts `limits?: RunLimits | "unbounded"` and
+  forwards verbatim; it never clamps and never strips `"unbounded"` (D2). The clamp is the
+  extension's job because that is where untrusted model input enters.
+- **Clamp lives in the extension as a pure helper** (`clampModelLimits`) so it is unit-testable
+  without driving the whole tool `execute` path (D3, Assumption from SPEC).
+- **Abort semantics are pinned, not changed** — transcript rollback is already the behaviour; T3
+  documents and tests it rather than reworking `Session.run` (D4).
+- **`_signal` stays on the two synchronous tools** — renaming would trip `noUnusedParameters`;
+  the `_`-prefix is the correct idiom for a fixed-arity unused param (D5).
 
-## Task list
+## Task List
 
-### Phase 1 — Foundation (refactors, no behaviour change)
+### Phase 1 — Foundation
 
-- [ ] **T1 — Move RLM types into `rlm.ts` (D49).** Pure move + barrel re-export.
-- [ ] **T2 — Move `getReplPreamble` to `src/preamble.ts` (D55).** Pure move + barrel + coverage floor.
+- [ ] **T1 — Forward `limits` through `ReplRunner.run`/`resume` (D2)**
 
-**Checkpoint after T1–T2:** `npm test` + `npm run check` + `npm run build` green.
+### Checkpoint: Foundation
+- [ ] `npx tsx --test test/repl.test.ts` green; full suite green; `npm run check` + `npm run build` clean.
 
-### Phase 2 — Core convergence (behaviour)
+### Phase 2 — Model boundary
 
-- [ ] **T3 — `runRlm` self-registers RLM tools + collision guard + option validation (D51).**
-  The "flip": caller registry must no longer pre-register `llm_query`/`rlm_query`/`SUBMIT`.
-- [ ] **T4 — Nesting, `maxDepth` downgrade, parent-context inheritance (D52).**
-- [ ] **T5 — Registry-built prompt (D50).** Carries F-77 + D17 + tool naming; update template-coupled literals.
-- [ ] **T6 — `status:"error"` + `error?: string` (D53/D54).**
-- [ ] **T7 — Defaults: `maxIterations`→10, `scriptName`→`"rlm.py"` (D58).**
+- [ ] **T2 — Clamp helper + expose clamped `maxDurationSecs`/`maxMemory` on the `repl` tool (D3)**
 
-**Checkpoint after T3–T7:** all seven issue tests green; full suite green.
+### Checkpoint: Model boundary
+- [ ] `npx tsx --test test/extension.test.ts test/repl.test.ts` green; full suite green.
 
-### Phase 3 — Removal (deletion + docs)
+### Phase 3 — Abort behaviour
 
-- [ ] **T8 — Delete `rlm_loop.ts` + its test; fold stragglers; barrel + README + coverage (D56/D57/D59).**
+- [ ] **T3 — Session-state-after-abort: document + assert transcript rollback (D4)**
+- [ ] **T4 — End-to-end abort through the real extension path (D7 test 1)**
 
-**Checkpoint after T8:** `grep RLMLoop src/` empty; `npm test`/`check`/`build`/`lint` clean; coverage
-floors met.
+### Checkpoint: Abort behaviour
+- [ ] Both new abort tests present and green; full suite green.
 
-## Risks and mitigations
+### Phase 4 — Documentation / DoD
+
+- [ ] **T5 — Scope-boundary description + `_signal` reconciliation (D5, D6)**
+
+### Checkpoint: Complete
+- [ ] Four issue tests exist and pass; `npm test` + `npm run check` + `npm run build` + `npm run lint` clean.
+- [ ] Ready for VERIFY (test-engineer) and REVIEW (code-reviewer).
+
+## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
-|---|---|---|
-| **T3 flips the registry contract** — ~110 `runRlm` invocations pass `rlmRegistry()` (which pre-registers RLM tools) | High | Redefine the `rlmRegistry()` helper (empty/plain registry) in the SAME task; fix each fallout test so the suite is green before commit |
-| **T5 template-coupling** — prompt rewording breaks pinned literals (`256.0KB`, `# Question`, `# Input (…)`, sentinels, D27 sentences, F-77 wording) | High | Update every pinned literal in the same commit (inventory in SPEC D50); run `test/rlm.test.ts` focused first |
-| **T8 deletion** — removing a public type (`RlmMessage`, `RLMLoop*`) and a coverage floor | Med | Barrel + README updated in the same task; drop `src/rlm_loop.ts` from `coverage-baseline.json`; `coverage:update` for `preamble.ts` |
-| **`answerSource`/`status` regressions** across T3–T6 | Med | Property-style tests already pin every `answerSource`; add status-branch tests (SPEC D60) |
-| **Mutation baseline stale** (predates 0.0.21) | Low | Treat absolute scores as directional; concrete kills are M1/M21 (T7 tests) |
+|------|--------|------------|
+| Test 1 (abort e2e) reveals signal does **not** stop later host calls despite being plumbed | Med | T4 in-scope: coder fixes the small gap; spec D1 does not forbid a fix if a genuine defect is found |
+| Driving `execute` in-test is heavy (approval dialog, ctx) | Low | T2/T4 may split into helper-unit + param-through tests; the split is recorded in the task summary |
+| Clamp constants drift from `sandbox.ts` defaults | Low | Caps (300 s / 1024 MiB) are spec-fixed; coder reads the live defaults and only *confirms* them, never changes them |
+| Test 3 is a tautology (asserts its own stub) | Med | T1's test must capture the actual `RunOptions` object passed and assert on its fields, not on a value the test itself supplied |
 
-## Open questions
+## Open Questions
 
-None requiring human input — all resolved as recorded assumptions (SPEC "Assumptions" 1–7). The
-flagged follow-ups (RlmStep/RlmProgressEvent, question-as-input, residual repl/rlm naming) go to the
-issue-monitor final report.
+- None blocking — see SPEC "Open questions / risks" (resume-limits symmetry, clamp-test split,
+  side-effect non-assertion are all recorded there as decisions, not blockers).

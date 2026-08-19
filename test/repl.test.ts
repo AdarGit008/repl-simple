@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
-import type { ApprovalDecision } from "../src/types.js";
+import type { ApprovalDecision, RunLimits } from "../src/types.js";
 import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -2156,5 +2156,144 @@ describe("ReplRunner — resume revalidates after its trust check (#59)", () => 
       target.trustChangeDiscards = original.bind(runner);
       cleanup();
     }
+  });
+});
+
+// ── limits and signal reach RunOptions (D2, D7 test 3) ──────────
+//
+// M22 showed a dropped RunOptions field (`onApproval`) could survive the suite
+// because nothing captured the object `ReplRunner` actually handed to the
+// session. This pins the seam directly: a stub session records the RunOptions
+// it *receives* from `run`/`resume`, and the test asserts the three fields
+// that must make it through — `onApproval`, `signal`, and `limits`.
+
+describe("ReplRunner — limits and signal reach RunOptions (D7 test 3)", () => {
+  it("forwards { onApproval, signal, limits } to session.run and session.resume", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd);
+
+    const runOptions: unknown[] = [];
+    const resumeOptions: unknown[] = [];
+    const okResult = {
+      status: "ok",
+      output: "ok",
+      outputTruncated: false,
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    };
+
+    const stubSession = {
+      run: async (_code: string, opts: unknown) => {
+        runOptions.push(opts);
+        return okResult;
+      },
+      resume: async (opts: unknown) => {
+        resumeOptions.push(opts);
+        return okResult;
+      },
+      isSuspended: () => true,
+    };
+
+    // The same own-property seam the #59 creation counters use: `createSession`
+    // is an ordinary prototype member at runtime, so an instance override
+    // shadows it for `getOrCreateSession`'s `this.createSession(...)` call.
+    const target = runner as unknown as {
+      createSession: (...args: unknown[]) => Promise<unknown>;
+    };
+    const original = target.createSession.bind(runner);
+    target.createSession = async () => ({
+      session: stubSession,
+      trusted: false, // matches the default isProjectTrusted () => false
+      hasPreamble: false,
+      busy: 0,
+      trustChangeNoticed: false,
+      notice: undefined,
+    });
+
+    const onApproval = async (): Promise<ApprovalDecision> => true;
+    const controller = new AbortController();
+    const limits: RunLimits = { maxDurationSecs: 7 };
+    const signal = controller.signal;
+
+    try {
+      await runner.run("1 + 1", "limits", onApproval, signal, limits);
+      await runner.resume("limits", onApproval, signal, limits);
+
+      assert.equal(runOptions.length, 1);
+      assert.equal(resumeOptions.length, 1);
+
+      type Captured = { onApproval?: unknown; signal?: unknown; limits?: unknown };
+      const runOpts = runOptions[0] as Captured;
+      const resumeOpts = resumeOptions[0] as Captured;
+
+      assert.equal(runOpts.onApproval, onApproval, "run dropped onApproval");
+      assert.equal(runOpts.signal, signal, "run dropped signal");
+      assert.equal(runOpts.limits, limits, "run dropped limits");
+      assert.equal(resumeOpts.onApproval, onApproval, "resume dropped onApproval");
+      assert.equal(resumeOpts.signal, signal, "resume dropped signal");
+      assert.equal(resumeOpts.limits, limits, "resume dropped limits");
+    } finally {
+      target.createSession = original.bind(runner);
+      cleanup();
+    }
+  });
+});
+
+// ── Session state after abort (D4, D7 test 4) ───────────────────
+//
+// An aborted run drops its snippet from the transcript: the run is "as if it
+// never ran" for later snippets — its variable bindings are not visible to a
+// later repl call in the same session. Host-tool side effects that executed
+// before the abort persist (documented, not asserted here — see D4).
+//
+// The abort is forced mid-run, not before anything executes: the gated `write`
+// approval callback aborts the signal after the interpreter has already run
+// `x = 2`, so a test that passed merely because the code never ran would be a
+// tautology. The discriminating assertion is run 3 seeing the run-1 value,
+// not run-2's.
+
+describe("ReplRunner — session state after abort (D4)", () => {
+  let runner: ReplRunner;
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("an aborted run's bindings are invisible to a later run (transcript rollback)", async () => {
+    await runner.run("x = 1", "rollback");
+
+    const controller = new AbortController();
+    const prompts: string[] = [];
+    const out = await runner.run(
+      "x = 2\nwrite('rollback.txt', str(x))",
+      "rollback",
+      async (req) => {
+        prompts.push(req.tool);
+        controller.abort();
+        return true;
+      },
+      controller.signal,
+    );
+
+    assert.match(out, /\[error: aborted\]/);
+    assert.deepEqual(prompts, ["write"], "the abort must fire at the gated write call");
+
+    const after = await runner.run("x", "rollback");
+    assert.match(
+      after,
+      /\[result\]\n1/,
+      `the aborted run's x=2 leaked into the transcript: ${after}`,
+    );
+  });
+
+  it("a successful run's bindings persist to the next run (positive control)", async () => {
+    await runner.run("y = 7", "control");
+    const out = await runner.run("y", "control");
+    assert.match(out, /\[result\]\n7/);
   });
 });

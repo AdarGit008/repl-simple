@@ -11,7 +11,7 @@ import {
 } from "./toolstore.js";
 import type { RefusedTool, UnreadableTool, PreambleStatus } from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
-import type { ApprovalRequest, ApprovalDecision, RunResult } from "./types.js";
+import type { ApprovalRequest, ApprovalDecision, RunResult, RunLimits } from "./types.js";
 
 // ── Outcomes ───────────────────────────────────────────────────────
 //
@@ -171,17 +171,28 @@ export class ReplRunner {
    * `signal.aborted` only *between* tool calls and never cancels one that is
    * running, so a tool that ignores its signal is a tool the user cannot stop
    * (#49). The sandbox honours it and returns an `aborted` result.
+   *
+   * `limits` is forwarded verbatim to the sandbox (`RunLimits` or
+   * `"unbounded"`); omitted means the sandbox's fail-safe defaults apply via
+   * `limitsConfig()`. This runner never clamps — clamping is the model
+   * boundary's job (D2).
+   *
+   * An aborted run is dropped from the transcript — later runs do not see its
+   * variable bindings, as if it never ran. Host-tool side effects that
+   * executed before the abort (a file written, a `bash` command run) persist;
+   * they are not rolled back (D4).
    */
   async run(
     code: string,
     sessionId = "default",
     onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
     signal?: AbortSignal,
+    limits?: RunLimits | "unbounded",
   ): Promise<string> {
     const live = await this.getOrCreateSession(sessionId);
     live.busy++;
     try {
-      const result = await live.session.run(code, { onApproval, signal });
+      const result = await live.session.run(code, { onApproval, signal, limits });
       return withNotice(live, formatResult(result, sessionId));
     } finally {
       live.busy--;
@@ -197,6 +208,9 @@ export class ReplRunner {
    *
    * `signal` carries the same meaning as in `run`.
    *
+   * `limits` carries the same meaning as in `run`: forwarded verbatim to the
+   * sandbox, never clamped here (D2).
+   *
    * Never throws: the model decides when to call `repl_resume`, so every state
    * it can believe it is in — no such session, session with nothing pending —
    * gets a sentence back rather than an exception (#48).
@@ -205,6 +219,7 @@ export class ReplRunner {
     sessionId: string,
     onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
     signal?: AbortSignal,
+    limits?: RunLimits | "unbounded",
   ): Promise<string> {
     const live = this.sessions.get(sessionId);
     if (!live) {
@@ -232,7 +247,7 @@ export class ReplRunner {
     }
     live.busy++;
     try {
-      const result = await live.session.resume({ onApproval, signal });
+      const result = await live.session.resume({ onApproval, signal, limits });
       return withNotice(live, formatResult(result, sessionId));
     } finally {
       live.busy--;
