@@ -292,7 +292,9 @@ export default function (pi: ReplExtensionApi) {
         "Variables, imports, and function definitions persist across calls with the " +
         "same sessionId. File system, shell, and HTTP tools are available as Python " +
         "functions. If the session has a tool call waiting for approval, running new " +
-        "code discards it — call repl_resume first if you still want that call.",
+        "code discards it — call repl_resume first if you still want that call. " +
+        "Cancelling a repl call stops it between tool calls, but a pure-Python loop " +
+        "with no pause points runs until the duration limit (maxDurationSecs).",
       parameters: Type.Object({
         code: Type.String({ description: "Python code to execute." }),
         sessionId: Type.Optional(
@@ -372,6 +374,9 @@ export default function (pi: ReplExtensionApi) {
           Type.String({ description: "Session to reset. Default: 'default'." }),
         ),
       }),
+      // _signal stays underscored: reset is synchronous and non-abortable, so a signal
+      // is meaningless here, and noUnusedParameters makes the _-prefix the correct idiom
+      // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const sessionId = params.sessionId ?? "default";
         const { existed, revoked } = getRunner(ctx).reset(sessionId);
@@ -422,6 +427,9 @@ export default function (pi: ReplExtensionApi) {
           }),
         ),
       }),
+      // _signal stays underscored: abandon is synchronous and non-abortable, so a signal
+      // is meaningless here, and noUnusedParameters makes the _-prefix the correct idiom
+      // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const r = getRunner(ctx);
         const sessionId = params.sessionId ?? "default";

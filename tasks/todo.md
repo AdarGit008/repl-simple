@@ -39,7 +39,7 @@ full suite must be green. Signal plumbing is already done (D1) — do not redo i
   - Verify: `npx tsx --test test/extension.test.ts` green; full suite green.
   - Files: `test/extension.test.ts` (and `extensions/repl-extension.ts` only if a real gap is found).
 
-- [ ] **T5 — Scope-boundary description + `_signal` reconciliation (D5, D6)**
+- [x] **T5 — Scope-boundary description + `_signal` reconciliation (D5, D6)**
   - Implement: append the D6 sentence to the `repl` tool `description` (cancel stops between tool
     calls; a pause-less Python loop runs to the duration limit). Add a one-line comment on
     `repl_reset`/`repl_abandon` explaining why `_signal` stays (synchronous, non-abortable,
