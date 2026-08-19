@@ -1507,14 +1507,15 @@ describe("runRlm() — direct answers and the raw fall-through", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "42");
     assert.equal(result.iterations.length, 1);
-    // The prose was never executed — the iteration's code is the synthesised
+    // The prose was never executed — the iteration's code is the wrapped
     // SUBMIT, and the answer still exits through a RunOk with an ok SUBMIT
-    // trace, so provenance is unchanged for #76.
+    // trace, so its provenance is "submitted" (D46), not "synthesised".
     assert.equal(result.iterations[0].code, 'SUBMIT("42")');
     assert.equal(result.iterations[0].result.status, "ok");
     const submitCall = result.iterations[0].result.calls.find((c) => c.tool === "SUBMIT");
     assert.ok(submitCall);
     assert.equal(submitCall.ok, true);
+    assert.equal(result.answerSource, "submitted");
   });
 
   it("9.3.7 tells the model when a fence-less reply was treated as raw code", async () => {
@@ -3519,6 +3520,17 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     );
   }
 
+  /** Estimated-token cost of one recorded call (mirrors the loop's charge). */
+  function recordedCost(call: {
+    systemPrompt: string;
+    messages: Array<{ role: string; content: string }>;
+  }): number {
+    return (
+      estimateTokens(call.systemPrompt) +
+      call.messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    );
+  }
+
   /**
    * A client that returns `code` for every iteration query and throws on the
    * cap-time synthesis call (the `maxIterations + 1`th query) — used where a
@@ -3669,9 +3681,81 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(failed.status, "max_iterations");
     assert.equal(failed.answerSource, "salvaged");
 
-    // Every exit path must define a valid answerSource.
+    // Every exit path must define a valid answerSource — set membership, not
+    // merely "a string" (which would accept any junk value).
     for (const r of [submitted, budget, aborted, synthesised, failed]) {
-      assert.equal(typeof r.answerSource, "string");
+      assert.ok(["submitted", "salvaged", "synthesised"].includes(r.answerSource));
     }
+  });
+
+  it("6. an abort during the synthesis call falls back to salvage, not synthesised (Assumption 5)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const synthesisReply = "The final answer is 42.";
+    const controller = new AbortController();
+    let queryCount = 0;
+    const llm: LlmClient = {
+      async query() {
+        queryCount++;
+        // The 4th query is the cap-time synthesis (maxIterations = 3): abort
+        // the signal but still resolve — an aborted signal at the cap must
+        // fold into salvage, never mark the reply synthesised (Assumption 5).
+        if (queryCount === 4) {
+          controller.abort();
+          return synthesisReply;
+        }
+        return code;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      signal: controller.signal,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    // The synthesised reply must NOT be used — the abort folds into salvage.
+    assert.equal(result.answer, "still working...\n");
+  });
+
+  it("7. the cap-time synthesis is un-charged against the spend budget (D45)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const codes = [code, code, code];
+
+    // Probe the three iteration calls' costs once without a budget, then size
+    // the budget to exactly that sum. The iteration queries are affordable,
+    // but if the cap-time synthesis were charged on top it would exceed the
+    // budget — the synthesis is un-charged (D45), so the run reaches the cap.
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 3 });
+    const investigationCost = probe
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    const synthesisCost = recordedCost(probe.calls()[3]);
+    assert.ok(investigationCost > 0, "the investigation must be charged");
+    assert.ok(synthesisCost > 0, "the synthesis call has a positive cost");
+
+    const synthesisReply = "The final answer is 42.";
+    const { llm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: investigationCost,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, synthesisReply);
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+    // Only the three iteration calls were charged; the synthesis call ran
+    // (4th query) but was never charged, so consumed equals the investigation
+    // cost exactly and the budget never degraded the run.
+    assert.equal(result.budget?.consumed, investigationCost);
+    assert.equal(llm.calls().length, 4, "the synthesis call still ran");
   });
 });
