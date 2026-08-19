@@ -198,7 +198,7 @@ export const CANDIDATE_MODULES = [
 //
 // Both probes below describe the *interpreter*, which does not change while
 // the process lives, and both were re-running on every call: the module probe
-// once per `RLMLoop.run()`, the gap probe once per `runInSandbox()`. That is
+// once per `runRlm()`, the gap probe once per `runInSandbox()`. That is
 // #68, filed as ~97 ms of wasted work per call.
 //
 // On 0.0.18 it was also a memory bug, which is what made it urgent: a Monty
