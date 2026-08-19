@@ -22,7 +22,7 @@ full suite must be green. Signal plumbing is already done (D1) — do not redo i
   - Verify: `npx tsx --test test/extension.test.ts` green; full suite green; `npm run check`/`build` clean.
   - Files: `extensions/repl-extension.ts`, `test/extension.test.ts`.
 
-- [ ] **T3 — Session-state-after-abort: document + assert transcript rollback (D4)**
+- [x] **T3 — Session-state-after-abort: document + assert transcript rollback (D4)**
   - RED: test 4 — an aborted run's variable bindings are invisible to a later `repl` call in the
     same session (transcript dropped), while an `ok` run's bindings persist.
   - Implement: add the D4 semantics to `ReplRunner.run`'s JSDoc (transcript rolls back; host-tool

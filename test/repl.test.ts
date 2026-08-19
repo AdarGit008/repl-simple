@@ -2239,3 +2239,61 @@ describe("ReplRunner — limits and signal reach RunOptions (D7 test 3)", () => 
     }
   });
 });
+
+// ── Session state after abort (D4, D7 test 4) ───────────────────
+//
+// An aborted run drops its snippet from the transcript: the run is "as if it
+// never ran" for later snippets — its variable bindings are not visible to a
+// later repl call in the same session. Host-tool side effects that executed
+// before the abort persist (documented, not asserted here — see D4).
+//
+// The abort is forced mid-run, not before anything executes: the gated `write`
+// approval callback aborts the signal after the interpreter has already run
+// `x = 2`, so a test that passed merely because the code never ran would be a
+// tautology. The discriminating assertion is run 3 seeing the run-1 value,
+// not run-2's.
+
+describe("ReplRunner — session state after abort (D4)", () => {
+  let runner: ReplRunner;
+  let cwd: string;
+
+  before(() => {
+    cwd = makeTempDir();
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  it("an aborted run's bindings are invisible to a later run (transcript rollback)", async () => {
+    await runner.run("x = 1", "rollback");
+
+    const controller = new AbortController();
+    const prompts: string[] = [];
+    const out = await runner.run(
+      "x = 2\nwrite('rollback.txt', str(x))",
+      "rollback",
+      async (req) => {
+        prompts.push(req.tool);
+        controller.abort();
+        return true;
+      },
+      controller.signal,
+    );
+
+    assert.match(out, /\[error: aborted\]/);
+    assert.deepEqual(prompts, ["write"], "the abort must fire at the gated write call");
+
+    const after = await runner.run("x", "rollback");
+    assert.match(
+      after,
+      /\[result\]\n1/,
+      `the aborted run's x=2 leaked into the transcript: ${after}`,
+    );
+  });
+
+  it("a successful run's bindings persist to the next run (positive control)", async () => {
+    await runner.run("y = 7", "control");
+    const out = await runner.run("y", "control");
+    assert.match(out, /\[result\]\n7/);
+  });
+});

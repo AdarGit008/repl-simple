@@ -176,6 +176,11 @@ export class ReplRunner {
    * `"unbounded"`); omitted means the sandbox's fail-safe defaults apply via
    * `limitsConfig()`. This runner never clamps — clamping is the model
    * boundary's job (D2).
+   *
+   * An aborted run is dropped from the transcript — later runs do not see its
+   * variable bindings, as if it never ran. Host-tool side effects that
+   * executed before the abort (a file written, a `bash` command run) persist;
+   * they are not rolled back (D4).
    */
   async run(
     code: string,
