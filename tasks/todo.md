@@ -31,7 +31,7 @@ coder per task, fresh context, one commit per task. After each task the full sui
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green.
   - Files: `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T5 — Registry-built prompt (D50)**
+- [x] **T5 — Registry-built prompt (D50)**
   - RED: test that the merged prompt **names every registered tool** (content assertion, not length).
   - Implement: port `RLMLoop.buildSystemPrompt` — render `registry.renderTypeStubs()` + `renderPythonToolRules(probeImportableModules())`, name `llm_query`/`rlm_query`/`SUBMIT`, and carry **verbatim** the F-77 fresh-sandbox wording and the D17 sentinel rule (both already in `DEFAULT_RLM_SYSTEM_PROMPT`). Update every template-coupled pinned literal in `test/rlm.test.ts` in the same commit (inventory in SPEC D50).
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green.

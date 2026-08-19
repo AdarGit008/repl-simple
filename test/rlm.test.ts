@@ -630,6 +630,41 @@ describe("runRlm() — self-registered RLM tools", () => {
   });
 });
 
+// ── Registry-built prompt (D50) ─────────────────────────────────
+
+describe("runRlm() — registry-built prompt", () => {
+  it("names every registered tool in the system prompt (issue test 1)", async () => {
+    // The merged prompt must be built from the real registry, not the static
+    // DEFAULT_RLM_SYSTEM_PROMPT: every registered tool — the caller's custom
+    // tool AND the three self-registered RLM tools — must be named (content
+    // assertion, not length).
+    const tool: HostTool = {
+      name: "my_tool",
+      description: "a caller tool",
+      params: [],
+      returns: "str",
+      execute: async () => "hi",
+    };
+    const registry = new ToolRegistry([tool]);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.ok(systemPrompt.includes("my_tool"), `prompt does not name my_tool:\n${systemPrompt}`);
+    assert.ok(
+      systemPrompt.includes("llm_query"),
+      `prompt does not name llm_query:\n${systemPrompt}`,
+    );
+    assert.ok(
+      systemPrompt.includes("rlm_query"),
+      `prompt does not name rlm_query:\n${systemPrompt}`,
+    );
+    assert.ok(systemPrompt.includes("SUBMIT"), `prompt does not name SUBMIT:\n${systemPrompt}`);
+  });
+});
+
 // ── Nesting, maxDepth downgrade, parent-context inheritance (D52) ──
 
 describe("runRlm() — nested rlm_query", () => {
@@ -844,11 +879,13 @@ describe("runRlm() — abort", () => {
   it("passes the signal to llmClient.query and a client that honours it is cancelled (issue test 4)", async () => {
     const controller = new AbortController();
     let observedSignal: AbortSignal | undefined;
+    let queryStarted = false;
     let cancelled = false;
 
     const llm: LlmClient = {
       async query(_systemPrompt, _messages, signal?: AbortSignal) {
         observedSignal = signal;
+        queryStarted = true;
         return new Promise<string>((_resolve, reject) => {
           const onAbort = () => {
             cancelled = true;
@@ -866,8 +903,15 @@ describe("runRlm() — abort", () => {
       signal: controller.signal,
     });
 
-    // Let the query start before aborting.
-    await new Promise((resolve) => setImmediate(resolve));
+    // Let the query start before aborting. `runRlm` builds the system prompt
+    // from the live registry before its first query (D50), and that build is
+    // async, so a single macrotask tick no longer guarantees the client has
+    // been invoked — poll until it is (the build always completes).
+    const deadline = Date.now() + 2000;
+    while (!queryStarted) {
+      assert.ok(Date.now() < deadline, "the first query never started");
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     controller.abort();
 
     const result = await resultPromise;
