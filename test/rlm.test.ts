@@ -771,6 +771,42 @@ describe("runRlm() — nested rlm_query", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "final: llm result");
   });
+
+  it("surfaces the error when the nested loop does not return ok", async () => {
+    // Every other nesting test drives the child to a SUBMIT (status:"ok").
+    // This one forces the child's code-gen query to throw — a non-abort LLM
+    // failure — so the nested runRlm returns status:"error" and the parent's
+    // rlm_query tool takes the `[rlm_query error: …]` branch (D52), which
+    // would otherwise be uncovered. The mock distinguishes the two loops by
+    // the question in the initial prompt: the parent asks `outer task`, the
+    // child asks `SUB-INVESTIGATION`.
+    const nestedQuestion = "SUB-INVESTIGATION";
+
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        if (messages[0].content.includes(`# Question\n${nestedQuestion}`)) {
+          throw new Error("child llm failure");
+        }
+        return (
+          "```python\n" +
+          `result = rlm_query(${JSON.stringify(nestedQuestion)})\n` +
+          'SUBMIT("outer: " + result)\n' +
+          "```"
+        );
+      },
+    };
+
+    const result = await runRlm("outer task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    // The parent run still completes, and the child's error is surfaced
+    // verbatim through the rlm_query error branch.
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer: [rlm_query error: error] child llm failure");
+  });
 });
 
 // ── Abort semantics (#75) ───────────────────────────────────────
@@ -3861,7 +3897,11 @@ describe("runRlm() — defaults (D58)", () => {
     const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry() });
 
     assert.equal(result.status, "max_iterations");
-    assert.equal(result.iterations.length, 10, "omitting maxIterations must run exactly 10 iterations");
+    assert.equal(
+      result.iterations.length,
+      10,
+      "omitting maxIterations must run exactly 10 iterations",
+    );
   });
 
   it('defaults scriptName to "rlm.py" (kills M21)', async () => {
@@ -3869,10 +3909,7 @@ describe("runRlm() — defaults (D58)", () => {
     // from `scriptName`. With no `runOptions.scriptName` (and no preamble, so
     // lineOffset cannot mask it) the default `"rlm.py"` must be the file named
     // in the diagnostic, not the sandbox's own `<repl>` fallback.
-    const { llm } = mockLlmCodeGen([
-      "```python\n1 +\n```",
-      '```python\nSUBMIT("done")\n```',
-    ]);
+    const { llm } = mockLlmCodeGen(["```python\n1 +\n```", '```python\nSUBMIT("done")\n```']);
 
     const result = await runRlm("q", {
       llmClient: llm,

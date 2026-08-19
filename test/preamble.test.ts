@@ -19,7 +19,7 @@ describe("getReplPreamble", () => {
     const preamble = getReplPreamble();
     const llmClient: LlmClient = {
       async query() {
-        return '```python\nSUBMIT(str(context_length()))\n```';
+        return "```python\nSUBMIT(str(context_length()))\n```";
       },
     };
     const result = await runRlm("task", {
