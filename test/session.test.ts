@@ -819,10 +819,11 @@ describe("Session — a resumed run honours the suspended run's limits (#177)", 
     const session = new Session({ registry });
 
     // The operator tightened the ceiling to 256 MiB; the run is granted that
-    // clamped value and suspends on the gated call. Deleting the env var
-    // before resume is the point: the unfixed resume re-reads `limitsConfig()`
-    // and gets 512 MiB, so the 320 MiB allocation succeeds. The fixed resume
-    // re-applies the persisted 256 MiB and the allocation fails.
+    // clamped value and suspends on the gated call. Deleting the env var before
+    // resume proves the grant survives independent of `limitsConfig()`: Monty's
+    // snapshot restore preserves the granted memory ceiling across the
+    // suspend/resume boundary. This is an acceptance test of an invariant Monty
+    // already guarantees, not a discriminator of the `Session.resume` merge.
     process.env.REPL_MAX_MEMORY_MB = "256";
     suspended(
       await session.run('gated_limits("x")\nbig = bytes(320 * 1024 * 1024)', {
@@ -911,6 +912,39 @@ describe("Session — a resumed run honours the suspended host wall-clock budget
       onApproval: () => true,
       limits: { maxWallClockSecs: 2 },
     });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+  });
+
+  it("a nested re-suspension still honours the suspended host wall-clock budget (#177)", async () => {
+    const registry = new ToolRegistry([gated, blocker]);
+    const session = new Session({ registry });
+
+    // Two gates in a row: the first suspends on `run`; the first `resume`
+    // approves it and immediately re-suspends on the second. Only the second
+    // `resume` reaches the 5 s block, so the 2 s host wall-clock budget must
+    // survive the nested re-suspension — the re-suspend branch re-persists the
+    // merged limits (src/session.ts). If it stored the raw caller runOpts, the
+    // second resume would read the 300 s default and the block would finish
+    // "ok".
+    suspended(
+      await session.run('gated_wallclock("a")\ngated_wallclock("b")\nblock_5s()', {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 2 },
+      }),
+    );
+
+    // Approve gate A, but answer gate B with "suspend" so the run pauses again
+    // instead of proceeding straight to the block. The gate re-consults
+    // `onApproval` for every gated call, so a plain `() => true` would approve
+    // B too and skip the re-suspension.
+    suspended(
+      await session.resume({
+        onApproval: (req) => (req.args[0] === "b" ? "suspend" : true),
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
     err(result);
     assert.equal(result.errorKind, "timeout");
   });

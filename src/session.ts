@@ -467,7 +467,7 @@ export class Session {
       // Suspended again on a later gated call
       this.suspended = result;
       this.suspendedCode = suspendedCode;
-      this.suspendedRunOpts = runOpts;
+      this.suspendedRunOpts = { ...runOpts, limits: wrappedRunOpts.limits };
       return result;
     } else {
       // Error: don't add snippet
