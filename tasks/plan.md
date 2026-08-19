@@ -61,6 +61,16 @@ Rejected alternatives:
   (`src/session.ts:542`), so that assertion is GREEN before the fix — it proves storage, not
   re-application, and cannot be the RED test.
 
+**Post-build finding (correction).** The memory seam above does **not** discriminate the fix:
+verified in a scratch checkout with the one-line fix removed, both Session tests still pass — Monty's
+snapshot restore already preserves `maxMemory` (and `maxDurationSecs`, `gcInterval`,
+`maxRecursionDepth`) across resume (`node_modules/@pydantic/monty/dist/session.d.ts`: "The dump
+restores its own resource limits and type-check state"). The two Session tests are therefore
+**acceptance tests of an invariant Monty already guarantees**, not RED-for-the-fix tests. The fix's
+observable effect is limited to the host-side `maxWallClockSecs` knob (`hostDeadlineAt`,
+`src/sandbox.ts:771-773` / `:1308`), which the `repl`/`repl_resume` extension flow never sets — it
+is correctness hardening and the seam #84 will generalise.
+
 ## Task List
 
 ### Phase 1: the fix + its Session-level proof

@@ -434,6 +434,7 @@ export class Session {
     // a grant or by the user — never by "something like it ran once".
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
+      limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
       lineOffset: this.prefixLineCount(),
       onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };

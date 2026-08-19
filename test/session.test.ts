@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
@@ -748,6 +748,93 @@ result
     // Both tools were seen
     assert.deepEqual(seen, ["gated", "gated2"]);
     assert.equal(r2.output, "second: second");
+  });
+});
+
+// ── a resumed run honours the suspended run's limits (#177) ─────────
+//
+// `Session.run` persists the raw `RunOptions` granted to a `repl` call into
+// `suspendedRunOpts` (src/session.ts:366), so the clamped limits the caller
+// was given survive the suspension. `Session.resume` re-affirms them via the
+// one merge field `limits: runOpts?.limits ?? this.suspendedRunOpts?.limits`
+// (D1, D4).
+
+describe("Session — a resumed run honours the suspended run's limits (#177)", () => {
+  // The invariant is preserved by Monty's snapshot restore at the sandbox layer and
+  // re-affirmed by `Session.resume` forwarding `suspendedRunOpts.limits`; the tests guard
+  // the acceptance invariant, the one-line fix being library-layer hardening (maxWallClockSecs + #84 seam).
+  const MIB = 1_048_576;
+
+  const gatedTool: HostTool = {
+    name: "gated_limits",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  // Hermetic default-ceiling tests (D6): an ambient REPL_* var in the outer
+  // `npm test` process must not turn the 512 MiB default into a different
+  // figure. Snapshot and clear both vars for the block, restore after.
+  let priorDuration: string | undefined;
+  let priorMemory: string | undefined;
+
+  before(() => {
+    priorDuration = process.env.REPL_MAX_DURATION_SECS;
+    priorMemory = process.env.REPL_MAX_MEMORY_MB;
+    delete process.env.REPL_MAX_DURATION_SECS;
+    delete process.env.REPL_MAX_MEMORY_MB;
+  });
+
+  after(() => {
+    if (priorDuration === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+    else process.env.REPL_MAX_DURATION_SECS = priorDuration;
+    if (priorMemory === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+    else process.env.REPL_MAX_MEMORY_MB = priorMemory;
+  });
+
+  it("resumed run honours the suspended below-default maxMemory ceiling", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    // The gated call suspends before the 128 MiB allocation runs. Resuming
+    // with no limits must still enforce the 32 MiB ceiling the original call
+    // was granted — not the 512 MiB `limitsConfig()` default. (`bytes`, not
+    // `bytearray`: the latter is not a builtin in this sandbox.)
+    suspended(
+      await session.run('gated_limits("x")\nbig = bytes(128 * 1024 * 1024)', {
+        onApproval: () => "suspend",
+        limits: { maxMemory: 32 * MIB },
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "memory");
+  });
+
+  it("a tightened REPL_MAX_MEMORY_MB survives into resume (D5/D6)", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    // The operator tightened the ceiling to 256 MiB; the run is granted that
+    // clamped value and suspends on the gated call. Deleting the env var
+    // before resume is the point: the unfixed resume re-reads `limitsConfig()`
+    // and gets 512 MiB, so the 320 MiB allocation succeeds. The fixed resume
+    // re-applies the persisted 256 MiB and the allocation fails.
+    process.env.REPL_MAX_MEMORY_MB = "256";
+    suspended(
+      await session.run('gated_limits("x")\nbig = bytes(320 * 1024 * 1024)', {
+        onApproval: () => "suspend",
+        limits: { maxMemory: 256 * MIB },
+      }),
+    );
+    delete process.env.REPL_MAX_MEMORY_MB;
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "memory");
   });
 });
 

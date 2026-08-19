@@ -24,6 +24,25 @@ Issue: https://github.com/AdarGit008/repl-simple/issues/177.
 Parent bucket: #31 (Bucket 3 — Resource containment). Siblings: #176 (just merged — the derived
 ceilings), #178 (same test file), #84 (owns the *broader* `suspendedRunOpts` merge — see D3).
 
+## Corrected understanding (post-build finding)
+
+**The original premise was refuted by experiment.** The claim that `repl_resume` "falls back to
+30 s / 512 MiB defaults" is **false**: Monty's snapshot restore already preserves every
+Monty-enforced knob across the suspend/resume boundary. Per
+`node_modules/@pydantic/monty/dist/session.d.ts` (`loadSession` / `loadSnapshot`): "The dump
+restores its own resource limits and type-check state." So `maxDurationSecs`, `maxMemory`,
+`gcInterval`, and `maxRecursionDepth` survive a resume regardless of what `Session.resume` passes —
+a resumed run does **not** fall back to `limitsConfig()` defaults.
+
+The one-line fix (`limits: runOpts?.limits ?? this.suspendedRunOpts?.limits`) is therefore
+**correctness hardening, not a bug fix**: its observable effect is limited to the host-side
+`maxWallClockSecs` knob (consumed by `hostDeadlineAt` at `src/sandbox.ts:771-773` / `:1308`) and
+the `"unbounded"` sentinel consistency — neither of which the `repl`/`repl_resume` extension flow
+ever sets, so the extension cannot observe the fix. It is retained as the seam #84 will generalise.
+
+The DoD and the `Session.resume` merge are **unchanged**. The two Session tests are acceptance
+tests of an invariant Monty already guarantees, not RED-for-the-fix discriminators.
+
 ## Current state (fact base — verified by scout, 2026-08-19)
 
 | Fact | Value |

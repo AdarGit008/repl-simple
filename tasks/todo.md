@@ -5,8 +5,8 @@ fresh context, one commit per task. After each task the full suite must be green
 `src/sandbox.ts`, `src/repl.ts`, or `extensions/repl-extension.ts`. Only `src/session.ts`,
 `test/session.test.ts`, and `test/extension.test.ts` are in scope.
 
-- [ ] **T1 — `Session.resume` re-applies `suspendedRunOpts.limits` (D1, D4)**
-  - RED — add a new `describe("Session — resume re-applies the suspended run's limits (#177)")` block
+- [x] **T1 — `Session.resume` re-applies `suspendedRunOpts.limits` (D1, D4)**
+  - [x] RED — add a new `describe("Session — resume re-applies the suspended run's limits (#177)")` block
     to `test/session.test.ts` (after the `approval & suspension` describe, reusing the `err`/`suspended`
     helpers at `:15`/`:19`). It needs a gated tool, a `before`/`after` that snapshot+clear
     `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` (mirror `test/extension.test.ts:207-231`), and two
@@ -20,16 +20,17 @@ fresh context, one commit per task. After each task the full suite must be green
        **delete `REPL_MAX_MEMORY_MB` before resuming** (this is what makes it RED: the unfixed resume
        re-reads `limitsConfig()` and gets the 512 MiB default, so 320 MiB succeeds); `resume({ onApproval:
        () => true })`; assert `err(result)` and `result.errorKind === "memory"`. Today RED.
-  - Implement — one line in `src/session.ts` `Session.resume`, in the `wrappedRunOpts` literal
+  - [x] Implement — one line in `src/session.ts` `Session.resume`, in the `wrappedRunOpts` literal
     (`:435-439`), after `...runOpts,`:
     ```ts
       limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
     ```
     Nothing else. Do not recover `onApproval`/`signal` from the suspension (D1/D2); do not add
     `mount`/`inputs`/`scriptName`/`maxStdoutBytes` (D3).
-  - Verify — `npx tsx --test test/session.test.ts` green; full `npm test` green;
+  - [x] Verify — `npx tsx --test test/session.test.ts` green; full `npm test` green;
     `npm run check` + `npm run build` + `npm run lint` clean.
   - Files — `src/session.ts`, `test/session.test.ts`.
+  - Post-build finding: Monty's snapshot restore already preserves maxDurationSecs/maxMemory across resume; the fix is library-layer hardening (maxWallClockSecs + #84 seam). Tests are acceptance tests of the invariant, not RED-for-the-fix.
 
 - [ ] **T2 — Pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume` (D2)**
   - RED — this is a **characterization pin**, not a bug fix: the code already forwards the signal
