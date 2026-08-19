@@ -1,6 +1,7 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ReplRunner } from "../src/repl.js";
+import { limitsConfig } from "../src/sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
 
 /**
@@ -78,10 +79,12 @@ function approvalTimeoutMs(): number | undefined {
 // The extension is the model boundary: it is where untrusted model input
 // enters, so a model-supplied limit is clamped, never trusted. `ReplRunner`
 // stays a faithful library and forwards whatever it is given (D2) — the clamp
-// lives here, as a pure helper so it is unit-testable without driving the
-// sandbox. Caps are spec-fixed: `300` s is the host wall-clock default (the
-// model can never out-run the host-side fail-safe) and `1024` MiB is 2× the
-// memory default.
+// lives here, as a small helper so it is unit-testable without driving the
+// sandbox. Each ceiling is `min(specCap, limitsConfig() effective value)`:
+// `MAX_MODEL_DURATION_SECS` / `MAX_MODEL_MEMORY_MIB` are the absolute upper
+// bound, while `limitsConfig()` supplies the operator's `REPL_*` env knob or
+// the sandbox default — so the operator's knob is a true ceiling the model
+// cannot out-ask, not a default it can override.
 
 /** Ceiling on a model-supplied `maxDurationSecs`. */
 const MAX_MODEL_DURATION_SECS = 300;
@@ -106,18 +109,30 @@ function clampCeiling(value: unknown, cap: number): number | undefined {
 /**
  * Build the `RunLimits` for a `repl` call from the two model-exposed knobs.
  *
- * `maxDurationSecs` is clamped to {@link MAX_MODEL_DURATION_SECS}; `maxMemory`
- * is in MiB here, clamped to {@link MAX_MODEL_MEMORY_MIB} and converted to
- * bytes. Both are omitted when not a positive finite number. The result is
- * always an object, never `"unbounded"` — that escape hatch is the library's,
- * not the model's (D2/D3).
+ * `maxDurationSecs` and `maxMemory` are clamped to ceilings derived from
+ * `limitsConfig()` (each `min(specCap, operator value)`), so the operator's
+ * `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` env vars are honoured, not
+ * overridden by a model-supplied value. `maxMemory` is in MiB here, clamped
+ * and converted to bytes. Both are omitted when not a positive finite number.
+ * The result is always an object, never `"unbounded"` — that escape hatch is
+ * the library's, not the model's (see SPEC.md D1–D2).
+ *
+ * Reads `process.env` via `limitsConfig()` at call time, so it is no longer a
+ * strictly pure function.
  */
 export function clampModelLimits(maxDurationSecs?: unknown, maxMemoryMiB?: unknown): RunLimits {
+  const cfg = limitsConfig();
+  const durationCap = Math.min(MAX_MODEL_DURATION_SECS, cfg.maxDurationSecs);
+  const memoryCapMiB = Math.min(MAX_MODEL_MEMORY_MIB, cfg.maxMemory / BYTES_PER_MIB);
+
   const limits: RunLimits = {};
-  const duration = clampCeiling(maxDurationSecs, MAX_MODEL_DURATION_SECS);
+  const duration = clampCeiling(maxDurationSecs, durationCap);
   if (duration !== undefined) limits.maxDurationSecs = duration;
-  const memoryMiB = clampCeiling(maxMemoryMiB, MAX_MODEL_MEMORY_MIB);
-  if (memoryMiB !== undefined) limits.maxMemory = memoryMiB * BYTES_PER_MIB;
+  const memoryMiB = clampCeiling(maxMemoryMiB, memoryCapMiB);
+  if (memoryMiB !== undefined) {
+    const bytes = Math.floor(memoryMiB * BYTES_PER_MIB);
+    if (bytes > 0) limits.maxMemory = bytes;
+  }
   return limits;
 }
 
@@ -306,14 +321,16 @@ export default function (pi: ReplExtensionApi) {
         maxDurationSecs: Type.Optional(
           Type.Number({
             description:
-              "Maximum interpreter compute time in seconds, capped at 300. " +
+              "Maximum interpreter compute time in seconds, capped at 300, or lower if the " +
+              "operator sets REPL_MAX_DURATION_SECS (default 30). " +
               "Omitted uses the sandbox default (30).",
           }),
         ),
         maxMemory: Type.Optional(
           Type.Number({
             description:
-              "Maximum sandbox heap in MiB, capped at 1024. " +
+              "Maximum sandbox heap in MiB, capped at 1024, or lower if the operator sets " +
+              "REPL_MAX_MEMORY_MB (default 512 MiB). " +
               "Omitted uses the sandbox default (512 MiB).",
           }),
         ),
