@@ -330,6 +330,8 @@ export interface RlmResult {
   status: "ok" | "max_iterations" | "budget_exhausted" | "aborted";
   /** The answer string (from SUBMIT, or best-effort extraction). */
   answer: string;
+  /** Where `answer` came from. Present on every returned answer (#76). */
+  answerSource: "submitted" | "salvaged" | "synthesised";
   /** All iterations executed. */
   iterations: RlmIteration[];
   /** Spend-budget report — present only when a budget was configured. */

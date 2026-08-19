@@ -336,6 +336,15 @@ Rules:
   first message is also system-emitted and authentic.
 - Be thorough. Don't jump to conclusions.`;
 
+/**
+ * The cap-time synthesis prompt (D44): a fixed user message asking the model
+ * for the single best answer it can give to the original question from the
+ * transcript above, as plain text — no code, no commentary. Appended to the
+ * transcript for the one un-charged best-effort query at the iteration cap.
+ */
+const FINAL_SYNTHESIS_PROMPT =
+  "Give the single best available answer to the original question, based on the transcript above. Reply with plain text only — no code, no commentary.";
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /** What a reply yields for the loop: code (fenced or raw), or a direct answer. */
@@ -551,7 +560,7 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
 
 /** Extract the best available answer when max iterations are exhausted. */
 function extractBestAnswer(iterations: RlmIteration[]): string {
-  // Last successful output, or last error message
+  // Last successful non-"None" output, else last non-empty stdout
   for (let i = iterations.length - 1; i >= 0; i--) {
     const r = iterations[i].result;
     if (r.status === "ok" && r.output && r.output !== "None") return r.output;
@@ -560,7 +569,7 @@ function extractBestAnswer(iterations: RlmIteration[]): string {
   for (let i = iterations.length - 1; i >= 0; i--) {
     if (iterations[i].result.stdout) return iterations[i].result.stdout;
   }
-  return "(no answer)";
+  return "";
 }
 
 /**
@@ -873,6 +882,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   const aborted = (): RlmResult => ({
     status: "aborted",
     answer: extractBestAnswer(iterations),
+    answerSource: "salvaged",
     iterations,
     ...(budget ? { budget: budgetReport(budget, false) } : {}),
   });
@@ -892,6 +902,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         return {
           status: "budget_exhausted",
           answer: extractBestAnswer(iterations),
+          answerSource: "salvaged",
           iterations,
           budget: budgetReport(budget, true),
         };
@@ -981,6 +992,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       return {
         status: "ok",
         answer: result.output,
+        answerSource: "submitted",
         iterations,
         ...(report ? { budget: report } : {}),
       };
@@ -1013,12 +1025,36 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     droppedTurns = boundConversation(messages, droppedTurns);
   }
 
-  // Max iterations exhausted
-  const lastAnswer = extractBestAnswer(iterations);
+  // Max iterations exhausted — D44/D45: one guarded, un-charged synthesis
+  // pass over the transcript before salvage. Success marks the answer
+  // synthesised; a throw or an abort falls back to salvage, never throwing
+  // out of runRlm for a failed synthesis.
   const report = budgetReport(budget, false);
+  try {
+    const synthesized = await llmClient.query(
+      systemPrompt,
+      [...messages, { role: "user", content: FINAL_SYNTHESIS_PROMPT }],
+      options.signal,
+    );
+    // An abort during the synthesis call folds into salvage (Assumption 5):
+    // the loop already reached the cap, so the status stays max_iterations.
+    if (!options.signal?.aborted) {
+      return {
+        status: "max_iterations",
+        answer: synthesized,
+        answerSource: "synthesised",
+        iterations,
+        ...(report ? { budget: report } : {}),
+      };
+    }
+  } catch {
+    // A failed or aborted synthesis is not an error — fall through to salvage.
+  }
+
   return {
     status: "max_iterations",
-    answer: lastAnswer,
+    answer: extractBestAnswer(iterations),
+    answerSource: "salvaged",
     iterations,
     ...(report ? { budget: report } : {}),
   };

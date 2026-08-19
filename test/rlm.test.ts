@@ -454,7 +454,8 @@ describe("runRlm()", () => {
 
   it("5.3.5 max iterations reached (no SUBMIT)", async () => {
     const exploitCode = "```python\nprint('still working...')\n```";
-    const { llm } = mockLlmCodeGen([exploitCode, exploitCode, exploitCode]);
+    // The cap now runs a synthesis pass, so the 4th reply is its answer.
+    const { llm } = mockLlmCodeGen([exploitCode, exploitCode, exploitCode, "42"]);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -1506,14 +1507,15 @@ describe("runRlm() — direct answers and the raw fall-through", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "42");
     assert.equal(result.iterations.length, 1);
-    // The prose was never executed — the iteration's code is the synthesised
+    // The prose was never executed — the iteration's code is the wrapped
     // SUBMIT, and the answer still exits through a RunOk with an ok SUBMIT
-    // trace, so provenance is unchanged for #76.
+    // trace, so its provenance is "submitted" (D46), not "synthesised".
     assert.equal(result.iterations[0].code, 'SUBMIT("42")');
     assert.equal(result.iterations[0].result.status, "ok");
     const submitCall = result.iterations[0].result.calls.find((c) => c.tool === "SUBMIT");
     assert.ok(submitCall);
     assert.equal(submitCall.ok, true);
+    assert.equal(result.answerSource, "submitted");
   });
 
   it("9.3.7 tells the model when a fence-less reply was treated as raw code", async () => {
@@ -2251,7 +2253,10 @@ describe("runRlm() — conversation bound", () => {
 
     await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
 
-    const last = llm.calls()[llm.calls().length - 1];
+    // The cap now appends a synthesis query after the loop; the conversation
+    // structure the loop produced is the final *iteration* query, one before
+    // the synthesis call.
+    const last = llm.calls()[llm.calls().length - 2];
     // The initial message is followed by the drop marker (user role, D3).
     assert.equal(last.messages[0].role, "user");
     assert.equal(last.messages[1].role, "user");
@@ -3434,7 +3439,8 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.status, "budget_exhausted");
     assert.equal(result.budget?.limited, true);
     assert.deepEqual(result.iterations, []);
-    assert.equal(result.answer, "(no answer)");
+    assert.equal(result.answer, "");
+    assert.equal(result.answerSource, "salvaged");
     assert.equal(llm.calls().length, 0, "the LLM must never be called");
   });
 
@@ -3500,5 +3506,256 @@ describe("runRlm() — spend budget", () => {
         /SpendBudget limit must be a finite, non-negative number/,
       );
     }
+  });
+});
+
+describe("runRlm() — answer provenance (issue #76)", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  /** Estimated-token cost of one recorded call (mirrors the loop's charge). */
+  function recordedCost(call: {
+    systemPrompt: string;
+    messages: Array<{ role: string; content: string }>;
+  }): number {
+    return (
+      estimateTokens(call.systemPrompt) +
+      call.messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    );
+  }
+
+  /**
+   * A client that returns `code` for every iteration query and throws on the
+   * cap-time synthesis call (the `maxIterations + 1`th query) — used where a
+   * test pins the salvage fallback rather than a successful synthesis.
+   */
+  function mockSalvageOnCap(code: string, maxIterations: number): LlmClient {
+    let queryCount = 0;
+    return {
+      async query() {
+        queryCount++;
+        if (queryCount === maxIterations + 1) throw new Error("synthesis unavailable");
+        return code;
+      },
+    };
+  }
+
+  it("1. a cap hit with only a debug print is salvaged, not submitted (issue test 1)", async () => {
+    const debug = "```python\nprint('still working...')\n```";
+    // Synthesis fails at the cap, so the debug print's stdout is salvaged.
+    const llm = mockSalvageOnCap(debug, 3);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    // The debug print's stdout is the best-effort salvage, never a SUBMIT.
+    assert.equal(result.answer, "still working...\n");
+  });
+
+  it("2. submitting the literal '(no answer)' is distinguishable from a failed run (issue test 2)", async () => {
+    const { llm: submitLlm } = mockLlmCodeGen(['```python\nSUBMIT("(no answer)")\n```']);
+    const submitted = await runRlm("q", {
+      llmClient: submitLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(submitted.status, "ok");
+    assert.equal(submitted.answerSource, "submitted");
+    assert.equal(submitted.answer, "(no answer)");
+
+    // The cap with nothing salvageable: no successful output, no stdout, and
+    // synthesis fails at the cap, so the salvage is empty.
+    const emptyLlm = mockSalvageOnCap("```python\nx = 1\n```", 1);
+    const empty = await runRlm("q", {
+      llmClient: emptyLlm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(empty.status, "max_iterations");
+    assert.equal(empty.answerSource, "salvaged");
+    assert.equal(empty.answer, "");
+  });
+
+  it("3. a synthesis pass runs at the cap and its reply is marked synthesised (issue test 3)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const synthesisReply = "The final answer is 42.";
+    const { llm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, synthesisReply);
+    assert.equal(result.iterations.length, 3);
+  });
+
+  it("4. a failing synthesis call falls back to salvage rather than throwing (issue test 4)", async () => {
+    const llm = mockSalvageOnCap("```python\nx = 1\n```", 3);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.answer, "");
+    assert.equal(result.iterations.length, 3);
+  });
+
+  it("5. every exit path carries the correct answerSource (issue test 5)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+
+    // (a) SUBMIT → submitted
+    const { llm: submitLlm } = mockLlmCodeGen(['```python\nSUBMIT("42")\n```']);
+    const submitted = await runRlm("q", {
+      llmClient: submitLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+    assert.equal(submitted.status, "ok");
+    assert.equal(submitted.answerSource, "submitted");
+
+    // (b) budget_exhausted → salvaged
+    const { llm: budgetLlm } = mockLlmCodeGen(['```python\nSUBMIT("42")\n```']);
+    const budget = await runRlm("q", {
+      llmClient: budgetLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 0,
+    });
+    assert.equal(budget.status, "budget_exhausted");
+    assert.equal(budget.answerSource, "salvaged");
+
+    // (c) aborted → salvaged
+    const controller = new AbortController();
+    controller.abort();
+    const { llm: abortLlm } = mockLlmCodeGen(['```python\nSUBMIT("42")\n```']);
+    const aborted = await runRlm("q", {
+      llmClient: abortLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+    });
+    assert.equal(aborted.status, "aborted");
+    assert.equal(aborted.answerSource, "salvaged");
+
+    // (d) max_iterations with synthesis success → synthesised
+    const synthesisReply = "The final answer is 42.";
+    const { llm: synthLlm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+    const synthesised = await runRlm("q", {
+      llmClient: synthLlm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+    assert.equal(synthesised.status, "max_iterations");
+    assert.equal(synthesised.answerSource, "synthesised");
+    assert.equal(synthesised.answer, synthesisReply);
+
+    // (e) max_iterations with synthesis failure → salvaged
+    const failLlm = mockSalvageOnCap("```python\nx = 1\n```", 3);
+    const failed = await runRlm("q", {
+      llmClient: failLlm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+    assert.equal(failed.status, "max_iterations");
+    assert.equal(failed.answerSource, "salvaged");
+
+    // Every exit path must define a valid answerSource — set membership, not
+    // merely "a string" (which would accept any junk value).
+    for (const r of [submitted, budget, aborted, synthesised, failed]) {
+      assert.ok(["submitted", "salvaged", "synthesised"].includes(r.answerSource));
+    }
+  });
+
+  it("6. an abort during the synthesis call falls back to salvage, not synthesised (Assumption 5)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const synthesisReply = "The final answer is 42.";
+    const controller = new AbortController();
+    let queryCount = 0;
+    const llm: LlmClient = {
+      async query() {
+        queryCount++;
+        // The 4th query is the cap-time synthesis (maxIterations = 3): abort
+        // the signal but still resolve — an aborted signal at the cap must
+        // fold into salvage, never mark the reply synthesised (Assumption 5).
+        if (queryCount === 4) {
+          controller.abort();
+          return synthesisReply;
+        }
+        return code;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      signal: controller.signal,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    // The synthesised reply must NOT be used — the abort folds into salvage.
+    assert.equal(result.answer, "still working...\n");
+  });
+
+  it("7. the cap-time synthesis is un-charged against the spend budget (D45)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const codes = [code, code, code];
+
+    // Probe the three iteration calls' costs once without a budget, then size
+    // the budget to exactly that sum. The iteration queries are affordable,
+    // but if the cap-time synthesis were charged on top it would exceed the
+    // budget — the synthesis is un-charged (D45), so the run reaches the cap.
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 3 });
+    const investigationCost = probe
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    const synthesisCost = recordedCost(probe.calls()[3]);
+    assert.ok(investigationCost > 0, "the investigation must be charged");
+    assert.ok(synthesisCost > 0, "the synthesis call has a positive cost");
+
+    const synthesisReply = "The final answer is 42.";
+    const { llm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: investigationCost,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, synthesisReply);
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+    // Only the three iteration calls were charged; the synthesis call ran
+    // (4th query) but was never charged, so consumed equals the investigation
+    // cost exactly and the budget never degraded the run.
+    assert.equal(result.budget?.consumed, investigationCost);
+    assert.equal(llm.calls().length, 4, "the synthesis call still ran");
   });
 });
