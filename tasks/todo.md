@@ -4,7 +4,7 @@ Source of truth: `SPEC.md` (D1–D7) + `tasks/plan.md`. Each task is RED-first (
 test before the code). One coder per task, fresh context, one commit per task. After each task the
 full suite must be green. Signal plumbing is already done (D1) — do not redo it.
 
-- [ ] **T1 — Forward `limits` through `ReplRunner.run`/`resume` (D2)**
+- [x] **T1 — Forward `limits` through `ReplRunner.run`/`resume` (D2)**
   - RED: `ReplRunner`-layer test with a stub `Session` asserting `session.run`/`session.resume`
     receive `{ onApproval, signal, limits }` — must fail today because `limits` is dropped (D7 test 3).
   - Implement: append `limits?: RunLimits | "unbounded"` as the last param of `run` and `resume`;

@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
-import type { ApprovalDecision } from "../src/types.js";
+import type { ApprovalDecision, RunLimits } from "../src/types.js";
 import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -2154,6 +2154,87 @@ describe("ReplRunner — resume revalidates after its trust check (#59)", () => 
       assert.equal(runner.liveSessionCount(), 1, "the eviction did not stick");
     } finally {
       target.trustChangeDiscards = original.bind(runner);
+      cleanup();
+    }
+  });
+});
+
+// ── limits and signal reach RunOptions (D2, D7 test 3) ──────────
+//
+// M22 showed a dropped RunOptions field (`onApproval`) could survive the suite
+// because nothing captured the object `ReplRunner` actually handed to the
+// session. This pins the seam directly: a stub session records the RunOptions
+// it *receives* from `run`/`resume`, and the test asserts the three fields
+// that must make it through — `onApproval`, `signal`, and `limits`.
+
+describe("ReplRunner — limits and signal reach RunOptions (D7 test 3)", () => {
+  it("forwards { onApproval, signal, limits } to session.run and session.resume", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd);
+
+    const runOptions: unknown[] = [];
+    const resumeOptions: unknown[] = [];
+    const okResult = {
+      status: "ok",
+      output: "ok",
+      outputTruncated: false,
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    };
+
+    const stubSession = {
+      run: async (_code: string, opts: unknown) => {
+        runOptions.push(opts);
+        return okResult;
+      },
+      resume: async (opts: unknown) => {
+        resumeOptions.push(opts);
+        return okResult;
+      },
+      isSuspended: () => true,
+    };
+
+    // The same own-property seam the #59 creation counters use: `createSession`
+    // is an ordinary prototype member at runtime, so an instance override
+    // shadows it for `getOrCreateSession`'s `this.createSession(...)` call.
+    const target = runner as unknown as {
+      createSession: (...args: unknown[]) => Promise<unknown>;
+    };
+    const original = target.createSession.bind(runner);
+    target.createSession = async () => ({
+      session: stubSession,
+      trusted: false, // matches the default isProjectTrusted () => false
+      hasPreamble: false,
+      busy: 0,
+      trustChangeNoticed: false,
+      notice: undefined,
+    });
+
+    const onApproval = async (): Promise<ApprovalDecision> => true;
+    const controller = new AbortController();
+    const limits: RunLimits = { maxDurationSecs: 7 };
+    const signal = controller.signal;
+
+    try {
+      await runner.run("1 + 1", "limits", onApproval, signal, limits);
+      await runner.resume("limits", onApproval, signal, limits);
+
+      assert.equal(runOptions.length, 1);
+      assert.equal(resumeOptions.length, 1);
+
+      type Captured = { onApproval?: unknown; signal?: unknown; limits?: unknown };
+      const runOpts = runOptions[0] as Captured;
+      const resumeOpts = resumeOptions[0] as Captured;
+
+      assert.equal(runOpts.onApproval, onApproval, "run dropped onApproval");
+      assert.equal(runOpts.signal, signal, "run dropped signal");
+      assert.equal(runOpts.limits, limits, "run dropped limits");
+      assert.equal(resumeOpts.onApproval, onApproval, "resume dropped onApproval");
+      assert.equal(resumeOpts.signal, signal, "resume dropped signal");
+      assert.equal(resumeOpts.limits, limits, "resume dropped limits");
+    } finally {
+      target.createSession = original.bind(runner);
       cleanup();
     }
   });
