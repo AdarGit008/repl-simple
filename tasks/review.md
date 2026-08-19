@@ -1,17 +1,17 @@
-# Review — issue #76: RLM answer provenance
+# Review — issue #78: Converge on runRlm and delete rlm_loop.ts
 
-code-reviewer persona (fresh context). Source of truth: `SPEC.md` D41–D47 + Assumptions, `tasks/plan.md`.
-Diff reviewed: `git diff 422174f..HEAD` (commits 73654de, a26e675, 3e8c1a1, 3e305fd).
+code-reviewer persona (fresh context). Source of truth: `SPEC.md` D48–D60, `tasks/plan.md`.
+Diff reviewed: `git diff 920ff62..HEAD` (11 commits, T1–T8 + VERIFY + REVIEW).
 
 ## Verdict
 
-**Approve** — no Critical or Required findings; no merge blocker.
+**Approve** — no Critical issues; one Important hardening gap (fixed in commit `ce7e8e9`), plus
+Suggestions.
 
 ## Overview
 
-Adds `RlmResult.answerSource`, removes the `"(no answer)"` magic string, and introduces a guarded,
-un-charged synthesis pass at the iteration cap. All five issue tests + two VERIFY-gap tests present,
-behavioral, and green. Implementation matches SPEC D41–D47 exactly; no scope creep into #78.
+The convergence is clean and to spec: every decision D48–D60 is implemented and test-pinned, the
+type-layering inversion is removed, and the public surface is preserved.
 
 ## Critical Issues
 
@@ -19,34 +19,37 @@ None.
 
 ## Important Issues
 
-None.
+- **`src/rlm.ts` option validation — non-finite numerics defeat the bounds.** `maxIterations` /
+  `maxDepth` / `depth` were checked with `< 1` / `< 0` only, so `NaN` / `Infinity` passed and made
+  the recursion guard (`depth >= maxDepth`) always false → unbounded `rlm_query` recursion (each
+  level spawning a sandbox session), and `maxIterations: Infinity` an unbounded loop. **Fixed**
+  (`ce7e8e9`): validation now uses `Number.isInteger` + bounds, with 8 new tests (NaN / Infinity /
+  fractional for each option).
 
 ## Suggestions
 
-- **Optional:** `src/rlm.ts:1034-1037` — synthesis `llmClient.query` is not wrapped in
-  `raceAgainstSignal` (unlike the loop query at `:917-918`). Abort is still honoured via the
-  post-await `options.signal?.aborted` check, so functionally safe; a consistency nicety only.
-- **Nit:** `src/rlm.ts:562` — the fixed comment omits the empty-string guard
-  (`r.output && r.output !== "None"`); consider "non-empty non-'None' output".
-- **Nit:** test 5's set-membership loop re-checks the same five objects already pinned by exact
-  `assert.equal`s; redundant but documents the full union — fine as-is.
-- **FYI:** `src/rlm.ts:1032` — `budgetReport(budget, false)` snapshotted before the synthesis await;
-  correct here (synthesis un-charged), mirrors the pre-existing site.
+- `src/rlm.ts:1067-1082` — nested `runRlm` forwards `runOptions.inputs` + merged `context` but not
+  the parent's top-level `options.inputs`; document or confirm the asymmetry (D52 only requires
+  `context`).
+- `src/rlm.ts:1037-1038,1051-1055` — `onLLMQuery`/downgrade prompts interpolate model-generated
+  strings unbounded and are not `raceAgainstSignal`-wrapped (parity with the main loop).
+- `src/rlm.ts:477-480,1095` — `renderTypeStubs()` re-spawns a sandbox session per `runRlm` and per
+  nesting level; not shared across levels.
+- `src/rlm.ts:1183` — `extractBestAnswer(iterations) ?? ""`: the `?? ""` is dead (always a string).
+- `test/rlm.test.ts:3738` — property-test title "every exit path" omits the `error` branch (the
+  branch is tested elsewhere at :1029).
+- `src/rlm.ts:1083` — nested non-`ok` discards the child's salvaged `answer` (spec-correct per D52).
 
 ## What's Done Well
 
-- Guarded synthesis preserves Assumption 5's abort semantics — abort during synthesis folds to
-  salvage, never marks `synthesised`, never throws (pinned by test 6).
-- Test 2 is the classic magic-string-collision regression: pins `answer === "(no answer)"` +
-  `submitted` vs `answer === ""` + `salvaged`.
-- All five return sites set `answerSource`; `RlmResult` only constructed inside `src/rlm.ts`, so no
-  path can return an undefined source; `tsc --noEmit` confirms exhaustiveness.
+- D49 layering is genuinely clean: `types.ts` is a leaf; no circular imports.
+- D51 collision guard + self-registration runs synchronously before any await — race-free.
+- D50 carries the F-77 + D17 wording verbatim; `options.systemPrompt` override still works.
+- D53 abort-vs-error is correct (`signal.aborted` checked before the error return).
+- Tests genuinely strong: all 5 status branches + nesting/collision/prompt/lineOffset all asserted.
 
 ## Verification Story
 
-- Tests: 143 rlm tests + full 1054/1054 pass; all 7 provenance tests green.
-- Build: `npm run check` clean; changed files (`src/rlm.ts`, `src/types.ts`, `test/rlm.test.ts`,
-  `test/types.test.ts`) biome-clean.
-- Coverage: `src/rlm.ts` 99.15% ≥ 97.69 floor.
-- Note: repo-wide `npm run lint` reports 87 errors, all in untracked `.pi-subagents/` artifacts —
-  not from this change.
+- Tests: 1026 pass / 0 fail; check + build clean; coverage gate met (`rlm.ts` 99.31 ≥ 99.14).
+- Security: input-name validation intact at the single merge site; no new dependencies.
+- `grep RLMLoop src/` returns nothing.
