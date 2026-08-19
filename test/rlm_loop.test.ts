@@ -2,11 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   RLMLoop,
-  getReplPreamble,
   type RLMLoopOptions,
   type RLMLoopResult,
   type RlmMessage,
 } from "../src/rlm_loop.js";
+import { getReplPreamble } from "../src/preamble.js";
 import { ToolRegistry } from "../src/registry.js";
 import type { HostTool } from "../src/types.js";
 

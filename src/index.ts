@@ -83,11 +83,13 @@ export { SubmitSignal } from "./submit_signal.js";
 // ── RLM Loop ────────────────────────────────────────────────────
 export {
   RLMLoop,
-  getReplPreamble,
   type RLMLoopOptions,
   type RLMLoopResult,
   type RlmMessage,
 } from "./rlm_loop.js";
+
+// ── RLM Preamble ────────────────────────────────────────────────
+export { getReplPreamble } from "./preamble.js";
 
 // ── Tool Store ──────────────────────────────────────────────────
 export {

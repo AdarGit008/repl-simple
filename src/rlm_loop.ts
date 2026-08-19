@@ -1,7 +1,3 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
 import { ToolRegistry, probeImportableModules, renderPythonToolRules } from "./registry.js";
 import { createRLMTools } from "./rlm_tools.js";
 import { runInSandbox, type SandboxOptions } from "./sandbox.js";
@@ -62,10 +58,6 @@ const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_MAX_DEPTH = 1;
 
 const RLM_TOOL_NAMES = ["llm_query", "rlm_query", "SUBMIT"] as const;
-
-/** Path to the bundled repl_server.py preamble, resolved relative to this module. */
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const REPL_PREAMBLE_PATH = join(__dirname, "..", "repl", "repl_server.py");
 
 // ── RLMLoop ──────────────────────────────────────────────────────
 
@@ -342,17 +334,6 @@ function formatOkResult(result: RunOk): string {
       "Call SUBMIT(answer) when you have the final answer.]",
   );
   return parts.join("\n");
-}
-
-/**
- * Read the bundled repl_server.py preamble.
- *
- * Convenience loader — equivalent to:
- *   readFileSync("repl/repl_server.py", "utf-8")
- * but resolved relative to the package so it works regardless of cwd.
- */
-export function getReplPreamble(): string {
-  return readFileSync(REPL_PREAMBLE_PATH, "utf-8");
 }
 
 /** Format an error result as feedback for the LLM. */
