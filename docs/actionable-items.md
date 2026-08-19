@@ -548,12 +548,12 @@ excerpt lines that fall inside the prefix.
 
 ---
 
-### A22 — Never return empty — **PARTIAL**
+### A22 — Never return empty — **DONE** (#76)
 
-`extractBestAnswer` (`rlm.ts:102-113`) and a `status` discriminator exist. Remaining: no final
-synthesis pass at the cap; salvaged values carry no provenance (a debug `print` is returned as the
-final answer); `"(no answer)"` is a magic string indistinguishable from a model that submitted that
-text; and the comment at `:104` claims errors are consulted when they never are.
+`extractBestAnswer` (`rlm.ts:102-113`) and a `status` discriminator exist. Resolved by #76: the
+final synthesis pass runs at the cap (D44); salvaged values carry `answerSource` provenance (D41);
+the `"(no answer)"` magic string is gone — `answer` is `""` (D42); and the `:104` comment now
+matches its code (D43).
 
 ---
 
