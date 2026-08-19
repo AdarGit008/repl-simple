@@ -35,7 +35,8 @@ success. See [#59](https://github.com/AdarGit008/repl-simple/issues/59).
 
 ### RLM Loop (auto-investigation)
 
-`RLMLoop` runs a code-gen → execute loop: LLM writes Python, sandbox runs it, results fed back until `SUBMIT(answer)`.
+`runRlm` is the single RLM entry point: it runs a code-gen → execute loop — the LLM writes Python,
+the sandbox runs it, and the results are fed back until `SUBMIT(answer)`.
 
 Each iteration runs in a fresh sandbox — no variables, imports, or state carry over between
 iterations, so each snippet must be self-contained. Diagnostics fed back to the model are
@@ -45,6 +46,11 @@ offset-corrected: line numbers refer to the model's own code, and no preamble so
 `runRlm` declares every `inputs` entry as a sandbox variable and **announces each in the LLM prompt** —
 `context` is always declared and defaults to `""`; values render head-and-tail beyond 5000 chars.
 Because every input reaches the model, `inputs` must never carry secrets.
+
+The three RLM tools below are self-registered by `runRlm` and available inside the sandbox;
+`rlm_query` can spawn a nested `runRlm`, bounded by `maxDepth` (default 1). Each result carries a
+`status` (`ok` / `max_iterations` / `budget_exhausted` / `aborted` / `error`), an `answer`, and an
+`answerSource` (`submitted` / `salvaged` / `synthesised`) describing where the answer came from.
 
 | Tool | Description |
 |------|-------------|
@@ -135,7 +141,7 @@ import {
   // REPL
   ReplRunner, // new ReplRunner(cwd, { isProjectTrusted, maxSessions? })
   // RLM Loop
-  RLMLoop,
+  runRlm,
   getReplPreamble,
   // Sandbox
   runInSandbox,

@@ -533,7 +533,7 @@ export function memoryGuardConfig(): { ceilingMb: number; floorMb: number } {
  * every caller renders it back to the model as feedback to retry against. This
  * is the *host* out of memory, where retrying is precisely wrong. Callers that
  * hold accumulated state catch it and return what they have — see
- * `RLMLoop.run`.
+ * `runRlm`.
  */
 function assertMemoryHeadroom(): void {
   const ceilingMb = effectiveCeilingMb(envMb("REPL_MEMORY_CEILING_MB", DEFAULT_MEMORY_CEILING_MB));

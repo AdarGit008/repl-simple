@@ -49,7 +49,7 @@ coder per task, fresh context, one commit per task. After each task the full sui
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green.
   - Files: `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T8 — Delete `rlm_loop.ts` + its test; fold stragglers; barrel + README + coverage (D56/D57/D59)**
+- [x] **T8 — Delete `rlm_loop.ts` + its test; fold stragglers; barrel + README + coverage (D56/D57/D59)**
   - Delete `src/rlm_loop.ts` and `test/rlm_loop.test.ts`; remove `RLMLoop`, `RLMLoopOptions`, `RLMLoopResult`, `RlmMessage` from `src/index.ts`.
   - Ensure every behaviour `rlm_loop.test.ts` covered lives on against `runRlm` (nesting/collision/prompt already in T3–T5; fold the F-77 `lineOffset` pair if not already covered by `runRlm`'s parallel describe). Add the status-branch tests (ok/max_iterations/budget_exhausted/aborted/error) if any is missing (SPEC Assumption 2).
   - Update `README.md` to document `runRlm` as the single entry point (drop `RLMLoop`).

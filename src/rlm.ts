@@ -979,7 +979,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
 
   // D51: the loop owns its RLM tool names. A caller that registered them
   // would have its tools silently shadowed by the merged registry below, so
-  // reject the collision up front (mirrors RLMLoop's constructor guard).
+  // reject the collision up front.
   for (const name of ["llm_query", "rlm_query", "SUBMIT"] as const) {
     if (options.registry.has(name)) {
       throw new Error(
@@ -1041,7 +1041,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         const maxDepth = options.maxDepth ?? 1;
 
         // At the depth limit there is no sandbox to investigate in: downgrade
-        // to a single llm_query ask, mirroring RLMLoop's behaviour (D52).
+        // to a single llm_query ask (D52).
         if (depth >= maxDepth) {
           return await llmClient.query(
             systemPrompt,

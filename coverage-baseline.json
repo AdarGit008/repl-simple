@@ -11,7 +11,6 @@
     "src/preamble.ts": 100,
     "src/registry.ts": 96.02,
     "src/repl.ts": 100,
-    "src/rlm_loop.ts": 98.28,
     "src/rlm_tools.ts": 99.07,
     "src/rlm.ts": 99.14,
     "src/sandbox.ts": 97.66,
