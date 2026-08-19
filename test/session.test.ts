@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
@@ -748,6 +748,205 @@ result
     // Both tools were seen
     assert.deepEqual(seen, ["gated", "gated2"]);
     assert.equal(r2.output, "second: second");
+  });
+});
+
+// ── a resumed run honours the suspended run's limits (#177) ─────────
+//
+// `Session.run` persists the raw `RunOptions` granted to a `repl` call into
+// `suspendedRunOpts` (src/session.ts:366), so the clamped limits the caller
+// was given survive the suspension. `Session.resume` re-affirms them via the
+// one merge field `limits: runOpts?.limits ?? this.suspendedRunOpts?.limits`
+// (D1, D4).
+
+describe("Session — a resumed run honours the suspended run's limits (#177)", () => {
+  // The invariant is preserved by Monty's snapshot restore at the sandbox layer and
+  // re-affirmed by `Session.resume` forwarding `suspendedRunOpts.limits`; the tests guard
+  // the acceptance invariant, the one-line fix being library-layer hardening (maxWallClockSecs + #84 seam).
+  const MIB = 1_048_576;
+
+  const gatedTool: HostTool = {
+    name: "gated_limits",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  // Hermetic default-ceiling tests (D6): an ambient REPL_* var in the outer
+  // `npm test` process must not turn the 512 MiB default into a different
+  // figure. Snapshot and clear both vars for the block, restore after.
+  let priorDuration: string | undefined;
+  let priorMemory: string | undefined;
+
+  before(() => {
+    priorDuration = process.env.REPL_MAX_DURATION_SECS;
+    priorMemory = process.env.REPL_MAX_MEMORY_MB;
+    delete process.env.REPL_MAX_DURATION_SECS;
+    delete process.env.REPL_MAX_MEMORY_MB;
+  });
+
+  after(() => {
+    if (priorDuration === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+    else process.env.REPL_MAX_DURATION_SECS = priorDuration;
+    if (priorMemory === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+    else process.env.REPL_MAX_MEMORY_MB = priorMemory;
+  });
+
+  it("resumed run honours the suspended below-default maxMemory ceiling", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    // The gated call suspends before the 128 MiB allocation runs. Resuming
+    // with no limits must still enforce the 32 MiB ceiling the original call
+    // was granted — not the 512 MiB `limitsConfig()` default. (`bytes`, not
+    // `bytearray`: the latter is not a builtin in this sandbox.)
+    suspended(
+      await session.run('gated_limits("x")\nbig = bytes(128 * 1024 * 1024)', {
+        onApproval: () => "suspend",
+        limits: { maxMemory: 32 * MIB },
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "memory");
+  });
+
+  it("a tightened REPL_MAX_MEMORY_MB survives into resume (D5/D6)", async () => {
+    const registry = new ToolRegistry([gatedTool]);
+    const session = new Session({ registry });
+
+    // The operator tightened the ceiling to 256 MiB; the run is granted that
+    // clamped value and suspends on the gated call. Deleting the env var before
+    // resume proves the grant survives independent of `limitsConfig()`: Monty's
+    // snapshot restore preserves the granted memory ceiling across the
+    // suspend/resume boundary. This is an acceptance test of an invariant Monty
+    // already guarantees, not a discriminator of the `Session.resume` merge.
+    process.env.REPL_MAX_MEMORY_MB = "256";
+    suspended(
+      await session.run('gated_limits("x")\nbig = bytes(320 * 1024 * 1024)', {
+        onApproval: () => "suspend",
+        limits: { maxMemory: 256 * MIB },
+      }),
+    );
+    delete process.env.REPL_MAX_MEMORY_MB;
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "memory");
+  });
+});
+
+// ── a resumed run honours the suspended host wall-clock budget (#177) ──
+//
+// The memory tests above are preserved by Monty's snapshot restore; the
+// `Session.resume` merge field `limits: runOpts?.limits ?? this.suspendedRunOpts?.limits`
+// (D1, D4) has one observable effect left: the host-side `maxWallClockSecs`
+// knob, which Monty does not snapshot. It is enforced by `withHostDeadline`
+// (src/sandbox.ts) as a wall-clock budget over the whole run, host-tool time
+// included — so a host tool that parks the host long past the budget trips
+// `"timeout"`, while one inside the default 300 s finishes `"ok"`.
+
+describe("Session — a resumed run honours the suspended host wall-clock budget (#177)", () => {
+  // A gated tool: suspends before the expensive continuation runs.
+  const gated: HostTool = {
+    name: "gated_wallclock",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  // A host tool that blocks the host for five seconds. It is host time, not
+  // interpreter compute: Monty's `maxDurationSecs` clock does not advance while
+  // the worker awaits it, so only `maxWallClockSecs` (via `withHostDeadline`)
+  // can bound it.
+  const blocker: HostTool = {
+    name: "block_5s",
+    description: "Blocks the host event loop for five seconds",
+    params: [],
+    returns: "str",
+    execute: () => new Promise((resolve) => setTimeout(() => resolve("unblocked"), 5_000)),
+  };
+
+  it("a resumed run honours the suspended host wall-clock budget (#177)", async () => {
+    const registry = new ToolRegistry([gated, blocker]);
+    const session = new Session({ registry });
+
+    // The gated call suspends before the 5 s block runs. The original call was
+    // granted a 2 s host wall-clock budget; resuming with no limits must still
+    // enforce it, so the 5 s block overruns and the host deadline returns
+    // "timeout" — not "ok" under the 300 s default (which is what the unfixed
+    // resume sees).
+    suspended(
+      await session.run('gated_wallclock("x")\nblock_5s()', {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 2 },
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+  });
+
+  it("an explicit maxWallClockSecs on resume wins over the suspended value (#177 D4)", async () => {
+    // A precedence pin, not the merge: `resume` spreads `...runOpts`, so the
+    // explicit `{ maxWallClockSecs: 2 }` is forwarded whether or not the
+    // `limits` merge field exists. This test is green with AND without the fix;
+    // it pins the D4 contract that an explicit 2 s outranks the suspended 300 s.
+    const registry = new ToolRegistry([gated, blocker]);
+    const session = new Session({ registry });
+
+    suspended(
+      await session.run('gated_wallclock("x")\nblock_5s()', {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 300 },
+      }),
+    );
+
+    const result = await session.resume({
+      onApproval: () => true,
+      limits: { maxWallClockSecs: 2 },
+    });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+  });
+
+  it("a nested re-suspension still honours the suspended host wall-clock budget (#177)", async () => {
+    const registry = new ToolRegistry([gated, blocker]);
+    const session = new Session({ registry });
+
+    // Two gates in a row: the first suspends on `run`; the first `resume`
+    // approves it and immediately re-suspends on the second. Only the second
+    // `resume` reaches the 5 s block, so the 2 s host wall-clock budget must
+    // survive the nested re-suspension — the re-suspend branch re-persists the
+    // merged limits (src/session.ts). If it stored the raw caller runOpts, the
+    // second resume would read the 300 s default and the block would finish
+    // "ok".
+    suspended(
+      await session.run('gated_wallclock("a")\ngated_wallclock("b")\nblock_5s()', {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 2 },
+      }),
+    );
+
+    // Approve gate A, but answer gate B with "suspend" so the run pauses again
+    // instead of proceeding straight to the block. The gate re-consults
+    // `onApproval` for every gated call, so a plain `() => true` would approve
+    // B too and skip the re-suspension.
+    suspended(
+      await session.resume({
+        onApproval: (req) => (req.args[0] === "b" ? "suspend" : true),
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
   });
 });
 

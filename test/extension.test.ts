@@ -1212,6 +1212,57 @@ describe("repl extension — suspension is reachable (#51)", () => {
   });
 });
 
+// ── repl_resume forwards the abort signal (#177 D2) ─────────────
+//
+// `repl_resume.execute` hands the abort `signal` to `ReplRunner.resume` as its
+// third positional argument (`extensions/repl-extension.ts:371-375`), but every
+// existing `repl_resume.execute(...)` test passes `undefined`. The deeper
+// `ReplRunner`→`Session`→sandbox signal path is already pinned (#150 "abort-rt",
+// D7 test 1); this pins the one unpinned hop — extension → `ReplRunner` — so a
+// future refactor cannot silently drop the signal on the floor. This is a
+// characterization pin: the code already forwards the signal, so the test
+// passes on first run and guards the seam.
+
+describe("repl extension — repl_resume forwards the abort signal (#177 D2)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-signal-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("passes the caller's abort signal through to ReplRunner.resume", async () => {
+    const controller = new AbortController();
+    const seen: unknown[] = [];
+    const originalResume = ReplRunner.prototype.resume;
+    ReplRunner.prototype.resume = (async (
+      _sessionId: string,
+      _onApproval: unknown,
+      signal: AbortSignal | undefined,
+    ) => {
+      seen.push(signal);
+      return "[result]\n1";
+    }) as unknown as typeof ReplRunner.prototype.resume;
+    try {
+      const resume = (await loadTools()).find((t) => t.name === "repl_resume");
+      assert.ok(resume);
+      await resume.execute("sig-1", { sessionId: "sig" }, controller.signal, undefined, {
+        cwd,
+        isProjectTrusted: () => true,
+        hasUI: true,
+        ui: { select: async () => APPROVE_CHOICE },
+      });
+    } finally {
+      ReplRunner.prototype.resume = originalResume;
+    }
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], controller.signal);
+  });
+});
+
 // ── Project trust gates the preamble (#53) ───────────────────────
 
 /**

@@ -434,6 +434,7 @@ export class Session {
     // a grant or by the user — never by "something like it ran once".
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
+      limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
       lineOffset: this.prefixLineCount(),
       onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
@@ -466,7 +467,7 @@ export class Session {
       // Suspended again on a later gated call
       this.suspended = result;
       this.suspendedCode = suspendedCode;
-      this.suspendedRunOpts = runOpts;
+      this.suspendedRunOpts = { ...runOpts, limits: wrappedRunOpts.limits };
       return result;
     } else {
       // Error: don't add snippet
