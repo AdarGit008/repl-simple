@@ -454,7 +454,8 @@ describe("runRlm()", () => {
 
   it("5.3.5 max iterations reached (no SUBMIT)", async () => {
     const exploitCode = "```python\nprint('still working...')\n```";
-    const { llm } = mockLlmCodeGen([exploitCode, exploitCode, exploitCode]);
+    // The cap now runs a synthesis pass, so the 4th reply is its answer.
+    const { llm } = mockLlmCodeGen([exploitCode, exploitCode, exploitCode, "42"]);
     const tools = createRLMTools({
       onLLMQuery: async () => "",
       onRLMQuery: async () => "",
@@ -2251,7 +2252,10 @@ describe("runRlm() — conversation bound", () => {
 
     await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
 
-    const last = llm.calls()[llm.calls().length - 1];
+    // The cap now appends a synthesis query after the loop; the conversation
+    // structure the loop produced is the final *iteration* query, one before
+    // the synthesis call.
+    const last = llm.calls()[llm.calls().length - 2];
     // The initial message is followed by the drop marker (user role, D3).
     assert.equal(last.messages[0].role, "user");
     assert.equal(last.messages[1].role, "user");
@@ -3515,9 +3519,26 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     );
   }
 
+  /**
+   * A client that returns `code` for every iteration query and throws on the
+   * cap-time synthesis call (the `maxIterations + 1`th query) — used where a
+   * test pins the salvage fallback rather than a successful synthesis.
+   */
+  function mockSalvageOnCap(code: string, maxIterations: number): LlmClient {
+    let queryCount = 0;
+    return {
+      async query() {
+        queryCount++;
+        if (queryCount === maxIterations + 1) throw new Error("synthesis unavailable");
+        return code;
+      },
+    };
+  }
+
   it("1. a cap hit with only a debug print is salvaged, not submitted (issue test 1)", async () => {
     const debug = "```python\nprint('still working...')\n```";
-    const { llm } = mockLlmCodeGen([debug, debug, debug]);
+    // Synthesis fails at the cap, so the debug print's stdout is salvaged.
+    const llm = mockSalvageOnCap(debug, 3);
 
     const result = await runRlm("q", {
       llmClient: llm,
@@ -3543,8 +3564,9 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(submitted.answerSource, "submitted");
     assert.equal(submitted.answer, "(no answer)");
 
-    // The cap with nothing salvageable: no successful output, no stdout.
-    const { llm: emptyLlm } = mockLlmCodeGen(["```python\nx = 1\n```"]);
+    // The cap with nothing salvageable: no successful output, no stdout, and
+    // synthesis fails at the cap, so the salvage is empty.
+    const emptyLlm = mockSalvageOnCap("```python\nx = 1\n```", 1);
     const empty = await runRlm("q", {
       llmClient: emptyLlm,
       registry: rlmRegistry(),
@@ -3554,5 +3576,102 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(empty.status, "max_iterations");
     assert.equal(empty.answerSource, "salvaged");
     assert.equal(empty.answer, "");
+  });
+
+  it("3. a synthesis pass runs at the cap and its reply is marked synthesised (issue test 3)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const synthesisReply = "The final answer is 42.";
+    const { llm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, synthesisReply);
+    assert.equal(result.iterations.length, 3);
+  });
+
+  it("4. a failing synthesis call falls back to salvage rather than throwing (issue test 4)", async () => {
+    const llm = mockSalvageOnCap("```python\nx = 1\n```", 3);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.answer, "");
+    assert.equal(result.iterations.length, 3);
+  });
+
+  it("5. every exit path carries the correct answerSource (issue test 5)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+
+    // (a) SUBMIT → submitted
+    const { llm: submitLlm } = mockLlmCodeGen(['```python\nSUBMIT("42")\n```']);
+    const submitted = await runRlm("q", {
+      llmClient: submitLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+    assert.equal(submitted.status, "ok");
+    assert.equal(submitted.answerSource, "submitted");
+
+    // (b) budget_exhausted → salvaged
+    const { llm: budgetLlm } = mockLlmCodeGen(['```python\nSUBMIT("42")\n```']);
+    const budget = await runRlm("q", {
+      llmClient: budgetLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 0,
+    });
+    assert.equal(budget.status, "budget_exhausted");
+    assert.equal(budget.answerSource, "salvaged");
+
+    // (c) aborted → salvaged
+    const controller = new AbortController();
+    controller.abort();
+    const { llm: abortLlm } = mockLlmCodeGen(['```python\nSUBMIT("42")\n```']);
+    const aborted = await runRlm("q", {
+      llmClient: abortLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+    });
+    assert.equal(aborted.status, "aborted");
+    assert.equal(aborted.answerSource, "salvaged");
+
+    // (d) max_iterations with synthesis success → synthesised
+    const synthesisReply = "The final answer is 42.";
+    const { llm: synthLlm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+    const synthesised = await runRlm("q", {
+      llmClient: synthLlm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+    assert.equal(synthesised.status, "max_iterations");
+    assert.equal(synthesised.answerSource, "synthesised");
+    assert.equal(synthesised.answer, synthesisReply);
+
+    // (e) max_iterations with synthesis failure → salvaged
+    const failLlm = mockSalvageOnCap("```python\nx = 1\n```", 3);
+    const failed = await runRlm("q", {
+      llmClient: failLlm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+    assert.equal(failed.status, "max_iterations");
+    assert.equal(failed.answerSource, "salvaged");
+
+    // Every exit path must define a valid answerSource.
+    for (const r of [submitted, budget, aborted, synthesised, failed]) {
+      assert.equal(typeof r.answerSource, "string");
+    }
   });
 });

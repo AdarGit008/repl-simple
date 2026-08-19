@@ -2,7 +2,7 @@
 
 - [x] **T1 — Provenance field + magic string removal + salvage path** (add `answerSource` to
   `RlmResult`, remove `"(no answer)"`, fix comment, set source on all 4 return sites; tests 1–2)
-- [ ] **T2 — Guarded final synthesis pass at the cap** (add `FINAL_SYNTHESIS_PROMPT` + guarded
+- [x] **T2 — Guarded final synthesis pass at the cap** (add `FINAL_SYNTHESIS_PROMPT` + guarded
   `llmClient.query` at the `max_iterations` site; tests 3–5)
 
 ## Checkpoint (after T2)
