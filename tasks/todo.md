@@ -32,7 +32,7 @@ fresh context, one commit per task. After each task the full suite must be green
   - Files — `src/session.ts`, `test/session.test.ts`.
   - Post-build finding: Monty's snapshot restore already preserves maxDurationSecs/maxMemory across resume; the fix is library-layer hardening (maxWallClockSecs + #84 seam). Tests are acceptance tests of the invariant, not RED-for-the-fix.
 
-- [ ] **T2 — Pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume` (D2)**
+- [x] **T2 — Pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume` (D2)**
   - RED — this is a **characterization pin**, not a bug fix: the code already forwards the signal
     (`extensions/repl-extension.ts:371-375`), so the new test passes on first run and guards the seam.
     Add a new `describe("repl extension — repl_resume forwards the abort signal (#177 D2)")` block to
