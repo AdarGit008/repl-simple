@@ -1,189 +1,222 @@
-# Spec: Derive the model-boundary clamp ceilings from the operator's limits — issue #176
+# Spec: repl_resume must re-apply the suspended run's clamped limits, and the extension-layer signal forwarding must be pinned — issue #177
 
 ## Objective
 
-The `repl` tool's model-facing clamp ceilings are hardcoded constants —
-`MAX_MODEL_DURATION_SECS = 300` and `MAX_MODEL_MEMORY_MIB = 1024` — in
-`extensions/repl-extension.ts`. The sandbox reads operator-tunable env vars
-(`REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB`) through `limitsConfig()`, but because
-`toResourceLimits` fills only *unset* knobs with `??`, any value the extension supplies **wins
-over** the operator's env var. An operator who tightens `REPL_MAX_MEMORY_MB=256` to bound per-worker
-resources is silently bypassed: a prompt-injected model can still request the fixed 1024 MiB / 300 s
-caps — a 4×/10×+ amplification with no wall-clock analog to catch the memory half.
+A `repl` call that suspends on a gated (approval-requiring) tool carries its clamped resource
+limits into the suspension, but `repl_resume` silently drops them: the resumed transcript re-runs
+under the sandbox **defaults** (`limitsConfig()` — 30 s / 512 MiB by default), not the limits the
+original call was granted. It is "safe direction" (more restrictive, never more permissive) but
+asymmetric, and it means a resumed run can be governed by limits that differ from what the model was
+told it had.
 
-Success looks like: the model-boundary clamp ceiling is **derived from the same source as the sandbox
-default** (`limitsConfig()`), so the operator's knob is a true ceiling rather than a default the
-model can override; the `maxMemory` byte conversion is integerized (no fractional/sub-byte counts
-reach Monty); and a tightened env var is honoured end-to-end.
+Second gap: the extension's `repl_resume` **does** forward the abort `signal` to `ReplRunner.resume`,
+but no test proves it — every `repl_resume.execute(...)` test passes `undefined`. The deeper
+`ReplRunner`→`Session`→sandbox signal path is already proven (#150 "abort-rt"), so the only unpinned
+hop is extension→`ReplRunner`.
 
-Parent #31 (Bucket 3 — Resource containment). Issue:
-https://github.com/AdarGit008/repl-simple/issues/176. Sibling from the same #33 ship report: #177
-(resume limits — must reuse the derived ceilings, not re-hardcode), #178 (test helper in the same
-file).
+Success looks like: a resumed run honours the **same clamped limits the original `repl` call was
+granted** (which are already derived from `limitsConfig()` via #176's `clampModelLimits`, so they
+round-trip through the derived ceiling automatically — 30 s / 512 MiB by default, never 300 s /
+1024 MiB), and a test pins that `repl_resume.execute` forwards the abort signal to
+`ReplRunner.resume`.
 
-## Current state (fact base, verified 2026-08-19)
+Issue: https://github.com/AdarGit008/repl-simple/issues/177.
+Parent bucket: #31 (Bucket 3 — Resource containment). Siblings: #176 (just merged — the derived
+ceilings), #178 (same test file), #84 (owns the *broader* `suspendedRunOpts` merge — see D3).
+
+## Current state (fact base — verified by scout, 2026-08-19)
 
 | Fact | Value |
 |---|---|
-| `extensions/repl-extension.ts:87-89` | `MAX_MODEL_DURATION_SECS = 300`, `MAX_MODEL_MEMORY_MIB = 1024`, `BYTES_PER_MIB = 1_048_576` — hardcoded ceilings. |
-| `extensions/repl-extension.ts:101-104` | `clampCeiling(value, cap)` — upper-bound-only, `Math.min(value, cap)`, omits non-positive-finite. |
-| `extensions/repl-extension.ts:115-121` | `clampModelLimits(maxDurationSecs?, maxMemoryMiB?)` — exported; `:119` does `memoryMiB * BYTES_PER_MIB` (unfloored → `0.1` MiB yields `104857.6` bytes). |
-| `src/sandbox.ts:710-718` | `limitsConfig()` (exported) returns `{ maxDurationSecs, maxMemory (bytes), maxWallClockSecs }` from `envInt("REPL_MAX_DURATION_SECS", 30)`, `envInt("REPL_MAX_MEMORY_MB", 512) * 1_048_576`, `envInt("REPL_MAX_WALL_CLOCK_SECS", 300)`. |
-| `src/sandbox.ts:754-761` | `toResourceLimits()` fills unset knobs with `??` from `limitsConfig()` — so an extension-supplied value wins over the env var. The root cause. |
-| `test/extension.test.ts:176-204` | `clampModelLimits` unit tests pin the **fixed** caps: `(10_000, undefined) → {maxDurationSecs: 300}`, `(undefined, 2048) → {maxMemory: 1024*MIB}`, `(300, 1024) → {300, 1024*MIB}`, `(301, undefined) → {maxDurationSecs: 300}`, `(undefined, 0.5) → {maxMemory: 524288}`. These four fixed-cap assertions encode the #33 decision that #176 reverses. |
-| `test/extension.test.ts:210-283` | "the repl tool passes clamped limits (never 'unbounded')" — already asserts the tool forwards `clampModelLimits` output to `ReplRunner.run`; the boundary wiring is proven. |
-| #33 `SPEC.md` (now replaced) | Asserted the caps are **fixed** by spec ("300 s / 1024 MiB, the caps themselves are fixed"). #176 overturns that; this file replaces it. |
+| `extensions/repl-extension.ts:354-377` | `repl_resume` schema = `{ sessionId? }` only. `execute` calls `r.resume(params.sessionId ?? "default", makeOnApproval(ctx, signal), signal)` — **no `limits` arg**. |
+| `extensions/repl-extension.ts:338-347` | `repl` `execute` calls `r.run(code, sid, onApproval, signal, clampModelLimits(params.maxDurationSecs, params.maxMemory))` — the symmetric path that *does* supply clamped limits. |
+| `extensions/repl-extension.ts:135-155` | `clampModelLimits` always returns a `RunLimits` object (never `"unbounded"`). |
+| `src/repl.ts:218-253` | `ReplRunner.resume(sessionId, onApproval?, signal?, limits?)` — **already forwards** `limits` (and `signal`) via `live.session.resume({ onApproval, signal, limits })` at `:250`. The gap is one layer up. |
+| `src/repl.ts:185-196` | `ReplRunner.run` → `session.run(code, { onApproval, signal, limits })` — identical object shape to resume. |
+| `src/session.ts:366` | `Session.run` persists `this.suspendedRunOpts = runOpts` — the raw `{ onApproval, signal, limits }`. So the clamped limits are **already stored**. |
+| `src/session.ts:389-472` | `Session.resume` builds `wrappedRunOpts = { ...runOpts, lineOffset, onApproval: gate(...) }` (`:435-439`) and **never reads `suspendedRunOpts` back**. Only serialization (`dump` `:542` / `load` `:610`) reads it. |
+| `src/sandbox.ts:752-762` | `toResourceLimits(limits)` fills *unset* knobs from `limitsConfig()` (`??`). With `limits === undefined`, every knob falls back to `limitsConfig()` (30 s / 512 MiB / 300 s wall-clock). |
+| `src/sandbox.ts:1313,1319` | `resumeSuspended` consumes `runOpts?.limits` for both `toResourceLimits(...)` and `hostDeadlineAt(...)`. |
+| `src/types.ts:96-161` | `RunLimits` (all-optional knobs) and `RunOptions` (`limits?: RunLimits | "unbounded"`, plus `signal`, `onApproval`, `inputs`, `mount`, `maxStdoutBytes`, `maxOutputBytes`, `scriptName`, `lineOffset`). `resume` reuses `RunOptions`. |
+| `test/repl.test.ts:2170` ("D7 test 3") | Already pins `ReplRunner.resume` forwards `{ onApproval, signal, limits }` to `session.resume`. Not the gap. |
+| `test/repl.test.ts:530-548` (#150 "abort-rt") | Already proves `ReplRunner.resume` → sandbox signal. Not the gap. |
+| `test/extension.test.ts:602+` | `repl_resume` tests (describe "suspension is reachable (#51)") all drive `execute` with `signal === undefined`, params `{ sessionId }` only. **No signal/limits pin.** |
+| `test/session.test.ts` | No `Session.resume` test asserts limits or signal reach the sandbox. |
+
+**Root cause (one line):** `Session.resume` reconstructs its options purely from the caller's
+`runOpts` and discards the persisted `suspendedRunOpts.limits`. The extension cannot fix this — it
+holds no record of the original clamp (it derives from the model's knobs at `repl` time and doesn't
+retain them), so "forward the original limits" is only expressible at the `Session` layer.
 
 ## Scope
 
 | In scope | Out of scope |
 |---|---|
-| Derive the two clamp ceilings from `limitsConfig()` at the model boundary (`extensions/repl-extension.ts`) | Touching `src/sandbox.ts` `toResourceLimits`/`limitsConfig` (the `??` fill is the sandbox's correct defaulting contract) |
-| Integerize the `maxMemory` byte conversion (floor) | Exposing `maxWallClockSecs`/`gcInterval`/`maxRecursionDepth` to the model (unchanged — see #33) |
-| Tests: env-var ceiling, duration ceiling, fractional-byte floor, updated fixed-cap tests | #177 (resume forwards limits) — separate sibling; must consume the derived ceilings when done |
-| Reconcile the four stale fixed-cap unit tests | #178 (monkey-patch comment) — separate chore |
+| `src/session.ts` — `Session.resume` re-applies `suspendedRunOpts.limits` when the caller supplied none | `src/sandbox.ts` (`limitsConfig`/`toResourceLimits`/`resumeSuspended`) — the `??` defaulting is the sandbox's correct contract |
+| `test/session.test.ts` — prove resumed runs inherit the suspended (clamped) limits | `extensions/repl-extension.ts` — **no schema change** under the chosen fix (D1); no new model-suppliable knobs |
+| `test/extension.test.ts` — pin that `repl_resume.execute` forwards the abort signal to `ReplRunner.resume` | `src/repl.ts` — `ReplRunner.resume` already forwards limits/signal (D7 test 3 covers it) |
+| A tightened `REPL_MAX_MEMORY_MB` surviving into `resume` (test) | #84's broader merge (mount/inputs/scriptName/maxStdoutBytes) — see D3 |
+| | #178's `runWithLimits` comment chore (separate issue) |
 
 ## Explicit decisions
 
-### D1 — The ceiling is `min(specCap, limitsConfig() effective value)` (Option A)
+### D1 — Option B: re-apply the suspended run's persisted clamped limits at the `Session` layer (not a schema change)
 
-The fix is exactly the shape the issue prescribes:
+The fix is:
 
 ```ts
-const cfg = limitsConfig();
-const durationCap = Math.min(MAX_MODEL_DURATION_SECS, cfg.maxDurationSecs);
-const memoryCapMiB  = Math.min(MAX_MODEL_MEMORY_MIB,   cfg.maxMemory / BYTES_PER_MIB);
+const wrappedRunOpts: RunOptions = {
+  ...runOpts,
+  limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
+  lineOffset: this.prefixLineCount(),
+  onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
+};
 ```
 
-`clampModelLimits` clamps each model knob against the **derived** cap instead of the hardcoded
-constant. `MAX_MODEL_DURATION_SECS`/`MAX_MODEL_MEMORY_MIB` remain as the absolute upper bound (so a
-*raised* operator knob is still spec-capped); `limitsConfig()` supplies the operator's configured
-value, or the sandbox default when unset.
+`Session.resume` merges `suspendedRunOpts.limits` in when the caller did not supply `limits`.
+`onApproval` and `signal` still come from the caller (they are deliberately **not** recovered from
+the suspension — a stale/aborted signal must not be reused, and the approval callback must be the
+fresh one).
 
-**Recorded consequence (deliberate):** this changes the *default* model ceiling. With no env vars
-set, `limitsConfig()` returns the sandbox defaults (30 s / 512 MiB), so the model ceiling becomes
-**30 s / 512 MiB** rather than the #33 fixed 300 s / 1024 MiB. The model's `maxDurationSecs` /
-`maxMemory` knobs become effectively *reduce-only* under defaults: a model can no longer request
-more compute or memory than the sandbox would grant anyway. This is the intended, security-correct
-posture — the model must never be able to out-ask the operator's configured bound — and it is the
-whole point of #176. An operator who wants the model to get more raises the env var, and the
-spec caps (300 s / 1024 MiB) still bind that raised value.
+**Why Option B over Option A** (expose `maxDurationSecs`/`maxMemory` on the `repl_resume` schema):
+- The acceptance criterion is *"a resumed run honours the limits granted to the original `repl`
+  call."* Only Option B honours the **original** grant. Option A would let the model *re-supply*
+  limits on resume — a different grant, and a new attack surface the model doesn't need.
+- The extension **cannot** forward the original limits: `clampModelLimits` runs at `repl` time and
+  its output is not retained by the extension. The only durable record of the original grant is
+  `Session.suspendedRunOpts`, which `Session.run` already wrote (`session.ts:366`).
+- No schema change → no new model-suppliable knobs, no tool-description churn.
+- Minimal diff: one merge field in `Session.resume`.
 
-This is a deliberate reversal of #33's "caps are fixed at 300/1024" decision; the #33 `SPEC.md`
-that asserted that is superseded by this file.
+The title's "at the extension layer" describes where the asymmetry is *visible* (the `repl` vs
+`repl_resume` execute bodies), not where the fix lives. The signal-forwarding half of the issue **is**
+at the extension layer (see D2). This is a recorded, deliberate reading; the go/no-go at Phase 6 is
+the human's chance to veto it.
 
-### D2 — Integerize the byte conversion with `Math.floor`
+### D2 — Signal forwarding is a test-only gap at the extension layer
 
-`maxMemory` reaches Monty as a byte count. `memoryMiB * BYTES_PER_MIB` can produce a fractional
-value (`0.1` MiB → `104857.6`). Floor it: `Math.floor(memoryMiB * BYTES_PER_MIB)`. The clamp runs
-first (so the value is already ≤ an integer cap); flooring only affects sub-MiB fractional inputs,
-which otherwise leak a non-integer byte count verbatim.
+`repl_resume.execute` already forwards `signal` (`extensions/repl-extension.ts:371-375`), and the
+deeper hop is proven (#150). The deliverable is a test that drives `repl_resume.execute` with a real
+`AbortSignal` (or stubs `ReplRunner.prototype.resume` to capture the signal — mirroring the
+`runWithLimits` helper) and asserts the signal reaches `ReplRunner.resume`.
 
-### D3 — `clampModelLimits` becomes env-aware; tests own the env
+### D3 — Scope boundary with #84 (recorded, no conflict)
 
-`clampModelLimits` now reads `process.env` via `limitsConfig()` at call time, so it is no longer a
-strictly pure function. Its JSDoc must say so. Tests that exercise the ceilings must set
-`REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` **and restore them** (save-and-restore in
-`try/finally` or a `before`/`after` hook) so no state leaks to later tests in the file. `tsx --test`
-runs each test file in its own process, so cross-file leakage is not a concern; intra-file
-sequential execution is.
+#84 ("`suspendedRunOpts` is saved, restored, and never used", OPEN, bucket-11) owns the *broader*
+merge of `suspendedRunOpts` into `Session.resume` — `limits`, `mount`, `inputs`, `maxStdoutBytes`,
+`scriptName`. #177 takes **only the `limits` field**, which is the single field its acceptance
+requires. It deliberately does **not** absorb `mount`/`inputs`/`scriptName`/`maxStdoutBytes`. When
+#84 lands it will generalise this same seam; this flight notes that hand-off in its close-out so #84
+does not redo or conflict with it.
 
-### D4 — The fix is entirely at the model boundary
+### D4 — Precedence: caller-supplied limits win, else suspended limits (`??`)
 
-`src/sandbox.ts` is not modified: `limitsConfig()` and the `??` defaulting in `toResourceLimits` are
-the sandbox's correct contract (fill *unset* knobs from the operator/env). The bug is that the
-*extension* hands the model's explicit value through in a way that overrides that contract. The fix
-makes the extension stop trusting the model above the operator's bound, so `ReplRunner` (a faithful
-library) never receives a value the operator forbade.
+`runOpts?.limits ?? this.suspendedRunOpts?.limits`. In the only real path today (`repl_resume` → no
+limits), the suspended limits apply. An embedder calling `ReplRunner.resume` with explicit `limits`
+keeps the existing contract (explicit arg honoured). `"unbounded"` is a truthy string and is carried
+through `??` unchanged. (Whether the suspended value should *always* win — #84's stated preference —
+is left to #84; #177 does not need it.)
 
-### D5 — Import path
+### D5 — Limits are already derived ceilings — the #176 D6 coupling is satisfied structurally
 
-`limitsConfig` is already exported from `src/sandbox.ts` and the extension already imports from
-`../src/*.js` (e.g. `ReplRunner` from `../src/repl.js`, which transitively imports sandbox). Add
-`import { limitsConfig } from "../src/sandbox.js";`. No new dependency, no new module boundary.
+`clampModelLimits` (which already reads `limitsConfig()` per #176) produces the values persisted into
+`suspendedRunOpts.limits`. Re-applying them on resume therefore inherits the **derived** ceilings
+(`min(MAX_MODEL_DURATION_SECS, limitsConfig().maxDurationSecs)` = 30 s, and
+`min(MAX_MODEL_MEMORY_MIB, limitsConfig().maxMemory / BYTES_PER_MIB)` = 512 MiB by default) with no
+re-hardcoding of 300/1024 anywhere in this flight. A tightened `REPL_MAX_MEMORY_MB` flows through the
+same clamp at `repl` time and is therefore preserved on resume.
 
-### D6 — Cross-issue guard
+### D6 — Env discipline in tests (inherited from #176/#178)
 
-`#177` (repl_resume forwards limits) must consume the **same derived ceilings** — it must not
-re-introduce hardcoded 300/1024. Note this in the close-out so #177's flight reads it. The new
-env-var test lives in `test/extension.test.ts`, where #178's `runWithLimits` monkey-patch helper
-also lives; the new tests do not touch `ReplRunner.prototype` and are unaffected by it.
-
-### D7 — Tool descriptions reflect the derived ceiling; default-ceiling tests are hermetic
-
-Two review follow-ups recorded as decisions:
-
-1. **Descriptions.** The `repl` tool's `maxDurationSecs`/`maxMemory` parameter descriptions must
-   not advertise the fixed 300 s / 1024 MiB caps (stale under D1). Reword them to the derived
-   ceiling: e.g. "capped at 300 s, or lower if the operator sets `REPL_MAX_DURATION_SECS`
-   (default 30)" and "capped at 1024 MiB, or lower if the operator sets `REPL_MAX_MEMORY_MB`
-   (default 512 MiB)". The description-pin test in `test/extension.test.ts` is updated to match.
-
-2. **Hermetic default-ceiling tests.** The default-ceiling assertions (30 s / 512 MiB) must hold
-   regardless of ambient `REPL_*` env vars. The `clampModelLimits` describe block snapshots and
-   clears `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` in a `before` hook and restores them in
-   an `after` hook, so an outer `REPL_MAX_MEMORY_MB=256 npm test` cannot spuriously fail them.
+`limitsConfig()` reads `process.env` at call time. Any test that exercises limits across a
+suspend/resume boundary must snapshot/clear/restore `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB`
+(the `before`/`after` pattern in `test/extension.test.ts:207-231`). The extension test file is run
+sequentially; a stub on `ReplRunner.prototype.resume` (the `runWithLimits`-style pattern) must
+restore in `finally`, and is safe only under that sequential assumption (which is #178's separate
+chore).
 
 ## Commands
 
 ```
-Focused:  npx tsx --test test/extension.test.ts
-Test:     npm test                    # tsx --test test/*.test.ts
-Type:     npm run check               # tsc --noEmit
-Build:    npm run build               # tsc -p tsconfig.build.json
-Lint:     npm run lint                # biome check --error-on-warnings
+Focused:  npx tsx --test test/session.test.ts            # Session-layer limits-inheritance tests
+Focused:  npx tsx --test test/extension.test.ts          # extension-layer signal-forwarding pin
+Test:     npm test                                        # tsx --test test/*.test.ts
+Type:     npm run check                                   # tsc --noEmit
+Build:    npm run build                                   # tsc -p tsconfig.build.json
+Lint:     npm run lint                                    # biome; scope to src extensions test
 ```
 
 ## Project structure (this flight)
 
 ```
-extensions/repl-extension.ts   → the model boundary; ceilings + clampModelLimits live here
-src/sandbox.ts                 → limitsConfig()/toResourceLimits(); NOT modified
-src/types.ts                   → RunLimits; NOT modified
-test/extension.test.ts         → clampModelLimits unit tests + "passes clamped limits" boundary test
+src/session.ts               → the fix: Session.resume merges suspendedRunOpts.limits (one field)
+src/sandbox.ts               → NOT modified (limitsConfig/toResourceLimits/resumeSuspended are the sandbox contract)
+src/repl.ts                  → NOT modified (already forwards limits/signal)
+extensions/repl-extension.ts → NOT modified (no schema change under D1)
+test/session.test.ts         → NEW: resumed run inherits suspended clamped limits (+ tightened-env survival)
+test/extension.test.ts       → NEW: repl_resume forwards the abort signal to ReplRunner.resume
 ```
 
 ## Code style
 
-Follow the existing file: 2-space indent, double quotes, JSDoc on exported functions, `_`-prefixed
-unused fixed-arity params, numeric separators (`1_048_576`). Keep the `clampCeiling` helper; do not
-introduce a new abstraction unless the derived-caps computation reads clearer factored into a small
-named helper — three similar lines beat a premature abstraction (incremental-implementation Rule 0).
+Follow the existing files: 2-space indent, double quotes, JSDoc on exported functions, `_`-prefixed
+unused fixed-arity params, numeric separators (`1_048_576`). Do not introduce a new abstraction for a
+single `??` merge field; the change should read as one obvious line in `Session.resume`.
 
-## Testing strategy (TDD)
+## Testing strategy (TDD, RED first)
 
-Test level: **unit** — `clampModelLimits` is a pure-ish boundary function; the sandbox is not driven.
-The existing `describe("repl extension — clampModelLimits", …)` block is the home. The "passes
-clamped limits" block already proves the tool forwards the result to `ReplRunner.run`, so unit
-coverage of `clampModelLimits` plus that existing passthrough assertion satisfies the issue's
-"reaches the sandbox as 256 MiB" acceptance.
+Test level: **integration at the `Session` seam for the limits fix**; **unit (seam) at the extension
+for the signal pin**. The `ReplRunner`→`Session` hop is already covered (D7 test 3) — do not re-prove
+it.
 
-New/reworked assertions (RED before GREEN):
+Assertions (RED before GREEN):
 
-1. **Operator memory env is the ceiling.** With `REPL_MAX_MEMORY_MB=256`, `clampModelLimits(undefined, 1024)` → `{ maxMemory: 256 * BYTES_PER_MIB }`, never `1024 * BYTES_PER_MIB`.
-2. **Operator duration env is the ceiling.** With `REPL_MAX_DURATION_SECS=10`, `clampModelLimits(1000, undefined)` → `{ maxDurationSecs: 10 }`, never `300`.
-3. **Default ceiling is the sandbox default, not the spec cap.** No env vars → `clampModelLimits(10_000, undefined)` → `{ maxDurationSecs: 30 }` and `clampModelLimits(undefined, 2048)` → `{ maxMemory: 512 * BYTES_PER_MIB }` (replaces the stale `300`/`1024` assertions; renames their titles to say "derived ceiling").
-4. **Fractional memory is floored.** `clampModelLimits(undefined, 0.1)` → `{ maxMemory: 104857 }` (was `104857.6`). `(undefined, 0.5)` stays `{ maxMemory: 524288 }`.
-5. Unchanged passthrough cases: valid-below-cap values honoured (`(5, 128)`, `(300, 1024)` under a *raised* env still spec-capped), invalid → `{}`.
+1. **Resumed run inherits the suspended limits.** Suspend a `Session` run granted explicit limits
+   (e.g. `{ maxDurationSecs: 5 }` or a memory value below the default), then `resume` **without**
+   limits and assert the resumed execution was governed by the suspended limits, not
+   `limitsConfig()` defaults. The observation mechanism (a below-default `maxDurationSecs` that
+   times out on resume, a seam/spy, or a serialisation assertion on `suspendedRunOpts`) is chosen by
+   the planner and pinned by the coder's RED test.
+2. **Tightened `REPL_MAX_MEMORY_MB` survives into resume.** With `REPL_MAX_MEMORY_MB=256`, a run
+   clamped to 256 MiB suspends; its resume still honours 256 MiB (never the 512 MiB default). Env
+   saved/restored.
+3. **`repl_resume` forwards the abort signal.** Stub `ReplRunner.prototype.resume` (or drive
+   `repl_resume.execute` with a real `AbortSignal`), assert the signal reaches `ReplRunner.resume`.
+   Restore the prototype in `finally`.
+4. Unchanged: resume with an explicit `limits` still honours the explicit value (D4 precedence);
+   `onApproval`/`signal` come from the caller (already proven, must not regress).
 
 ## Boundaries
 
-- **Always:** run the focused test then the full suite + `check` + `build` + `lint` before declaring a task done; RED first; save/restore env in tests.
-- **Ask first / Never:** (autonomous flight — no live ask) do not touch `src/sandbox.ts`, `ReplRunner`, or any file beyond `extensions/repl-extension.ts` and `test/extension.test.ts`; do not change the tool schema (parameter descriptions may be updated per D7).
+- **Always:** RED first; run the focused test then the full suite + `check` + `build` + `lint`
+  (scoped to `src extensions test`) before declaring a task done; save/restore `REPL_*` env and
+  restore stubbed prototypes in `finally`.
+- **Ask first / Never (autonomous — no live ask):** do not touch `src/sandbox.ts`, `src/repl.ts`,
+  `extensions/repl-extension.ts`, or any file beyond `src/session.ts`, `test/session.test.ts`,
+  `test/extension.test.ts`. Do not change the `repl_resume` schema or its tool description. Do not
+  absorb #84's broader merge (mount/inputs/scriptName/maxStdoutBytes). Do not re-hardcode 300/1024.
 
 ## Success criteria
 
-- `clampModelLimits` clamps against `min(specCap, limitsConfig() effective value)`, not a hardcoded constant.
-- The `maxMemory` byte conversion is `Math.floor(memoryMiB * BYTES_PER_MIB)`.
-- With `REPL_MAX_MEMORY_MB=256`, a model-supplied `maxMemory=1024` yields `256 * BYTES_PER_MIB` bytes; with `REPL_MAX_DURATION_SECS=10`, `maxDurationSecs=1000` yields `10`. (Issue acceptance.)
-- The four stale fixed-cap assertions are updated to the derived ceilings; full suite green; `check`/`build`/`lint` clean.
+- `Session.resume` re-applies `suspendedRunOpts.limits` when the caller supplied none; explicit
+  caller limits still win.
+- A resumed run honours the limits granted to the original `repl` call (derived ceilings, 30 s /
+  512 MiB by default — never 300 s / 1024 MiB).
+- A test pins `repl_resume.execute` forwarding the abort signal to `ReplRunner.resume`.
+- A tightened `REPL_MAX_MEMORY_MB` survives into `resume` (tested).
+- Full suite green; `check`/`build`/`lint` clean.
 
 ## Assumptions (recorded)
 
-1. **Option A (D1) is the intended reading** of "derive each ceiling from the same source as the sandbox default" — the default model ceiling tightens from 300 s / 1024 MiB to 30 s / 512 MiB. This is the security-correct posture and the issue's literal code. Recorded as a deliberate behavior change, visible to review.
-2. **`maxDurationSecs` is compared against `limitsConfig().maxDurationSecs` (compute seconds), not `maxWallClockSecs`.** Both the model knob and `limitsConfig().maxDurationSecs` are compute-seconds (Monty interpreter time), so the comparison is apples-to-apples; the 300 s wall-clock value was #33's conflation and is deliberately not used as the duration ceiling.
-3. **No `limitsConfig()` API change** — it already returns exactly what is needed (`maxDurationSecs`, `maxMemory` in bytes); bytes → MiB is recovered by `/ BYTES_PER_MIB`.
+1. **Option B is the intended reading** (see D1) — the fix lives in `Session.resume`, not the
+   extension schema. Recorded; veto point is the Phase 6 go/no-go.
+2. **The resumed run may keep the caller's `signal`/`onApproval`** (fresh, not recovered from the
+   suspension) — only `limits` is recovered. This matches #84's stated policy and #150's proof.
+3. **The `Session`-level limits test may assert via an observable sandbox effect** (e.g. a
+   below-default `maxDurationSecs` that the resumed run times out on) rather than a spy, since
+   `resumeSuspended` is a module import. The planner pins the exact mechanism.
 
 ## Open questions
 
-None blocking. (The resume-limits question #33 left open is owned by #177, not this flight.)
+None blocking. (The broader `suspendedRunOpts` merge precedence — whether suspended limits should
+*always* win over an embedder's explicit limits — is #84's, not this flight's.)

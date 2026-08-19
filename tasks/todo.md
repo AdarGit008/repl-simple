@@ -1,48 +1,80 @@
-# Todo — issue #176: Derive the clamp ceilings from the operator's limits
+# Todo — issue #177: `repl_resume` re-applies the suspended run's clamped limits; pin the signal forward
 
-Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Each task is RED-first (write the failing
-test before the code). One coder per task, fresh context, one commit per task. After each task the
-full suite must be green. The bug is at the model boundary only — do not touch `src/sandbox.ts`.
+Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Each task is RED-first. One coder per task,
+fresh context, one commit per task. After each task the full suite must be green. Do **not** touch
+`src/sandbox.ts`, `src/repl.ts`, or `extensions/repl-extension.ts`. Only `src/session.ts`,
+`test/session.test.ts`, and `test/extension.test.ts` are in scope.
 
-- [x] **T1 — Integerize the `maxMemory` byte conversion (D2)**
-  - RED: `clampModelLimits(undefined, 0.1)` must equal `{ maxMemory: 104857 }` (today it is
-    `104857.6`). Add to the `describe("repl extension — clampModelLimits")` block in
-    `test/extension.test.ts`; confirm it fails.
-  - Implement: `limits.maxMemory = Math.floor(memoryMiB * BYTES_PER_MIB)` in
-    `extensions/repl-extension.ts` (`clampModelLimits`). The existing `(undefined, 0.5) → 524288`
-    assertion must stay green (0.5 × MiB is already integral).
-  - Verify: `npx tsx --test test/extension.test.ts` green; full `npm test` green;
+- [ ] **T1 — `Session.resume` re-applies `suspendedRunOpts.limits` (D1, D4)**
+  - RED — add a new `describe("Session — resume re-applies the suspended run's limits (#177)")` block
+    to `test/session.test.ts` (after the `approval & suspension` describe, reusing the `err`/`suspended`
+    helpers at `:15`/`:19`). It needs a gated tool, a `before`/`after` that snapshot+clear
+    `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` (mirror `test/extension.test.ts:207-231`), and two
+    tests:
+    1. **Below-default ceiling.** `suspended(await session.run('gated_limits("x")\nbig = bytearray(128 * 1024 * 1024)', { onApproval: () => "suspend", limits: { maxMemory: 32 * 1_048_576 } }))`,
+       then `resume({ onApproval: () => true })` with **no** limits; assert `err(result)` and
+       `result.errorKind === "memory"`. Today this returns `"ok"` (the 128 MiB allocation succeeds under
+       the 512 MiB default) — RED.
+    2. **Tightened-env survival (D5/D6).** Set `REPL_MAX_MEMORY_MB = "256"`; suspend a run granted
+       `limits: { maxMemory: 256 * 1_048_576 }` whose second line is `big = bytearray(320 * 1024 * 1024)`;
+       **delete `REPL_MAX_MEMORY_MB` before resuming** (this is what makes it RED: the unfixed resume
+       re-reads `limitsConfig()` and gets the 512 MiB default, so 320 MiB succeeds); `resume({ onApproval:
+       () => true })`; assert `err(result)` and `result.errorKind === "memory"`. Today RED.
+  - Implement — one line in `src/session.ts` `Session.resume`, in the `wrappedRunOpts` literal
+    (`:435-439`), after `...runOpts,`:
+    ```ts
+      limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
+    ```
+    Nothing else. Do not recover `onApproval`/`signal` from the suspension (D1/D2); do not add
+    `mount`/`inputs`/`scriptName`/`maxStdoutBytes` (D3).
+  - Verify — `npx tsx --test test/session.test.ts` green; full `npm test` green;
     `npm run check` + `npm run build` + `npm run lint` clean.
-  - Files: `extensions/repl-extension.ts`, `test/extension.test.ts`.
+  - Files — `src/session.ts`, `test/session.test.ts`.
 
-- [x] **T2 — Derive both clamp ceilings from `limitsConfig()` (D1, D5)**
-  - RED (add to the same describe block, save/restore env in `try/finally`):
-    1. With `REPL_MAX_MEMORY_MB=256`, `clampModelLimits(undefined, 1024)` → `{ maxMemory: 256 * 1_048_576 }`.
-    2. With `REPL_MAX_DURATION_SECS=10`, `clampModelLimits(1000, undefined)` → `{ maxDurationSecs: 10 }`.
-    Both fail today (they return the fixed `1024 * MiB` / `300`).
-  - Implement: `import { limitsConfig } from "../src/sandbox.js";` in
-    `extensions/repl-extension.ts`; in `clampModelLimits`, derive
-    `durationCap = Math.min(MAX_MODEL_DURATION_SECS, limitsConfig().maxDurationSecs)` and
-    `memoryCapMiB = Math.min(MAX_MODEL_MEMORY_MIB, limitsConfig().maxMemory / BYTES_PER_MIB)`, and
-    clamp against those instead of the constants. Update the JSDoc to state `clampModelLimits`
-    now reads `process.env` via `limitsConfig()`.
-  - Update the four stale fixed-cap assertions in `test/extension.test.ts` (the
-    `(10_000, undefined) → 300`, `(undefined, 2048) → 1024*MiB`, `(300, 1024) → {300, 1024*MiB}`,
-    `(301, undefined) → 300` cases) to the derived default ceilings (`30` / `512 * MiB`) and rename
-    their titles to say "derived ceiling", since they now run with no env vars set.
-  - Verify: `npx tsx --test test/extension.test.ts` green; full `npm test` green;
+- [ ] **T2 — Pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume` (D2)**
+  - RED — this is a **characterization pin**, not a bug fix: the code already forwards the signal
+    (`extensions/repl-extension.ts:371-375`), so the new test passes on first run and guards the seam.
+    Add a new `describe("repl extension — repl_resume forwards the abort signal (#177 D2)")` block to
+    `test/extension.test.ts` (after the `suspension is reachable (#51)` describe at `:983`), with a
+    `mkdtemp` `cwd` in `before`/`after`. Stub `ReplRunner.prototype.resume` (mirroring
+    `runWithLimits` at `:347-372`) to capture its 3rd positional argument, restore it in `finally`:
+    ```ts
+    const controller = new AbortController();
+    const seen: unknown[] = [];
+    const originalResume = ReplRunner.prototype.resume;
+    ReplRunner.prototype.resume = (async (_sessionId, _onApproval, signal) => {
+      seen.push(signal);
+      return "[result]\n1";
+    }) as unknown as typeof ReplRunner.prototype.resume;
+    try {
+      const resume = (await loadTools()).find((t) => t.name === "repl_resume");
+      assert.ok(resume);
+      await resume.execute("sig-1", { sessionId: "sig" }, controller.signal, undefined,
+        { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
+    } finally {
+      ReplRunner.prototype.resume = originalResume;
+    }
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], controller.signal);
+    ```
+  - Implement — none. If the test fails, the signal forward has regressed: record the blocker and do
+    not "fix" it by changing `repl-extension.ts` out of scope.
+  - Verify — `npx tsx --test test/extension.test.ts` green; full `npm test` green;
     `npm run check` + `npm run build` + `npm run lint` clean.
-  - Files: `extensions/repl-extension.ts`, `test/extension.test.ts`.
+  - Files — `test/extension.test.ts`.
 
 ## Checkpoint (after T2)
 
-- [ ] Issue acceptance met: with `REPL_MAX_MEMORY_MB=256`, a model-supplied `maxMemory=1024` yields
-      `256 * 1_048_576` bytes (never `1024 * MiB`); `REPL_MAX_DURATION_SECS=10` caps `1000` to `10`.
+- [ ] Issue acceptance met: a resumed run honours the same clamped limits the original `repl` call was
+      granted (derived ceilings, never 300 s / 1024 MiB); explicit caller limits still win (D4).
+- [ ] `repl_resume` signal-forwarding seam pinned.
+- [ ] Tightened `REPL_MAX_MEMORY_MB` survives into resume (tested).
 - [ ] Full suite green; `check`/`build`/`lint` clean.
 
-## DoD (from #176, reconciled)
+## DoD (from #177, reconciled)
 
-- [ ] Ceilings derived from `limitsConfig()` (`min(specCap, effective value)`), not hardcoded.
-- [ ] `maxMemory` byte conversion floored to an integer.
-- [ ] Tests pin the tightened-env-var ceiling and the fractional-byte floor.
-- [ ] No `src/sandbox.ts` changes; no tool-schema or description changes.
+- [ ] `Session.resume` merges `runOpts?.limits ?? this.suspendedRunOpts?.limits`; caller limits win.
+- [ ] Session-level integration test proves resumed runs use the suspended limits (memory seam).
+- [ ] Extension-level test pins `repl_resume` → `ReplRunner.resume` signal forwarding.
+- [ ] No changes to `src/sandbox.ts`, `src/repl.ts`, `extensions/repl-extension.ts`; no `repl_resume`
+      schema/description change; no #84 merge (mount/inputs/scriptName/maxStdoutBytes).
