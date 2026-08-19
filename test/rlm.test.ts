@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
 import { estimateTokens, SpendBudget } from "../src/budget.js";
-import type { HostTool, LlmClient, RlmIteration, RunErrorKind } from "../src/types.js";
+import type { HostTool, RunErrorKind } from "../src/types.js";
 
 import { createRLMTools } from "../src/rlm_tools.js";
 import {
@@ -15,6 +15,8 @@ import {
   buildFeedback,
   DEFAULT_RLM_SYSTEM_PROMPT,
   type CodeExtraction,
+  type LlmClient,
+  type RlmIteration,
 } from "../src/rlm.js";
 
 // ── Load repl_server.py — the shipped RLM preamble ──────────────

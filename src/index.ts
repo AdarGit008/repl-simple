@@ -13,11 +13,6 @@ export type {
   RunSuspended,
   DiscardedSuspension,
   RunResult,
-  LlmClient,
-  RlmOptions,
-  RlmResult,
-  RlmIteration,
-  RlmBudgetReport,
 } from "./types.js";
 export { HostToolError } from "./types.js";
 
@@ -119,6 +114,11 @@ export {
   extractDirectAnswer,
   type CodeExtraction,
   DEFAULT_RLM_SYSTEM_PROMPT,
+  type LlmClient,
+  type RlmOptions,
+  type RlmResult,
+  type RlmIteration,
+  type RlmBudgetReport,
 } from "./rlm.js";
 
 // ── Repl ────────────────────────────────────────────────────────

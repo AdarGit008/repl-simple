@@ -14,11 +14,15 @@ import {
   type RunResult,
   type RunErrorKind,
   type ToolCallTrace,
+} from "../src/types.js";
+import {
+  SpendBudget,
+  estimateTokens,
+  type RlmBudgetReport,
   type LlmClient,
   type RlmOptions,
   type RlmResult,
-} from "../src/types.js";
-import { SpendBudget, estimateTokens, type RlmBudgetReport } from "../src/index.js";
+} from "../src/index.js";
 import { ToolRegistry } from "../src/registry.js";
 
 // ── HostToolError (runtime-testable) ───────────────────────────
