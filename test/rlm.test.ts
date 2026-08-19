@@ -3434,7 +3434,8 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.status, "budget_exhausted");
     assert.equal(result.budget?.limited, true);
     assert.deepEqual(result.iterations, []);
-    assert.equal(result.answer, "(no answer)");
+    assert.equal(result.answer, "");
+    assert.equal(result.answerSource, "salvaged");
     assert.equal(llm.calls().length, 0, "the LLM must never be called");
   });
 
@@ -3500,5 +3501,58 @@ describe("runRlm() — spend budget", () => {
         /SpendBudget limit must be a finite, non-negative number/,
       );
     }
+  });
+});
+
+describe("runRlm() — answer provenance (issue #76)", () => {
+  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry(
+      createRLMTools({
+        onLLMQuery: async () => "",
+        onRLMQuery: async () => "",
+      }),
+    );
+  }
+
+  it("1. a cap hit with only a debug print is salvaged, not submitted (issue test 1)", async () => {
+    const debug = "```python\nprint('still working...')\n```";
+    const { llm } = mockLlmCodeGen([debug, debug, debug]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    // The debug print's stdout is the best-effort salvage, never a SUBMIT.
+    assert.equal(result.answer, "still working...\n");
+  });
+
+  it("2. submitting the literal '(no answer)' is distinguishable from a failed run (issue test 2)", async () => {
+    const { llm: submitLlm } = mockLlmCodeGen(['```python\nSUBMIT("(no answer)")\n```']);
+    const submitted = await runRlm("q", {
+      llmClient: submitLlm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(submitted.status, "ok");
+    assert.equal(submitted.answerSource, "submitted");
+    assert.equal(submitted.answer, "(no answer)");
+
+    // The cap with nothing salvageable: no successful output, no stdout.
+    const { llm: emptyLlm } = mockLlmCodeGen(["```python\nx = 1\n```"]);
+    const empty = await runRlm("q", {
+      llmClient: emptyLlm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(empty.status, "max_iterations");
+    assert.equal(empty.answerSource, "salvaged");
+    assert.equal(empty.answer, "");
   });
 });

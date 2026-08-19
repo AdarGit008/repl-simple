@@ -313,6 +313,7 @@ describe("RlmResult budget report", () => {
     const result: RlmResult = {
       status: "budget_exhausted",
       answer: "best effort",
+      answerSource: "salvaged",
       iterations: [],
       budget: report,
     };
@@ -326,6 +327,7 @@ describe("RlmResult budget report", () => {
     const result: RlmResult = {
       status: "max_iterations",
       answer: "partial",
+      answerSource: "salvaged",
       iterations: [],
       budget: { limit: 10, consumed: 10, limited: false },
     };
@@ -334,7 +336,12 @@ describe("RlmResult budget report", () => {
   });
 
   it("omits budget when none is configured", () => {
-    const result: RlmResult = { status: "ok", answer: "done", iterations: [] };
+    const result: RlmResult = {
+      status: "ok",
+      answer: "done",
+      answerSource: "submitted",
+      iterations: [],
+    };
     assert.equal(result.budget, undefined);
   });
 });

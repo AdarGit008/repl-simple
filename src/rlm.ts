@@ -551,7 +551,7 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
 
 /** Extract the best available answer when max iterations are exhausted. */
 function extractBestAnswer(iterations: RlmIteration[]): string {
-  // Last successful output, or last error message
+  // Last successful non-"None" output, else last non-empty stdout
   for (let i = iterations.length - 1; i >= 0; i--) {
     const r = iterations[i].result;
     if (r.status === "ok" && r.output && r.output !== "None") return r.output;
@@ -560,7 +560,7 @@ function extractBestAnswer(iterations: RlmIteration[]): string {
   for (let i = iterations.length - 1; i >= 0; i--) {
     if (iterations[i].result.stdout) return iterations[i].result.stdout;
   }
-  return "(no answer)";
+  return "";
 }
 
 /**
@@ -873,6 +873,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   const aborted = (): RlmResult => ({
     status: "aborted",
     answer: extractBestAnswer(iterations),
+    answerSource: "salvaged",
     iterations,
     ...(budget ? { budget: budgetReport(budget, false) } : {}),
   });
@@ -892,6 +893,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         return {
           status: "budget_exhausted",
           answer: extractBestAnswer(iterations),
+          answerSource: "salvaged",
           iterations,
           budget: budgetReport(budget, true),
         };
@@ -981,6 +983,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       return {
         status: "ok",
         answer: result.output,
+        answerSource: "submitted",
         iterations,
         ...(report ? { budget: report } : {}),
       };
@@ -1019,6 +1022,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   return {
     status: "max_iterations",
     answer: lastAnswer,
+    answerSource: "salvaged",
     iterations,
     ...(report ? { budget: report } : {}),
   };
