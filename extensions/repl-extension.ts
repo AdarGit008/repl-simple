@@ -79,7 +79,7 @@ function approvalTimeoutMs(): number | undefined {
 // The extension is the model boundary: it is where untrusted model input
 // enters, so a model-supplied limit is clamped, never trusted. `ReplRunner`
 // stays a faithful library and forwards whatever it is given (D2) — the clamp
-// lives here, as a pure helper so it is unit-testable without driving the
+// lives here, as a small helper so it is unit-testable without driving the
 // sandbox. Each ceiling is `min(specCap, limitsConfig() effective value)`:
 // `MAX_MODEL_DURATION_SECS` / `MAX_MODEL_MEMORY_MIB` are the absolute upper
 // bound, while `limitsConfig()` supplies the operator's `REPL_*` env knob or
@@ -115,7 +115,7 @@ function clampCeiling(value: unknown, cap: number): number | undefined {
  * overridden by a model-supplied value. `maxMemory` is in MiB here, clamped
  * and converted to bytes. Both are omitted when not a positive finite number.
  * The result is always an object, never `"unbounded"` — that escape hatch is
- * the library's, not the model's (D2/D3).
+ * the library's, not the model's (see SPEC.md D1–D2).
  *
  * Reads `process.env` via `limitsConfig()` at call time, so it is no longer a
  * strictly pure function.
@@ -318,14 +318,16 @@ export default function (pi: ReplExtensionApi) {
         maxDurationSecs: Type.Optional(
           Type.Number({
             description:
-              "Maximum interpreter compute time in seconds, capped at 300. " +
+              "Maximum interpreter compute time in seconds, capped at 300, or lower if the " +
+              "operator sets REPL_MAX_DURATION_SECS (default 30). " +
               "Omitted uses the sandbox default (30).",
           }),
         ),
         maxMemory: Type.Optional(
           Type.Number({
             description:
-              "Maximum sandbox heap in MiB, capped at 1024. " +
+              "Maximum sandbox heap in MiB, capped at 1024, or lower if the operator sets " +
+              "REPL_MAX_MEMORY_MB (default 512 MiB). " +
               "Omitted uses the sandbox default (512 MiB).",
           }),
         ),

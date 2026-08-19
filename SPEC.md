@@ -109,6 +109,21 @@ re-introduce hardcoded 300/1024. Note this in the close-out so #177's flight rea
 env-var test lives in `test/extension.test.ts`, where #178's `runWithLimits` monkey-patch helper
 also lives; the new tests do not touch `ReplRunner.prototype` and are unaffected by it.
 
+### D7 — Tool descriptions reflect the derived ceiling; default-ceiling tests are hermetic
+
+Two review follow-ups recorded as decisions:
+
+1. **Descriptions.** The `repl` tool's `maxDurationSecs`/`maxMemory` parameter descriptions must
+   not advertise the fixed 300 s / 1024 MiB caps (stale under D1). Reword them to the derived
+   ceiling: e.g. "capped at 300 s, or lower if the operator sets `REPL_MAX_DURATION_SECS`
+   (default 30)" and "capped at 1024 MiB, or lower if the operator sets `REPL_MAX_MEMORY_MB`
+   (default 512 MiB)". The description-pin test in `test/extension.test.ts` is updated to match.
+
+2. **Hermetic default-ceiling tests.** The default-ceiling assertions (30 s / 512 MiB) must hold
+   regardless of ambient `REPL_*` env vars. The `clampModelLimits` describe block snapshots and
+   clears `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` in a `before` hook and restores them in
+   an `after` hook, so an outer `REPL_MAX_MEMORY_MB=256 npm test` cannot spuriously fail them.
+
 ## Commands
 
 ```
@@ -154,7 +169,7 @@ New/reworked assertions (RED before GREEN):
 ## Boundaries
 
 - **Always:** run the focused test then the full suite + `check` + `build` + `lint` before declaring a task done; RED first; save/restore env in tests.
-- **Ask first / Never:** (autonomous flight — no live ask) do not touch `src/sandbox.ts`, `ReplRunner`, or any file beyond `extensions/repl-extension.ts` and `test/extension.test.ts`; do not change the tool schema or descriptions.
+- **Ask first / Never:** (autonomous flight — no live ask) do not touch `src/sandbox.ts`, `ReplRunner`, or any file beyond `extensions/repl-extension.ts` and `test/extension.test.ts`; do not change the tool schema (parameter descriptions may be updated per D7).
 
 ## Success criteria
 

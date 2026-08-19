@@ -131,8 +131,14 @@ describe("repl extension — parameter schemas", () => {
     assert.deepEqual(repl.parameters.required, ["code"]);
     // The descriptions must name the caps, or the model is told it may ask
     // for more than the clamp will grant.
-    assert.match(repl.parameters.properties.maxDurationSecs?.description ?? "", /300/);
-    assert.match(repl.parameters.properties.maxMemory?.description ?? "", /1024/);
+    assert.match(
+      repl.parameters.properties.maxDurationSecs?.description ?? "",
+      /capped at 300, or lower/,
+    );
+    assert.match(
+      repl.parameters.properties.maxMemory?.description ?? "",
+      /capped at 1024, or lower/,
+    );
   });
 
   it("documents the cancellation boundary in the repl description (D6)", async () => {
@@ -175,6 +181,26 @@ describe("repl extension — parameter schemas", () => {
 
 describe("repl extension — clampModelLimits", () => {
   const MIB = 1_048_576;
+
+  // Hermetic default-ceiling tests (D7): an ambient REPL_* var in the outer
+  // `npm test` process must not turn the 30 s / 512 MiB assertions into
+  // failures. Snapshot and clear both vars for the block, restore after.
+  let priorDuration: string | undefined;
+  let priorMemory: string | undefined;
+
+  before(() => {
+    priorDuration = process.env.REPL_MAX_DURATION_SECS;
+    priorMemory = process.env.REPL_MAX_MEMORY_MB;
+    delete process.env.REPL_MAX_DURATION_SECS;
+    delete process.env.REPL_MAX_MEMORY_MB;
+  });
+
+  after(() => {
+    if (priorDuration === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+    else process.env.REPL_MAX_DURATION_SECS = priorDuration;
+    if (priorMemory === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+    else process.env.REPL_MAX_MEMORY_MB = priorMemory;
+  });
 
   it("clamps an above-cap maxDurationSecs to the derived ceiling", () => {
     assert.deepEqual(clampModelLimits(10_000, undefined), { maxDurationSecs: 30 });
@@ -253,6 +279,32 @@ describe("repl extension — clampModelLimits", () => {
     // (30 s / 512 MiB). A value equal to the ceiling is honoured, not clamped down.
     assert.deepEqual(clampModelLimits(30, undefined), { maxDurationSecs: 30 });
     assert.deepEqual(clampModelLimits(undefined, 512), { maxMemory: 512 * MIB });
+  });
+
+  it("boundary equality under an env override", () => {
+    // A request exactly at the operator's ceiling is honoured, not clamped
+    // down: clampCeiling is upper-bound-only, so equality survives.
+    const prior = process.env.REPL_MAX_MEMORY_MB;
+    process.env.REPL_MAX_MEMORY_MB = "256";
+    try {
+      assert.deepEqual(clampModelLimits(undefined, 256), { maxMemory: 256 * MIB });
+    } finally {
+      if (prior === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+      else process.env.REPL_MAX_MEMORY_MB = prior;
+    }
+  });
+
+  it("invalid env falls back to the default ceiling", () => {
+    // `envInt` treats an unparseable value as a typo and falls back to the
+    // 512 MiB default, so the derived ceiling is the default, not the spec cap.
+    const prior = process.env.REPL_MAX_MEMORY_MB;
+    process.env.REPL_MAX_MEMORY_MB = "abc";
+    try {
+      assert.deepEqual(clampModelLimits(undefined, 2048), { maxMemory: 512 * MIB });
+    } finally {
+      if (prior === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+      else process.env.REPL_MAX_MEMORY_MB = prior;
+    }
   });
 });
 
