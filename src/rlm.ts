@@ -988,11 +988,17 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       );
     }
   }
-  if (maxIterations < 1) {
-    throw new Error("runRlm: maxIterations must be >= 1");
+  if (!Number.isInteger(maxIterations) || maxIterations < 1) {
+    throw new Error("runRlm: maxIterations must be a positive integer");
   }
-  if (options.maxDepth !== undefined && options.maxDepth < 0) {
-    throw new Error("runRlm: maxDepth must be >= 0");
+  if (
+    options.maxDepth !== undefined &&
+    (!Number.isInteger(options.maxDepth) || options.maxDepth < 0)
+  ) {
+    throw new Error("runRlm: maxDepth must be a non-negative integer");
+  }
+  if (options.depth !== undefined && (!Number.isInteger(options.depth) || options.depth < 0)) {
+    throw new Error("runRlm: depth must be a non-negative integer");
   }
 
   // Build sandbox RunOptions (combine RLM-level runOptions with inputs/scriptName).

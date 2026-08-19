@@ -617,7 +617,31 @@ describe("runRlm() — self-registered RLM tools", () => {
     const { llm } = mockLlmCodeGen([]);
     await assert.rejects(
       runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: 0 }),
-      { message: "runRlm: maxIterations must be >= 1" },
+      { message: "runRlm: maxIterations must be a positive integer" },
+    );
+  });
+
+  it("throws when maxIterations is NaN", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: NaN }),
+      { message: "runRlm: maxIterations must be a positive integer" },
+    );
+  });
+
+  it("throws when maxIterations is Infinity", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: Infinity }),
+      { message: "runRlm: maxIterations must be a positive integer" },
+    );
+  });
+
+  it("throws when maxIterations is fractional", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: 1.5 }),
+      { message: "runRlm: maxIterations must be a positive integer" },
     );
   });
 
@@ -625,7 +649,55 @@ describe("runRlm() — self-registered RLM tools", () => {
     const { llm } = mockLlmCodeGen([]);
     await assert.rejects(
       runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxDepth: -1 }),
-      { message: "runRlm: maxDepth must be >= 0" },
+      { message: "runRlm: maxDepth must be a non-negative integer" },
+    );
+  });
+
+  it("throws when maxDepth is NaN", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxDepth: NaN }),
+      { message: "runRlm: maxDepth must be a non-negative integer" },
+    );
+  });
+
+  it("throws when maxDepth is Infinity", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxDepth: Infinity }),
+      { message: "runRlm: maxDepth must be a non-negative integer" },
+    );
+  });
+
+  it("throws when maxDepth is fractional", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxDepth: 0.5 }),
+      { message: "runRlm: maxDepth must be a non-negative integer" },
+    );
+  });
+
+  it("throws when depth is NaN", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), depth: NaN }),
+      { message: "runRlm: depth must be a non-negative integer" },
+    );
+  });
+
+  it("throws when depth is Infinity", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), depth: Infinity }),
+      { message: "runRlm: depth must be a non-negative integer" },
+    );
+  });
+
+  it("throws when depth is fractional", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), depth: 0.5 }),
+      { message: "runRlm: depth must be a non-negative integer" },
     );
   });
 });
