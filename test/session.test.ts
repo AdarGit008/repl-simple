@@ -838,6 +838,84 @@ describe("Session — a resumed run honours the suspended run's limits (#177)", 
   });
 });
 
+// ── a resumed run honours the suspended host wall-clock budget (#177) ──
+//
+// The memory tests above are preserved by Monty's snapshot restore; the
+// `Session.resume` merge field `limits: runOpts?.limits ?? this.suspendedRunOpts?.limits`
+// (D1, D4) has one observable effect left: the host-side `maxWallClockSecs`
+// knob, which Monty does not snapshot. It is enforced by `withHostDeadline`
+// (src/sandbox.ts) as a wall-clock budget over the whole run, host-tool time
+// included — so a host tool that parks the host long past the budget trips
+// `"timeout"`, while one inside the default 300 s finishes `"ok"`.
+
+describe("Session — a resumed run honours the suspended host wall-clock budget (#177)", () => {
+  // A gated tool: suspends before the expensive continuation runs.
+  const gated: HostTool = {
+    name: "gated_wallclock",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  // A host tool that blocks the host for five seconds. It is host time, not
+  // interpreter compute: Monty's `maxDurationSecs` clock does not advance while
+  // the worker awaits it, so only `maxWallClockSecs` (via `withHostDeadline`)
+  // can bound it.
+  const blocker: HostTool = {
+    name: "block_5s",
+    description: "Blocks the host event loop for five seconds",
+    params: [],
+    returns: "str",
+    execute: () => new Promise((resolve) => setTimeout(() => resolve("unblocked"), 5_000)),
+  };
+
+  it("a resumed run honours the suspended host wall-clock budget (#177)", async () => {
+    const registry = new ToolRegistry([gated, blocker]);
+    const session = new Session({ registry });
+
+    // The gated call suspends before the 5 s block runs. The original call was
+    // granted a 2 s host wall-clock budget; resuming with no limits must still
+    // enforce it, so the 5 s block overruns and the host deadline returns
+    // "timeout" — not "ok" under the 300 s default (which is what the unfixed
+    // resume sees).
+    suspended(
+      await session.run('gated_wallclock("x")\nblock_5s()', {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 2 },
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+  });
+
+  it("an explicit maxWallClockSecs on resume wins over the suspended value (#177 D4)", async () => {
+    // A precedence pin, not the merge: `resume` spreads `...runOpts`, so the
+    // explicit `{ maxWallClockSecs: 2 }` is forwarded whether or not the
+    // `limits` merge field exists. This test is green with AND without the fix;
+    // it pins the D4 contract that an explicit 2 s outranks the suspended 300 s.
+    const registry = new ToolRegistry([gated, blocker]);
+    const session = new Session({ registry });
+
+    suspended(
+      await session.run('gated_wallclock("x")\nblock_5s()', {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 300 },
+      }),
+    );
+
+    const result = await session.resume({
+      onApproval: () => true,
+      limits: { maxWallClockSecs: 2 },
+    });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+  });
+});
+
 // ── reset ───────────────────────────────────────────────────────
 
 describe("Session — reset", () => {
