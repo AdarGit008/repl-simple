@@ -135,6 +135,17 @@ describe("repl extension — parameter schemas", () => {
     assert.match(repl.parameters.properties.maxMemory?.description ?? "", /1024/);
   });
 
+  it("documents the cancellation boundary in the repl description (D6)", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl, "repl did not register");
+
+    // The description must promise only what the implementation can deliver:
+    // cancellation applies at tool-call pause points, never inside a
+    // pure-Python loop, where only maxDurationSecs bounds the run.
+    assert.match(repl.description, /stops it between tool calls/);
+    assert.match(repl.description, /pure-Python loop with no pause points/);
+  });
+
   it("the other three take sessionId (optional) and require nothing", async () => {
     const tools = await loadTools();
 
@@ -179,6 +190,11 @@ describe("repl extension — clampModelLimits", () => {
 
   it("leaves a value exactly at the cap untouched", () => {
     assert.deepEqual(clampModelLimits(300, 1024), { maxDurationSecs: 300, maxMemory: 1024 * MIB });
+  });
+
+  it("clamps a just-above-cap duration and converts fractional MiB exactly", () => {
+    assert.deepEqual(clampModelLimits(301, undefined), { maxDurationSecs: 300 });
+    assert.deepEqual(clampModelLimits(undefined, 0.5), { maxMemory: 524288 });
   });
 
   it("omits values that are not positive finite numbers", () => {
@@ -1199,11 +1215,7 @@ describe("repl extension — abort between gated host calls (D7 test 1)", () => 
     // first gated call really ran, the second never reached the approval gate
     // (let alone executed).
     assert.deepEqual(prompts, ["write"], "the second gated call was dispatched to the gate");
-    assert.equal(
-      readFileSync(join(cwd, "first.txt"), "utf8"),
-      "one",
-      "the first call never ran",
-    );
+    assert.equal(readFileSync(join(cwd, "first.txt"), "utf8"), "one", "the first call never ran");
     assert.equal(
       existsSync(join(cwd, "second.txt")),
       false,
