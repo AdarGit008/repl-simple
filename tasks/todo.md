@@ -15,7 +15,7 @@ full suite must be green. The bug is at the model boundary only — do not touch
     `npm run check` + `npm run build` + `npm run lint` clean.
   - Files: `extensions/repl-extension.ts`, `test/extension.test.ts`.
 
-- [ ] **T2 — Derive both clamp ceilings from `limitsConfig()` (D1, D5)**
+- [x] **T2 — Derive both clamp ceilings from `limitsConfig()` (D1, D5)**
   - RED (add to the same describe block, save/restore env in `try/finally`):
     1. With `REPL_MAX_MEMORY_MB=256`, `clampModelLimits(undefined, 1024)` → `{ maxMemory: 256 * 1_048_576 }`.
     2. With `REPL_MAX_DURATION_SECS=10`, `clampModelLimits(1000, undefined)` → `{ maxDurationSecs: 10 }`.

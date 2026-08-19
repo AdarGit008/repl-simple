@@ -176,24 +176,24 @@ describe("repl extension — parameter schemas", () => {
 describe("repl extension — clampModelLimits", () => {
   const MIB = 1_048_576;
 
-  it("clamps an above-cap maxDurationSecs to 300", () => {
-    assert.deepEqual(clampModelLimits(10_000, undefined), { maxDurationSecs: 300 });
+  it("clamps an above-cap maxDurationSecs to the derived ceiling", () => {
+    assert.deepEqual(clampModelLimits(10_000, undefined), { maxDurationSecs: 30 });
   });
 
-  it("clamps an above-cap maxMemory to 1024 MiB, in bytes", () => {
-    assert.deepEqual(clampModelLimits(undefined, 2048), { maxMemory: 1024 * MIB });
+  it("clamps an above-cap maxMemory to the derived ceiling, in bytes", () => {
+    assert.deepEqual(clampModelLimits(undefined, 2048), { maxMemory: 512 * MIB });
   });
 
   it("honours shorter/smaller requests — the clamp is a ceiling, not a floor", () => {
     assert.deepEqual(clampModelLimits(5, 128), { maxDurationSecs: 5, maxMemory: 128 * MIB });
   });
 
-  it("leaves a value exactly at the cap untouched", () => {
-    assert.deepEqual(clampModelLimits(300, 1024), { maxDurationSecs: 300, maxMemory: 1024 * MIB });
+  it("clamps both knobs to their derived ceilings", () => {
+    assert.deepEqual(clampModelLimits(300, 1024), { maxDurationSecs: 30, maxMemory: 512 * MIB });
   });
 
-  it("clamps a just-above-cap duration and converts fractional MiB exactly", () => {
-    assert.deepEqual(clampModelLimits(301, undefined), { maxDurationSecs: 300 });
+  it("clamps a just-above-cap duration to the derived ceiling and converts fractional MiB exactly", () => {
+    assert.deepEqual(clampModelLimits(301, undefined), { maxDurationSecs: 30 });
     assert.deepEqual(clampModelLimits(undefined, 0.5), { maxMemory: 524288 });
   });
 
@@ -206,6 +206,28 @@ describe("repl extension — clampModelLimits", () => {
     assert.deepEqual(clampModelLimits(NaN, Infinity), {});
     assert.deepEqual(clampModelLimits("10", null), {});
     assert.deepEqual(clampModelLimits(undefined, undefined), {});
+  });
+
+  it("caps maxMemory at the operator's REPL_MAX_MEMORY_MB ceiling", () => {
+    const prior = process.env.REPL_MAX_MEMORY_MB;
+    process.env.REPL_MAX_MEMORY_MB = "256";
+    try {
+      assert.deepEqual(clampModelLimits(undefined, 1024), { maxMemory: 256 * MIB });
+    } finally {
+      if (prior === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+      else process.env.REPL_MAX_MEMORY_MB = prior;
+    }
+  });
+
+  it("caps maxDurationSecs at the operator's REPL_MAX_DURATION_SECS ceiling", () => {
+    const prior = process.env.REPL_MAX_DURATION_SECS;
+    process.env.REPL_MAX_DURATION_SECS = "10";
+    try {
+      assert.deepEqual(clampModelLimits(1000, undefined), { maxDurationSecs: 10 });
+    } finally {
+      if (prior === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+      else process.env.REPL_MAX_DURATION_SECS = prior;
+    }
   });
 });
 
@@ -259,7 +281,7 @@ describe("repl extension — the repl tool passes clamped limits (never 'unbound
 
   it("clamps an above-cap request before it reaches the runner", async () => {
     const seen = await runWithLimits({ code: "1 + 1", maxDurationSecs: 10_000, maxMemory: 2048 });
-    assert.deepEqual(seen, [{ maxDurationSecs: 300, maxMemory: 1024 * 1_048_576 }]);
+    assert.deepEqual(seen, [{ maxDurationSecs: 30, maxMemory: 512 * 1_048_576 }]);
   });
 
   it("never emits 'unbounded', even with no limits supplied", async () => {
