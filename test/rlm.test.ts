@@ -630,6 +630,114 @@ describe("runRlm() — self-registered RLM tools", () => {
   });
 });
 
+// ── Nesting, maxDepth downgrade, parent-context inheritance (D52) ──
+
+describe("runRlm() — nested rlm_query", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("rlm_query spawns a nested runRlm and returns its answer", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("investigate", "ctx data")\nSUBMIT("outer: " + result)\n```',
+      '```python\nSUBMIT("nested answer")\n```',
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer: nested answer");
+    assert.equal(result.iterations.length, 1);
+  });
+
+  it("rlm_query at maxDepth downgrades to llm_query (no nested spawn)", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```',
+      "downgraded answer",
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "downgraded answer");
+
+    // The downgrade prompt reached the llmClient, and no nested loop ran:
+    // exactly two query calls — the root code gen and the downgraded ask.
+    assert.equal(llm.calls().length, 2);
+    const downgrade = llm.calls()[1].messages[0].content;
+    assert.match(downgrade, /\[rlm_query downgraded at max depth 1\]/);
+    assert.match(downgrade, /Query: q/);
+    assert.match(downgrade, /Context: c/);
+  });
+
+  it("default depth is 0 (rlm_query spawns nested, not downgraded)", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("sub")\nSUBMIT(result)\n```',
+      '```python\nSUBMIT("from nested")\n```',
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "from nested");
+    // A depth-0 rlm_query must spawn a nested loop, never downgrade.
+    assert.ok(
+      !llm.calls().some((c) => c.messages[0].content.includes("downgraded")),
+      "a depth-0 rlm_query must spawn a nested loop, not downgrade",
+    );
+  });
+
+  it("child inherits the parent's context plus its own sub-context", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("sub", "SUB-CTX")\nSUBMIT("outer: " + result)\n```',
+      "```python\nSUBMIT(context)\n```",
+    ]);
+
+    const result = await runRlm("parent", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "PARENT-CTX" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    // The child's context is the parent context first, then the sub-context.
+    assert.equal(result.answer, "outer: PARENT-CTX\n\nSUB-CTX");
+  });
+
+  it("nested loop composes with llm_query", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nnested = rlm_query("investigate")\nSUBMIT("final: " + nested)\n```',
+      '```python\nanswer = llm_query("what do you think?")\nSUBMIT(answer)\n```',
+      "llm result",
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "final: llm result");
+  });
+});
+
 // ── Abort semantics (#75) ───────────────────────────────────────
 
 describe("runRlm() — abort", () => {

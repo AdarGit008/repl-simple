@@ -133,6 +133,11 @@ export interface RlmResult {
   iterations: RlmIteration[];
   /** Spend-budget report — present only when a budget was configured. */
   budget?: RlmBudgetReport;
+  /**
+   * Error message for a failed result. Populated on `status: "error"` (D53);
+   * the nested `rlm_query` error branch reads it (D52).
+   */
+  error?: string;
 }
 
 // ── Feedback budgets ────────────────────────────────────────────
@@ -957,49 +962,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     throw new Error("runRlm: maxDepth must be >= 0");
   }
 
-  // The sandbox registry is the caller's tools merged with the loop's own
-  // RLM tools (llm_query, rlm_query, SUBMIT). `llm_query` is a single-turn
-  // ask against the same system prompt; `rlm_query` is a placeholder that
-  // downgrades to an llm_query-style ask until nesting lands (T4).
-  const registry = new ToolRegistry([
-    ...options.registry.list(),
-    ...createRLMTools({
-      onLLMQuery: async (prompt) =>
-        llmClient.query(systemPrompt, [{ role: "user", content: prompt }], options.signal),
-      // T4: replace with nested runRlm
-      onRLMQuery: async (query, context) =>
-        llmClient.query(
-          systemPrompt,
-          [
-            {
-              role: "user",
-              content: `[rlm_query] Query: ${query}\nContext: ${context ?? "(none)"}`,
-            },
-          ],
-          options.signal,
-        ),
-    }),
-  ]);
-
-  // Build the spend budget once, before the loop (D3): a number mints a fresh
-  // per-run budget; an instance is shared and mutated in place, so siblings
-  // passing the same instance compete for one pool; absent means no budget
-  // logic at all (D5).
-  const budget: SpendBudget | undefined =
-    options.budget instanceof SpendBudget
-      ? options.budget
-      : options.budget !== undefined
-        ? new SpendBudget(options.budget)
-        : undefined;
-
-  // The system prompt is constant across iterations, so its token cost is
-  // computed once here instead of re-encoded on every charge.
-  const systemPromptTokens = estimateTokens(systemPrompt);
-
-  // Build sandbox options
-  const sandboxOpts: SandboxOptions = { registry };
-
-  // Build sandbox RunOptions (combine RLM-level runOptions with inputs/scriptName)
+  // Build sandbox RunOptions (combine RLM-level runOptions with inputs/scriptName).
+  // Built BEFORE the RLM-tool registry so the `onRLMQuery` closure below can
+  // read the parent loop's finalised context for parent-context inheritance
+  // (D52) — the child inherits what the parent already knows.
   const sandboxRunOpts = options.runOptions ? { ...options.runOptions } : {};
   // `context` is always declared, defaulting to "" — the shipped preamble
   // (repl_server.py) references it from its helper bodies, and an undeclared
@@ -1027,6 +993,86 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   if (options.signal) {
     sandboxRunOpts.signal = options.signal;
   }
+
+  // The sandbox registry is the caller's tools merged with the loop's own
+  // RLM tools (llm_query, rlm_query, SUBMIT). `llm_query` is a single-turn
+  // ask against the same system prompt; `rlm_query` spawns a nested runRlm
+  // until `maxDepth` is reached, then downgrades to an llm_query-style ask.
+  const registry = new ToolRegistry([
+    ...options.registry.list(),
+    ...createRLMTools({
+      onLLMQuery: async (prompt) =>
+        llmClient.query(systemPrompt, [{ role: "user", content: prompt }], options.signal),
+      onRLMQuery: async (query, context) => {
+        const depth = options.depth ?? 0;
+        const maxDepth = options.maxDepth ?? 1;
+
+        // At the depth limit there is no sandbox to investigate in: downgrade
+        // to a single llm_query ask, mirroring RLMLoop's behaviour (D52).
+        if (depth >= maxDepth) {
+          return await llmClient.query(
+            systemPrompt,
+            [
+              {
+                role: "user",
+                content:
+                  `[rlm_query downgraded at max depth ${maxDepth}]\n` +
+                  `Query: ${query}\n` +
+                  `Context: ${context ?? "(none)"}`,
+              },
+            ],
+            options.signal,
+          );
+        }
+
+        // Parent-context inheritance (A26, M16): the child sees the parent
+        // loop's own context first, then its explicit sub-context — a
+        // sub-investigation must not be blind to what its parent already
+        // knows.
+        const merged = [runInputs.context, context].filter(Boolean).join("\n\n");
+
+        const nested = await runRlm(query, {
+          llmClient: options.llmClient,
+          registry: options.registry,
+          maxIterations: options.maxIterations,
+          maxDepth: options.maxDepth,
+          depth: depth + 1,
+          runOptions: options.runOptions,
+          preamble: options.preamble,
+          systemPrompt: options.systemPrompt,
+          signal: options.signal,
+          // The child is bounded by maxIterations/maxDepth, not the parent's
+          // spend pool — a nested loop must not share/compete for the
+          // parent's SpendBudget (D52). `onIteration` is deliberately not
+          // forwarded: child iterations are the child's own.
+          budget: undefined,
+          inputs: { context: merged },
+        });
+
+        return nested.status === "ok"
+          ? nested.answer
+          : `[rlm_query error: ${nested.status}] ${nested.error ?? ""}`;
+      },
+    }),
+  ]);
+
+  // Build the spend budget once, before the loop (D3): a number mints a fresh
+  // per-run budget; an instance is shared and mutated in place, so siblings
+  // passing the same instance compete for one pool; absent means no budget
+  // logic at all (D5).
+  const budget: SpendBudget | undefined =
+    options.budget instanceof SpendBudget
+      ? options.budget
+      : options.budget !== undefined
+        ? new SpendBudget(options.budget)
+        : undefined;
+
+  // The system prompt is constant across iterations, so its token cost is
+  // computed once here instead of re-encoded on every charge.
+  const systemPromptTokens = estimateTokens(systemPrompt);
+
+  // Build sandbox options
+  const sandboxOpts: SandboxOptions = { registry };
 
   // Build initial conversation
   const messages: Array<{ role: "user" | "assistant"; content: string }> = [

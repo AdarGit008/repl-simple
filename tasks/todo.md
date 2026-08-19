@@ -25,7 +25,7 @@ coder per task, fresh context, one commit per task. After each task the full sui
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green; `npm run check`/`build` clean.
   - Files: `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T4 — Nesting, `maxDepth` downgrade, parent-context inheritance (D52)**
+- [x] **T4 — Nesting, `maxDepth` downgrade, parent-context inheritance (D52)**
   - RED: fold the `rlm_loop` nesting cases — `rlm_query` spawns a nested `runRlm`; at `maxDepth` it downgrades to `llm_query`; default `depth` 0; nested + `llm_query` compose; and the child inherits the parent's context.
   - Implement: `RlmOptions.maxDepth?` (default 1) / `depth?` (default 0); `onRLMQuery` spawns nested `runRlm(query, { depth: depth+1, … })` and on nested `ok` returns its `answer`, else `[rlm_query error: <status>] …`; at `depth >= maxDepth` downgrade to `llm_query`. Child `context` = parent context merged with the explicit `rlm_query` context arg (parent-context inheritance).
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green.
