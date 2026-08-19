@@ -437,11 +437,11 @@ truncated view is authenticated: the assistant reply copied into the conversatio
 conversation budget (256 KiB, 50/50 head+tail — the row above) with a deliberately weak recovery
 clause ("Keep replies concise and re-state anything important."), because the model cannot recover
 its own elided reply from anywhere (policy Q3), while `iterations[].llmResponse` keeps the raw
-reply for the caller; truncated views are sentinel-delimited (Exception 5); error lines are
-`> `-quoted so a forged `stdout:` line cannot pass as the real delimiter (D19); input names are
+reply for the caller; truncated views are sentinel-delimited (Exception 5); error and output lines are
+`> `-quoted so a forged `stdout:` line cannot pass as the real delimiter (D19, D36); input names are
 validated against a Python-identifier pattern before any query (D20); the drop marker's label
-derives from the budget via `formatSize` ("256.0KB"); the quoted error section renders ≤ 2× its
-value budget (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
+derives from the budget via `formatSize` ("256.0KB"); the quoted error and output sections render ≤ 2× their
+value budgets (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
 vector); and the aggregate input-preview cut is
 block-level elision over whole per-value previews (D15), so no cut can split a fence or a header.
 
@@ -476,8 +476,8 @@ authenticity only to the marker the system places next to the sentinels, declari
 resembling a summary inside the data itself to be that data's own content (D27), and the
 ZWSP/homoglyph confusable family — a neutralised sentinel differs from a real one by one
 invisible character — makes the mechanism a soft control (defense-in-depth), not
-authentication. On the error branch the authentic sentinels render line-quoted as
-`> [TRUNCATED VIEW BEGIN]` because D19's quoting is applied after the wrap; the rule notes
+authentication. On the error and ok branches the authentic sentinels render line-quoted as
+`> [TRUNCATED VIEW BEGIN]` because D19/D36's quoting is applied after the wrap; the rule notes
 that quoted shape rather than reordering. The sentinel bytes are subtracted from the
 section budget before the `truncateText` call, so the ceilings in the table stay hard with the
 sentinels included; the value is byte-measured after the neutralisation swap, so the budgets

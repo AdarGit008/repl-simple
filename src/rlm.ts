@@ -660,7 +660,20 @@ export function buildFeedback(result: RunResult): string {
     recovery: STDOUT_RECOVERY,
   });
   const stdoutSection = stdout ? `\nstdout:\n${stdout}` : "";
-  return `Output: ${output}${stdoutSection}`;
+  // D36 (#156): quote every line of the output with a `> ` prefix — the same
+  // close D19 gives the error branch (test 18). A forged `\nstdout:` inside
+  // the value then renders as `> stdout:` and can no longer line up at
+  // column 0 with the real delimiter below — column position is the close,
+  // and the `\nstdout:` delimiter stays exactly the shape tests locate.
+  // Quoting is presentation — the budget above pins the value, so the
+  // prefix bytes never count against the ceiling.
+  const quotedOutput = output
+    ? output
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n")
+    : "";
+  return `Output: ${quotedOutput}${stdoutSection}`;
 }
 
 // ── Spend budget ─────────────────────────────────────────────────
