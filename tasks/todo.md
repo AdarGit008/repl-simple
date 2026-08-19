@@ -30,7 +30,7 @@ full suite must be green. Signal plumbing is already done (D1) — do not redo i
   - Verify: `npx tsx --test test/repl.test.ts` green; full suite green.
   - Files: `src/repl.ts`, `test/repl.test.ts`.
 
-- [ ] **T4 — End-to-end abort through the real extension path (D7 test 1)**
+- [x] **T4 — End-to-end abort through the real extension path (D7 test 1)**
   - RED: test 1 — through `ReplRunner` (extension path), run code making ≥2 gated host calls, abort
     after the first returns, assert the later calls never ran via a side-effect counter.
   - Implement: the test itself (signal is already plumbed). If it reveals signal does NOT stop

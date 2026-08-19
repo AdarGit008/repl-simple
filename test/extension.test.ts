@@ -1147,3 +1147,69 @@ describe("repl extension — project trust gates the preamble (#53)", () => {
     assert.doesNotMatch(result.content[0].text, /preamble withheld/);
   });
 });
+
+// ── End-to-end abort between gated host calls (D7 test 1) ────────
+//
+// The signal is already plumbed end to end (`ReplRunner.run` → `Session.run` →
+// sandbox), and the `#49` tests above abort at the approval *dialog* before any
+// host tool has run. This pins the other half of the abort contract: an abort
+// that lands **between pause points** — after a gated host tool has executed
+// and returned, before a later gated call runs — stops the later call from
+// ever being dispatched.
+//
+// The abort is raised inside the approval callback for the FIRST gated call
+// (that callback is a pause point), which then approves the call in flight.
+// The sandbox notices `signal.aborted` at the top of its next dispatch-loop
+// iteration — after the first `write` has executed and resumed Python — and
+// returns `aborted` before the second `write` reaches the gate. The assertion
+// is the side-effect counter, not the status string: one approval asked, the
+// first file written, the second file absent.
+
+describe("repl extension — abort between gated host calls (D7 test 1)", () => {
+  let cwd: string;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-abort-mid-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("stops a later gated call once the run is aborted after the first returns", async () => {
+    const runner = new ReplRunner(cwd);
+
+    const controller = new AbortController();
+    const prompts: string[] = [];
+    const out = await runner.run(
+      "write('first.txt', 'one')\nwrite('second.txt', 'two')",
+      "abort-mid",
+      async (req) => {
+        prompts.push(req.tool);
+        // Abort at the first pause point, approve the call in flight, and let
+        // the loop notice the abort on its next iteration — after the first
+        // write has executed and returned.
+        controller.abort();
+        return true;
+      },
+      controller.signal,
+    );
+
+    // The discriminating assertions are the side effects, not the status: the
+    // first gated call really ran, the second never reached the approval gate
+    // (let alone executed).
+    assert.deepEqual(prompts, ["write"], "the second gated call was dispatched to the gate");
+    assert.equal(
+      readFileSync(join(cwd, "first.txt"), "utf8"),
+      "one",
+      "the first call never ran",
+    );
+    assert.equal(
+      existsSync(join(cwd, "second.txt")),
+      false,
+      "the second gated call executed despite the abort",
+    );
+    // Context, not the assertion itself: the run reports the abort.
+    assert.match(out, /\[error: aborted\]/);
+  });
+});
