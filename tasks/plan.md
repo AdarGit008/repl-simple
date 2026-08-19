@@ -1,97 +1,76 @@
-# Plan — issue #76: RLM answer provenance — salvage, synthesis, and the `(no answer)` magic string
+# Implementation Plan: issue #78 — Converge on `runRlm` and delete `rlm_loop.ts`
 
-Branch `issue/76-salvage-provenance` · Flight pattern: DEFINE (SPEC D41–D47, done) → BUILD (T1–T2,
-RED-first) → VERIFY (test-engineer) → REVIEW (code-reviewer) → SHIP (security-auditor). Single writer,
-one coder per task, one commit per task.
+Source of truth: `SPEC.md` (decisions D48–D60). This plan decomposes the spec into 8
+dependency-ordered tasks. Flight pattern: DEFINE (done) → BUILD (T1–T8, RED-first) → VERIFY
+(test-engineer) → REVIEW (code-reviewer) → SHIP (security-auditor). Single writer, one coder per
+task, one commit per task.
 
-## Architecture decisions
+## Overview
 
-- **D41** — `RlmResult` gains a required `answerSource: "submitted" | "salvaged" | "synthesised"`.
-  Name fixed now so #78 consumes it verbatim (its Do item 6).
-- **D42** — Remove the `"(no answer)"` magic string; `extractBestAnswer` returns `""` when nothing is
-  salvageable. `answer` stays a required `string`.
-- **D43** — Fix `extractBestAnswer`'s comment to match code (no error consultation added).
-- **D44** — Guarded final synthesis pass at the `max_iterations` cap: one extra `llmClient.query`
-  over the transcript; success → `"synthesised"`, throw/abort → fall back to salvage `"salvaged"`.
-- **D45** — Synthesis is a single un-charged best-effort call (not charged to budget).
-- **D46** — All four `runRlm` return sites set `answerSource` (submitted / salvaged ×3 / synthesised).
-- **D47** — RED-first; `src/rlm.ts` coverage floor 97.69; bounded mutation sweep over changed sites.
+Make `runRlm` (`src/rlm.ts`) the single RLM implementation and delete `rlm_loop.ts` (`RLMLoop`),
+folding in the capabilities only `RLMLoop` had: registry-built prompt, self-registered RLM tools with
+a name-collision guard, nesting with `maxDepth` downgrade, and `status:"error"`. The public import
+surface for `runRlm`/`LlmClient`/`RlmResult`/… is preserved; `RLMLoop` and its types are removed.
+
+## Architecture decisions (see SPEC D48–D60)
+
+- **D48** `runRlm` is canonical; `rlm_loop.ts` deleted (no deprecation shim).
+- **D49** RLM types (`LlmClient`, `RlmIteration`, `RlmOptions`, `RlmResult`) move from `types.ts`
+  into `rlm.ts`; the `types.ts → registry.js`/`budget.js` type-only inversion is removed; re-export
+  from `index.ts` unchanged.
+- **D51** `runRlm` **self-registers** its RLM tools (`llm_query` → `llmClient`, `rlm_query` → nested
+  `runRlm`/downgrade, `SUBMIT`) via `createRLMTools`, merges them into the sandbox registry, and
+  **throws** on a name collision with the caller's registry (port of `RLMLoop`'s constructor check).
+- **D50** the merged system prompt is **registry-built** (stubs + python-tool rules) and carries the
+  F-77 fresh-sandbox wording and the D17 sentinel rule **verbatim**, naming all three RLM tools.
+- **D52** nesting: `maxDepth?` (default 1) / `depth?` (default 0); at the limit `rlm_query` downgrades
+  to `llm_query`; otherwise it spawns a nested `runRlm`; the child **inherits the parent's context**.
+- **D53/D54** `status:"error"` + `error?: string` return an `llmClient` throw as a result; keep
+  `answerSource` verbatim (D41).
+- **D55** `getReplPreamble` → `src/preamble.ts` (same `repl/repl_server.py` path resolution).
+- **D56/D57/D59** delete `rlm_loop.ts` + its test, fold the unique cases into `rlm.test.ts`, update
+  the barrel and README; no further rename.
+- **D58** defaults pin behaviour: `maxIterations`→10 (M1), `scriptName`→`"rlm.py"` (M21).
 
 ## Task list
 
-### Phase 1 — BUILD
+### Phase 1 — Foundation (refactors, no behaviour change)
 
-- [ ] **T1 — Provenance field + magic string removal + salvage path**
+- [ ] **T1 — Move RLM types into `rlm.ts` (D49).** Pure move + barrel re-export.
+- [ ] **T2 — Move `getReplPreamble` to `src/preamble.ts` (D55).** Pure move + barrel + coverage floor.
 
-  **Description:** Add the `answerSource` field to `RlmResult`, remove the `"(no answer)"` magic
-  string, fix `extractBestAnswer`'s comment, and set `answerSource` on all four return sites (site 4
-  starts as `"salvaged"` — synthesis arrives in T2).
+**Checkpoint after T1–T2:** `npm test` + `npm run check` + `npm run build` green.
 
-  **Acceptance criteria:**
-  - [ ] `RlmResult.answerSource` is declared (required, 3-value union) in `src/types.ts`.
-  - [ ] No `"(no answer)"` literal remains in `src/`; `extractBestAnswer` returns `""` when nothing
-        is salvageable.
-  - [ ] `extractBestAnswer`'s comment matches its code (D43).
-  - [ ] Return sites 1–4 all set `answerSource` (submitted / salvaged / salvaged / salvaged).
-  - [ ] Issue tests 1 and 2 written RED first, then GREEN: cap-with-debug-print → `salvaged`;
-        literal `"(no answer)"` submit distinguishable from a failed run.
+### Phase 2 — Core convergence (behaviour)
 
-  **Verification:**
-  - [ ] `npx tsx --test test/rlm.test.ts` green (no synthesis tests yet — they land in T2).
-  - [ ] `npm test` green; `npm run check` clean; `npm run build` clean; `npm run lint` clean.
+- [ ] **T3 — `runRlm` self-registers RLM tools + collision guard + option validation (D51).**
+  The "flip": caller registry must no longer pre-register `llm_query`/`rlm_query`/`SUBMIT`.
+- [ ] **T4 — Nesting, `maxDepth` downgrade, parent-context inheritance (D52).**
+- [ ] **T5 — Registry-built prompt (D50).** Carries F-77 + D17 + tool naming; update template-coupled literals.
+- [ ] **T6 — `status:"error"` + `error?: string` (D53/D54).**
+- [ ] **T7 — Defaults: `maxIterations`→10, `scriptName`→`"rlm.py"` (D58).**
 
-  **Dependencies:** None (SPEC D41–D47 done).
+**Checkpoint after T3–T7:** all seven issue tests green; full suite green.
 
-  **Files:** `src/types.ts`, `src/rlm.ts`, `test/rlm.test.ts`.
+### Phase 3 — Removal (deletion + docs)
 
-  **Scope:** M (3 files).
+- [ ] **T8 — Delete `rlm_loop.ts` + its test; fold stragglers; barrel + README + coverage (D56/D57/D59).**
 
-- [ ] **T2 — Guarded final synthesis pass at the cap**
-
-  **Description:** Add `FINAL_SYNTHESIS_PROMPT` and the guarded synthesis call at the
-  `max_iterations` return site (D44): one `llmClient.query` over the transcript; success →
-  `answerSource: "synthesised"`, failure/abort → fall back to `extractBestAnswer` with
-  `answerSource: "salvaged"` (never throw).
-
-  **Acceptance criteria:**
-  - [ ] `FINAL_SYNTHESIS_PROMPT` constant exists in `src/rlm.ts`.
-  - [ ] Site 4 attempts synthesis before salvaging; success marks `"synthesised"`, failure falls
-        back to `"salvaged"` without throwing.
-  - [ ] Issue tests 3, 4, 5 written RED first, then GREEN: synthesis marks `"synthesised"`; failing
-        synthesis falls back; property test asserts a valid `answerSource` on every exit path.
-
-  **Verification:**
-  - [ ] `npx tsx --test test/rlm.test.ts` green (all five issue tests).
-  - [ ] `npm test` green; `npm run check` clean; `npm run build` clean; `npm run lint` clean.
-
-  **Dependencies:** T1.
-
-  **Files:** `src/rlm.ts`, `test/rlm.test.ts`.
-
-  **Scope:** M (2 files).
-
-### Checkpoint: after T2
-
-- [ ] All five issue tests pass; full suite green; check/build/lint clean.
-
-### Phase 2 — VERIFY / REVIEW / SHIP
-
-- **VERIFY** — test-engineer persona runs the full suite and analyzes `src/rlm.ts` coverage against
-  the 97.69 floor; reports gaps. If gaps/failures, a fresh coder fixes, then re-verify.
-- **REVIEW** — code-reviewer persona: five-axis review with file:line findings.
-- **SHIP** — security-auditor persona merges the review + coverage reports into a go/no-go decision
-  with a rollback plan.
+**Checkpoint after T8:** `grep RLMLoop src/` empty; `npm test`/`check`/`build`/`lint` clean; coverage
+floors met.
 
 ## Risks and mitigations
 
 | Risk | Impact | Mitigation |
-|------|--------|------------|
-| Synthesis reply uncapped / malformed | Med | Treat like any assistant reply; single bounded call (Assumption 6) |
-| `answer: ""` changes consumer-visible output | Low | Property test pins it; flagged to issue-monitor for #78 + docs |
-| Mockable throwing `LlmClient` | Med | Existing test mock extended; technique recorded if it cannot throw |
-| Scope creep into #78 (RlmResult completion, `status:"error"`, M1) | Med | Explicit out-of-scope in SPEC; reviewer checks for it |
-| Direct-answer path mislabelled | Low | D46: it stays `"submitted"` (flows through SUBMIT/ok) |
+|---|---|---|
+| **T3 flips the registry contract** — ~110 `runRlm` invocations pass `rlmRegistry()` (which pre-registers RLM tools) | High | Redefine the `rlmRegistry()` helper (empty/plain registry) in the SAME task; fix each fallout test so the suite is green before commit |
+| **T5 template-coupling** — prompt rewording breaks pinned literals (`256.0KB`, `# Question`, `# Input (…)`, sentinels, D27 sentences, F-77 wording) | High | Update every pinned literal in the same commit (inventory in SPEC D50); run `test/rlm.test.ts` focused first |
+| **T8 deletion** — removing a public type (`RlmMessage`, `RLMLoop*`) and a coverage floor | Med | Barrel + README updated in the same task; drop `src/rlm_loop.ts` from `coverage-baseline.json`; `coverage:update` for `preamble.ts` |
+| **`answerSource`/`status` regressions** across T3–T6 | Med | Property-style tests already pin every `answerSource`; add status-branch tests (SPEC D60) |
+| **Mutation baseline stale** (predates 0.0.21) | Low | Treat absolute scores as directional; concrete kills are M1/M21 (T7 tests) |
 
 ## Open questions
 
-None requiring human input — all resolved as recorded assumptions (SPEC "Assumptions" 1–6).
+None requiring human input — all resolved as recorded assumptions (SPEC "Assumptions" 1–7). The
+flagged follow-ups (RlmStep/RlmProgressEvent, question-as-input, residual repl/rlm naming) go to the
+issue-monitor final report.
