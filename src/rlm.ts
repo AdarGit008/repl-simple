@@ -1,5 +1,6 @@
 import type { RunOptions, RunResult } from "./types.js";
-import type { ToolRegistry } from "./registry.js";
+import { ToolRegistry } from "./registry.js";
+import { createRLMTools } from "./rlm_tools.js";
 import { estimateTokens, SpendBudget } from "./budget.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
@@ -50,7 +51,11 @@ export interface RlmIteration {
 export interface RlmOptions {
   /** LLM client for code generation. REQUIRED. */
   llmClient: LlmClient;
-  /** Tool registry for the sandbox (must include RLM tools: llm_query, rlm_query, SUBMIT). */
+  /**
+   * Tool registry for the sandbox. RLM tools (`llm_query`, `rlm_query`,
+   * `SUBMIT`) are self-registered by `runRlm` — do NOT include them here;
+   * a collision throws (D51).
+   */
   registry: ToolRegistry;
   /** Python preamble injected before user code (e.g. repl_server.py). */
   preamble?: string;
@@ -64,6 +69,10 @@ export interface RlmOptions {
   systemPrompt?: string;
   /** Max RLM iterations before giving up. Default: 10. */
   maxIterations?: number;
+  /** Nesting depth limit for `rlm_query` recursion. Default: 1. */
+  maxDepth?: number;
+  /** Current nesting depth (0 = root). Default: 0. */
+  depth?: number;
   /**
    * Spend budget for this run, in estimated tokens (D3).
    *
@@ -926,10 +935,51 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   }
 
   const llmClient = options.llmClient;
-  const registry = options.registry;
   const maxIterations = options.maxIterations ?? 10;
   const systemPrompt = options.systemPrompt ?? DEFAULT_RLM_SYSTEM_PROMPT;
   const iterations: RlmIteration[] = [];
+
+  // D51: the loop owns its RLM tool names. A caller that registered them
+  // would have its tools silently shadowed by the merged registry below, so
+  // reject the collision up front (mirrors RLMLoop's constructor guard).
+  for (const name of ["llm_query", "rlm_query", "SUBMIT"] as const) {
+    if (options.registry.has(name)) {
+      throw new Error(
+        `runRlm: tool '${name}' conflicts with user registry. ` +
+          `Remove it — the loop provides its own RLM tools.`,
+      );
+    }
+  }
+  if (maxIterations < 1) {
+    throw new Error("runRlm: maxIterations must be >= 1");
+  }
+  if (options.maxDepth !== undefined && options.maxDepth < 0) {
+    throw new Error("runRlm: maxDepth must be >= 0");
+  }
+
+  // The sandbox registry is the caller's tools merged with the loop's own
+  // RLM tools (llm_query, rlm_query, SUBMIT). `llm_query` is a single-turn
+  // ask against the same system prompt; `rlm_query` is a placeholder that
+  // downgrades to an llm_query-style ask until nesting lands (T4).
+  const registry = new ToolRegistry([
+    ...options.registry.list(),
+    ...createRLMTools({
+      onLLMQuery: async (prompt) =>
+        llmClient.query(systemPrompt, [{ role: "user", content: prompt }], options.signal),
+      // T4: replace with nested runRlm
+      onRLMQuery: async (query, context) =>
+        llmClient.query(
+          systemPrompt,
+          [
+            {
+              role: "user",
+              content: `[rlm_query] Query: ${query}\nContext: ${context ?? "(none)"}`,
+            },
+          ],
+          options.signal,
+        ),
+    }),
+  ]);
 
   // Build the spend budget once, before the loop (D3): a number mints a fresh
   // per-run budget; an instance is shared and mutated in place, so siblings

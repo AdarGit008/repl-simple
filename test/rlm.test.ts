@@ -7,7 +7,6 @@ import { ToolRegistry } from "../src/registry.js";
 import { estimateTokens, SpendBudget } from "../src/budget.js";
 import type { HostTool, RunErrorKind } from "../src/types.js";
 
-import { createRLMTools } from "../src/rlm_tools.js";
 import {
   runRlm,
   extractPythonCode,
@@ -344,11 +343,7 @@ function mockLlmCodeGen(codes: string[]): {
 describe("runRlm()", () => {
   it("5.3.1 single iteration with SUBMIT", async () => {
     const { llm } = mockLlmCodeGen(['```python\nSUBMIT("the answer is 42")\n```']);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("what is the answer?", {
       llmClient: llm,
@@ -369,11 +364,7 @@ describe("runRlm()", () => {
       '```python\nprint("exploring...")\nresult = 42\nprint(result)\n```',
       '```python\nSUBMIT("42")\n```',
     ]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("calculate", {
       llmClient: llm,
@@ -404,11 +395,7 @@ describe("runRlm()", () => {
       "```python\nprint(hello  # missing paren\n```",
       "```python\nprint('hello')\nSUBMIT('done')\n```",
     ]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -433,11 +420,7 @@ describe("runRlm()", () => {
 
   it("5.3.4 error recovery: runtime error → LLM fixes → SUBMIT", async () => {
     const { llm } = mockLlmCodeGen(["```python\n1/0\n```", "```python\nSUBMIT('fixed')\n```"]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -458,11 +441,7 @@ describe("runRlm()", () => {
     const exploitCode = "```python\nprint('still working...')\n```";
     // The cap now runs a synthesis pass, so the 4th reply is its answer.
     const { llm } = mockLlmCodeGen([exploitCode, exploitCode, exploitCode, "42"]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("endless", {
       llmClient: llm,
@@ -484,11 +463,7 @@ describe("runRlm()", () => {
     const { llm } = mockLlmCodeGen([
       ["```python", "SUBMIT('immediate')", "print('never runs')", "```"].join("\n"),
     ]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -508,11 +483,7 @@ describe("runRlm()", () => {
 
   it("5.3.7 empty LLM response", async () => {
     const { llm } = mockLlmCodeGen(["", '```python\nSUBMIT("done")\n```']);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -531,11 +502,7 @@ describe("runRlm()", () => {
       "I think the answer is 42. Let me submit.",
       '```python\nSUBMIT("42")\n```',
     ]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -552,11 +519,7 @@ describe("runRlm()", () => {
 
   it("5.3.9 onIteration callback", async () => {
     const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const recorded: RlmIteration[] = [];
     const result = await runRlm("test", {
@@ -579,11 +542,7 @@ describe("runRlm()", () => {
       "```python\nprint('iteration 0')\n```",
       "```python\nprint('iteration 1')\n```",
     ]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const controller = new AbortController();
 
@@ -604,11 +563,7 @@ describe("runRlm()", () => {
   it("5.3.11 preamble injection", async () => {
     const preamble = 'context = "hello world"\n';
     const { llm } = mockLlmCodeGen(["```python\nSUBMIT(str(len(context)))\n```"]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("how long?", {
       llmClient: llm,
@@ -624,17 +579,63 @@ describe("runRlm()", () => {
   });
 });
 
+// ── Self-registered RLM tools (D51) ─────────────────────────────
+
+describe("runRlm() — self-registered RLM tools", () => {
+  /** A registry containing exactly one caller tool with the given name. */
+  function registryWith(name: string): ToolRegistry {
+    const tool: HostTool = {
+      name,
+      description: "caller-owned tool",
+      params: [],
+      returns: "str",
+      execute: async () => "caller-owned result",
+    };
+    return new ToolRegistry([tool]);
+  }
+
+  for (const name of ["llm_query", "rlm_query", "SUBMIT"]) {
+    it(`throws when the caller's registry already has '${name}'`, async () => {
+      const { llm } = mockLlmCodeGen([]);
+      await assert.rejects(runRlm("q", { llmClient: llm, registry: registryWith(name) }), {
+        message: `runRlm: tool '${name}' conflicts with user registry. Remove it — the loop provides its own RLM tools.`,
+      });
+    });
+  }
+
+  it("does not throw for an unrelated caller tool", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("ok")\n```']);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: registryWith("custom_tool"),
+    });
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "ok");
+  });
+
+  it("throws when maxIterations < 1", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: 0 }),
+      { message: "runRlm: maxIterations must be >= 1" },
+    );
+  });
+
+  it("throws when maxDepth < 0", async () => {
+    const { llm } = mockLlmCodeGen([]);
+    await assert.rejects(
+      runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxDepth: -1 }),
+      { message: "runRlm: maxDepth must be >= 0" },
+    );
+  });
+});
+
 // ── Abort semantics (#75) ───────────────────────────────────────
 
 describe("runRlm() — abort", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("abort at iteration 2 of 5 returns an aborted result with two iterations (issue test 1)", async () => {
@@ -787,10 +788,7 @@ describe("runRlm() — abort", () => {
         return `slow:${invocations}`;
       },
     };
-    const registry = new ToolRegistry([
-      ...createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" }),
-      abortingTool,
-    ]);
+    const registry = new ToolRegistry([abortingTool]);
     const { llm } = mockLlmCodeGen(["```python\nprint('start')\na = slow()\n```"]);
 
     const result = await runRlm("q", {
@@ -869,11 +867,7 @@ describe("runRlm() edge cases", () => {
       i < 4 ? `\`\`\`python\nprint('iteration ${i}')\n\`\`\`` : '```python\nSUBMIT("final")\n```',
     );
     const { llm } = mockLlmCodeGen(codes);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -895,11 +889,7 @@ describe("runRlm() edge cases", () => {
   it("5.4.3 very long stdout", async () => {
     const longPrint = "```python\nprint('x' * 100000)\n```";
     const { llm } = mockLlmCodeGen([longPrint, '```python\nSUBMIT("done")\n```']);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -915,11 +905,7 @@ describe("runRlm() edge cases", () => {
 
   it("5.4.5 SUBMIT followed by more code — code after SUBMIT never runs", async () => {
     const { llm } = mockLlmCodeGen(['```python\nSUBMIT("answer")\nprint("after submit")\n```']);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", {
       llmClient: llm,
@@ -947,14 +933,9 @@ describe("runRlm() edge cases", () => {
 // ── The advertised context configuration (#72) ─────────────────
 
 describe("runRlm() — context input", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("9.2.1 succeeds with the shipped repl_server.py preamble and no inputs", async () => {
@@ -1265,14 +1246,9 @@ describe("runRlm() — context input", () => {
 
 describe("runRlm() — preamble lineOffset wiring", () => {
   // D19 quoting is presentation; F-77's excerpt contract is preserved on the unquoted text.
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   /** The feedback for iteration 1 — the last message of the second LLM call. */
@@ -1405,14 +1381,9 @@ describe("runRlm() — preamble lineOffset wiring", () => {
 // plainly, and continuity-implying wording must not survive anywhere in it.
 
 describe("runRlm() — fresh-sandbox contract (issue test 4)", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   /** Reply set: iteration 1 fails, iteration 2 terminates cleanly. */
@@ -1485,14 +1456,9 @@ describe("runRlm() — fresh-sandbox contract (issue test 4)", () => {
 // ── Direct answers and the raw fall-through (#73) ────────────────
 
 describe("runRlm() — direct answers and the raw fall-through", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("9.3.6 executes a fence-less direct answer as a SUBMIT, not as code", async () => {
@@ -1558,13 +1524,9 @@ describe("runRlm() — a crashed sandbox", () => {
       "```python\nx = 10 ** 100000000\n1\n```",
       '```python\nSUBMIT("recovered")\n```',
     ]);
-    const tools = createRLMTools({
-      onLLMQuery: async () => "",
-      onRLMQuery: async () => "",
-    });
     const result = await runRlm("q", {
       llmClient: llm,
-      registry: new ToolRegistry(tools),
+      registry: new ToolRegistry([]),
       maxIterations: 2,
       runOptions: { limits: { maxDurationSecs: 0.5 } },
     });
@@ -1609,14 +1571,10 @@ describe("runRlm() — a run that hit a limit", () => {
         `\`\`\`python\n${c.code}\n\`\`\``,
         '```python\nSUBMIT("recovered")\n```',
       ]);
-      const tools = createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      });
 
       const result = await runRlm("q", {
         llmClient: llm,
-        registry: new ToolRegistry(tools),
+        registry: new ToolRegistry([]),
         maxIterations: 2,
         runOptions: { limits: c.limits },
       });
@@ -2204,8 +2162,7 @@ describe("runRlm() — conversation bound", () => {
     // and the feedback re-caps at the same budgets, so the historical
     // [119, 262403, 524687, 786971] growth cannot recur.
     const { llm } = mockLlmCodeGen([0, 1, 2, 3].map(labelledPrint));
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 4 });
 
@@ -2220,8 +2177,7 @@ describe("runRlm() — conversation bound", () => {
     // Ten iterations each add ~32 KiB of capped feedback, crossing the 256 KiB
     // budget around turn eight, so the oldest turns must be dropped.
     const { llm } = mockLlmCodeGen(Array.from({ length: 10 }, (_, i) => labelledPrint(i)));
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
 
@@ -2250,8 +2206,7 @@ describe("runRlm() — conversation bound", () => {
 
   it("emits a history-dropped marker and never leaves a dangling feedback (test 5)", async () => {
     const { llm } = mockLlmCodeGen(Array.from({ length: 10 }, (_, i) => labelledPrint(i)));
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     await runRlm("test", { llmClient: llm, registry, maxIterations: 10 });
 
@@ -2382,8 +2337,7 @@ describe("runRlm() — conversation bound", () => {
     // would drop a pair and insert the history-dropped marker instead.
     const target = 256 * 1024;
     const { llm } = exactBudgetLlm(target);
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
 
@@ -2418,8 +2372,7 @@ describe("runRlm() — conversation bound", () => {
     // sentinel-delimited view (T7 — template-coupling gotcha).
     const hugeReply = silentPaddedReply(300 * 1024, "HUGE_REPLY_HEAD");
     const { llm } = mockLlmCodeGen([hugeReply, '```python\nSUBMIT("done")\n```']);
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
 
@@ -2452,8 +2405,7 @@ describe("runRlm() — conversation bound", () => {
     // record in iterations[].llmResponse stays raw.
     const hugeReply = silentPaddedReply(2 * 1024 * 1024, "PATHOLOGICAL_REPLY");
     const { llm } = mockLlmCodeGen([hugeReply, '```python\nSUBMIT("done")\n```']);
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
 
@@ -2490,8 +2442,7 @@ describe("runRlm() — conversation bound", () => {
     // sentinel-wrapped within the ceiling; one byte over fires the marker;
     // and a ~300 KiB reply spends the full budget (a halved cap can never
     // retain more than half).
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
     /** Push `reply` through one iteration and return the pushed assistant message. */
     const pushedAssistant = async (reply: string): Promise<{ role: string; content: string }> => {
       const { llm } = mockLlmCodeGen([reply, '```python\nSUBMIT("done")\n```']);
@@ -2604,8 +2555,7 @@ describe("runRlm() — conversation bound", () => {
         return callRecords;
       },
     };
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 6 });
 
@@ -2691,8 +2641,7 @@ describe("runRlm() — conversation bound", () => {
         return callRecords;
       },
     };
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 6 });
 
@@ -2745,8 +2694,7 @@ describe("runRlm() — conversation bound", () => {
     // nothing may be dropped and no marker may appear.
     const target = 256 * 1024 - 100;
     const { llm } = exactBudgetLlm(target);
-    const tools = createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" });
-    const registry = new ToolRegistry(tools);
+    const registry = new ToolRegistry([]);
 
     const result = await runRlm("test", { llmClient: llm, registry, maxIterations: 5 });
 
@@ -2769,14 +2717,9 @@ describe("runRlm() — conversation bound", () => {
 // ── Aggregate input preview cap (D6) ───────────────────────────
 
 describe("runRlm() — aggregate input preview cap", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("caps the initial prompt's input section to 32 KiB with many large inputs (test 7)", async () => {
@@ -2941,14 +2884,9 @@ describe("runRlm() — aggregate input preview cap", () => {
 // ── Question cap (D8) ──────────────────────────────────────────
 
 describe("runRlm() — question cap", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("caps an oversized question to 64 KiB in messages[0] with the policy marker (test 9)", async () => {
@@ -3098,14 +3036,9 @@ describe("runRlm() — question cap", () => {
 // ── Composition and boundary strength (D21) ────────────────────
 
 describe("runRlm() — composition and boundary strength", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("holds per-section caps when a huge question, inputs and prints compose (test 19)", async () => {
@@ -3191,14 +3124,9 @@ describe("runRlm() — a SUBMIT call that failed to resolve", () => {
   // arguments the checker did not vet lands here too.
   const MALFORMED = 'SUBMIT("a", **{"answer": "b"})';
 
-  /** Registry with the three RLM tools. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "the sub-LLM said something",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   it("keeps iterating after a malformed SUBMIT and returns the real answer", async () => {
@@ -3282,6 +3210,7 @@ describe("runRlm() — a SUBMIT call that failed to resolve", () => {
     // the script happened to evaluate to.
     const { llm } = mockLlmCodeGen([
       '```python\nanswer = llm_query("hi")\nprint(answer)\n```',
+      "the sub-LLM said something",
       '```python\nSUBMIT("the real answer")\n```',
     ]);
 
@@ -3330,14 +3259,9 @@ describe("runRlm() — a SUBMIT call that failed to resolve", () => {
 // loop charges exactly what it sends.
 
 describe("runRlm() — spend budget", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   /** Estimated-token cost of one recorded call (mirrors the loop's charge). */
@@ -3512,14 +3436,9 @@ describe("runRlm() — spend budget", () => {
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {
-  /** Registry with the three RLM tools, wired to no-op callbacks. */
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
   function rlmRegistry(): ToolRegistry {
-    return new ToolRegistry(
-      createRLMTools({
-        onLLMQuery: async () => "",
-        onRLMQuery: async () => "",
-      }),
-    );
+    return new ToolRegistry([]);
   }
 
   /** Estimated-token cost of one recorded call (mirrors the loop's charge). */

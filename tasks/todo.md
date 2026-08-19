@@ -18,7 +18,7 @@ coder per task, fresh context, one commit per task. After each task the full sui
   - Verify: `npm run check` + `npm run build` + `npm test` green; coverage passes.
   - Files: `src/preamble.ts` (new), `src/rlm_loop.ts`, `src/index.ts`, `coverage-baseline.json`.
 
-- [ ] **T3 — `runRlm` self-registers RLM tools + collision guard + validation (D51)**
+- [x] **T3 — `runRlm` self-registers RLM tools + collision guard + validation (D51)**
   - RED: test that `runRlm` throws when the caller's registry already has `llm_query`/`rlm_query`/`SUBMIT` (port `RLMLoop`'s message shape, prefix `runRlm:`).
   - Implement: `runRlm` builds its RLM tools via `createRLMTools` and merges them into the sandbox registry. `onLLMQuery` → `llmClient.query(systemPrompt, [{role:"user",content:prompt}], signal)`; `SUBMIT` as-is; `rlm_query` wired to a **placeholder** that downgrades to `llm_query` (real nesting lands in T4). Validate `maxIterations >= 1` and `maxDepth >= 0`.
   - **Flip the test helper:** redefine every `rlmRegistry()` to NOT pre-register RLM tools (empty or plain custom tools); fix each fallout test so the full suite is green (tests needing `llm_query` now control `options.llmClient`).
