@@ -176,7 +176,7 @@ describe("repl extension — parameter schemas", () => {
 // ── Model limit clamp (D3) ───────────────────────────────────────
 //
 // The extension is the model boundary, so a model-supplied limit is clamped,
-// never trusted. `clampModelLimits` is a pure helper so it is tested directly
+// never trusted. `clampModelLimits` is a small helper so it is tested directly
 // rather than only through the sandbox path.
 
 describe("repl extension — clampModelLimits", () => {
@@ -225,6 +225,10 @@ describe("repl extension — clampModelLimits", () => {
 
   it("floors a sub-MiB memory request to a whole number of bytes", () => {
     assert.deepEqual(clampModelLimits(undefined, 0.1), { maxMemory: 104857 });
+  });
+
+  it("omits a sub-byte memory request instead of forwarding zero bytes", () => {
+    assert.deepEqual(clampModelLimits(undefined, 1e-7), {});
   });
 
   it("omits values that are not positive finite numbers", () => {
@@ -312,12 +316,25 @@ describe("repl extension — clampModelLimits", () => {
 
 describe("repl extension — the repl tool passes clamped limits (never 'unbounded')", () => {
   let cwd: string;
+  // Hermeticity: the assertions below pin the derived default ceilings (30 s /
+  // 512 MiB). Clear any ambient REPL_* vars so an outer `REPL_MAX_...=... npm
+  // test` cannot break them, and restore them afterwards.
+  let priorDuration: string | undefined;
+  let priorMemory: string | undefined;
 
   before(() => {
     cwd = mkdtempSync(join(tmpdir(), "repl-ext-clamp-"));
+    priorDuration = process.env.REPL_MAX_DURATION_SECS;
+    priorMemory = process.env.REPL_MAX_MEMORY_MB;
+    delete process.env.REPL_MAX_DURATION_SECS;
+    delete process.env.REPL_MAX_MEMORY_MB;
   });
 
   after(() => {
+    if (priorDuration === undefined) delete process.env.REPL_MAX_DURATION_SECS;
+    else process.env.REPL_MAX_DURATION_SECS = priorDuration;
+    if (priorMemory === undefined) delete process.env.REPL_MAX_MEMORY_MB;
+    else process.env.REPL_MAX_MEMORY_MB = priorMemory;
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
