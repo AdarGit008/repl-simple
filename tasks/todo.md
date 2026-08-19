@@ -13,7 +13,7 @@ full suite must be green. Signal plumbing is already done (D1) — do not redo i
   - Verify: `npx tsx --test test/repl.test.ts` green; full suite green; `npm run check`/`build` clean.
   - Files: `src/repl.ts`, `test/repl.test.ts`.
 
-- [ ] **T2 — Clamp helper + expose clamped limits on the `repl` tool (D3)**
+- [x] **T2 — Clamp helper + expose clamped limits on the `repl` tool (D3)**
   - RED: test 2 — a model-supplied `maxDurationSecs`/`maxMemory` above the cap is clamped to
     300 / 1024 MiB, not honoured; and the tool never emits `"unbounded"`.
   - Implement: exported pure `clampModelLimits(maxDurationSecs?, maxMemoryMiB?)` in
