@@ -530,7 +530,7 @@ never used.
 fences — each falls through to "treat the whole response as code" and costs a full iteration to a
 guaranteed `SyntaxError`. With two ```python blocks it takes the **first**, so a self-correcting model
 loses its correction. No `extractDirectAnswer` fallback: a prose-only reply burns the iteration and
-returns `"(no answer)"`.
+returns `""` (the `"(no answer)"` magic string was removed by #76).
 
 ---
 
