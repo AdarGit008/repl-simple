@@ -990,17 +990,25 @@ describe("runRlm() — abort", () => {
     assert.equal(result.budget?.limited, false, "abort is not budget exhaustion");
   });
 
-  it("a non-abort LLM error re-throws, not misreported as aborted", async () => {
+  it("a non-abort LLM error returns status:'error' with the message preserved (issue test 4)", async () => {
+    // D53: a real LLM error is a result, not an exception. Nothing completed,
+    // so there is no answer to salvage and zero iterations (D54).
+    let calls = 0;
     const llm: LlmClient = {
       async query() {
-        throw new Error("network down");
+        calls++;
+        throw new Error("boom");
       },
     };
 
-    await assert.rejects(
-      runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 }),
-      /network down/,
-    );
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    assert.equal(result.status, "error");
+    assert.equal(result.error, "boom");
+    assert.equal(result.answer, "");
+    assert.equal(result.answerSource, "salvaged");
+    assert.deepEqual(result.iterations, []);
+    assert.equal(calls, 1, "the first rejection must end the loop");
   });
 });
 

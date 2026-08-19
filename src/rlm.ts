@@ -123,9 +123,10 @@ export interface RlmResult {
    * "ok" when SUBMIT was called, "max_iterations" when the loop exhausted,
    * "budget_exhausted" when the spend budget degraded the run (D4), "aborted"
    * when the caller's signal fired mid-run — the loop returns what it
-   * completed rather than throwing (#75).
+   * completed rather than throwing (#75) — and "error" when the LLM client
+   * rejected (D53), again returning a result rather than throwing.
    */
-  status: "ok" | "max_iterations" | "budget_exhausted" | "aborted";
+  status: "ok" | "max_iterations" | "budget_exhausted" | "aborted" | "error";
   /** The answer string (from SUBMIT, or best-effort extraction). */
   answer: string;
   /** Where `answer` came from. Present on every returned answer (#76). */
@@ -1174,7 +1175,16 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       if (options.signal?.aborted) {
         return aborted();
       }
-      throw err;
+      // D53: a real LLM error is a result, not an exception. Salvage whatever
+      // completed before the failure and carry the message on `error`.
+      return {
+        status: "error",
+        error: err instanceof Error ? err.message : String(err),
+        answer: extractBestAnswer(iterations),
+        answerSource: "salvaged",
+        iterations,
+        ...(budget ? { budget: budgetReport(budget, false) } : {}),
+      };
     }
 
     // 2. Extract the payload: a fenced block, a direct answer, or the

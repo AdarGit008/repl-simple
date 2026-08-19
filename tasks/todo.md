@@ -37,7 +37,7 @@ coder per task, fresh context, one commit per task. After each task the full sui
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green.
   - Files: `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T6 — `status:"error"` + `error?: string` (D53/D54)**
+- [x] **T6 — `status:"error"` + `error?: string` (D53/D54)**
   - RED: test that a non-abort `llmClient.query` rejection returns `{ status:"error", error, answer, answerSource:"salvaged", iterations }`, not an exception.
   - Implement: add `"error"` to `RlmResult["status"]` and `error?: string`; catch the main-loop query throw (non-abort) and return the result; abort stays the `"aborted"` path.
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green; `npm run check` clean.
