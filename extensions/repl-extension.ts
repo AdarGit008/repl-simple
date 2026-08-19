@@ -117,7 +117,7 @@ export function clampModelLimits(maxDurationSecs?: unknown, maxMemoryMiB?: unkno
   const duration = clampCeiling(maxDurationSecs, MAX_MODEL_DURATION_SECS);
   if (duration !== undefined) limits.maxDurationSecs = duration;
   const memoryMiB = clampCeiling(maxMemoryMiB, MAX_MODEL_MEMORY_MIB);
-  if (memoryMiB !== undefined) limits.maxMemory = memoryMiB * BYTES_PER_MIB;
+  if (memoryMiB !== undefined) limits.maxMemory = Math.floor(memoryMiB * BYTES_PER_MIB);
   return limits;
 }
 

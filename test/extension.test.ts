@@ -197,6 +197,10 @@ describe("repl extension — clampModelLimits", () => {
     assert.deepEqual(clampModelLimits(undefined, 0.5), { maxMemory: 524288 });
   });
 
+  it("floors a sub-MiB memory request to a whole number of bytes", () => {
+    assert.deepEqual(clampModelLimits(undefined, 0.1), { maxMemory: 104857 });
+  });
+
   it("omits values that are not positive finite numbers", () => {
     assert.deepEqual(clampModelLimits(0, -1), {});
     assert.deepEqual(clampModelLimits(NaN, Infinity), {});

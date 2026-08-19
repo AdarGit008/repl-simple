@@ -4,7 +4,7 @@ Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Each task is RED-first (
 test before the code). One coder per task, fresh context, one commit per task. After each task the
 full suite must be green. The bug is at the model boundary only — do not touch `src/sandbox.ts`.
 
-- [ ] **T1 — Integerize the `maxMemory` byte conversion (D2)**
+- [x] **T1 — Integerize the `maxMemory` byte conversion (D2)**
   - RED: `clampModelLimits(undefined, 0.1)` must equal `{ maxMemory: 104857 }` (today it is
     `104857.6`). Add to the `describe("repl extension — clampModelLimits")` block in
     `test/extension.test.ts`; confirm it fails.
