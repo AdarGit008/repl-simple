@@ -43,7 +43,7 @@ coder per task, fresh context, one commit per task. After each task the full sui
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green; `npm run check` clean.
   - Files: `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T7 — Defaults: `maxIterations`→10, `scriptName`→`"rlm.py"` (D58)**
+- [x] **T7 — Defaults: `maxIterations`→10, `scriptName`→`"rlm.py"` (D58)**
   - RED: test that omitting `maxIterations` yields 10 iterations (kills M1); test that `scriptName` defaults to `"rlm.py"` (kills M21).
   - Implement: pin both defaults if not already.
   - Verify: `npx tsx --test test/rlm.test.ts` green; full suite green.

@@ -3840,3 +3840,49 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(llm.calls().length, 4, "the synthesis call still ran");
   });
 });
+
+// ── Defaults pin behaviour (D58) ────────────────────────────────
+//
+// These pin the two defaults that otherwise survive mutation: no `maxIterations`
+// → 10 iterations (M1), and `scriptName` → `"rlm.py"` (M21).
+
+describe("runRlm() — defaults (D58)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("defaults maxIterations to 10 (kills M1)", async () => {
+    // More than 10 code replies, none of which SUBMITs: the loop must stop at
+    // the default cap, not run forever or stop at any other count.
+    const code = "```python\nprint('still working...')\n```";
+    const { llm } = mockLlmCodeGen(Array.from({ length: 15 }, () => code));
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry() });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.iterations.length, 10, "omitting maxIterations must run exactly 10 iterations");
+  });
+
+  it('defaults scriptName to "rlm.py" (kills M21)', async () => {
+    // A syntax error on the model's first line renders the diagnostic location
+    // from `scriptName`. With no `runOptions.scriptName` (and no preamble, so
+    // lineOffset cannot mask it) the default `"rlm.py"` must be the file named
+    // in the diagnostic, not the sandbox's own `<repl>` fallback.
+    const { llm } = mockLlmCodeGen([
+      "```python\n1 +\n```",
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+    });
+
+    assert.equal(result.status, "ok");
+    const feedback = llm.calls()[1].messages[llm.calls()[1].messages.length - 1].content;
+    assert.match(feedback, / --> rlm\.py:1:/, 'the default scriptName is "rlm.py"');
+    assert.doesNotMatch(feedback, / --> <repl>:/, "the sandbox fallback must not leak through");
+  });
+});
