@@ -2,7 +2,7 @@
 
 Source of truth: `SPEC.md` (D61–D63) + `tasks/plan.md`.
 
-- [ ] **T1 — Charge `llm_query` + `rlm_query` downgrade against the shared pool; refuse on exhaustion**
+- [x] **T1 — Charge `llm_query` + `rlm_query` downgrade against the shared pool; refuse on exhaustion**
   - RED: add failing tests in `test/rlm.test.ts` (extend the "runRlm() — spend budget" block or a new
     sibling block):
     - `llm_query` charges the pool — generous budget; `answer = llm_query("…")` + `SUBMIT(answer)`;

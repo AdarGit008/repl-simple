@@ -3701,6 +3701,105 @@ describe("runRlm() — spend budget", () => {
       );
     }
   });
+
+  it("8. llm_query charges the shared pool", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nanswer = llm_query("what do you think?")\nSUBMIT(answer)\n```',
+      "llm result",
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "llm result");
+
+    // The llm_query call charges the same pool as the top-level code-gen call:
+    // consumed equals the sum of every recorded call's cost (D61/D62).
+    assert.equal(llm.calls().length, 2);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("9. llm_query refuses instead of throwing on a tight budget", async () => {
+    const code = '```python\nanswer = llm_query("what do you think?")\nSUBMIT(answer)\n```';
+
+    // Probe the code-gen cost without a budget, then size the budget to exactly
+    // that first call — the llm_query call must then refuse (D63).
+    const { llm: probe } = mockLlmCodeGen([code, "llm result"]);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 5 });
+    const codeGenCost = recordedCost(probe.calls()[0]);
+
+    const { llm } = mockLlmCodeGen([code, "llm result"]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: codeGenCost,
+    });
+
+    // No throw; the refusal marker is the tool's return value, submitted as the
+    // answer — and llm_query never reached the LLM.
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "[llm_query refused: spend budget exhausted]");
+    assert.equal(llm.calls().length, 1, "llm_query must refuse before calling the LLM");
+  });
+
+  it("10. rlm_query downgrade charges the shared pool", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```',
+      "downgraded answer",
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "downgraded answer");
+
+    // The downgrade charges the same pool as the code-gen call (D62).
+    assert.equal(llm.calls().length, 2);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("11. rlm_query downgrade refuses instead of throwing on a tight budget", async () => {
+    const code = '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```';
+
+    const { llm: probe } = mockLlmCodeGen([code, "downgraded answer"]);
+    await runRlm("q", {
+      llmClient: probe,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+    });
+    const codeGenCost = recordedCost(probe.calls()[0]);
+
+    const { llm } = mockLlmCodeGen([code, "downgraded answer"]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+      budget: codeGenCost,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "[rlm_query refused: spend budget exhausted]");
+    assert.equal(llm.calls().length, 1, "rlm_query must refuse before calling the LLM");
+  });
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {
