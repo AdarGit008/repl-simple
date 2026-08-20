@@ -886,13 +886,23 @@ export function buildFeedback(result: RunResult): string {
 // message content, measured in estimated tokens — so a run never overspends.
 // The estimator lives in budget.ts; rlm.ts never measures bytes itself (D8).
 
-/** Estimated-token cost of one LLM call: the precomputed prompt plus every message. */
+/**
+ * Estimated-token cost of one LLM call: the precomputed prompt plus every
+ * message, floored at 1 token so no LLM call is ever free (D65). An empty
+ * system prompt plus empty tool prompts would otherwise estimate 0 tokens and
+ * let a `while True: llm_query("")` loop burn unbounded spend for free.
+ */
 function callCost(
   systemPromptTokens: number,
   messages: Array<{ role: "user" | "assistant"; content: string }>,
 ): number {
-  return (
-    systemPromptTokens + messages.reduce((sum, message) => sum + estimateTokens(message.content), 0)
+  // D65: the ≥1-token floor applies uniformly to every charged path (top-level
+  // loop, llm_query, rlm_query downgrade, nested loops, synthesis) with no
+  // special-casing — tryCharge/SpendBudget stay untouched.
+  return Math.max(
+    1,
+    systemPromptTokens +
+      messages.reduce((sum, message) => sum + estimateTokens(message.content), 0),
   );
 }
 

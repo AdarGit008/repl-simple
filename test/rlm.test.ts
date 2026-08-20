@@ -4083,6 +4083,66 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.budget?.consumed, expected);
     assert.equal(result.budget?.limited, false);
   });
+
+  it("16. an empty systemPrompt + empty llm_query charges the ≥1-token floor (D65)", async () => {
+    const code = '```python\na = llm_query("")\nb = llm_query("")\nSUBMIT(a + "|" + b)\n```';
+
+    // Probe the top-level code-gen cost with the empty system prompt, then
+    // size budgets relative to it (plan.md Risks row 1): the code-gen call
+    // always charges first, so the floor is measured on top of it.
+    const { llm: probe } = mockLlmCodeGen([code, "", ""]);
+    await runRlm("q", {
+      llmClient: probe,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      systemPrompt: "",
+    });
+    const codeGenCost = recordedCost(probe.calls()[0]);
+    assert.ok(codeGenCost > 0, "the top-level code-gen charge is non-zero");
+
+    // (a) A generous budget: both empty llm_query("") calls run, and each
+    // charges the ≥1-token floor — consumed is the code-gen cost plus 2.
+    const { llm: generous } = mockLlmCodeGen([code, "", ""]);
+    const generousResult = await runRlm("q", {
+      llmClient: generous,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      systemPrompt: "",
+      budget: 1_000_000,
+    });
+    assert.equal(generousResult.status, "ok");
+    assert.equal(generousResult.answer, "|");
+    assert.equal(generous.calls().length, 3, "both empty llm_query calls reach the LLM");
+    assert.equal(
+      generousResult.budget?.consumed,
+      codeGenCost + 2,
+      "each empty llm_query() must charge at least 1 token (D65)",
+    );
+
+    // (b) A budget that affords exactly the code-gen plus ONE empty call: the
+    // first llm_query("") charges the floor, the second refuses with the
+    // marker — never throws (D65).
+    const { llm } = mockLlmCodeGen([code, "", ""]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      systemPrompt: "",
+      budget: codeGenCost + 1,
+    });
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "|[llm_query refused: spend budget exhausted]");
+    assert.equal(
+      llm.calls().length,
+      2,
+      "the second empty llm_query must refuse before calling the LLM",
+    );
+    assert.equal(
+      result.budget?.consumed,
+      codeGenCost + 1,
+      "the refused second empty call must charge nothing",
+    );
+  });
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {

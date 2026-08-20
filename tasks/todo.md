@@ -2,7 +2,7 @@
 
 Source of truth: `SPEC.md` (D64–D66) + `tasks/plan.md`.
 
-- [ ] **T1 — Enforce a ≥1-token minimum in `callCost` (D65); no LLM call is ever free**
+- [x] **T1 — Enforce a ≥1-token minimum in `callCost` (D65); no LLM call is ever free**
   - RED: add failing test(s) in `test/rlm.test.ts` proving that with `systemPrompt: ""` and
     `llm_query("")` the charge is ≥1 (not 0): a budget that affords exactly one empty call makes the
     second empty `llm_query("")` refuse with `[llm_query refused: spend budget exhausted]`; assert
