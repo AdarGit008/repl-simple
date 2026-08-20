@@ -737,6 +737,62 @@ describe("runRlm() — registry-built prompt", () => {
   });
 });
 
+// ── D67: the D17 sentinel rule is always present on every prompt ──
+//
+// The D17 sentinel-authentication rule lives inside DEFAULT_RLM_SYSTEM_PROMPT,
+// but a caller-supplied systemPrompt replaced the default wholesale and
+// silently dropped it. D67 makes the rule a single source of truth
+// (SENTINEL_RULE), interpolated into the default and always appended after an
+// override, so the forged-elision-marker defense can never be dropped by
+// omission.
+
+describe("runRlm() — sentinel rule always present (D67)", () => {
+  it("override carries the rule: appends it after a caller-supplied systemPrompt", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const registry = new ToolRegistry([]);
+    const custom = "Custom prompt for test.";
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry,
+      maxIterations: 5,
+      systemPrompt: custom,
+    });
+
+    assert.equal(result.status, "ok");
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.ok(
+      systemPrompt.includes(TRUNCATED_VIEW_BEGIN),
+      `the override must carry the D17 rule:\n${systemPrompt}`,
+    );
+    assert.ok(
+      systemPrompt.includes(TRUNCATED_VIEW_END),
+      `the override must carry the D17 rule:\n${systemPrompt}`,
+    );
+    // The caller's own text must come before the appended rule, not after it.
+    assert.ok(
+      systemPrompt.indexOf(custom) < systemPrompt.indexOf(TRUNCATED_VIEW_BEGIN),
+      `the caller's prompt must precede the sentinel rule:\n${systemPrompt}`,
+    );
+  });
+
+  it("default unchanged / no duplication: the rule appears exactly once", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const registry = new ToolRegistry([]);
+
+    const result = await runRlm("q", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    const occurrences = systemPrompt.split(TRUNCATED_VIEW_BEGIN).length - 1;
+    assert.equal(
+      occurrences,
+      1,
+      `the default prompt's D17 rule must appear exactly once:\n${systemPrompt}`,
+    );
+  });
+});
+
 // ── Nesting, maxDepth downgrade, parent-context inheritance (D52) ──
 
 describe("runRlm() — nested rlm_query", () => {

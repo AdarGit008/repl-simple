@@ -139,6 +139,11 @@ New/strengthened tests:
    in its current position (second-to-last bullet, before "- Be thorough."), producing identical bytes —
    so existing prompt-pinning tests keep passing unchanged.
 6. **No new public API or dependencies.** The constant is module-internal; the public surface is unchanged.
+7. **Empty-string override stays empty (build-phase amendment).** `systemPrompt: ""` is a meaningful
+   degenerate case pinned by the D65 ≥1-token-floor test; routing `""` through the default prompt would
+   corrupt that floor. Resolution therefore preserves `??` semantics and appends `SENTINEL_RULE` only for a
+   **non-empty** override: `undefined` → default (rule present once), non-empty → rule appended (D67),
+   `""` → verbatim empty (D65 intact). Documented in a `(D67)` code comment.
 
 ## Open questions
 
