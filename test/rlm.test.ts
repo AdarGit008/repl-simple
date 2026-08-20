@@ -3747,6 +3747,10 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "[llm_query refused: spend budget exhausted]");
     assert.equal(llm.calls().length, 1, "llm_query must refuse before calling the LLM");
+
+    // The pool is exactly at the code-gen charge: the refused llm_query charged
+    // nothing, so consumed is the code-gen call's recorded cost (D63).
+    assert.equal(result.budget?.consumed, recordedCost(llm.calls()[0]));
   });
 
   it("10. rlm_query downgrade charges the shared pool", async () => {
@@ -3799,6 +3803,10 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "[rlm_query refused: spend budget exhausted]");
     assert.equal(llm.calls().length, 1, "rlm_query must refuse before calling the LLM");
+
+    // The pool is exactly at the code-gen charge: the refused downgrade charged
+    // nothing, so consumed is the code-gen call's recorded cost (D63).
+    assert.equal(result.budget?.consumed, recordedCost(llm.calls()[0]));
   });
 
   it("12. nested rlm_query shares the parent's pool", async () => {
@@ -3855,6 +3863,70 @@ describe("runRlm() — spend budget", () => {
       `answer should surface the child's budget exhaustion:\n${result.answer}`,
     );
     assert.equal(llm.calls().length, 2, "the child's second iteration must not run");
+
+    // consumed equals the affordable prefix (parent code-gen + child first
+    // iteration): the child's second iteration was refused whole, never charged.
+    assert.equal(
+      result.budget?.consumed,
+      recordedCost(llm.calls()[0]) + recordedCost(llm.calls()[1]),
+    );
+  });
+
+  it("14. omitting budget keeps llm_query, downgrade, and nested spawn budget-free (D61)", async () => {
+    const parentCode =
+      '```python\na = llm_query("outer ask")\nn = rlm_query("sub")\nSUBMIT(a + "|" + n)\n```';
+    const childCode =
+      '```python\nr = rlm_query("inner q", "inner ctx")\nSUBMIT("child: " + r)\n```';
+
+    const { llm } = mockLlmCodeGen([
+      parentCode,
+      "outer llm result",
+      childCode,
+      "inner downgraded result",
+    ]);
+
+    // Defaults maxDepth:1 / depth:0: the parent's rlm_query spawns a nested run
+    // (depth 1) whose own rlm_query downgrades at maxDepth. With no budget,
+    // every tool path runs budget-free (D61/D5).
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer llm result|child: inner downgraded result");
+    assert.ok(!result.answer.includes("refused"), "no refusal marker may fire without a budget");
+    assert.equal(llm.calls().length, 4, "every tool path must reach the LLM");
+    assert.equal(result.budget, undefined);
+    assert.ok(!("budget" in result), "no budget field may be present");
+  });
+
+  it("15. a deep tree (maxDepth 2) charges every level against one pool (D61)", async () => {
+    const parentCode = '```python\nn = rlm_query("sub")\nSUBMIT("outer: " + n)\n```';
+    const childCode = '```python\ng = rlm_query("grand")\nSUBMIT("mid: " + g)\n```';
+    const grandchildCode = '```python\na = llm_query("deep ask")\nSUBMIT("deep: " + a)\n```';
+
+    const { llm } = mockLlmCodeGen([parentCode, childCode, grandchildCode, "deep llm result"]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 2,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer: mid: deep: deep llm result");
+
+    // The hard ceiling spans every level: consumed equals the sum of all four
+    // recorded calls (parent + child + grandchild code-gens + the grandchild's
+    // llm_query), proving the child-llm_query-charges path (D61/D62).
+    assert.equal(llm.calls().length, 4);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+    assert.equal(result.budget?.limited, false);
   });
 });
 
