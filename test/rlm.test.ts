@@ -891,10 +891,9 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
 
   it("truncates the public RlmResult.error to 1 KiB and drops the request-context marker", async () => {
     // A 64 KiB provider error: filler plus a marker standing in for the
-    // request context the caller must not round-trip. The marker sits in the
-    // elided middle because the 50/50 head/tail split (VALUE_HEAD_RATIO)
-    // keeps the tail of the message — a marker appended at the very end would
-    // survive truncation.
+    // request context the caller must not round-trip. Head-only truncation
+    // keeps only the leading error-type prefix, so both the mid-message marker
+    // and everything in the tail are dropped.
     const llm: LlmClient = {
       async query() {
         throw new Error(`${"A".repeat(32 * 1024)}UNIQUE-TAIL-SENTINEL${"A".repeat(32 * 1024)}`);
@@ -909,24 +908,43 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
     // 1 — the budget is a hard ceiling, marker included, so no tolerance).
     assert.ok(!result.error!.includes("UNIQUE-TAIL-SENTINEL"));
     assert.ok(result.error!.includes("[…"), `no elision marker: ${result.error!.slice(0, 80)}`);
-    // Deterministic 1 KiB ceiling: a 64 KiB all-"A" payload with the marker in
-    // the elided middle collapses to 473 head bytes + marker + 474 tail bytes
-    // = exactly 1024 bytes (headRatio 0.5 keeps both ends, marker included).
-    assert.ok(new TextEncoder().encode(result.error!).length === 1024);
-    // headRatio 0.5 retains both head and tail — not a head-only cut.
+    // 1 KiB ceiling is a hard bound (invariant 1 — marker included). The exact
+    // byte count over-specifies truncate.ts internals; the invariant is the
+    // ceiling, and a head-only cut of a 64 KiB payload lands in the high 900s.
+    assert.ok(new TextEncoder().encode(result.error!).length <= 1024);
+    assert.ok(new TextEncoder().encode(result.error!).length > 900);
+    // Head-only cut: the head survives, the tail is dropped.
     assert.ok(
       result.error!.startsWith("A"),
       `truncated error lost its head: ${result.error!.slice(0, 40)}`,
     );
     assert.ok(
-      result.error!.endsWith("A"),
-      `truncated error lost its tail: ${result.error!.slice(-40)}`,
+      !result.error!.endsWith("A"),
+      `truncated error retained its tail: ${result.error!.slice(-40)}`,
     );
     // The neutral recovery clause renders inside the elision marker.
     assert.ok(
       result.error!.includes("The full provider error is not surfaced."),
       "recovery clause missing from the truncated error",
     );
+  });
+
+  it("drops the very end of a long provider error (request-context tail)", async () => {
+    // The redaction goal (D3) is dropping the long retry-hint / request-body
+    // tail — where provider request-context / retry-hints / request-IDs live.
+    // A secret marker at the VERY END of a long error lands in the retained
+    // tail window of a 50/50 head+tail cut and would leak; head-only must
+    // drop it.
+    const llm: LlmClient = {
+      async query() {
+        throw new Error(`${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`);
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    assert.equal(result.status, "error");
+    assert.ok(!result.error!.includes("TAIL-SECRET-REQID"));
   });
 
   it("passes a short non-Error throw verbatim through the String(err) branch", async () => {
@@ -948,9 +966,7 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
   it("truncates a long non-Error throw via the String(err) branch", async () => {
     // The String(err) branch feeds the same truncateText call as `err.message`:
     // a long string throw must be cut to the 1 KiB ceiling exactly like an
-    // Error. The marker sits in the elided middle because headRatio 0.5 keeps
-    // the tail — a marker appended at the very end would survive truncation
-    // (the same pitfall the public-return test documents).
+    // Error, and head-only drops the tail where the marker sits.
     const llm: LlmClient = {
       async query() {
         throw `${"Z".repeat(32 * 1024)}NONERR-TAIL${"Z".repeat(32 * 1024)}`;
@@ -963,6 +979,7 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
     assert.ok(!result.error!.includes("NONERR-TAIL"), "non-Error tail marker leaked");
     assert.ok(result.error!.includes("[…"), `no elision marker: ${result.error!.slice(0, 80)}`);
     assert.ok(new TextEncoder().encode(result.error!).length <= 1024);
+    assert.ok(new TextEncoder().encode(result.error!).length > 900);
   });
 
   it("truncates the nested [rlm_query error: …] re-interpolation to 1 KiB", async () => {
@@ -971,8 +988,8 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
     // and the parent's rlm_query tool takes the `[rlm_query error: …]` branch
     // (D52). The marker sits 4 KiB in — inside the sandbox's ~8 KiB head window
     // (so it leaks through the sandbox's 16 KiB output cap today, making this
-    // RED) but outside the 1 KiB (512 B head/tail) `:1188` window (so the
-    // source truncation elides it once #167 lands).
+    // RED) but outside the 1 KiB head-only `:1188` window (so the source
+    // truncation elides it once #167 lands).
     const nestedQuestion = "SUB-INVESTIGATION";
 
     const llm: LlmClient = {
@@ -997,19 +1014,19 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
 
     // The parent run completes, and the child's error is re-interpolated in
     // already-truncated form — no request-context marker survives.
+    const PREFIX = "outer: [rlm_query error: error] ";
+    const prefixLen = new TextEncoder().encode(PREFIX).length;
     assert.equal(result.status, "ok");
     assert.ok(
-      result.answer.startsWith("outer: [rlm_query error: error] "),
+      result.answer.startsWith(PREFIX),
       `unexpected answer prefix: ${result.answer.slice(0, 120)}`,
     );
     assert.ok(!result.answer.includes("NESTED-TAIL-SENTINEL"));
     // The re-interpolated answer is bounded: the fixed
-    // "outer: [rlm_query error: error] " prefix plus the ≤1 KiB truncated
-    // child error.
-    assert.ok(
-      new TextEncoder().encode(result.answer).length <=
-        1024 + new TextEncoder().encode("outer: [rlm_query error: error] ").length,
-    );
+    // "outer: [rlm_query error: error] " prefix plus the head-only truncated
+    // child error (≤1 KiB, high 900s).
+    assert.ok(new TextEncoder().encode(result.answer).length <= 1024 + prefixLen);
+    assert.ok(new TextEncoder().encode(result.answer).length > 900 + prefixLen);
     // The child's truncation carries the neutral recovery clause into the
     // parent's answer.
     assert.ok(

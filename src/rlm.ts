@@ -13,6 +13,7 @@ import {
   OUTPUT_MAX_BYTES,
   VALUE_HEAD_RATIO,
   VALUE_RECOVERY,
+  HEAD_ONLY_RATIO,
 } from "./truncate.js";
 
 // ── RLM types ────────────────────────────────────────────────────
@@ -137,8 +138,12 @@ export interface RlmResult {
   budget?: RlmBudgetReport;
   /**
    * Error message for a failed result. Populated on `status: "error"` (D53);
-   * the nested `rlm_query` error branch reads it (D52). Truncated to
-   * `RLM_ERROR_MAX_BYTES` (1 KiB) at the assignment site (#167).
+   * the nested `rlm_query` error branch reads it (D52). Truncated head-only
+   * with plain `truncateText` (no sentinel wrap — this is a caller-facing
+   * API return, not a prompt-bound view) at `RLM_ERROR_MAX_BYTES` (1 KiB)
+   * at the assignment site (#167). Head-only keeps only the leading
+   * error-type prefix and drops the tail, where provider request-context /
+   * retry-hints / request-IDs live.
    */
   error?: string;
 }
@@ -169,6 +174,14 @@ const FEEDBACK_ERROR_MAX_BYTES = 16 * 1024;
  * exception the feedback truncated away (#144, D7).
  */
 const ERROR_RECOVERY = "Catch the exception and print the full traceback to see more.";
+
+// ── RLM provider-error budget ───────────────────────────────────
+//
+// `RlmResult.error` is the caller-facing error from a failed LLM query (D53),
+// not a model-facing view, so it is truncated head-only with plain
+// `truncateText` (no sentinel wrap) at 1 KiB (#167). Head-only keeps only the
+// leading error-type prefix and drops the tail, where provider request-context
+// / retry-hints / request-IDs live.
 
 /** Byte ceiling for the RLM-level `RlmResult.error` (LLM provider error, 1 KiB). */
 const RLM_ERROR_MAX_BYTES = 1024;
@@ -1197,7 +1210,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         status: "error",
         error: truncateText(err instanceof Error ? err.message : String(err), {
           maxBytes: RLM_ERROR_MAX_BYTES,
-          headRatio: VALUE_HEAD_RATIO,
+          headRatio: HEAD_ONLY_RATIO,
           recovery: RLM_ERROR_RECOVERY,
         }).text,
         answer: extractBestAnswer(iterations),
