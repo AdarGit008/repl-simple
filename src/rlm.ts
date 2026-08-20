@@ -82,6 +82,11 @@ export interface RlmOptions {
    * used and mutated **in place**, so siblings passing the same instance share
    * one pool and `consumed` reflects the pool's cumulative spend. Omitted →
    * no budget logic runs and `RlmResult.budget` is absent (D5).
+   *
+   * `estimateTokens` is a deterministic lower bound (UTF-8 bytes ÷ 4) and
+   * under-counts non-ASCII/emoji/CJK content up to ~1 token/byte; callers
+   * needing a hard real-token spend bound must apply their own margin for
+   * non-English content (D66).
    */
   budget?: number | SpendBudget;
   /** Abort signal — honoured during the LLM query, the sandbox run, and between iterations (#75). */
@@ -521,7 +526,8 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
  * The cap-time synthesis prompt (D44): a fixed user message asking the model
  * for the single best answer it can give to the original question from the
  * transcript above, as plain text — no code, no commentary. Appended to the
- * transcript for the one un-charged best-effort query at the iteration cap.
+ * transcript for the single best-effort query at the iteration cap (charged
+ * against the shared pool when a budget is set, D64).
  */
 const FINAL_SYNTHESIS_PROMPT =
   "Give the single best available answer to the original question, based on the transcript above. Reply with plain text only — no code, no commentary.";
@@ -886,13 +892,23 @@ export function buildFeedback(result: RunResult): string {
 // message content, measured in estimated tokens — so a run never overspends.
 // The estimator lives in budget.ts; rlm.ts never measures bytes itself (D8).
 
-/** Estimated-token cost of one LLM call: the precomputed prompt plus every message. */
+/**
+ * Estimated-token cost of one LLM call: the precomputed prompt plus every
+ * message, floored at 1 token so no LLM call is ever free (D65). An empty
+ * system prompt plus empty tool prompts would otherwise estimate 0 tokens and
+ * let a `while True: llm_query("")` loop burn unbounded spend for free.
+ */
 function callCost(
   systemPromptTokens: number,
   messages: Array<{ role: "user" | "assistant"; content: string }>,
 ): number {
-  return (
-    systemPromptTokens + messages.reduce((sum, message) => sum + estimateTokens(message.content), 0)
+  // D65: the ≥1-token floor applies uniformly to every charged path (top-level
+  // loop, llm_query, rlm_query downgrade, nested loops, synthesis) with no
+  // special-casing — tryCharge/SpendBudget stay untouched.
+  return Math.max(
+    1,
+    systemPromptTokens +
+      messages.reduce((sum, message) => sum + estimateTokens(message.content), 0),
   );
 }
 
@@ -1338,17 +1354,35 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     droppedTurns = boundConversation(messages, droppedTurns);
   }
 
-  // Max iterations exhausted — D44/D45: one guarded, un-charged synthesis
-  // pass over the transcript before salvage. Success marks the answer
-  // synthesised; a throw or an abort falls back to salvage, never throwing
-  // out of runRlm for a failed synthesis.
+  // Max iterations exhausted — D44/D45: the single final synthesis pass over
+  // the transcript. D64 charges it against the shared pool before it runs
+  // (the same `callCost` accounting as every other charged path, D62); on
+  // refusal the run salvages the best answer accumulated so far — never
+  // throwing and never a bare synthesis-caused `budget_exhausted` (D4/D64).
+  // When `budget` is omitted the pass stays un-charged (D5 unchanged).
+  const synthesisMessages: Array<{ role: "user" | "assistant"; content: string }> = [
+    ...messages,
+    { role: "user", content: FINAL_SYNTHESIS_PROMPT },
+  ];
+
+  if (budget && !budget.tryCharge(callCost(systemPromptTokens, synthesisMessages))) {
+    // Refusal → salvage (D64): return the last iteration's extracted answer
+    // (the value the run already had before the synthesis refinement), never
+    // throwing and never a bare budget_exhausted — the run reached the cap.
+    return {
+      status: "max_iterations",
+      answer: extractBestAnswer(iterations),
+      answerSource: "salvaged",
+      iterations,
+      budget: budgetReport(budget, false),
+    };
+  }
+
+  // The report is built after the charge so a successful synthesis's cost is
+  // included in `consumed` (D64).
   const report = budgetReport(budget, false);
   try {
-    const synthesized = await llmClient.query(
-      systemPrompt,
-      [...messages, { role: "user", content: FINAL_SYNTHESIS_PROMPT }],
-      options.signal,
-    );
+    const synthesized = await llmClient.query(systemPrompt, synthesisMessages, options.signal);
     // An abort during the synthesis call folds into salvage (Assumption 5):
     // the loop already reached the cap, so the status stays max_iterations.
     if (!options.signal?.aborted) {

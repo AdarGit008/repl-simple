@@ -1,45 +1,55 @@
-# Todo — issue #165: bound tree spend on the shared `SpendBudget`
+# Todo — issue #182: close the two residual spend gaps left by #165
 
-Source of truth: `SPEC.md` (D61–D63) + `tasks/plan.md`.
+Source of truth: `SPEC.md` (D64–D66) + `tasks/plan.md`.
 
-- [x] **T1 — Charge `llm_query` + `rlm_query` downgrade against the shared pool; refuse on exhaustion**
-  - RED: add failing tests in `test/rlm.test.ts` (extend the "runRlm() — spend budget" block or a new
-    sibling block):
-    - `llm_query` charges the pool — generous budget; `answer = llm_query("…")` + `SUBMIT(answer)`;
-      assert `result.budget.consumed === Σ recordedCost(all recorded calls)`.
-    - `llm_query` refuses on a tight budget — budget sized to the first code-gen call only; assert the
-      refusal marker in the answer/stdout, no throw, termination as `budget_exhausted`/marker.
-    - `rlm_query` downgrade charges — `maxDepth:1, depth:1`; assert `consumed` includes the downgrade
-      call.
-    - `rlm_query` downgrade refuses — tight budget; assert the refusal marker.
-  - Implement (GREEN) in `src/rlm.ts`: add `budget` + `systemPromptTokens`-aware `callCost` charging
-    and refusal markers (`"[llm_query refused: spend budget exhausted]"`,
-    `"[rlm_query refused: spend budget exhausted]"`) to `onLLMQuery` and the downgrade branch of
-    `onRLMQuery`.
-  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
+- [x] **T1 — Enforce a ≥1-token minimum in `callCost` (D65); no LLM call is ever free**
+  - RED: add failing test(s) in `test/rlm.test.ts` proving that with `systemPrompt: ""` and
+    `llm_query("")` the charge is ≥1 (not 0): a budget that affords exactly one empty call makes the
+    second empty `llm_query("")` refuse with `[llm_query refused: spend budget exhausted]`; assert
+    `consumed ≥ 1` per call. Account for the top-level code-gen charge (size budgets via the
+    existing `recordedCost` helpers).
+  - Implement (GREEN) in `src/rlm.ts` `callCost` (preferred): `Math.max(1, systemPromptTokens +
+    Σ estimateTokens(content))`. Fallback: floor inside `src/budget.ts` `tryCharge`. No
+    special-casing; uniform across all charged paths.
+  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green; existing #165 spend tests
+    (non-empty prompts) unaffected.
 
-- [x] **T2 — Thread the shared pool into nested `runRlm`; update the D52 comment**
+- [x] **T2 — Charge the D44/D45 synthesis pass and degrade to salvage on refusal (D64)**
   - RED: add failing tests:
-    - nested `rlm_query` shares the parent's pool — generous budget; assert
-      `result.budget.consumed === Σ recordedCost(parent + child calls)`.
-    - a pool that cannot afford the child's second iteration → child returns `budget_exhausted`,
-      surfaced as `[rlm_query error: budget_exhausted]`, no throw.
-  - Implement (GREEN) in `src/rlm.ts`: change `budget: undefined` → `budget` in the nested `runRlm`
-    call inside `onRLMQuery`; rewrite the stale D52 comment to state the child shares the parent's
-    pool (D61).
+    - synthesis charges — a run with no SUBMIT (runs to the iteration cap) and a generous budget;
+      assert `result.budget.consumed` includes the synthesis call's cost and the final answer is the
+      synthesized answer.
+    - synthesis salvages — budget sized to afford the iterations but not the synthesis call; assert
+      the run returns the salvaged (pre-synthesis) answer, never throws, and status is not a bare
+      `budget_exhausted` caused by the synthesis charge.
+  - Implement (GREEN) in `src/rlm.ts`: `tryCharge(callCost(...))` immediately before the final
+    synthesis `llmClient.query`; on refusal return the last iteration's extracted answer (salvage).
+    Keep the omitted-budget path un-charged (D5).
   - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
 
-## Checkpoint (after T2)
+- [x] **T3 — Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget` (D66, doc-only)**
+  - Add a JSDoc note on `RlmOptions.budget` (in `src/rlm.ts`): `estimateTokens` is a deterministic
+    lower bound (bytes ÷ 4) and under-counts non-ASCII/emoji/CJK up to ~1 token/byte; callers
+    needing a hard real-token bound must apply their own margin for non-English content.
+  - No behavior change, no test (D2 doc note convention).
+  - Verify: `npm run check`, `npm run lint` green (no test needed).
 
-- [ ] All six new tests green; full suite, `tsc --noEmit`, and biome clean.
-- [ ] SPEC.md success criteria met.
+## Checkpoint (after T3)
 
-## DoD (from #165, reconciled)
+- [x] All SPEC success criteria met (D64, D65, D66).
+- [x] Full suite, `tsc --noEmit`, and biome clean.
 
-- [ ] `llm_query`, `rlm_query` downgrade, and nested `runRlm` all charge the single shared
-      `SpendBudget` pool.
-- [ ] A refused tool call returns its marker string and never throws or calls the LLM.
-- [ ] A configured budget is a hard ceiling on **total tree** spend.
-- [ ] Omitting `budget` leaves every path budget-free (no regression).
-- [ ] Out of scope (not touched): #171, #168, #170, the final synthesis pass (D44/D45),
-      `budgetReport`/`SpendBudget`/public `RlmResult`.
+  _Verify-phase coverage gap #1 closed (D64): added regression test
+  `runRlm() — answer provenance > 8. a charged synthesis query that throws still
+  counts its cost and salvages (D64)` in test/rlm.test.ts — full suite, `tsc --noEmit`,
+  and biome all green. Test-only change; src/ untouched._
+
+## DoD (from #182, reconciled)
+
+- [x] The synthesis pass charges the shared pool; refusal degrades to salvage (never throws, never a
+      bare synthesis-caused `budget_exhausted`).
+- [x] No LLM call is ever free: a ≥1-token floor applies uniformly across every charged path.
+- [x] `RlmOptions.budget` documents the `estimateTokens` lower-bound caveat.
+- [x] Both behaviors pinned by named tests (RED → GREEN).
+- [x] Out of scope (not touched): #171, #168, #184, #170; `budgetReport`/`SpendBudget`/public
+      `RlmResult` shapes.

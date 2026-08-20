@@ -4083,6 +4083,142 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.budget?.consumed, expected);
     assert.equal(result.budget?.limited, false);
   });
+
+  it("16. an empty systemPrompt + empty llm_query charges the ≥1-token floor (D65)", async () => {
+    const code = '```python\na = llm_query("")\nb = llm_query("")\nSUBMIT(a + "|" + b)\n```';
+
+    // Probe the top-level code-gen cost with the empty system prompt, then
+    // size budgets relative to it (plan.md Risks row 1): the code-gen call
+    // always charges first, so the floor is measured on top of it.
+    const { llm: probe } = mockLlmCodeGen([code, "", ""]);
+    await runRlm("q", {
+      llmClient: probe,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      systemPrompt: "",
+    });
+    const codeGenCost = recordedCost(probe.calls()[0]);
+    assert.ok(codeGenCost > 0, "the top-level code-gen charge is non-zero");
+
+    // (a) A generous budget: both empty llm_query("") calls run, and each
+    // charges the ≥1-token floor — consumed is the code-gen cost plus 2.
+    const { llm: generous } = mockLlmCodeGen([code, "", ""]);
+    const generousResult = await runRlm("q", {
+      llmClient: generous,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      systemPrompt: "",
+      budget: 1_000_000,
+    });
+    assert.equal(generousResult.status, "ok");
+    assert.equal(generousResult.answer, "|");
+    assert.equal(generous.calls().length, 3, "both empty llm_query calls reach the LLM");
+    assert.equal(
+      generousResult.budget?.consumed,
+      codeGenCost + 2,
+      "each empty llm_query() must charge at least 1 token (D65)",
+    );
+
+    // (b) A budget that affords exactly the code-gen plus ONE empty call: the
+    // first llm_query("") charges the floor, the second refuses with the
+    // marker — never throws (D65).
+    const { llm } = mockLlmCodeGen([code, "", ""]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      systemPrompt: "",
+      budget: codeGenCost + 1,
+    });
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "|[llm_query refused: spend budget exhausted]");
+    assert.equal(
+      llm.calls().length,
+      2,
+      "the second empty llm_query must refuse before calling the LLM",
+    );
+    assert.equal(
+      result.budget?.consumed,
+      codeGenCost + 1,
+      "the refused second empty call must charge nothing",
+    );
+  });
+
+  it("17. synthesis pass charges the pool (D64)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const synthesisReply = "The final answer is 42.";
+
+    const { llm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, synthesisReply);
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+
+    // The synthesis call charges the same pool as the three iteration calls:
+    // consumed equals the sum of every recorded call's cost, including the
+    // final synthesis query (D64).
+    assert.equal(llm.calls().length, 4, "three iterations plus the synthesis call");
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+
+    // The synthesis charge is a positive addition over the investigation-only
+    // spend, proving it was charged on top of the three iterations.
+    const investigationCost = llm
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.ok(
+      (result.budget?.consumed ?? 0) > investigationCost,
+      "consumed must include the synthesis charge on top of the iterations",
+    );
+  });
+
+  it("18. synthesis pass salvages on refusal — never a bare budget_exhausted (D64)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const codes = [code, code, code];
+
+    // Probe the three iteration calls' costs once without a budget, then size
+    // the budget to exactly that sum: the iterations fit, the synthesis call
+    // does not, so the run must salvage rather than charge or throw.
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 3 });
+    const investigationCost = probe
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.ok(investigationCost > 0, "the investigation must be charged");
+
+    const synthesisReply = "The final answer is 42.";
+    const { llm } = mockLlmCodeGen([code, code, code, synthesisReply]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: investigationCost,
+    });
+
+    // No throw (the await resolved): the run salvages the pre-synthesis
+    // answer and stays at the cap — never a bare budget_exhausted caused by
+    // the synthesis charge alone (D64).
+    assert.equal(result.status, "max_iterations");
+    assert.notEqual(result.status, "budget_exhausted");
+    assert.equal(result.budget?.limited, false);
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.answer, "still working...\n");
+
+    // The synthesis call was refused whole: it never reached the LLM and
+    // charged nothing, so consumed is exactly the investigation cost.
+    assert.equal(llm.calls().length, 3, "the synthesis call must not run");
+    assert.equal(result.budget?.consumed, investigationCost);
+  });
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {
@@ -4291,14 +4427,14 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(result.answer, "still working...\n");
   });
 
-  it("7. the cap-time synthesis is un-charged against the spend budget (D45)", async () => {
+  it("7. the cap-time synthesis is charged against the spend budget (D64)", async () => {
     const code = "```python\nprint('still working...')\n```";
     const codes = [code, code, code];
 
     // Probe the three iteration calls' costs once without a budget, then size
-    // the budget to exactly that sum. The iteration queries are affordable,
-    // but if the cap-time synthesis were charged on top it would exceed the
-    // budget — the synthesis is un-charged (D45), so the run reaches the cap.
+    // the budget to exactly the investigation plus the synthesis call. Both
+    // fit exactly: the synthesis charges the shared pool (D64), so consumed
+    // reaches the limit and the answer is synthesised.
     const { llm: probe } = mockLlmCodeGen(codes);
     await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 3 });
     const investigationCost = probe
@@ -4315,7 +4451,7 @@ describe("runRlm() — answer provenance (issue #76)", () => {
       llmClient: llm,
       registry: rlmRegistry(),
       maxIterations: 3,
-      budget: investigationCost,
+      budget: investigationCost + synthesisCost,
     });
 
     assert.equal(result.status, "max_iterations");
@@ -4323,11 +4459,54 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(result.answer, synthesisReply);
     assert.ok(result.budget, "a configured budget must be reported");
     assert.equal(result.budget?.limited, false);
-    // Only the three iteration calls were charged; the synthesis call ran
-    // (4th query) but was never charged, so consumed equals the investigation
-    // cost exactly and the budget never degraded the run.
-    assert.equal(result.budget?.consumed, investigationCost);
-    assert.equal(llm.calls().length, 4, "the synthesis call still ran");
+    // The synthesis call is charged on top of the three iterations: consumed
+    // equals the limit exactly and includes the synthesis charge (D64).
+    assert.equal(result.budget?.consumed, result.budget?.limit);
+    assert.equal(result.budget?.consumed, investigationCost + synthesisCost);
+    assert.equal(llm.calls().length, 4, "the synthesis call still runs");
+  });
+
+  it("8. a charged synthesis query that throws still counts its cost and salvages (D64)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const codes = [code, code, code];
+
+    // Probe the three iteration calls plus the synthesis call once without a
+    // budget, then size the budget to exactly the full spend. The synthesis
+    // charge is identical whether the query returns or throws — it is charged
+    // before it runs (D64).
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 3 });
+    const investigationCost = probe
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    const synthesisCost = recordedCost(probe.calls()[3]);
+    assert.ok(investigationCost > 0, "the investigation must be charged");
+    assert.ok(synthesisCost > 0, "the synthesis call has a positive cost");
+
+    // The synthesis query throws at the cap (mockSalvageOnCap), yet the charge
+    // already succeeded: the run must still salvage rather than throw or
+    // degrade to a bare budget_exhausted.
+    const llm = mockSalvageOnCap(code, 3);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: investigationCost + synthesisCost,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.notEqual(result.status, "budget_exhausted");
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.answer, "still working...\n");
+
+    // The charged-then-thrown synthesis still counts against the pool: the
+    // budgetReport is built after the successful charge, so consumed reaches
+    // the limit exactly and includes the synthesis charge (D64).
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+    assert.equal(result.budget?.consumed, result.budget?.limit);
+    assert.equal(result.budget?.consumed, investigationCost + synthesisCost);
   });
 });
 
