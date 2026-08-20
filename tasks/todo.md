@@ -7,8 +7,8 @@ fresh context, one commit per task. After each task the full suite must be green
 message; do **not** rewrite the two #167 short-message tests; do **not** absorb #171/#182/#166
 scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in scope.
 
-- [ ] **T1 — Truncate provider errors at the two tool paths (D1–D7)**
-  - [ ] RED — add a new `describe("runRlm() — tool-path provider-error redaction (#184)")` block to
+- [x] **T1 — Truncate provider errors at the two tool paths (D1–D7)**
+  - [x] RED — add a new `describe("runRlm() — tool-path provider-error redaction (#184)")` block to
     `test/rlm.test.ts`, reusing the local `rlmRegistry()` helper (`new ToolRegistry([])`). Three
     tests, all RED today:
     1. **llm_query path is truncated.** Inline fake `llmClient.query`: call 1 returns
@@ -24,7 +24,7 @@ scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` ar
     3. **Short message passes verbatim (regression pin).** Tool call throws `new Error("boom")`;
        assert `iterations[0].result.error!.includes("boom")`. Green stays green after the fix
        (`truncateText` is a no-op under budget).
-  - [ ] GREEN — in `src/rlm.ts`, add a module-private helper beside the RLM provider-error
+  - [x] GREEN — in `src/rlm.ts`, add a module-private helper beside the RLM provider-error
     constants (`RLM_ERROR_MAX_BYTES` at `:187`, `RLM_ERROR_RECOVERY` at `:193`):
     ```ts
     /** Head-only truncation of a provider rejection before it surfaces as a sandbox RuntimeError. */
@@ -39,7 +39,7 @@ scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` ar
     branch) in `try { return await llmClient.query(...) } catch (err) { throw new
     Error(redactProviderError(err)); }`. Do **not** touch the `tryCharge` blocks or the budget
     markers. Do **not** touch `buildFeedback`.
-  - [ ] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
+  - [x] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
     `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean. Confirm
     the two #167 short-message tests still pass unchanged.
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
