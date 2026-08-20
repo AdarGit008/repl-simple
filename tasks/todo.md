@@ -1,36 +1,79 @@
-# Todo — issue #166: enforce the D17 sentinel rule when options.systemPrompt is overridden
+# Todo — issue #184: redact provider errors on the llm_query / downgraded-rlm_query tool paths
 
-Source of truth: `SPEC.md` (D67) + `tasks/plan.md`.
+Source of truth: `SPEC.md` (D1–D7) + `tasks/plan.md`. Each task is RED-first. One coder per task,
+fresh context, one commit per task. After each task the full suite must be green. Do **not** touch
+`buildFeedback`'s `VALUE_HEAD_RATIO`; do **not** touch `src/repl.ts` / `src/session.ts` /
+`src/sandbox.ts` / `src/truncate.ts`; do **not** use `truncateWithSentinels` for the provider
+message; do **not** rewrite the two #167 short-message tests; do **not** absorb #171/#182/#166
+scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in scope.
 
-- [x] **T1 — Extract `SENTINEL_RULE`, append to overrides, interpolate into the default (D67)**
-  - RED: add failing tests in `test/rlm.test.ts` (extend the "Sentinel contract (D17)" block):
-    - **override carries the rule** — run `runRlm` with a custom `systemPrompt` lacking the sentinel
-      wording; assert `llm.calls()[0].systemPrompt` contains the D17 rule text and that the caller's
-      own prompt text appears **before** the rule text.
-    - **default unchanged / no duplication** — a run with no `systemPrompt` still emits a prompt whose
-      D17 section is byte-identical to the pre-change default, and the rule appears **exactly once**
-      in the default path.
-  - Implement (GREEN) in `src/rlm.ts`:
-    - Add a module-internal `SENTINEL_RULE` constant holding the D17 bullet verbatim.
-    - Interpolate it into `DEFAULT_RLM_SYSTEM_PROMPT` in its current position (second-to-last bullet,
-      before "- Be thorough.") — output byte-identical.
-    - Resolve the prompt as `options.systemPrompt ? \`${options.systemPrompt}\n${SENTINEL_RULE}\`
-      : (await buildSystemPrompt(registry))`.
-    - Update the `RlmOptions.systemPrompt` JSDoc to state the rule is always appended (callers need
-      not restate it).
-  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green; existing tool-naming and
-    fresh-sandbox prompt tests unaffected.
+- [ ] **T1 — Truncate provider errors at the two tool paths (D1–D7)**
+  - [ ] RED — add a new `describe("runRlm() — tool-path provider-error redaction (#184)")` block to
+    `test/rlm.test.ts`, reusing the local `rlmRegistry()` helper (`new ToolRegistry([])`). Three
+    tests, all RED today:
+    1. **llm_query path is truncated.** Inline fake `llmClient.query`: call 1 returns
+       `` ```python\nllm_query("hello")\nSUBMIT("done")\n``` ``; later calls throw
+       `new Error("A".repeat(64 * 1024) + "TAIL-SECRET-REQID")`. Run
+       `runRlm("q", { llmClient, registry: rlmRegistry(), maxIterations: 1 })`. Assert
+       `iterations.length === 1`; `!iterations[0].result.error!.includes("TAIL-SECRET-REQID")`; and
+       `!buildFeedback(iterations[0].result).includes("TAIL-SECRET-REQID")`. Today RED (raw 64 KiB
+       message reaches both surfaces).
+    2. **Downgrade path is truncated.** Same fake; run with `maxDepth: 1, depth: 1`; call 1 returns
+       `` ```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n``` ``. Same two assertions.
+       Today RED.
+    3. **Short message passes verbatim (regression pin).** Tool call throws `new Error("boom")`;
+       assert `iterations[0].result.error!.includes("boom")`. Green stays green after the fix
+       (`truncateText` is a no-op under budget).
+  - [ ] GREEN — in `src/rlm.ts`, add a module-private helper beside the RLM provider-error
+    constants (`RLM_ERROR_MAX_BYTES` at `:187`, `RLM_ERROR_RECOVERY` at `:193`):
+    ```ts
+    /** Head-only truncation of a provider rejection before it surfaces as a sandbox RuntimeError. */
+    function redactProviderError(err: unknown): string {
+      return truncateText(
+        err instanceof Error ? err.message : String(err),
+        { maxBytes: RLM_ERROR_MAX_BYTES, headRatio: HEAD_ONLY_RATIO, recovery: RLM_ERROR_RECOVERY },
+      ).text;
+    }
+    ```
+    Wrap the two `llmClient.query` calls (`:1087-1091` in `onLLMQuery`; `:1111` in the downgrade
+    branch) in `try { return await llmClient.query(...) } catch (err) { throw new
+    Error(redactProviderError(err)); }`. Do **not** touch the `tryCharge` blocks or the budget
+    markers. Do **not** touch `buildFeedback`.
+  - [ ] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
+    `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean. Confirm
+    the two #167 short-message tests still pass unchanged.
+  - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
-## Checkpoint (after T1)
+- [ ] **T2 — Record the two tool-path surfaces in the truncation policy**
+  - No RED test (documentation). In `docs/truncation-policy.md`:
+    1. Add an Implementation-record row to the table for the `llm_query` and downgraded-`rlm_query`
+       provider-error surfaces (1 KiB, head-only, #184).
+    2. Append a short `**#184 (tool-path provider errors).**` narrative after the `#167` narrative
+       explaining: the two source choke points (`onLLMQuery`, downgrade branch), the plain-
+       `truncateText` (not `truncateWithSentinels`) choice because the message becomes a sandbox
+       `RuntimeError`, head-only per D7, and the reused neutral recovery clause.
+  - [ ] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
+    + `npm run build` unaffected (doc-only). No test changes.
+  - Files — `docs/truncation-policy.md`.
 
-- [x] All SPEC success criteria met (D67).
-- [x] Full suite, `tsc --noEmit`, and biome clean.
+## Checkpoint (after T2)
 
-## DoD
+- [ ] Issue acceptance met: both tool paths truncated head-only at 1 KiB before the sandbox
+      `RuntimeError`; `iterations[].result.error` bounded/redacted; short messages verbatim.
+- [ ] Two RED-first tests pin the llm_query and downgrade paths; one regression pin for short
+      messages.
+- [ ] `docs/truncation-policy.md` records the two surfaces.
+- [ ] Full suite green; `check`/`build`/scoped-`lint` clean.
 
-- [x] A caller-supplied `systemPrompt` always carries the D17 sentinel rule (appended after the override).
-- [x] The default prompt output is byte-identical to today (regression-pinned).
-- [x] `RlmOptions.systemPrompt` JSDoc states the always-append contract.
-- [x] Named tests (RED → GREEN) pin both the override and default paths.
-- [x] Out of scope (not touched): #171, #168, #184, #170, #173; `truncateWithSentinels`, sentinel
-      constants, shared truncator, public `RlmResult` shapes.
+## DoD (from #184, reconciled)
+
+- [ ] Provider errors on the `llm_query` and downgraded-`rlm_query` paths are truncated at the
+      source (head-only, ≤ 1 KiB) before they surface as a sandbox `RuntimeError`.
+- [ ] `iterations[].result.error` for these paths is bounded/redacted, not raw.
+- [ ] RED test: a request-context marker at the very end does not reach the model prompt via
+      `buildFeedback`, nor the caller via `iterations[].result.error`.
+- [ ] Short provider errors pass verbatim (regression pin).
+- [ ] No `truncateWithSentinels`; no change to `buildFeedback`'s `VALUE_HEAD_RATIO`.
+- [ ] No changes to `src/repl.ts`, `src/session.ts`, `src/sandbox.ts`, `src/truncate.ts`;
+      no #171/#182/#166 scope absorbed.
+- [ ] Truncation policy updated with the two new surfaces.
