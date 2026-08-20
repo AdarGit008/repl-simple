@@ -526,6 +526,19 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
 const FINAL_SYNTHESIS_PROMPT =
   "Give the single best available answer to the original question, based on the transcript above. Reply with plain text only — no code, no commentary.";
 
+// ── Tool refusal markers (D63) ──────────────────────────────────
+//
+// A tool-mediated LLM call (llm_query or the rlm_query downgrade) that cannot
+// charge the shared spend pool returns one of these marker strings instead of
+// calling the LLM — it degrades, never throws (D4). The sandbox sees the
+// string as the tool's return value.
+
+/** `llm_query` refusal — the sandbox sees this as the tool's return value. */
+const LLM_QUERY_REFUSED = "[llm_query refused: spend budget exhausted]";
+
+/** `rlm_query` downgrade refusal — same shape, distinct tool. */
+const RLM_QUERY_REFUSED = "[rlm_query refused: spend budget exhausted]";
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /** What a reply yields for the loop: code (fenced or raw), or a direct answer. */
@@ -1063,8 +1076,20 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   const registry = new ToolRegistry([
     ...options.registry.list(),
     ...createRLMTools({
-      onLLMQuery: async (prompt) =>
-        llmClient.query(systemPrompt, [{ role: "user", content: prompt }], options.signal),
+      onLLMQuery: async (prompt) => {
+        // D62/D63: a tool-mediated call charges the shared pool before it runs,
+        // at the same per-call cost as the top-level loop. If it cannot charge,
+        // the tool returns a refusal marker instead of calling the LLM.
+        if (budget) {
+          const cost = callCost(systemPromptTokens, [{ role: "user", content: prompt }]);
+          if (!budget.tryCharge(cost)) return LLM_QUERY_REFUSED;
+        }
+        return await llmClient.query(
+          systemPrompt,
+          [{ role: "user", content: prompt }],
+          options.signal,
+        );
+      },
       onRLMQuery: async (query, context) => {
         const depth = options.depth ?? 0;
         const maxDepth = options.maxDepth ?? 1;
@@ -1072,19 +1097,18 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         // At the depth limit there is no sandbox to investigate in: downgrade
         // to a single llm_query ask (D52).
         if (depth >= maxDepth) {
-          return await llmClient.query(
-            systemPrompt,
-            [
-              {
-                role: "user",
-                content:
-                  `[rlm_query downgraded at max depth ${maxDepth}]\n` +
-                  `Query: ${query}\n` +
-                  `Context: ${context ?? "(none)"}`,
-              },
-            ],
-            options.signal,
-          );
+          const content =
+            `[rlm_query downgraded at max depth ${maxDepth}]\n` +
+            `Query: ${query}\n` +
+            `Context: ${context ?? "(none)"}`;
+          // D62/D63: the downgrade charges the shared pool before it runs, at
+          // the same per-call cost as the top-level loop. If it cannot charge,
+          // the tool returns a refusal marker instead of calling the LLM.
+          if (budget) {
+            const cost = callCost(systemPromptTokens, [{ role: "user", content }]);
+            if (!budget.tryCharge(cost)) return RLM_QUERY_REFUSED;
+          }
+          return await llmClient.query(systemPrompt, [{ role: "user", content }], options.signal);
         }
 
         // Parent-context inheritance (A26, M16): the child sees the parent
@@ -1103,11 +1127,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           preamble: options.preamble,
           systemPrompt: options.systemPrompt,
           signal: options.signal,
-          // The child is bounded by maxIterations/maxDepth, not the parent's
-          // spend pool — a nested loop must not share/compete for the
-          // parent's SpendBudget (D52). `onIteration` is deliberately not
-          // forwarded: child iterations are the child's own.
-          budget: undefined,
+          // The child shares the parent's SpendBudget pool (D61): every
+          // nested loop's iterations charge the same pool, so a configured
+          // budget is a hard ceiling on total tree spend. `onIteration` is
+          // deliberately not forwarded: child iterations are the child's own.
+          budget,
           inputs: { context: merged },
         });
 

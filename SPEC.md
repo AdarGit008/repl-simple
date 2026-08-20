@@ -1,218 +1,189 @@
-# Spec: Redact `RlmResult.error` before returning it and before it is re-interpolated into nested feedback — issue #167
+# Spec: Bound spend of `llm_query` / `rlm_query` / nested `runRlm` against the run budget — issue #165
 
 ## Objective
 
-`RlmResult.error` carries the raw `llmClient` error message (`err.message`) to two consumers:
+`RlmOptions.budget` currently charges only the **top-level iteration loop** of `runRlm`. Three LLM
+paths escape the budget entirely:
 
-1. the **public return** — `status: "error"` result handed to the API caller; and
-2. the **nested-feedback re-interpolation** — `[rlm_query error: <status>] <error>` (line 1093),
-   which feeds the parent loop's sandbox variable `result`, and from there reaches the model's
-   prompt.
+1. `onLLMQuery` (`llm_query` from sandbox code) calls `llmClient.query` directly.
+2. `onRLMQuery` (`rlm_query`) at the depth limit **downgrades** to a direct `llmClient.query`.
+3. `onRLMQuery` below the depth limit spawns a nested `runRlm` that passes `budget: undefined`
+   (D52), so the child loop's iterations are uncharged — and each child can itself call
+   `llm_query` / `rlm_query`.
 
-Provider error text can carry request context the caller never intended to round-trip into a
-model-visible prompt: prompt snippets, request IDs, retry hints. The fix is to truncate/sanitize the
-message at a small cap **at the source** so both consumers get the bounded form.
+Impact: a caller setting `budget` to cap runaway cost gets **no protection against sandbox code
+looping `llm_query` / `rlm_query`** — unbounded LLM spend / cost-DoS. Recursion depth is bounded
+(`maxDepth`), breadth is not.
 
-Success looks like: a short provider error (`"boom"`, `"child llm failure"`) survives byte-for-byte;
-a huge provider error is truncated to a small cap on both the public `RlmResult.error` and the
-nested `[rlm_query error: …]` re-interpolation; no request-context tail reaches the model.
+This change threads **one `SpendBudget` pool through the whole tree**: every tool-mediated LLM call
+and every nested loop charges the same pool, so a configured budget is a hard ceiling on total tree
+spend. When a tool-mediated call cannot charge, it degrades to a marker string (never throws),
+matching the existing D4 "degrades instead of throwing" semantics.
 
-Issue: https://github.com/AdarGit008/repl-simple/issues/167.
-Source: #78 (RLM convergence) security audit — Low. Parent bucket: #41 (Bucket 4 — Security
-perimeter). Siblings touching the same file: #166 (sentinel rule under `systemPrompt` override),
-#171 (signal-race + truncate the downgrade interpolation — a different code block).
+## Current state (fact base — verified against HEAD `ed94e84`)
 
-## Corrected understanding (pre-build, vs. the issue-monitor initial scan)
-
-The initial scan (gotcha G1) claimed the two existing tests — `test/rlm.test.ts:880`
-(`"outer: [rlm_query error: error] child llm failure"`) and `test/rlm.test.ts:1104-1115`
-(`result.error === "boom"`) — "pin verbatim unredacted behavior and will break". **They will not.**
-Both messages are far under the cap (`"boom"` = 4 bytes, `"child llm failure"` = 17 bytes), and
-`truncateText` is a byte-identical no-op under budget. Under D3/D5 those two tests remain GREEN
-and are deliberately **not rewritten** — they become the "short message passes verbatim" pins.
-The RED step is instead two **new** long-message tests (public return; nested re-interpolation).
-The monitor's "must be updated" wording is superseded by this finding; it is re-flagged to the
-monitor in the Phase 6 report.
-
-## Post-review correction (Phase 5 — head-only, not head+tail)
-
-The Phase 5 code review found that D3's 50/50 head+tail shape (`VALUE_HEAD_RATIO` = 0.5) **retains
-the final ~474 bytes** of a truncated provider error — exactly where provider request-context /
-retry-hints / request-IDs live — contradicting D3's own stated goal ("dropping long
-retry-hint/request-body tails"). Fix: switch to **head-only** (`HEAD_ONLY_RATIO`), so only the
-leading error-type prefix survives and the tail is dropped. This is recorded as **D7** and
-supersedes the `headRatio` wording in D3. Line references below that predate this fix cite the
-assignment site as `:1188` and the re-interpolation as `:1093`; after the fix they are `:1198` and
-`:1103` respectively (no semantic change — the numbers shifted because the fix added lines).
-
-## Current state (fact base — verified by orchestrator, 2026-08-20)
-
-| Fact | Value |
-|---|---|
-| `src/rlm.ts:1187-1188` | `return { status: "error", error: err instanceof Error ? err.message : String(err), … }` — raw, unredacted. The only assignment site of `RlmResult.error`. |
-| `src/rlm.ts:1093` | `` : `[rlm_query error: ${nested.status}] ${nested.error ?? ""}`; `` — the only *read* of `RlmResult.error` in the repo (confirmed by grep). |
-| `src/rlm.ts:139-142` | `RlmResult.error?: string` — JSDoc: "Populated on `status: "error"` (D53); the nested `rlm_query` error branch reads it (D52)." Needs a redaction note. |
-| `src/rlm.ts:356-371` | `truncateWithSentinels(value, {maxBytes, headRatio, recovery})` — module-private; wraps in `[TRUNCATED VIEW BEGIN/END]` sentinels iff truncated (D17 marker auth). |
-| `src/rlm.ts:163` | `FEEDBACK_ERROR_MAX_BYTES = 16 * 1024` — caps the **sandbox** `RunResult.error` inside `buildFeedback`; a *different* field (`RunResult.error` vs `RlmResult.error`), not reusable here. |
-| `src/rlm.ts:170` | `ERROR_RECOVERY = "Catch the exception and print the full traceback to see more."` — semantically wrong for an LLM client error (no Python to re-run). |
-| `src/truncate.ts:384` | `truncateText(text, opts) → { text, truncated }` — the shared truncator; "the only place that cuts" (invariant 4). Imported into `rlm.ts` at line 7-8. |
-| `src/truncate.ts:47` | `VALUE_HEAD_RATIO = 0.5` — head ratio for value-shape truncation. |
-| `test/rlm.test.ts:880` | Pins short nested error verbatim: `"outer: [rlm_query error: error] child llm failure"`. Stays GREEN under D5. |
-| `test/rlm.test.ts:1104-1115` | Pins short return verbatim: `result.error === "boom"` (issue test 4). Stays GREEN under D5. |
-| `test/rlm.test.ts:1948-1990` | Caps `RunResult.error` (sandbox) in `buildFeedback` — template only, not this field. |
-| `docs/truncation-policy.md:372-391` | "Implementation record" table — no `RlmResult.error` row. `:342` Non-goals says "the `error` string is now capped (16 KiB, #144)" — that is `RunResult.error`, not `RlmResult.error`. |
+- **`src/budget.ts`** — `SpendBudget` class (`limit`, `consumed`, `remaining`, `tryCharge(tokens)`)
+  and `estimateTokens` (UTF-8 bytes ÷ 4). Already shared-mutable: "Siblings that pass the same
+  instance compete for one pool". This is the seam to reuse — no new abstraction.
+- **`src/rlm.ts:78-85`** — `RlmOptions.budget?: number | SpendBudget` (a `number` mints a fresh
+  per-run pool; an instance is shared/mutated in place; omitted → no budget logic, D5).
+- **`src/rlm.ts:~1110-1115`** — budget minting: `const budget = options.budget instanceof SpendBudget
+  ? options.budget : options.budget !== undefined ? new SpendBudget(options.budget) : undefined;`
+- **`src/rlm.ts:~1120`** — `const systemPromptTokens = estimateTokens(systemPrompt);` (precomputed
+  once; `systemPrompt` is a `let` declared at the top of `runRlm` and resolved after the registry is
+  built, D50).
+- **`src/rlm.ts:854-862`** — `callCost(systemPromptTokens, messages)` = `systemPromptTokens +
+  Σ estimateTokens(message.content)`.
+- **`src/rlm.ts:869-875`** — `budgetReport(budget, limited)` returns `{limit, consumed, limited}`
+  or `undefined`.
+- **`src/rlm.ts:1043-1044`** — `onLLMQuery` calls `llmClient.query(systemPrompt, [{role:"user",
+  content: prompt}], options.signal)` with **no charge**.
+- **`src/rlm.ts:1045-1096`** — `onRLMQuery`:
+  - downgrade branch (`depth >= maxDepth`, `:1051-1069`) calls `llmClient.query(...)` with **no
+    charge**;
+  - nested branch (`:1072-1091`) calls `runRlm(query, {... budget: undefined ...})` with the D52
+    comment "The child is bounded by maxIterations/maxDepth, not the parent's spend pool".
+- **`src/rlm.ts:~1154`** — top-level charge inside `for (let i = 0; i < maxIterations; i++)`:
+  `const cost = callCost(systemPromptTokens, messages); if (!budget.tryCharge(cost)) return
+  {status:"budget_exhausted", ...}`.
+- **`src/rlm.ts` (D44/D45)** — the final synthesis `llmClient.query` after the cap is **deliberately
+  un-charged** ("one guarded, un-charged synthesis pass").
 
 ## Scope
 
-| In scope | Out of scope |
-|---|---|
-| `src/rlm.ts` — truncate `RlmResult.error` at the assignment site (`:1188`), plus two new constants and a JSDoc note | `truncateWithSentinels` at `:1093` (sentinel-wrap of the *re-interpolation* is rejected — see D2) |
-| `test/rlm.test.ts` — two new long-message tests (public return; nested re-interpolation) | Rewriting the existing short-message tests (`:880`, `:1104-1115`) — they stay GREEN (D5) |
-| `docs/truncation-policy.md` — Implementation-record row + Non-goals line + a short narrative | `src/repl.ts` / `src/session.ts` / `src/sandbox.ts` — the `RunResult.error` path is a different field |
-| | #166 (sentinel auth under `systemPrompt` override) — record, don't implement |
-| | #171 (signal-race + truncate the downgrade `Query:`/`Context:` interpolation at `:1040-1065`) — different block, don't absorb |
+### In scope
 
-## Explicit decisions
+- Charge `onLLMQuery` (`llm_query`) against the resolved budget **before** the call.
+- Charge the `onRLMQuery` **downgrade** branch against the resolved budget **before** the call.
+- Thread the resolved budget into the nested `runRlm` (replace `budget: undefined` with the shared
+  instance) so the child loop competes for the same pool.
+- Degrade refused tool calls to a deterministic marker string (never throw).
+- Update the now-stale D52 comment about nested spend.
+- Tests proving each path (RED → GREEN).
 
-### D1 — Redact at the source (single choke point)
+### Out of scope (explicit)
 
-Apply truncation where `RlmResult.error` is **assigned** (`src/rlm.ts:1188`), not where it is
-consumed (`:1093`). The two consumers are exactly (1) the public return and (2) `nested.error` at
-`:1093` — one choke point covers both, and the re-interpolation reads the already-bounded value.
-No edit at `:1093`; its interpolation template is unchanged.
+- **#171** — signal-race / truncation parity of the same `llm_query` / downgrade / synthesis calls.
+- **#168** — breadth backstop (cap on host-tool *invocation count* per iteration).
+- **#170** — nested `inputs` forwarding.
+- The final **synthesis pass** (D44/D45) stays un-charged — see Assumption 3 / residual risk.
+- Any change to `budgetReport`, `SpendBudget`, or the public `RlmResult` shape.
 
-### D2 — Plain `truncateText`, not `truncateWithSentinels`
+## Decisions
 
-The public `RlmResult.error` is an API surface, not a model-facing prompt. `truncateWithSentinels`
-emits `[TRUNCATED VIEW BEGIN/END]` authentication sentinels (D17) that would leak meaningless
-marker text to API callers. Use the shared `truncateText` (invariant 4) directly.
+Continuing the repo's `D#` decision numbering (highest cited in `src/` is D53; #78's spec used up to
+D60). New decisions:
 
-**Recorded consequence:** the model-facing nested error therefore carries an *unauthenticated*
-`[… N of M …]` elision marker (no sentinel wrap). This is accepted: D17's marker authentication
-concerns forged markers in attacker-controlled text, and the goal here is size + request-context
-redaction, not marker authentication. Tightening that is #166's scope, not this flight's.
+- **D61 — One shared `SpendBudget` pool through the whole tree.** The single resolved `budget`
+  (`SpendBudget | undefined`) is threaded into the `onLLMQuery` and `onRLMQuery` closures and passed
+  to nested `runRlm` instead of `undefined`. Every LLM call in the tree — top-level iteration,
+  `llm_query`, `rlm_query` downgrade, and every nested loop's iterations — charges the same pool.
+  When `budget` is absent, every path stays budget-free (unchanged, D5).
 
-### D3 — Cap = `RLM_ERROR_MAX_BYTES = 1024` (1 KiB)
+- **D62 — Tool-mediated calls charge at the same per-call cost, before they run.** The cost of a
+  single tool-mediated call is `callCost(systemPromptTokens, [{role:"user", content}])` — the shared
+  system prompt plus that call's one user message — reusing the existing `callCost` helper so the
+  accounting is identical to the top-level loop. `llm_query` charges `prompt`; the `rlm_query`
+  downgrade charges the downgrade message content.
 
-A "small cap" per the issue, distinct from the 16 KiB `FEEDBACK_ERROR_MAX_BYTES` (sandbox
-`RunResult.error`). 1 KiB keeps a useful provider-error prefix (rate-limit/overloaded messages are
-short) while dropping long retry-hint/request-body tails. **Shape: head-only (`HEAD_ONLY_RATIO`),
-per D7** — superseding the original 50/50 head+tail choice, which retained the very tail this
-redaction exists to drop. Recorded as an assumption; veto point is the Phase 6 go/no-go.
-
-### D4 — Recovery clause is neutral, not `ERROR_RECOVERY`
-
-`ERROR_RECOVERY` ("Catch the exception and print the full traceback") tells the model to re-run
-Python under `try/except` — impossible for an LLM provider rejection, which never touches the
-sandbox. A new constant `RLM_ERROR_RECOVERY = "The full provider error is not surfaced."` serves
-both audiences: for the API caller it is plain fact; for the model it is honest (an LLM rejection
-is not something the model's code can fix). It only renders inside the `[… …]` marker when
-truncation actually fires.
-
-### D5 — Short messages pass verbatim; existing tests are not rewritten
-
-`truncateText` is byte-identical under budget. `"boom"` and `"child llm failure"` are far under
-1 KiB, so `test/rlm.test.ts:880` and `:1104-1115` stay GREEN and become the "short message passes
-verbatim" pins. Do not rewrite their assertions; the RED tests are the two new long-message tests.
-
-### D7 — Head-only, not head+tail (Phase 5 review correction)
-
-`VALUE_HEAD_RATIO` (0.5) is a *value* shape — symmetric, "identified by both ends at once" — but a
-provider error message is chronological prose: the useful part is the leading error-type prefix,
-and the tail is where providers append retry hints, request bodies, and request IDs. The fix uses
-`HEAD_ONLY_RATIO` (imported from `src/truncate.ts`), dropping the tail entirely. A RED test pins it:
-a `TAIL-SECRET-REQID` marker at the very end of a 64 KiB error must not survive into
-`RlmResult.error`. This supersedes the D3 `headRatio` wording.
-
-### D6 — The sentinel-forged-marker concern is #166's, not this flight's
-
-A forged `[TRUNCATED VIEW BEGIN]` inside a provider error would pass through `truncateText`
-un-neutralised. `truncateWithSentinels` neutralises such text; plain `truncateText` does not. This
-is the same class of gap as #166 (D17 only lives in `DEFAULT_RLM_SYSTEM_PROMPT`), and is
-deliberately out of scope here. Record, don't implement.
+- **D63 — A tool call that cannot charge degrades to a marker string, never throws.** Matching D4,
+  when `tryCharge` returns `false` the tool returns a deterministic refusal string instead of
+  calling the LLM:
+  - `llm_query` → `"[llm_query refused: spend budget exhausted]"`
+  - `rlm_query` downgrade → `"[rlm_query refused: spend budget exhausted]"`
+  Sandbox code sees the string as the tool's return value. The loop then stops at the next iteration
+  boundary when its own top-level charge fails (`status: "budget_exhausted"`). A nested loop reports
+  exhaustion through its own `budget_exhausted` status, which the parent's existing
+  `[rlm_query error: …]` branch already surfaces.
 
 ## Commands
 
 ```
-Focused:  npx tsx --test test/rlm.test.ts              # the two new long-message tests
-Test:     npm test                                      # tsx --test test/*.test.ts
-Type:     npm run check                                 # tsc --noEmit
-Build:    npm run build                                 # tsc -p tsconfig.build.json
-Lint:     npm run lint                                  # biome; scope to src test
+Install:   npm ci
+Test:      npm test                    # tsx --test test/*.test.ts
+Build:     npm run build               # tsc -p tsconfig.build.json
+Typecheck: npm run check               # tsc --noEmit
+Lint:      npm run lint                # biome check --error-on-warnings
+Coverage:  npm run coverage
 ```
 
-## Project structure (this flight)
+## Project structure
 
 ```
-src/rlm.ts                    → the fix: RLM_ERROR_MAX_BYTES + RLM_ERROR_RECOVERY constants; truncate at :1188; JSDoc note on RlmResult.error
-src/truncate.ts               → NOT modified (truncateText is reused as-is)
-test/rlm.test.ts              → NEW: two long-message truncation tests (public return; nested re-interpolation)
-docs/truncation-policy.md     → NEW: Implementation-record row + Non-goals line + short narrative
+src/rlm.ts          → the RLM loop; the three uncharged paths live here
+src/budget.ts       → SpendBudget + estimateTokens (unchanged)
+test/rlm.test.ts    → tests; extends the "runRlm() — spend budget" block
+SPEC.md             → this document
+tasks/plan.md       → implementation plan
+tasks/todo.md       → task list
 ```
 
 ## Code style
 
-Follow the existing file: 2-space indent, double quotes, JSDoc on exported/notable declarations,
-numeric separators (`16 * 1024`). Do not introduce a new abstraction or a new exported helper for a
-single truncation call — the change should read as one obvious line at `:1188` plus two named
-constants next to the existing feedback-budget constants.
+Match `src/rlm.ts` conventions: decision-referencing comments (`// … (D61)`), the `FEEDBACK_`
+naming discipline, and bracketed lowercase-snake-tool prompt strings (`[rlm_query error: …]`,
+`[rlm_query downgraded at max depth N]`). Refusal markers follow the same shape. No new
+dependencies; biome-formatted; 2-space; TS strict (`noUnusedLocals`, `noUnusedParameters`).
 
-## Testing strategy (TDD, RED first)
+## Testing strategy
 
-Test level: unit/integration at the `runRlm` public seam (the existing `runRlm()` describe blocks
-already drive `runRlm` with a fake `LlmClient`, e.g. the `:1104` "issue test 4" and `:855` nested
-test).
+TDD — RED first. Integration tests through the real sandbox (`runInSandbox` → Monty), mirroring the
+existing "runRlm() — spend budget" and "runRlm() — nested rlm_query" blocks: `mockLlmCodeGen`
+records every `llmClient.query` call, `recordedCost` mirrors the loop's charge, and `rlmRegistry()`
+returns an empty `ToolRegistry` (runRlm self-registers its RLM tools, D51). Use SUBMIT-terminated
+runs (status `"ok"`) so the un-charged synthesis pass never fires.
 
-RED tests (both must fail against current code, which returns/interpolates the full message):
+New tests (in a new describe block, or extending the existing "spend budget" block):
 
-1. **Public return is truncated.** A fake `LlmClient` whose `query` throws
-   `new Error("A".repeat(64 * 1024) + "UNIQUE-TAIL-SENTINEL")`. Run `runRlm("q", { llmClient, registry,
-   maxIterations: 5 })`. Assert `result.status === "error"`; `result.error` does **not** contain
-   `"UNIQUE-TAIL-SENTINEL"`; `result.error` contains an elision marker (`[…`); and
-   `new TextEncoder().encode(result.error!).length <= 1024` (or a small documented tolerance equal
-   to the marker + recovery bytes). Today this is RED (the full 64 KiB message comes back).
-2. **Nested re-interpolation is truncated.** Mirror the `:855` nested test: the child `rlm_query`
-   throws `new Error("B".repeat(64 * 1024) + "NESTED-TAIL-SENTINEL")`; the parent
-   `SUBMIT("outer: " + result)`. Assert `result.answer` starts with `"outer: [rlm_query error: error] "`
-   and does **not** contain `"NESTED-TAIL-SENTINEL"`. Today RED.
-
-GREEN: one line at `:1188` wraps the message in `truncateText(…, { maxBytes: RLM_ERROR_MAX_BYTES,
-headRatio: HEAD_ONLY_RATIO, recovery: RLM_ERROR_RECOVERY }).text`, plus the two constants.
-
-Post-review RED test (D7): a `TAIL-SECRET-REQID` marker at the **very end** of a 64 KiB error must
-not survive into `RlmResult.error` — head-only drops the tail; head+tail would retain it.
-
-Regression pins that must stay GREEN: `test/rlm.test.ts:880` (short nested error verbatim) and
-`:1104-1115` (short return verbatim) — D5.
+1. **`llm_query` charges the shared pool** — generous budget; code `answer = llm_query("…")` then
+   `SUBMIT(answer)`; assert `result.budget.consumed === Σ recordedCost(call)` over **all** recorded
+   calls (top-level code-gen + the `llm_query` call).
+2. **`llm_query` refuses instead of throwing when the pool cannot afford it** — budget sized to the
+   first code-gen call only; code calls `llm_query(...)`; assert the answer/stdout carries the
+   refusal marker, no throw, and the run terminates `budget_exhausted` (or surfaces the marker).
+3. **`rlm_query` downgrade charges the shared pool** — `maxDepth:1, depth:1` so it downgrades;
+   generous budget; assert `consumed` includes the downgrade call's cost.
+4. **`rlm_query` downgrade refuses instead of throwing** — tight budget; assert the refusal marker.
+5. **nested `rlm_query` shares the parent's pool** — a nested spawn; pool sized so the parent's
+   code-gen + the child's first code-gen fit but the child's second iteration does not; assert the
+   child returns `budget_exhausted`, surfaced as `[rlm_query error: budget_exhausted]` in the
+   parent's answer, and the parent's `budget.consumed` reflects the child's spend.
+6. **omitting budget leaves every path uncharged** — existing test 5 still passes (no regression).
 
 ## Boundaries
 
-- **Always:** RED first; run the focused test then the full suite + `check` + `build` + `lint`
-  (scoped to `src test`) before declaring a task done.
-- **Ask first / Never (autonomous — no live ask):** do not edit `src/rlm.ts:1093` (the
-  re-interpolation template), do not use `truncateWithSentinels` for this fix, do not touch
-  `src/repl.ts`/`src/session.ts`/`src/sandbox.ts`, do not rewrite the two existing short-message
-  assertions, do not absorb #166's sentinel-auth or #171's downgrade-interpolation scope.
+- **Always:** run `npm test`, `npm run check`, `npm run lint` before reporting done; follow D#/code
+  style; pin refusal markers as literals in tests (D17 convention).
+- **Ask first:** none — this run is autonomous; assumptions are recorded below.
+- **Never:** absorb #171/#168/#170 scope; change `budgetReport`/`SpendBudget`/public `RlmResult`;
+  add dependencies; reorder unrelated code; leave the tree red between tasks.
 
 ## Success criteria
 
-- `RlmResult.error` is truncated at 1 KiB (head-only, neutral recovery) at the assignment site.
-- The nested `[rlm_query error: …]` re-interpolation carries the truncated message.
-- Short provider errors pass verbatim (existing `:880` and `:1104-1115` tests stay GREEN).
-- Two new RED-first tests pin the public-return and nested re-interpolation truncation.
-- `docs/truncation-policy.md` records the new surface (Implementation record + Non-goals).
-- Full suite green; `check`/`build`/`lint` clean.
+- [ ] `llm_query`, `rlm_query` downgrade, and nested `runRlm` all charge the single shared
+      `SpendBudget` pool.
+- [ ] A refused tool call returns its marker string and never throws or calls the LLM.
+- [ ] A configured budget is a hard ceiling on **total tree** spend (nested loops compete for the
+      parent's pool).
+- [ ] Omitting `budget` leaves all paths budget-free (no regression).
+- [ ] Full suite green; `tsc` clean; biome clean.
 
-## Assumptions (recorded)
+## Assumptions (recorded — no clarifying questions, autonomous run)
 
-1. **Cap = 1 KiB** (D3) — "small cap" is interpreted as 1024 bytes; 16 KiB is rejected as it is the
-   *sandbox* error budget, a different surface. Veto point: Phase 6 go/no-go.
-2. **Plain truncateText, not sentinel-wrap** (D2) — the public return must not leak sentinels.
-3. **Single choke point at `:1188`** (D1) — no `:1093` edit; `nested.error` is read post-truncation.
-4. **Neutral recovery clause** (D4) — no Python re-run route exists for an LLM error.
-5. **Existing short-message tests are not rewritten** (D5) — they remain the verbatim-under-cap pins.
+1. "Charge every tool-mediated call" means charge **before** the call (D4's before-the-call charge),
+   not after.
+2. "Degrade instead of throw" (D4) extends to tool calls: a refused call returns a marker string,
+   which matches the tools' string-returning contract.
+3. The final **synthesis pass** (D44/D45) is out of scope — the issue names only `llm_query` /
+   `rlm_query` / nested. It remains a single un-charged call at the cap. *Recorded as residual risk
+   for the issue-monitor to recommend filing.*
+4. The cost model for a tool-mediated call is the shared system prompt + the single user message,
+   reusing `callCost` — no new token accounting.
+5. "Thread one pool through the tree" means: pass the **resolved** `SpendBudget` instance (whatever
+   form the caller supplied) to nested loops, and charge tool calls against it. Absent budget → no
+   charging anywhere.
+6. No new public API; refusal strings are private module constants (tests pin literals, per D17).
 
 ## Open questions
 
-None blocking. (Whether the model-facing nested error should be sentinel-wrapped for D17 parity is
-deferred to #166/#171 — out of this flight's scope, recorded in D2/D6.)
+None blocking.

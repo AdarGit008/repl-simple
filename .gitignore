@@ -1,6 +1,9 @@
 node_modules/
 dist/
 
+# graphify knowledge-graph output (generated, untracked)
+graphify-out/
+
 # Agent-local project state. `.pi/code-tools/*.py` is Python the agent wrote
 # for itself and the repl preamble executes before user code, so committing it
 # would hand every future cloner code that runs on their machine. Project trust

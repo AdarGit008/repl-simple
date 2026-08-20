@@ -3856,6 +3856,233 @@ describe("runRlm() — spend budget", () => {
       );
     }
   });
+
+  it("8. llm_query charges the shared pool", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nanswer = llm_query("what do you think?")\nSUBMIT(answer)\n```',
+      "llm result",
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "llm result");
+
+    // The llm_query call charges the same pool as the top-level code-gen call:
+    // consumed equals the sum of every recorded call's cost (D61/D62).
+    assert.equal(llm.calls().length, 2);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("9. llm_query refuses instead of throwing on a tight budget", async () => {
+    const code = '```python\nanswer = llm_query("what do you think?")\nSUBMIT(answer)\n```';
+
+    // Probe the code-gen cost without a budget, then size the budget to exactly
+    // that first call — the llm_query call must then refuse (D63).
+    const { llm: probe } = mockLlmCodeGen([code, "llm result"]);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 5 });
+    const codeGenCost = recordedCost(probe.calls()[0]);
+
+    const { llm } = mockLlmCodeGen([code, "llm result"]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: codeGenCost,
+    });
+
+    // No throw; the refusal marker is the tool's return value, submitted as the
+    // answer — and llm_query never reached the LLM.
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "[llm_query refused: spend budget exhausted]");
+    assert.equal(llm.calls().length, 1, "llm_query must refuse before calling the LLM");
+
+    // The pool is exactly at the code-gen charge: the refused llm_query charged
+    // nothing, so consumed is the code-gen call's recorded cost (D63).
+    assert.equal(result.budget?.consumed, recordedCost(llm.calls()[0]));
+  });
+
+  it("10. rlm_query downgrade charges the shared pool", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```',
+      "downgraded answer",
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "downgraded answer");
+
+    // The downgrade charges the same pool as the code-gen call (D62).
+    assert.equal(llm.calls().length, 2);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("11. rlm_query downgrade refuses instead of throwing on a tight budget", async () => {
+    const code = '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```';
+
+    const { llm: probe } = mockLlmCodeGen([code, "downgraded answer"]);
+    await runRlm("q", {
+      llmClient: probe,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+    });
+    const codeGenCost = recordedCost(probe.calls()[0]);
+
+    const { llm } = mockLlmCodeGen([code, "downgraded answer"]);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 1,
+      depth: 1,
+      budget: codeGenCost,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "[rlm_query refused: spend budget exhausted]");
+    assert.equal(llm.calls().length, 1, "rlm_query must refuse before calling the LLM");
+
+    // The pool is exactly at the code-gen charge: the refused downgrade charged
+    // nothing, so consumed is the code-gen call's recorded cost (D63).
+    assert.equal(result.budget?.consumed, recordedCost(llm.calls()[0]));
+  });
+
+  it("12. nested rlm_query shares the parent's pool", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nnested = rlm_query("sub")\nSUBMIT("outer: " + nested)\n```',
+      '```python\nSUBMIT("from nested")\n```',
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer: from nested");
+
+    // The child loop charges the same pool as the parent's code-gen, so the
+    // total consumed equals the sum of every recorded call's cost (D61).
+    assert.equal(llm.calls().length, 2);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("13. a pool that cannot afford the child's second iteration surfaces budget_exhausted", async () => {
+    const parentCode = '```python\nnested = rlm_query("sub")\nSUBMIT("outer: " + nested)\n```';
+    const childFirst = "```python\nprint('child iteration 1')\n```";
+    const childSecond = '```python\nSUBMIT("child answer")\n```';
+    const codes = [parentCode, childFirst, childSecond];
+
+    // Probe the per-call costs once without a budget, then size the shared
+    // budget so the parent's code-gen + the child's FIRST iteration fit but the
+    // child's SECOND iteration does not (D61).
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("task", { llmClient: probe, registry: rlmRegistry(), maxIterations: 5 });
+    const calls = probe.calls();
+    assert.equal(calls.length, 3, "the probe must run the child's second iteration");
+    const affordable = recordedCost(calls[0]) + recordedCost(calls[1]);
+
+    const { llm } = mockLlmCodeGen(codes);
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: affordable,
+    });
+
+    // No throw: the child's exhaustion surfaces through the parent's rlm_query
+    // error branch (D52), and the child stops before its second iteration.
+    assert.equal(result.status, "ok");
+    assert.ok(
+      result.answer.includes("[rlm_query error: budget_exhausted]"),
+      `answer should surface the child's budget exhaustion:\n${result.answer}`,
+    );
+    assert.equal(llm.calls().length, 2, "the child's second iteration must not run");
+
+    // consumed equals the affordable prefix (parent code-gen + child first
+    // iteration): the child's second iteration was refused whole, never charged.
+    assert.equal(
+      result.budget?.consumed,
+      recordedCost(llm.calls()[0]) + recordedCost(llm.calls()[1]),
+    );
+  });
+
+  it("14. omitting budget keeps llm_query, downgrade, and nested spawn budget-free (D61)", async () => {
+    const parentCode =
+      '```python\na = llm_query("outer ask")\nn = rlm_query("sub")\nSUBMIT(a + "|" + n)\n```';
+    const childCode =
+      '```python\nr = rlm_query("inner q", "inner ctx")\nSUBMIT("child: " + r)\n```';
+
+    const { llm } = mockLlmCodeGen([
+      parentCode,
+      "outer llm result",
+      childCode,
+      "inner downgraded result",
+    ]);
+
+    // Defaults maxDepth:1 / depth:0: the parent's rlm_query spawns a nested run
+    // (depth 1) whose own rlm_query downgrades at maxDepth. With no budget,
+    // every tool path runs budget-free (D61/D5).
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer llm result|child: inner downgraded result");
+    assert.ok(!result.answer.includes("refused"), "no refusal marker may fire without a budget");
+    assert.equal(llm.calls().length, 4, "every tool path must reach the LLM");
+    assert.equal(result.budget, undefined);
+    assert.ok(!("budget" in result), "no budget field may be present");
+  });
+
+  it("15. a deep tree (maxDepth 2) charges every level against one pool (D61)", async () => {
+    const parentCode = '```python\nn = rlm_query("sub")\nSUBMIT("outer: " + n)\n```';
+    const childCode = '```python\ng = rlm_query("grand")\nSUBMIT("mid: " + g)\n```';
+    const grandchildCode = '```python\na = llm_query("deep ask")\nSUBMIT("deep: " + a)\n```';
+
+    const { llm } = mockLlmCodeGen([parentCode, childCode, grandchildCode, "deep llm result"]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      maxDepth: 2,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer: mid: deep: deep llm result");
+
+    // The hard ceiling spans every level: consumed equals the sum of all four
+    // recorded calls (parent + child + grandchild code-gens + the grandchild's
+    // llm_query), proving the child-llm_query-charges path (D61/D62).
+    assert.equal(llm.calls().length, 4);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+    assert.equal(result.budget?.limited, false);
+  });
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {
