@@ -7,8 +7,8 @@ touch `src/repl.ts` / `src/session.ts` / `src/sandbox.ts`, do **not** rewrite th
 short-message assertions (`test/rlm.test.ts:880`, `:1104-1115`), do **not** absorb #166 or #171 scope.
 Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in scope.
 
-- [ ] **T1 — Truncate `RlmResult.error` at the source (D1, D2, D3, D4, D5)**
-  - [ ] RED — add a new `describe("runRlm() — RlmResult.error redaction (#167)")` block to
+- [x] **T1 — Truncate `RlmResult.error` at the source (D1, D2, D3, D4, D5)**
+  - [x] RED — add a new `describe("runRlm() — RlmResult.error redaction (#167)")` block to
     `test/rlm.test.ts` (after the existing `runRlm()` describes, reusing the local `rlmRegistry()`
     helper). Two tests, both RED today:
     1. **Public return is truncated.** Fake `LlmClient.query` throws
@@ -22,7 +22,7 @@ Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in sc
        "NESTED-TAIL-SENTINEL")`; the parent submits `SUBMIT("outer: " + result)`. Assert
        `result.status === "ok"`, `result.answer.startsWith("outer: [rlm_query error: error] ")`,
        and `!result.answer.includes("NESTED-TAIL-SENTINEL")`. Today RED.
-  - [ ] GREEN — in `src/rlm.ts`, add two named constants beside the feedback-budget constants
+  - [x] GREEN — in `src/rlm.ts`, add two named constants beside the feedback-budget constants
     (`FEEDBACK_ERROR_MAX_BYTES` at `:163`, `ERROR_RECOVERY` at `:170`):
     ```ts
     /** Byte ceiling for the RLM-level `RlmResult.error` (LLM provider error, 1 KiB). */
@@ -43,7 +43,7 @@ Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in sc
     ```
     Add a one-line JSDoc note to `RlmResult.error` (`:139-142`) that the message is truncated at
     `RLM_ERROR_MAX_BYTES` (1 KiB). Do **not** touch `:1093` or any `systemPrompt`/downgrade block.
-  - [ ] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
+  - [x] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
     `npm run check` + `npm run build` + `npm run lint` clean. Confirm the two existing
     short-message tests (`:880`, `:1104-1115`) still pass unchanged (D5).
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.

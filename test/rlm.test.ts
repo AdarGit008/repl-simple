@@ -881,6 +881,78 @@ describe("runRlm() — nested rlm_query", () => {
   });
 });
 
+// ── RlmResult.error redaction (#167) ────────────────────────────
+
+describe("runRlm() — RlmResult.error redaction (#167)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("truncates the public RlmResult.error to 1 KiB and drops the request-context marker", async () => {
+    // A 64 KiB provider error: filler plus a marker standing in for the
+    // request context the caller must not round-trip. The marker sits in the
+    // elided middle because the 50/50 head/tail split (VALUE_HEAD_RATIO)
+    // keeps the tail of the message — a marker appended at the very end would
+    // survive truncation.
+    const llm: LlmClient = {
+      async query() {
+        throw new Error(`${"A".repeat(32 * 1024)}UNIQUE-TAIL-SENTINEL${"A".repeat(32 * 1024)}`);
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    assert.equal(result.status, "error");
+    // The full message no longer reaches the caller: the request-context
+    // marker is elided, and the message is cut to the 1 KiB ceiling (invariant
+    // 1 — the budget is a hard ceiling, marker included, so no tolerance).
+    assert.ok(!result.error!.includes("UNIQUE-TAIL-SENTINEL"));
+    assert.ok(result.error!.includes("[…"), `no elision marker: ${result.error!.slice(0, 80)}`);
+    assert.ok(new TextEncoder().encode(result.error!).length <= 1024);
+  });
+
+  it("truncates the nested [rlm_query error: …] re-interpolation to 1 KiB", async () => {
+    // Mirrors the existing nested-rlm_query test: the child's code-gen query
+    // throws a huge provider error, so the nested runRlm returns status:"error"
+    // and the parent's rlm_query tool takes the `[rlm_query error: …]` branch
+    // (D52). The marker sits 4 KiB in — inside the sandbox's ~8 KiB head window
+    // (so it leaks through the sandbox's 16 KiB output cap today, making this
+    // RED) but outside the 1 KiB (512 B head/tail) `:1188` window (so the
+    // source truncation elides it once #167 lands).
+    const nestedQuestion = "SUB-INVESTIGATION";
+
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        if (messages[0].content.includes(`# Question\n${nestedQuestion}`)) {
+          throw new Error(`${"B".repeat(4 * 1024)}NESTED-TAIL-SENTINEL${"B".repeat(60 * 1024)}`);
+        }
+        return (
+          "```python\n" +
+          `result = rlm_query(${JSON.stringify(nestedQuestion)})\n` +
+          'SUBMIT("outer: " + result)\n' +
+          "```"
+        );
+      },
+    };
+
+    const result = await runRlm("outer task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    // The parent run completes, and the child's error is re-interpolated in
+    // already-truncated form — no request-context marker survives.
+    assert.equal(result.status, "ok");
+    assert.ok(
+      result.answer.startsWith("outer: [rlm_query error: error] "),
+      `unexpected answer prefix: ${result.answer.slice(0, 120)}`,
+    );
+    assert.ok(!result.answer.includes("NESTED-TAIL-SENTINEL"));
+  });
+});
+
 // ── Abort semantics (#75) ───────────────────────────────────────
 
 describe("runRlm() — abort", () => {

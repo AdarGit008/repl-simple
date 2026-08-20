@@ -137,7 +137,8 @@ export interface RlmResult {
   budget?: RlmBudgetReport;
   /**
    * Error message for a failed result. Populated on `status: "error"` (D53);
-   * the nested `rlm_query` error branch reads it (D52).
+   * the nested `rlm_query` error branch reads it (D52). Truncated to
+   * `RLM_ERROR_MAX_BYTES` (1 KiB) at the assignment site (#167).
    */
   error?: string;
 }
@@ -168,6 +169,15 @@ const FEEDBACK_ERROR_MAX_BYTES = 16 * 1024;
  * exception the feedback truncated away (#144, D7).
  */
 const ERROR_RECOVERY = "Catch the exception and print the full traceback to see more.";
+
+/** Byte ceiling for the RLM-level `RlmResult.error` (LLM provider error, 1 KiB). */
+const RLM_ERROR_MAX_BYTES = 1024;
+/**
+ * Recovery clause for a truncated provider error. Deliberately NOT
+ * `ERROR_RECOVERY`: an LLM client rejection never touches the sandbox, so
+ * "catch the exception and print the full traceback" is inapplicable.
+ */
+const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
 
 // ── Conversation budget ─────────────────────────────────────────
 //
@@ -1185,7 +1195,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       // completed before the failure and carry the message on `error`.
       return {
         status: "error",
-        error: err instanceof Error ? err.message : String(err),
+        error: truncateText(err instanceof Error ? err.message : String(err), {
+          maxBytes: RLM_ERROR_MAX_BYTES,
+          headRatio: VALUE_HEAD_RATIO,
+          recovery: RLM_ERROR_RECOVERY,
+        }).text,
         answer: extractBestAnswer(iterations),
         answerSource: "salvaged",
         iterations,
