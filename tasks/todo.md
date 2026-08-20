@@ -27,7 +27,7 @@ Source of truth: `SPEC.md` (D64–D66) + `tasks/plan.md`.
     Keep the omitted-budget path un-charged (D5).
   - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
 
-- [ ] **T3 — Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget` (D66, doc-only)**
+- [x] **T3 — Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget` (D66, doc-only)**
   - Add a JSDoc note on `RlmOptions.budget` (in `src/rlm.ts`): `estimateTokens` is a deterministic
     lower bound (bytes ÷ 4) and under-counts non-ASCII/emoji/CJK up to ~1 token/byte; callers
     needing a hard real-token bound must apply their own margin for non-English content.

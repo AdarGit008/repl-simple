@@ -82,6 +82,11 @@ export interface RlmOptions {
    * used and mutated **in place**, so siblings passing the same instance share
    * one pool and `consumed` reflects the pool's cumulative spend. Omitted →
    * no budget logic runs and `RlmResult.budget` is absent (D5).
+   *
+   * `estimateTokens` is a deterministic lower bound (UTF-8 bytes ÷ 4) and
+   * under-counts non-ASCII/emoji/CJK content up to ~1 token/byte; callers
+   * needing a hard real-token spend bound must apply their own margin for
+   * non-English content (D66).
    */
   budget?: number | SpendBudget;
   /** Abort signal — honoured during the LLM query, the sandbox run, and between iterations (#75). */
