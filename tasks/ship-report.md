@@ -1,64 +1,47 @@
-# Ship Report — issue #33: Plumb signal and limits through the extension and ReplRunner
+# Ship Report — issue #165 (bound tree spend on the shared `SpendBudget`)
 
 ## Decision: **GO** ✅
 
-Not high-risk or irreversible (library + extension change; no auth, secrets, migrations, payments,
-deploys; the change only *narrows* what the model can do). Security: **0 Critical / 0 High /
-1 Medium / 1 Low / 2 Info**. The single Medium is a least-privilege/config-integrity issue, bounded
-by the spec's own caps and the host wall clock in any default deployment — acceptable to ship
-provided it is filed as a follow-up (below).
+No Critical / High / Medium findings from any of the three report sources. The change is a
+correct, well-tested hardening: the single resolved `SpendBudget` is now a hard ceiling on
+*estimated* LLM spend across the whole RLM tree (`llm_query`, `rlm_query` downgrade, nested
+`runRlm`), and every new charge path is code-enforced with no string-parsing or TOCTOU gap.
+
+## Fan-out verdicts (all three sources covered — ship fan-out skip rule does not apply)
+
+| Source | Verdict | Findings |
+|--------|---------|----------|
+| test-engineer (VERIFY) | **GO** | 1063 pass / 0 fail; `tsc` + scoped biome clean; changed regions ~99% line / ~96% branch coverage; all SPEC success criteria pinned by named tests 8–15 |
+| code-reviewer (REVIEW) | **APPROVE** | 0 Critical, 0 code-level Important; 1 repo-hygiene Important (lint gate red on `graphify-out/`) — fixed (`.gitignore` += `graphify-out/`, `npm run lint` now green); 3 Suggestions (all non-blocking) |
+| security-auditor (SHIP) | **PASS** | 0 Critical / 0 High / 0 Medium; 3 Low + 3 Info — all pre-existing residuals or out-of-scope, none a defect introduced by this change |
 
 ## What was built
 
-| Decision | Item | Landed |
-|---|---|---|
-| D2 | `ReplRunner.run`/`resume` accept `limits?: RunLimits \| "unbounded"` and forward verbatim | T1 |
-| D3 | `clampModelLimits` helper + clamped `maxDurationSecs`/`maxMemory` (300 s / 1024 MiB) on `repl` | T2 |
-| D4 | Abort = transcript rollback (side effects persist) — documented + pinned | T3 |
-| D7 t1 | End-to-end abort-between-gated-calls test (side-effect counter) | T4 |
-| D5/D6 | Scope-boundary description sentence + `_signal` rationale | T5 |
-| — | Biome fix + D6 description test + clamp edge cases | VERIFY |
+Threading one `SpendBudget` pool through `runRlm` (D61–D63):
 
-## Gates
+- `onLLMQuery` (`llm_query`) charges `callCost(systemPromptTokens, [{role:"user",content:prompt}])` before the call; refuses with a marker on exhaustion.
+- `onRLMQuery` downgrade branch charges the downgrade message before the call; refuses with a marker.
+- Nested `runRlm` passes the resolved `SpendBudget` instance (was `budget: undefined`), so child loops compete for the parent's pool; D52 comment updated.
+- Refusal degrades, never throws (D4/D63): `"[llm_query refused: spend budget exhausted]"`, `"[rlm_query refused: spend budget exhausted]"`.
+- 8 new/strengthened tests (8–15) in `test/rlm.test.ts`, incl. refused-whole boundary, no-budget regression, and a `maxDepth:2` deep-tree charge pin.
 
-- `npm test` — **1041/1041 pass** · `npm run check` + `npm run build` clean · `npx biome check
-  src extensions test` clean (repo-wide `npm run lint` has 87 pre-existing errors in untracked
-  `.pi-subagents/*.json`, not from this flight).
+## Residual risks (recorded, not hidden)
 
-## Review & audit
+| Residual | Severity | Owner |
+|----------|----------|-------|
+| D44/D45 synthesis pass stays un-charged — bounded single-call over-spend at `max_iterations` | Low | new follow-up (SPEC Assumption 3) |
+| Breadth flood of refused `rlm_query` spawns → per-spawn `buildSystemPrompt` host work before first charge | Low | #168 (breadth backstop) |
+| Empty `systemPrompt` + empty tool prompt → 0-token charge, free call (defense-in-depth) | Low | new follow-up (min 1-token charge) |
+| Tool-mediated calls omit `raceAgainstSignal` (client-only cancellation) | Info | #171 (signal-race parity) |
+| `estimateTokens` lower bound under-counts non-ASCII (documented D2) | Info | doc note on `RlmOptions.budget` |
 
-- Five-axis code review: **Approve**, 0 Critical / 0 Important, 3 Suggestions.
-- Security audit: **GO** — 0 Critical / 0 High / 1 Medium / 1 Low / 2 Info. Verified the model can
-  never reach `"unbounded"`, never exceed 300 s / 1024 MiB, and every malformed input degrades to
-  the fail-safe default.
+## Rollback plan
 
-## Rollback
-
-- **Pre-merge (now):** branch is unmerged; rollback = do not merge, or
-  `git branch -D issue/33-plumb-signal-limits`. `main` is still `5e57e57`.
-- **Post-merge:** `git revert --no-commit a934fbd..41a5d7d` then commit (linear 7-commit range);
-  or `git revert -m 1 <merge>` if squashed. Verify `npm test` back to 1039 pre-flight baseline.
-
-## Residual risks & post-ship follow-ups
-
-1. **[Medium/security] Clamp ceilings ignore `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB`** —
-   an operator who tightens those env vars to bound per-worker resources is silently bypassed; a
-   prompt-injected model can still request the fixed 300 s / 1024 MiB caps. Derive the ceiling as
-   `min(specCap, envDefault)` and integerize the memory bytes.
-2. **[Low] Fractional `maxMemory`** yields non-integer/sub-byte byte counts to Monty — floor to an
-   integer (fold into #1).
-3. **[Info] `repl_resume` forwards no `limits`** — resumed runs re-apply sandbox defaults; safe
-   direction (more restrictive, never more permissive) but asymmetric. Expose the two knobs on
-   `repl_resume`, or persist the suspended run's clamped limits in `Session`.
-4. **[Info] Test helper monkey-patches `ReplRunner.prototype.run`** — add a sequential-assumption
-   comment if the suite is ever parallelised.
-5. **Issue-body updates** (from the initial scan): the body's signal-half line refs are stale; the
-   DoD "No `_signal` remains" needs rescoping to the abortable tools; record the
-   "transcript-rollback, side-effects-persist" semantics so a future flight doesn't misread
-   "rolled back".
-
-## Close-out actions
-
-- Merge `issue/33-plumb-signal-limits` into `main` (closes #33, a bucket-3 step; unblocks #35).
-- File the follow-ups above; update #33's body (stale line refs, `_signal` DoD rescope, D4
-  semantics) per the issue-monitor's final report.
+- **Trigger:** none expected; roll back if post-merge the full suite regresses or the spend
+  accounting is observed to differ from `Σ recordedCost`.
+- **Steps:** `git revert` the three build commits in reverse order
+  (`4124498`, `5dda924`, and the test-reinforcement `50fad63`) — each is an independent,
+  cleanly-scoped commit; the spec/plan commit `af5af15` and the `.gitignore` fix `b80f509` are
+  independently revertable and orthogonal.
+- **Verify:** `npm test` + `npm run check` + `npm run lint` green after revert.
+- **Time to rollback:** < 5 minutes (pure code revert, no schema/migration, no deploy).
