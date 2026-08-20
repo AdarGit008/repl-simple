@@ -1250,7 +1250,9 @@ describe("runRlm() — tool-path provider-error redaction (#184)", () => {
     assert.ok(result.iterations[0].result.error!.includes("boom"));
     // The recovery clause only appears on truncation; its absence proves the
     // short error passed through un-truncated (not mutated by a sub-budget path).
-    assert.ok(!result.iterations[0].result.error!.includes("The full provider error is not surfaced."));
+    assert.ok(
+      !result.iterations[0].result.error!.includes("The full provider error is not surfaced."),
+    );
     assert.ok(!result.iterations[0].result.error!.includes("[…"));
   });
 });
