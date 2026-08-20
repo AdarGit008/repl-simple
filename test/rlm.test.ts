@@ -4465,6 +4465,49 @@ describe("runRlm() — answer provenance (issue #76)", () => {
     assert.equal(result.budget?.consumed, investigationCost + synthesisCost);
     assert.equal(llm.calls().length, 4, "the synthesis call still runs");
   });
+
+  it("8. a charged synthesis query that throws still counts its cost and salvages (D64)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const codes = [code, code, code];
+
+    // Probe the three iteration calls plus the synthesis call once without a
+    // budget, then size the budget to exactly the full spend. The synthesis
+    // charge is identical whether the query returns or throws — it is charged
+    // before it runs (D64).
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("q", { llmClient: probe, registry: rlmRegistry(), maxIterations: 3 });
+    const investigationCost = probe
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    const synthesisCost = recordedCost(probe.calls()[3]);
+    assert.ok(investigationCost > 0, "the investigation must be charged");
+    assert.ok(synthesisCost > 0, "the synthesis call has a positive cost");
+
+    // The synthesis query throws at the cap (mockSalvageOnCap), yet the charge
+    // already succeeded: the run must still salvage rather than throw or
+    // degrade to a bare budget_exhausted.
+    const llm = mockSalvageOnCap(code, 3);
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: investigationCost + synthesisCost,
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.notEqual(result.status, "budget_exhausted");
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.answer, "still working...\n");
+
+    // The charged-then-thrown synthesis still counts against the pool: the
+    // budgetReport is built after the successful charge, so consumed reaches
+    // the limit exactly and includes the synthesis charge (D64).
+    assert.ok(result.budget, "a configured budget must be reported");
+    assert.equal(result.budget?.limited, false);
+    assert.equal(result.budget?.consumed, result.budget?.limit);
+    assert.equal(result.budget?.consumed, investigationCost + synthesisCost);
+  });
 });
 
 // ── Defaults pin behaviour (D58) ────────────────────────────────

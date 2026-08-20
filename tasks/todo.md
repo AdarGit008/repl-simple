@@ -39,6 +39,11 @@ Source of truth: `SPEC.md` (D64–D66) + `tasks/plan.md`.
 - [ ] All SPEC success criteria met (D64, D65, D66).
 - [ ] Full suite, `tsc --noEmit`, and biome clean.
 
+  _Verify-phase coverage gap #1 closed (D64): added regression test
+  `runRlm() — answer provenance > 8. a charged synthesis query that throws still
+  counts its cost and salvages (D64)` in test/rlm.test.ts — full suite, `tsc --noEmit`,
+  and biome all green. Test-only change; src/ untouched._
+
 ## DoD (from #182, reconciled)
 
 - [ ] The synthesis pass charges the shared pool; refusal degrades to salvage (never throws, never a
