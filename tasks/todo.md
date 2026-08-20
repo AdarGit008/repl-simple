@@ -1,81 +1,82 @@
-# Todo — issue #177: `repl_resume` re-applies the suspended run's clamped limits; pin the signal forward
+# Todo — issue #167: redact `RlmResult.error` before return and nested re-interpolation
 
 Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Each task is RED-first. One coder per task,
 fresh context, one commit per task. After each task the full suite must be green. Do **not** touch
-`src/sandbox.ts`, `src/repl.ts`, or `extensions/repl-extension.ts`. Only `src/session.ts`,
-`test/session.test.ts`, and `test/extension.test.ts` are in scope.
+`src/rlm.ts:1093` (the re-interpolation template), do **not** use `truncateWithSentinels`, do **not**
+touch `src/repl.ts` / `src/session.ts` / `src/sandbox.ts`, do **not** rewrite the two existing
+short-message assertions (`test/rlm.test.ts:880`, `:1104-1115`), do **not** absorb #166 or #171 scope.
+Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in scope.
 
-- [x] **T1 — `Session.resume` re-applies `suspendedRunOpts.limits` (D1, D4)**
-  - [x] RED — add a new `describe("Session — resume re-applies the suspended run's limits (#177)")` block
-    to `test/session.test.ts` (after the `approval & suspension` describe, reusing the `err`/`suspended`
-    helpers at `:15`/`:19`). It needs a gated tool, a `before`/`after` that snapshot+clear
-    `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` (mirror `test/extension.test.ts:207-231`), and two
-    tests:
-    1. **Below-default ceiling.** `suspended(await session.run('gated_limits("x")\nbig = bytearray(128 * 1024 * 1024)', { onApproval: () => "suspend", limits: { maxMemory: 32 * 1_048_576 } }))`,
-       then `resume({ onApproval: () => true })` with **no** limits; assert `err(result)` and
-       `result.errorKind === "memory"`. Today this returns `"ok"` (the 128 MiB allocation succeeds under
-       the 512 MiB default) — RED.
-    2. **Tightened-env survival (D5/D6).** Set `REPL_MAX_MEMORY_MB = "256"`; suspend a run granted
-       `limits: { maxMemory: 256 * 1_048_576 }` whose second line is `big = bytearray(320 * 1024 * 1024)`;
-       **delete `REPL_MAX_MEMORY_MB` before resuming** (this is what makes it RED: the unfixed resume
-       re-reads `limitsConfig()` and gets the 512 MiB default, so 320 MiB succeeds); `resume({ onApproval:
-       () => true })`; assert `err(result)` and `result.errorKind === "memory"`. Today RED.
-  - [x] Implement — one line in `src/session.ts` `Session.resume`, in the `wrappedRunOpts` literal
-    (`:435-439`), after `...runOpts,`:
+- [ ] **T1 — Truncate `RlmResult.error` at the source (D1, D2, D3, D4, D5)**
+  - [ ] RED — add a new `describe("runRlm() — RlmResult.error redaction (#167)")` block to
+    `test/rlm.test.ts` (after the existing `runRlm()` describes, reusing the local `rlmRegistry()`
+    helper). Two tests, both RED today:
+    1. **Public return is truncated.** Fake `LlmClient.query` throws
+       `new Error("A".repeat(64 * 1024) + "UNIQUE-TAIL-SENTINEL")`. Run `runRlm("q", { llmClient,
+       registry: rlmRegistry(), maxIterations: 5 })`. Assert `result.status === "error"`;
+       `!result.error!.includes("UNIQUE-TAIL-SENTINEL")`; `result.error!.includes("[…")`; and
+       `new TextEncoder().encode(result.error!).length <= 1024` plus a small documented tolerance
+       for the marker+recovery bytes. Today RED (the full 64 KiB message returns verbatim).
+    2. **Nested re-interpolation is truncated.** Mirror the existing nested `rlm_query` test
+       (`:855`): the child query throws `new Error("B".repeat(64 * 1024) +
+       "NESTED-TAIL-SENTINEL")`; the parent submits `SUBMIT("outer: " + result)`. Assert
+       `result.status === "ok"`, `result.answer.startsWith("outer: [rlm_query error: error] ")`,
+       and `!result.answer.includes("NESTED-TAIL-SENTINEL")`. Today RED.
+  - [ ] GREEN — in `src/rlm.ts`, add two named constants beside the feedback-budget constants
+    (`FEEDBACK_ERROR_MAX_BYTES` at `:163`, `ERROR_RECOVERY` at `:170`):
     ```ts
-      limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
+    /** Byte ceiling for the RLM-level `RlmResult.error` (LLM provider error, 1 KiB). */
+    const RLM_ERROR_MAX_BYTES = 1024;
+    /**
+     * Recovery clause for a truncated provider error. Deliberately NOT
+     * `ERROR_RECOVERY`: an LLM client rejection never touches the sandbox, so
+     * "catch the exception and print the full traceback" is inapplicable.
+     */
+    const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
     ```
-    Nothing else. Do not recover `onApproval`/`signal` from the suspension (D1/D2); do not add
-    `mount`/`inputs`/`scriptName`/`maxStdoutBytes` (D3).
-  - [x] Verify — `npx tsx --test test/session.test.ts` green; full `npm test` green;
-    `npm run check` + `npm run build` + `npm run lint` clean.
-  - Files — `src/session.ts`, `test/session.test.ts`.
-  - Post-build finding: Monty's snapshot restore already preserves maxDurationSecs/maxMemory across resume; the fix is library-layer hardening (maxWallClockSecs + #84 seam). Tests are acceptance tests of the invariant, not RED-for-the-fix.
+    Then at the assignment site (`:1188`), replace the raw message:
+    ```ts
+    error: truncateText(
+      err instanceof Error ? err.message : String(err),
+      { maxBytes: RLM_ERROR_MAX_BYTES, headRatio: VALUE_HEAD_RATIO, recovery: RLM_ERROR_RECOVERY },
+    ).text,
+    ```
+    Add a one-line JSDoc note to `RlmResult.error` (`:139-142`) that the message is truncated at
+    `RLM_ERROR_MAX_BYTES` (1 KiB). Do **not** touch `:1093` or any `systemPrompt`/downgrade block.
+  - [ ] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
+    `npm run check` + `npm run build` + `npm run lint` clean. Confirm the two existing
+    short-message tests (`:880`, `:1104-1115`) still pass unchanged (D5).
+  - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [x] **T2 — Pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume` (D2)**
-  - RED — this is a **characterization pin**, not a bug fix: the code already forwards the signal
-    (`extensions/repl-extension.ts:371-375`), so the new test passes on first run and guards the seam.
-    Add a new `describe("repl extension — repl_resume forwards the abort signal (#177 D2)")` block to
-    `test/extension.test.ts` (after the `suspension is reachable (#51)` describe at `:983`), with a
-    `mkdtemp` `cwd` in `before`/`after`. Stub `ReplRunner.prototype.resume` (mirroring
-    `runWithLimits` at `:347-372`) to capture its 3rd positional argument, restore it in `finally`:
-    ```ts
-    const controller = new AbortController();
-    const seen: unknown[] = [];
-    const originalResume = ReplRunner.prototype.resume;
-    ReplRunner.prototype.resume = (async (_sessionId, _onApproval, signal) => {
-      seen.push(signal);
-      return "[result]\n1";
-    }) as unknown as typeof ReplRunner.prototype.resume;
-    try {
-      const resume = (await loadTools()).find((t) => t.name === "repl_resume");
-      assert.ok(resume);
-      await resume.execute("sig-1", { sessionId: "sig" }, controller.signal, undefined,
-        { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
-    } finally {
-      ReplRunner.prototype.resume = originalResume;
-    }
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0], controller.signal);
-    ```
-  - Implement — none. If the test fails, the signal forward has regressed: record the blocker and do
-    not "fix" it by changing `repl-extension.ts` out of scope.
-  - Verify — `npx tsx --test test/extension.test.ts` green; full `npm test` green;
-    `npm run check` + `npm run build` + `npm run lint` clean.
-  - Files — `test/extension.test.ts`.
+- [ ] **T2 — Record the new surface in the truncation policy (D-spec G4)**
+  - No RED test (documentation). In `docs/truncation-policy.md`:
+    1. Add an Implementation-record row to the table (`:372-391`):
+       `| \`RlmResult.error\` (LLM provider error) | 1 KiB | 50/50 head+tail | #167 |`
+    2. Update the Non-goals line (`:342`) — it currently says "the `error` string is now capped
+       (16 KiB, #144)" referring only to `RunResult.error`; add a clause distinguishing the
+       RLM-level `RlmResult.error` (1 KiB, #167, plain `truncateText`, no sentinel wrap).
+    3. Append a short `**#167 (RlmResult.error).**` narrative after the `#145` narrative
+       (`:435+`) explaining: the source choke point at `:1188`, the plain-`truncateText` (not
+       `truncateWithSentinels`) choice because the public return is an API surface, and the
+       deliberate neutral recovery clause (no Python re-run route for an LLM rejection).
+  - [ ] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
+    + `npm run build` unaffected (doc-only). No test changes.
+  - Files — `docs/truncation-policy.md`.
 
 ## Checkpoint (after T2)
 
-- [ ] Issue acceptance met: a resumed run honours the same clamped limits the original `repl` call was
-      granted (derived ceilings, never 300 s / 1024 MiB); explicit caller limits still win (D4).
-- [ ] `repl_resume` signal-forwarding seam pinned.
-- [ ] Tightened `REPL_MAX_MEMORY_MB` survives into resume (tested).
+- [ ] Issue acceptance met: `RlmResult.error` truncated at 1 KiB on both the public return and the
+      nested `[rlm_query error: …]` re-interpolation; short errors pass verbatim.
+- [ ] Two new RED-first tests pin the public-return and nested re-interpolation truncation.
+- [ ] `docs/truncation-policy.md` records the `RlmResult.error` surface.
 - [ ] Full suite green; `check`/`build`/`lint` clean.
 
-## DoD (from #177, reconciled)
+## DoD (from #167, reconciled)
 
-- [ ] `Session.resume` merges `runOpts?.limits ?? this.suspendedRunOpts?.limits`; caller limits win.
-- [ ] Session-level integration test proves resumed runs use the suspended limits (memory seam).
-- [ ] Extension-level test pins `repl_resume` → `ReplRunner.resume` signal forwarding.
-- [ ] No changes to `src/sandbox.ts`, `src/repl.ts`, `extensions/repl-extension.ts`; no `repl_resume`
-      schema/description change; no #84 merge (mount/inputs/scriptName/maxStdoutBytes).
+- [ ] `RlmResult.error` is truncated at the source (`src/rlm.ts:1188`) with `truncateText` at 1 KiB.
+- [ ] The nested `[rlm_query error: …]` re-interpolation (`:1093`) carries the truncated message
+      (no edit at `:1093` — it reads the already-bounded `nested.error`).
+- [ ] Short messages pass verbatim (existing `:880` / `:1104-1115` tests stay GREEN).
+- [ ] No `truncateWithSentinels`; no sentinel leak to the public API return.
+- [ ] No changes to `src/repl.ts`, `src/session.ts`, `src/sandbox.ts`; no #166/#171 scope absorbed.
+- [ ] Truncation policy updated with the new surface.
