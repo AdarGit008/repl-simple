@@ -1,81 +1,45 @@
-# Todo — issue #177: `repl_resume` re-applies the suspended run's clamped limits; pin the signal forward
+# Todo — issue #165: bound tree spend on the shared `SpendBudget`
 
-Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Each task is RED-first. One coder per task,
-fresh context, one commit per task. After each task the full suite must be green. Do **not** touch
-`src/sandbox.ts`, `src/repl.ts`, or `extensions/repl-extension.ts`. Only `src/session.ts`,
-`test/session.test.ts`, and `test/extension.test.ts` are in scope.
+Source of truth: `SPEC.md` (D61–D63) + `tasks/plan.md`.
 
-- [x] **T1 — `Session.resume` re-applies `suspendedRunOpts.limits` (D1, D4)**
-  - [x] RED — add a new `describe("Session — resume re-applies the suspended run's limits (#177)")` block
-    to `test/session.test.ts` (after the `approval & suspension` describe, reusing the `err`/`suspended`
-    helpers at `:15`/`:19`). It needs a gated tool, a `before`/`after` that snapshot+clear
-    `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` (mirror `test/extension.test.ts:207-231`), and two
-    tests:
-    1. **Below-default ceiling.** `suspended(await session.run('gated_limits("x")\nbig = bytearray(128 * 1024 * 1024)', { onApproval: () => "suspend", limits: { maxMemory: 32 * 1_048_576 } }))`,
-       then `resume({ onApproval: () => true })` with **no** limits; assert `err(result)` and
-       `result.errorKind === "memory"`. Today this returns `"ok"` (the 128 MiB allocation succeeds under
-       the 512 MiB default) — RED.
-    2. **Tightened-env survival (D5/D6).** Set `REPL_MAX_MEMORY_MB = "256"`; suspend a run granted
-       `limits: { maxMemory: 256 * 1_048_576 }` whose second line is `big = bytearray(320 * 1024 * 1024)`;
-       **delete `REPL_MAX_MEMORY_MB` before resuming** (this is what makes it RED: the unfixed resume
-       re-reads `limitsConfig()` and gets the 512 MiB default, so 320 MiB succeeds); `resume({ onApproval:
-       () => true })`; assert `err(result)` and `result.errorKind === "memory"`. Today RED.
-  - [x] Implement — one line in `src/session.ts` `Session.resume`, in the `wrappedRunOpts` literal
-    (`:435-439`), after `...runOpts,`:
-    ```ts
-      limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
-    ```
-    Nothing else. Do not recover `onApproval`/`signal` from the suspension (D1/D2); do not add
-    `mount`/`inputs`/`scriptName`/`maxStdoutBytes` (D3).
-  - [x] Verify — `npx tsx --test test/session.test.ts` green; full `npm test` green;
-    `npm run check` + `npm run build` + `npm run lint` clean.
-  - Files — `src/session.ts`, `test/session.test.ts`.
-  - Post-build finding: Monty's snapshot restore already preserves maxDurationSecs/maxMemory across resume; the fix is library-layer hardening (maxWallClockSecs + #84 seam). Tests are acceptance tests of the invariant, not RED-for-the-fix.
+- [ ] **T1 — Charge `llm_query` + `rlm_query` downgrade against the shared pool; refuse on exhaustion**
+  - RED: add failing tests in `test/rlm.test.ts` (extend the "runRlm() — spend budget" block or a new
+    sibling block):
+    - `llm_query` charges the pool — generous budget; `answer = llm_query("…")` + `SUBMIT(answer)`;
+      assert `result.budget.consumed === Σ recordedCost(all recorded calls)`.
+    - `llm_query` refuses on a tight budget — budget sized to the first code-gen call only; assert the
+      refusal marker in the answer/stdout, no throw, termination as `budget_exhausted`/marker.
+    - `rlm_query` downgrade charges — `maxDepth:1, depth:1`; assert `consumed` includes the downgrade
+      call.
+    - `rlm_query` downgrade refuses — tight budget; assert the refusal marker.
+  - Implement (GREEN) in `src/rlm.ts`: add `budget` + `systemPromptTokens`-aware `callCost` charging
+    and refusal markers (`"[llm_query refused: spend budget exhausted]"`,
+    `"[rlm_query refused: spend budget exhausted]"`) to `onLLMQuery` and the downgrade branch of
+    `onRLMQuery`.
+  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
 
-- [x] **T2 — Pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume` (D2)**
-  - RED — this is a **characterization pin**, not a bug fix: the code already forwards the signal
-    (`extensions/repl-extension.ts:371-375`), so the new test passes on first run and guards the seam.
-    Add a new `describe("repl extension — repl_resume forwards the abort signal (#177 D2)")` block to
-    `test/extension.test.ts` (after the `suspension is reachable (#51)` describe at `:983`), with a
-    `mkdtemp` `cwd` in `before`/`after`. Stub `ReplRunner.prototype.resume` (mirroring
-    `runWithLimits` at `:347-372`) to capture its 3rd positional argument, restore it in `finally`:
-    ```ts
-    const controller = new AbortController();
-    const seen: unknown[] = [];
-    const originalResume = ReplRunner.prototype.resume;
-    ReplRunner.prototype.resume = (async (_sessionId, _onApproval, signal) => {
-      seen.push(signal);
-      return "[result]\n1";
-    }) as unknown as typeof ReplRunner.prototype.resume;
-    try {
-      const resume = (await loadTools()).find((t) => t.name === "repl_resume");
-      assert.ok(resume);
-      await resume.execute("sig-1", { sessionId: "sig" }, controller.signal, undefined,
-        { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select: async () => APPROVE_CHOICE } });
-    } finally {
-      ReplRunner.prototype.resume = originalResume;
-    }
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0], controller.signal);
-    ```
-  - Implement — none. If the test fails, the signal forward has regressed: record the blocker and do
-    not "fix" it by changing `repl-extension.ts` out of scope.
-  - Verify — `npx tsx --test test/extension.test.ts` green; full `npm test` green;
-    `npm run check` + `npm run build` + `npm run lint` clean.
-  - Files — `test/extension.test.ts`.
+- [ ] **T2 — Thread the shared pool into nested `runRlm`; update the D52 comment**
+  - RED: add failing tests:
+    - nested `rlm_query` shares the parent's pool — generous budget; assert
+      `result.budget.consumed === Σ recordedCost(parent + child calls)`.
+    - a pool that cannot afford the child's second iteration → child returns `budget_exhausted`,
+      surfaced as `[rlm_query error: budget_exhausted]`, no throw.
+  - Implement (GREEN) in `src/rlm.ts`: change `budget: undefined` → `budget` in the nested `runRlm`
+    call inside `onRLMQuery`; rewrite the stale D52 comment to state the child shares the parent's
+    pool (D61).
+  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
 
 ## Checkpoint (after T2)
 
-- [ ] Issue acceptance met: a resumed run honours the same clamped limits the original `repl` call was
-      granted (derived ceilings, never 300 s / 1024 MiB); explicit caller limits still win (D4).
-- [ ] `repl_resume` signal-forwarding seam pinned.
-- [ ] Tightened `REPL_MAX_MEMORY_MB` survives into resume (tested).
-- [ ] Full suite green; `check`/`build`/`lint` clean.
+- [ ] All six new tests green; full suite, `tsc --noEmit`, and biome clean.
+- [ ] SPEC.md success criteria met.
 
-## DoD (from #177, reconciled)
+## DoD (from #165, reconciled)
 
-- [ ] `Session.resume` merges `runOpts?.limits ?? this.suspendedRunOpts?.limits`; caller limits win.
-- [ ] Session-level integration test proves resumed runs use the suspended limits (memory seam).
-- [ ] Extension-level test pins `repl_resume` → `ReplRunner.resume` signal forwarding.
-- [ ] No changes to `src/sandbox.ts`, `src/repl.ts`, `extensions/repl-extension.ts`; no `repl_resume`
-      schema/description change; no #84 merge (mount/inputs/scriptName/maxStdoutBytes).
+- [ ] `llm_query`, `rlm_query` downgrade, and nested `runRlm` all charge the single shared
+      `SpendBudget` pool.
+- [ ] A refused tool call returns its marker string and never throws or calls the LLM.
+- [ ] A configured budget is a hard ceiling on **total tree** spend.
+- [ ] Omitting `budget` leaves every path budget-free (no regression).
+- [ ] Out of scope (not touched): #171, #168, #170, the final synthesis pass (D44/D45),
+      `budgetReport`/`SpendBudget`/public `RlmResult`.

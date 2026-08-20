@@ -1,241 +1,189 @@
-# Spec: repl_resume must re-apply the suspended run's clamped limits, and the extension-layer signal forwarding must be pinned — issue #177
+# Spec: Bound spend of `llm_query` / `rlm_query` / nested `runRlm` against the run budget — issue #165
 
 ## Objective
 
-A `repl` call that suspends on a gated (approval-requiring) tool carries its clamped resource
-limits into the suspension, but `repl_resume` silently drops them: the resumed transcript re-runs
-under the sandbox **defaults** (`limitsConfig()` — 30 s / 512 MiB by default), not the limits the
-original call was granted. It is "safe direction" (more restrictive, never more permissive) but
-asymmetric, and it means a resumed run can be governed by limits that differ from what the model was
-told it had.
+`RlmOptions.budget` currently charges only the **top-level iteration loop** of `runRlm`. Three LLM
+paths escape the budget entirely:
 
-Second gap: the extension's `repl_resume` **does** forward the abort `signal` to `ReplRunner.resume`,
-but no test proves it — every `repl_resume.execute(...)` test passes `undefined`. The deeper
-`ReplRunner`→`Session`→sandbox signal path is already proven (#150 "abort-rt"), so the only unpinned
-hop is extension→`ReplRunner`.
+1. `onLLMQuery` (`llm_query` from sandbox code) calls `llmClient.query` directly.
+2. `onRLMQuery` (`rlm_query`) at the depth limit **downgrades** to a direct `llmClient.query`.
+3. `onRLMQuery` below the depth limit spawns a nested `runRlm` that passes `budget: undefined`
+   (D52), so the child loop's iterations are uncharged — and each child can itself call
+   `llm_query` / `rlm_query`.
 
-Success looks like: a resumed run honours the **same clamped limits the original `repl` call was
-granted** (which are already derived from `limitsConfig()` via #176's `clampModelLimits`, so they
-round-trip through the derived ceiling automatically — 30 s / 512 MiB by default, never 300 s /
-1024 MiB), and a test pins that `repl_resume.execute` forwards the abort signal to
-`ReplRunner.resume`.
+Impact: a caller setting `budget` to cap runaway cost gets **no protection against sandbox code
+looping `llm_query` / `rlm_query`** — unbounded LLM spend / cost-DoS. Recursion depth is bounded
+(`maxDepth`), breadth is not.
 
-Issue: https://github.com/AdarGit008/repl-simple/issues/177.
-Parent bucket: #31 (Bucket 3 — Resource containment). Siblings: #176 (just merged — the derived
-ceilings), #178 (same test file), #84 (owns the *broader* `suspendedRunOpts` merge — see D3).
+This change threads **one `SpendBudget` pool through the whole tree**: every tool-mediated LLM call
+and every nested loop charges the same pool, so a configured budget is a hard ceiling on total tree
+spend. When a tool-mediated call cannot charge, it degrades to a marker string (never throws),
+matching the existing D4 "degrades instead of throwing" semantics.
 
-## Corrected understanding (post-build finding)
+## Current state (fact base — verified against HEAD `ed94e84`)
 
-**The original premise was refuted by experiment.** The claim that `repl_resume` "falls back to
-30 s / 512 MiB defaults" is **false**: Monty's snapshot restore already preserves every
-Monty-enforced knob across the suspend/resume boundary. Per
-`node_modules/@pydantic/monty/dist/session.d.ts` (`loadSession` / `loadSnapshot`): "The dump
-restores its own resource limits and type-check state." So `maxDurationSecs`, `maxMemory`,
-`gcInterval`, and `maxRecursionDepth` survive a resume regardless of what `Session.resume` passes —
-a resumed run does **not** fall back to `limitsConfig()` defaults.
-
-The one-line fix (`limits: runOpts?.limits ?? this.suspendedRunOpts?.limits`) is therefore
-**correctness hardening, not a bug fix**: its observable effect is limited to the host-side
-`maxWallClockSecs` knob (consumed by `hostDeadlineAt` at `src/sandbox.ts:771-773` / `:1308`) and
-the `"unbounded"` sentinel consistency — neither of which the `repl`/`repl_resume` extension flow
-ever sets, so the extension cannot observe the fix. It is retained as the seam #84 will generalise.
-
-The DoD and the `Session.resume` merge are **unchanged**. The two Session tests are acceptance
-tests of an invariant Monty already guarantees, not RED-for-the-fix discriminators.
-
-## Current state (fact base — verified by scout, 2026-08-19)
-
-| Fact | Value |
-|---|---|
-| `extensions/repl-extension.ts:354-377` | `repl_resume` schema = `{ sessionId? }` only. `execute` calls `r.resume(params.sessionId ?? "default", makeOnApproval(ctx, signal), signal)` — **no `limits` arg**. |
-| `extensions/repl-extension.ts:338-347` | `repl` `execute` calls `r.run(code, sid, onApproval, signal, clampModelLimits(params.maxDurationSecs, params.maxMemory))` — the symmetric path that *does* supply clamped limits. |
-| `extensions/repl-extension.ts:135-155` | `clampModelLimits` always returns a `RunLimits` object (never `"unbounded"`). |
-| `src/repl.ts:218-253` | `ReplRunner.resume(sessionId, onApproval?, signal?, limits?)` — **already forwards** `limits` (and `signal`) via `live.session.resume({ onApproval, signal, limits })` at `:250`. The gap is one layer up. |
-| `src/repl.ts:185-196` | `ReplRunner.run` → `session.run(code, { onApproval, signal, limits })` — identical object shape to resume. |
-| `src/session.ts:366` | `Session.run` persists `this.suspendedRunOpts = runOpts` — the raw `{ onApproval, signal, limits }`. So the clamped limits are **already stored**. |
-| `src/session.ts:389-472` | `Session.resume` builds `wrappedRunOpts = { ...runOpts, lineOffset, onApproval: gate(...) }` (`:435-439`) and **never reads `suspendedRunOpts` back**. Only serialization (`dump` `:542` / `load` `:610`) reads it. |
-| `src/sandbox.ts:752-762` | `toResourceLimits(limits)` fills *unset* knobs from `limitsConfig()` (`??`). With `limits === undefined`, every knob falls back to `limitsConfig()` (30 s / 512 MiB / 300 s wall-clock). |
-| `src/sandbox.ts:1313,1319` | `resumeSuspended` consumes `runOpts?.limits` for both `toResourceLimits(...)` and `hostDeadlineAt(...)`. |
-| `src/types.ts:96-161` | `RunLimits` (all-optional knobs) and `RunOptions` (`limits?: RunLimits | "unbounded"`, plus `signal`, `onApproval`, `inputs`, `mount`, `maxStdoutBytes`, `maxOutputBytes`, `scriptName`, `lineOffset`). `resume` reuses `RunOptions`. |
-| `test/repl.test.ts:2170` ("D7 test 3") | Already pins `ReplRunner.resume` forwards `{ onApproval, signal, limits }` to `session.resume`. Not the gap. |
-| `test/repl.test.ts:530-548` (#150 "abort-rt") | Already proves `ReplRunner.resume` → sandbox signal. Not the gap. |
-| `test/extension.test.ts:602+` | `repl_resume` tests (describe "suspension is reachable (#51)") all drive `execute` with `signal === undefined`, params `{ sessionId }` only. **No signal/limits pin.** |
-| `test/session.test.ts` | No `Session.resume` test asserts limits or signal reach the sandbox. |
-
-**Root cause (one line):** `Session.resume` reconstructs its options purely from the caller's
-`runOpts` and discards the persisted `suspendedRunOpts.limits`. The extension cannot fix this — it
-holds no record of the original clamp (it derives from the model's knobs at `repl` time and doesn't
-retain them), so "forward the original limits" is only expressible at the `Session` layer.
+- **`src/budget.ts`** — `SpendBudget` class (`limit`, `consumed`, `remaining`, `tryCharge(tokens)`)
+  and `estimateTokens` (UTF-8 bytes ÷ 4). Already shared-mutable: "Siblings that pass the same
+  instance compete for one pool". This is the seam to reuse — no new abstraction.
+- **`src/rlm.ts:78-85`** — `RlmOptions.budget?: number | SpendBudget` (a `number` mints a fresh
+  per-run pool; an instance is shared/mutated in place; omitted → no budget logic, D5).
+- **`src/rlm.ts:~1110-1115`** — budget minting: `const budget = options.budget instanceof SpendBudget
+  ? options.budget : options.budget !== undefined ? new SpendBudget(options.budget) : undefined;`
+- **`src/rlm.ts:~1120`** — `const systemPromptTokens = estimateTokens(systemPrompt);` (precomputed
+  once; `systemPrompt` is a `let` declared at the top of `runRlm` and resolved after the registry is
+  built, D50).
+- **`src/rlm.ts:854-862`** — `callCost(systemPromptTokens, messages)` = `systemPromptTokens +
+  Σ estimateTokens(message.content)`.
+- **`src/rlm.ts:869-875`** — `budgetReport(budget, limited)` returns `{limit, consumed, limited}`
+  or `undefined`.
+- **`src/rlm.ts:1043-1044`** — `onLLMQuery` calls `llmClient.query(systemPrompt, [{role:"user",
+  content: prompt}], options.signal)` with **no charge**.
+- **`src/rlm.ts:1045-1096`** — `onRLMQuery`:
+  - downgrade branch (`depth >= maxDepth`, `:1051-1069`) calls `llmClient.query(...)` with **no
+    charge**;
+  - nested branch (`:1072-1091`) calls `runRlm(query, {... budget: undefined ...})` with the D52
+    comment "The child is bounded by maxIterations/maxDepth, not the parent's spend pool".
+- **`src/rlm.ts:~1154`** — top-level charge inside `for (let i = 0; i < maxIterations; i++)`:
+  `const cost = callCost(systemPromptTokens, messages); if (!budget.tryCharge(cost)) return
+  {status:"budget_exhausted", ...}`.
+- **`src/rlm.ts` (D44/D45)** — the final synthesis `llmClient.query` after the cap is **deliberately
+  un-charged** ("one guarded, un-charged synthesis pass").
 
 ## Scope
 
-| In scope | Out of scope |
-|---|---|
-| `src/session.ts` — `Session.resume` re-applies `suspendedRunOpts.limits` when the caller supplied none | `src/sandbox.ts` (`limitsConfig`/`toResourceLimits`/`resumeSuspended`) — the `??` defaulting is the sandbox's correct contract |
-| `test/session.test.ts` — prove resumed runs inherit the suspended (clamped) limits | `extensions/repl-extension.ts` — **no schema change** under the chosen fix (D1); no new model-suppliable knobs |
-| `test/extension.test.ts` — pin that `repl_resume.execute` forwards the abort signal to `ReplRunner.resume` | `src/repl.ts` — `ReplRunner.resume` already forwards limits/signal (D7 test 3 covers it) |
-| A tightened `REPL_MAX_MEMORY_MB` surviving into `resume` (test) | #84's broader merge (mount/inputs/scriptName/maxStdoutBytes) — see D3 |
-| | #178's `runWithLimits` comment chore (separate issue) |
+### In scope
 
-## Explicit decisions
+- Charge `onLLMQuery` (`llm_query`) against the resolved budget **before** the call.
+- Charge the `onRLMQuery` **downgrade** branch against the resolved budget **before** the call.
+- Thread the resolved budget into the nested `runRlm` (replace `budget: undefined` with the shared
+  instance) so the child loop competes for the same pool.
+- Degrade refused tool calls to a deterministic marker string (never throw).
+- Update the now-stale D52 comment about nested spend.
+- Tests proving each path (RED → GREEN).
 
-### D1 — Option B: re-apply the suspended run's persisted clamped limits at the `Session` layer (not a schema change)
+### Out of scope (explicit)
 
-The fix is:
+- **#171** — signal-race / truncation parity of the same `llm_query` / downgrade / synthesis calls.
+- **#168** — breadth backstop (cap on host-tool *invocation count* per iteration).
+- **#170** — nested `inputs` forwarding.
+- The final **synthesis pass** (D44/D45) stays un-charged — see Assumption 3 / residual risk.
+- Any change to `budgetReport`, `SpendBudget`, or the public `RlmResult` shape.
 
-```ts
-const wrappedRunOpts: RunOptions = {
-  ...runOpts,
-  limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
-  lineOffset: this.prefixLineCount(),
-  onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
-};
-```
+## Decisions
 
-`Session.resume` merges `suspendedRunOpts.limits` in when the caller did not supply `limits`.
-`onApproval` and `signal` still come from the caller (they are deliberately **not** recovered from
-the suspension — a stale/aborted signal must not be reused, and the approval callback must be the
-fresh one).
+Continuing the repo's `D#` decision numbering (highest cited in `src/` is D53; #78's spec used up to
+D60). New decisions:
 
-**Why Option B over Option A** (expose `maxDurationSecs`/`maxMemory` on the `repl_resume` schema):
-- The acceptance criterion is *"a resumed run honours the limits granted to the original `repl`
-  call."* Only Option B honours the **original** grant. Option A would let the model *re-supply*
-  limits on resume — a different grant, and a new attack surface the model doesn't need.
-- The extension **cannot** forward the original limits: `clampModelLimits` runs at `repl` time and
-  its output is not retained by the extension. The only durable record of the original grant is
-  `Session.suspendedRunOpts`, which `Session.run` already wrote (`session.ts:366`).
-- No schema change → no new model-suppliable knobs, no tool-description churn.
-- Minimal diff: one merge field in `Session.resume`.
+- **D61 — One shared `SpendBudget` pool through the whole tree.** The single resolved `budget`
+  (`SpendBudget | undefined`) is threaded into the `onLLMQuery` and `onRLMQuery` closures and passed
+  to nested `runRlm` instead of `undefined`. Every LLM call in the tree — top-level iteration,
+  `llm_query`, `rlm_query` downgrade, and every nested loop's iterations — charges the same pool.
+  When `budget` is absent, every path stays budget-free (unchanged, D5).
 
-The title's "at the extension layer" describes where the asymmetry is *visible* (the `repl` vs
-`repl_resume` execute bodies), not where the fix lives. The signal-forwarding half of the issue **is**
-at the extension layer (see D2). This is a recorded, deliberate reading; the go/no-go at Phase 6 is
-the human's chance to veto it.
+- **D62 — Tool-mediated calls charge at the same per-call cost, before they run.** The cost of a
+  single tool-mediated call is `callCost(systemPromptTokens, [{role:"user", content}])` — the shared
+  system prompt plus that call's one user message — reusing the existing `callCost` helper so the
+  accounting is identical to the top-level loop. `llm_query` charges `prompt`; the `rlm_query`
+  downgrade charges the downgrade message content.
 
-### D2 — Signal forwarding is a test-only gap at the extension layer
-
-`repl_resume.execute` already forwards `signal` (`extensions/repl-extension.ts:371-375`), and the
-deeper hop is proven (#150). The deliverable is a test that drives `repl_resume.execute` with a real
-`AbortSignal` (or stubs `ReplRunner.prototype.resume` to capture the signal — mirroring the
-`runWithLimits` helper) and asserts the signal reaches `ReplRunner.resume`.
-
-### D3 — Scope boundary with #84 (recorded, no conflict)
-
-#84 ("`suspendedRunOpts` is saved, restored, and never used", OPEN, bucket-11) owns the *broader*
-merge of `suspendedRunOpts` into `Session.resume` — `limits`, `mount`, `inputs`, `maxStdoutBytes`,
-`scriptName`. #177 takes **only the `limits` field**, which is the single field its acceptance
-requires. It deliberately does **not** absorb `mount`/`inputs`/`scriptName`/`maxStdoutBytes`. When
-#84 lands it will generalise this same seam; this flight notes that hand-off in its close-out so #84
-does not redo or conflict with it.
-
-### D4 — Precedence: caller-supplied limits win, else suspended limits (`??`)
-
-`runOpts?.limits ?? this.suspendedRunOpts?.limits`. In the only real path today (`repl_resume` → no
-limits), the suspended limits apply. An embedder calling `ReplRunner.resume` with explicit `limits`
-keeps the existing contract (explicit arg honoured). `"unbounded"` is a truthy string and is carried
-through `??` unchanged. (Whether the suspended value should *always* win — #84's stated preference —
-is left to #84; #177 does not need it.)
-
-### D5 — Limits are already derived ceilings — the #176 D6 coupling is satisfied structurally
-
-`clampModelLimits` (which already reads `limitsConfig()` per #176) produces the values persisted into
-`suspendedRunOpts.limits`. Re-applying them on resume therefore inherits the **derived** ceilings
-(`min(MAX_MODEL_DURATION_SECS, limitsConfig().maxDurationSecs)` = 30 s, and
-`min(MAX_MODEL_MEMORY_MIB, limitsConfig().maxMemory / BYTES_PER_MIB)` = 512 MiB by default) with no
-re-hardcoding of 300/1024 anywhere in this flight. A tightened `REPL_MAX_MEMORY_MB` flows through the
-same clamp at `repl` time and is therefore preserved on resume.
-
-### D6 — Env discipline in tests (inherited from #176/#178)
-
-`limitsConfig()` reads `process.env` at call time. Any test that exercises limits across a
-suspend/resume boundary must snapshot/clear/restore `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB`
-(the `before`/`after` pattern in `test/extension.test.ts:207-231`). The extension test file is run
-sequentially; a stub on `ReplRunner.prototype.resume` (the `runWithLimits`-style pattern) must
-restore in `finally`, and is safe only under that sequential assumption (which is #178's separate
-chore).
+- **D63 — A tool call that cannot charge degrades to a marker string, never throws.** Matching D4,
+  when `tryCharge` returns `false` the tool returns a deterministic refusal string instead of
+  calling the LLM:
+  - `llm_query` → `"[llm_query refused: spend budget exhausted]"`
+  - `rlm_query` downgrade → `"[rlm_query refused: spend budget exhausted]"`
+  Sandbox code sees the string as the tool's return value. The loop then stops at the next iteration
+  boundary when its own top-level charge fails (`status: "budget_exhausted"`). A nested loop reports
+  exhaustion through its own `budget_exhausted` status, which the parent's existing
+  `[rlm_query error: …]` branch already surfaces.
 
 ## Commands
 
 ```
-Focused:  npx tsx --test test/session.test.ts            # Session-layer limits-inheritance tests
-Focused:  npx tsx --test test/extension.test.ts          # extension-layer signal-forwarding pin
-Test:     npm test                                        # tsx --test test/*.test.ts
-Type:     npm run check                                   # tsc --noEmit
-Build:    npm run build                                   # tsc -p tsconfig.build.json
-Lint:     npm run lint                                    # biome; scope to src extensions test
+Install:   npm ci
+Test:      npm test                    # tsx --test test/*.test.ts
+Build:     npm run build               # tsc -p tsconfig.build.json
+Typecheck: npm run check               # tsc --noEmit
+Lint:      npm run lint                # biome check --error-on-warnings
+Coverage:  npm run coverage
 ```
 
-## Project structure (this flight)
+## Project structure
 
 ```
-src/session.ts               → the fix: Session.resume merges suspendedRunOpts.limits (one field)
-src/sandbox.ts               → NOT modified (limitsConfig/toResourceLimits/resumeSuspended are the sandbox contract)
-src/repl.ts                  → NOT modified (already forwards limits/signal)
-extensions/repl-extension.ts → NOT modified (no schema change under D1)
-test/session.test.ts         → NEW: resumed run inherits suspended clamped limits (+ tightened-env survival)
-test/extension.test.ts       → NEW: repl_resume forwards the abort signal to ReplRunner.resume
+src/rlm.ts          → the RLM loop; the three uncharged paths live here
+src/budget.ts       → SpendBudget + estimateTokens (unchanged)
+test/rlm.test.ts    → tests; extends the "runRlm() — spend budget" block
+SPEC.md             → this document
+tasks/plan.md       → implementation plan
+tasks/todo.md       → task list
 ```
 
 ## Code style
 
-Follow the existing files: 2-space indent, double quotes, JSDoc on exported functions, `_`-prefixed
-unused fixed-arity params, numeric separators (`1_048_576`). Do not introduce a new abstraction for a
-single `??` merge field; the change should read as one obvious line in `Session.resume`.
+Match `src/rlm.ts` conventions: decision-referencing comments (`// … (D61)`), the `FEEDBACK_`
+naming discipline, and bracketed lowercase-snake-tool prompt strings (`[rlm_query error: …]`,
+`[rlm_query downgraded at max depth N]`). Refusal markers follow the same shape. No new
+dependencies; biome-formatted; 2-space; TS strict (`noUnusedLocals`, `noUnusedParameters`).
 
-## Testing strategy (TDD, RED first)
+## Testing strategy
 
-Test level: **integration at the `Session` seam for the limits fix**; **unit (seam) at the extension
-for the signal pin**. The `ReplRunner`→`Session` hop is already covered (D7 test 3) — do not re-prove
-it.
+TDD — RED first. Integration tests through the real sandbox (`runInSandbox` → Monty), mirroring the
+existing "runRlm() — spend budget" and "runRlm() — nested rlm_query" blocks: `mockLlmCodeGen`
+records every `llmClient.query` call, `recordedCost` mirrors the loop's charge, and `rlmRegistry()`
+returns an empty `ToolRegistry` (runRlm self-registers its RLM tools, D51). Use SUBMIT-terminated
+runs (status `"ok"`) so the un-charged synthesis pass never fires.
 
-Assertions (RED before GREEN):
+New tests (in a new describe block, or extending the existing "spend budget" block):
 
-1. **Resumed run inherits the suspended limits.** Suspend a `Session` run granted explicit limits
-   (e.g. `{ maxDurationSecs: 5 }` or a memory value below the default), then `resume` **without**
-   limits and assert the resumed execution was governed by the suspended limits, not
-   `limitsConfig()` defaults. The observation mechanism (a below-default `maxDurationSecs` that
-   times out on resume, a seam/spy, or a serialisation assertion on `suspendedRunOpts`) is chosen by
-   the planner and pinned by the coder's RED test.
-2. **Tightened `REPL_MAX_MEMORY_MB` survives into resume.** With `REPL_MAX_MEMORY_MB=256`, a run
-   clamped to 256 MiB suspends; its resume still honours 256 MiB (never the 512 MiB default). Env
-   saved/restored.
-3. **`repl_resume` forwards the abort signal.** Stub `ReplRunner.prototype.resume` (or drive
-   `repl_resume.execute` with a real `AbortSignal`), assert the signal reaches `ReplRunner.resume`.
-   Restore the prototype in `finally`.
-4. Unchanged: resume with an explicit `limits` still honours the explicit value (D4 precedence);
-   `onApproval`/`signal` come from the caller (already proven, must not regress).
+1. **`llm_query` charges the shared pool** — generous budget; code `answer = llm_query("…")` then
+   `SUBMIT(answer)`; assert `result.budget.consumed === Σ recordedCost(call)` over **all** recorded
+   calls (top-level code-gen + the `llm_query` call).
+2. **`llm_query` refuses instead of throwing when the pool cannot afford it** — budget sized to the
+   first code-gen call only; code calls `llm_query(...)`; assert the answer/stdout carries the
+   refusal marker, no throw, and the run terminates `budget_exhausted` (or surfaces the marker).
+3. **`rlm_query` downgrade charges the shared pool** — `maxDepth:1, depth:1` so it downgrades;
+   generous budget; assert `consumed` includes the downgrade call's cost.
+4. **`rlm_query` downgrade refuses instead of throwing** — tight budget; assert the refusal marker.
+5. **nested `rlm_query` shares the parent's pool** — a nested spawn; pool sized so the parent's
+   code-gen + the child's first code-gen fit but the child's second iteration does not; assert the
+   child returns `budget_exhausted`, surfaced as `[rlm_query error: budget_exhausted]` in the
+   parent's answer, and the parent's `budget.consumed` reflects the child's spend.
+6. **omitting budget leaves every path uncharged** — existing test 5 still passes (no regression).
 
 ## Boundaries
 
-- **Always:** RED first; run the focused test then the full suite + `check` + `build` + `lint`
-  (scoped to `src extensions test`) before declaring a task done; save/restore `REPL_*` env and
-  restore stubbed prototypes in `finally`.
-- **Ask first / Never (autonomous — no live ask):** do not touch `src/sandbox.ts`, `src/repl.ts`,
-  `extensions/repl-extension.ts`, or any file beyond `src/session.ts`, `test/session.test.ts`,
-  `test/extension.test.ts`. Do not change the `repl_resume` schema or its tool description. Do not
-  absorb #84's broader merge (mount/inputs/scriptName/maxStdoutBytes). Do not re-hardcode 300/1024.
+- **Always:** run `npm test`, `npm run check`, `npm run lint` before reporting done; follow D#/code
+  style; pin refusal markers as literals in tests (D17 convention).
+- **Ask first:** none — this run is autonomous; assumptions are recorded below.
+- **Never:** absorb #171/#168/#170 scope; change `budgetReport`/`SpendBudget`/public `RlmResult`;
+  add dependencies; reorder unrelated code; leave the tree red between tasks.
 
 ## Success criteria
 
-- `Session.resume` re-applies `suspendedRunOpts.limits` when the caller supplied none; explicit
-  caller limits still win.
-- A resumed run honours the limits granted to the original `repl` call (derived ceilings, 30 s /
-  512 MiB by default — never 300 s / 1024 MiB).
-- A test pins `repl_resume.execute` forwarding the abort signal to `ReplRunner.resume`.
-- A tightened `REPL_MAX_MEMORY_MB` survives into `resume` (tested).
-- Full suite green; `check`/`build`/`lint` clean.
+- [ ] `llm_query`, `rlm_query` downgrade, and nested `runRlm` all charge the single shared
+      `SpendBudget` pool.
+- [ ] A refused tool call returns its marker string and never throws or calls the LLM.
+- [ ] A configured budget is a hard ceiling on **total tree** spend (nested loops compete for the
+      parent's pool).
+- [ ] Omitting `budget` leaves all paths budget-free (no regression).
+- [ ] Full suite green; `tsc` clean; biome clean.
 
-## Assumptions (recorded)
+## Assumptions (recorded — no clarifying questions, autonomous run)
 
-1. **Option B is the intended reading** (see D1) — the fix lives in `Session.resume`, not the
-   extension schema. Recorded; veto point is the Phase 6 go/no-go.
-2. **The resumed run may keep the caller's `signal`/`onApproval`** (fresh, not recovered from the
-   suspension) — only `limits` is recovered. This matches #84's stated policy and #150's proof.
-3. **The `Session`-level limits test may assert via an observable sandbox effect** (e.g. a
-   below-default `maxDurationSecs` that the resumed run times out on) rather than a spy, since
-   `resumeSuspended` is a module import. The planner pins the exact mechanism.
+1. "Charge every tool-mediated call" means charge **before** the call (D4's before-the-call charge),
+   not after.
+2. "Degrade instead of throw" (D4) extends to tool calls: a refused call returns a marker string,
+   which matches the tools' string-returning contract.
+3. The final **synthesis pass** (D44/D45) is out of scope — the issue names only `llm_query` /
+   `rlm_query` / nested. It remains a single un-charged call at the cap. *Recorded as residual risk
+   for the issue-monitor to recommend filing.*
+4. The cost model for a tool-mediated call is the shared system prompt + the single user message,
+   reusing `callCost` — no new token accounting.
+5. "Thread one pool through the tree" means: pass the **resolved** `SpendBudget` instance (whatever
+   form the caller supplied) to nested loops, and charge tool calls against it. Absent budget → no
+   charging anywhere.
+6. No new public API; refusal strings are private module constants (tests pin literals, per D17).
 
 ## Open questions
 
-None blocking. (The broader `suspendedRunOpts` merge precedence — whether suspended limits should
-*always* win over an embedder's explicit limits — is #84's, not this flight's.)
+None blocking.

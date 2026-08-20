@@ -1,102 +1,69 @@
-# Implementation Plan: issue #177 — `repl_resume` re-applies the suspended run's clamped limits; pin the extension's signal forward
+# Implementation Plan: issue #165 — bound tree spend on the shared `SpendBudget`
 
 ## Overview
 
-`Session.run` persists the suspended run's raw `RunOptions` into `suspendedRunOpts`
-(`src/session.ts:366`), so the clamped limits granted to a `repl` call survive the suspension.
-`Session.resume` throws that record away: its `wrappedRunOpts` (`src/session.ts:435-439`) is built
-purely from the caller's `runOpts` and never reads `suspendedRunOpts`, so the resumed continuation
-runs under `limitsConfig()` defaults (30 s / 512 MiB) rather than the grant the original call was
-given. The fix is one field: merge `suspendedRunOpts.limits` in when the caller supplied none
-(D1). Separately, `repl_resume.execute` already forwards the abort `signal` to
-`ReplRunner.resume` (`extensions/repl-extension.ts:371-375`), but no test proves it — the second
-deliverable is a pin test at that extension seam (D2).
+`runRlm` charges only its top-level iteration loop. This plan threads the single resolved
+`SpendBudget` pool through the two tool-mediated LLM paths (`llm_query`, the `rlm_query` downgrade)
+and the nested `runRlm`, so a configured budget is a hard ceiling on total tree spend. Refused
+tool calls degrade to a marker string (D4), never throw. Two sequential tasks, each RED → GREEN,
+each leaving the tree green.
 
-## Architecture Decisions (SPEC D1–D6, not restated)
+## Architecture Decisions
 
-- **D1 — fix lives in `Session.resume`, not the schema.** One merge field:
-  `limits: runOpts?.limits ?? this.suspendedRunOpts?.limits` (D4 precedence: caller wins via `??`;
-  `"unbounded"` is truthy and carries through). `onApproval`/`signal` stay caller-supplied.
-- **D2 — signal forwarding is a test-only gap** at the extension layer; `ReplRunner`→`Session`→sandbox
-  is already pinned (#150, D7 test 3). No `src/repl.ts` / `extensions/repl-extension.ts` change.
-- **D3 — `limits` field only.** No `mount`/`inputs`/`scriptName`/`maxStdoutBytes` (that is #84's).
-- **D5/D6 — env discipline.** `limitsConfig()` reads `process.env` at call time, so the Session-level
-  tests snapshot/clear `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` (the `before`/`after` pattern
-  in `test/extension.test.ts:207-231`), and the extension pin restores the stubbed prototype in `finally`.
+Reference SPEC.md (D61–D63), not restated here. Key implementation facts the coder must respect:
 
-## Chosen test-observation mechanism (SPEC assumption 3)
-
-**A below-default `maxMemory` observed as `RunError.errorKind === "memory"`** — the Option (i)
-behavioural seam, but with the *memory* knob instead of the *duration* knob the SPEC example named.
-
-Why it proves the fix, deterministically:
-
-- The resumed worker's limits come from the same place as the run path:
-  `resumeSuspended` hands `{ limits: toResourceLimits(runOpts?.limits) }` to the checkout
-  (`src/sandbox.ts:1313`) and `hostDeadlineAt(runOpts?.limits)` (`:1308`). With
-  `runOpts.limits === undefined`, every knob falls back to `limitsConfig()` (`:752-762`).
-- `maxMemory` is enforced **on resumed instructions**, not just the first run:
-  `classifyResumeError`'s contract states a resume "may breach `maxDurationSecs` or `maxMemory` on any
-  instruction it executes after the resume" (`src/sandbox.ts:145`), and `runtimeKind` maps
-  `MontyRuntimeError` typeName `"MemoryError"` → `"memory"` (`:187-192`).
-- The assertion has **no timing dependence**: `bytearray(128 MiB)` against a 32 MiB ceiling fails at
-  the allocation; against the 512 MiB default it succeeds. Wide margins on both sides (128 MiB > 32 MiB
-  by 4×; 128 MiB + ~10 MiB baseline ≈ 138 MiB < 512 MiB). The discriminating signal is the error
-  *kind*, so the test is immune to message rewording.
-- The SUSPEND phase never allocates: the gated call is the first statement; the `bytearray(...)` line
-  executes only after the resume approves, so the 32 MiB ceiling comfortably survives the
-  suspend/resume machinery (~8.7 MiB bare session per `src/sandbox.ts:731`).
-
-Rejected alternatives:
-
-- **Option (i) via `maxDurationSecs` (busy loop → timeout):** `maxDurationSecs` is polled inside the
-  worker and advances only while the interpreter executes (`src/types.ts` `RunLimits` JSDoc), so the
-  moment a loop trips it is poll-granularity-dependent — flaky under load. Memory is a hard, immediate
-  failure.
-- **Option (ii) spy/seam:** `resumeSuspended` is an ESM named import in `src/session.ts:1`, not
-  reassignable from a test; the suite's only stub pattern is prototype stubbing
-  (`test/extension.test.ts:347-372`), which cannot reach a module-level binding without a new
-  abstraction — which the SPEC forbids for a single `??` merge field.
-- **Option (iii) dump/load serialisation:** `Session.dump()` already serializes `suspendedRunOpts.limits`
-  (`src/session.ts:542`), so that assertion is GREEN before the fix — it proves storage, not
-  re-application, and cannot be the RED test.
-
-**Post-build finding (correction).** The memory seam above does **not** discriminate the fix:
-verified in a scratch checkout with the one-line fix removed, both Session tests still pass — Monty's
-snapshot restore already preserves `maxMemory` (and `maxDurationSecs`, `gcInterval`,
-`maxRecursionDepth`) across resume (`node_modules/@pydantic/monty/dist/session.d.ts`: "The dump
-restores its own resource limits and type-check state"). The two Session tests are therefore
-**acceptance tests of an invariant Monty already guarantees**, not RED-for-the-fix tests. The fix's
-observable effect is limited to the host-side `maxWallClockSecs` knob (`hostDeadlineAt`,
-`src/sandbox.ts:771-773` / `:1308`), which the `repl`/`repl_resume` extension flow never sets — it
-is correctness hardening and the seam #84 will generalise.
+- **Closure capture of later-declared bindings.** The `onLLMQuery` / `onRLMQuery` closures are built
+  inside `createRLMTools({...})`, **before** `budget` (minted ~`src/rlm.ts:1110`) and
+  `systemPromptTokens` (~`:1120`) are declared as `const`. Both tool callbacks execute only during
+  `runInSandbox` inside the loop — after those bindings are initialised — so referencing them inside
+  the arrow-function bodies is safe (no TDZ violation; TS accepts deferred references). **Minimal-diff
+  approach:** keep the existing declaration order and reference `budget` + `systemPromptTokens` in the
+  closures. (Alternative — hoist `budget` minting above the registry and declare
+  `let systemPromptTokens` beside `let systemPrompt` — is acceptable but not required.)
+- **Reuse `callCost` (D62).** A tool call's cost is `callCost(systemPromptTokens,
+  [{role:"user", content}])` — never a bespoke estimate.
+- **Refusal markers (D63):** `"[llm_query refused: spend budget exhausted]"` and
+  `"[rlm_query refused: spend budget exhausted]"` as private module `const`s; tests pin the literals.
+- **Nested threading (D61):** replace `budget: undefined` with `budget` in the nested `runRlm` call
+  and update the stale D52 comment ("The child is bounded by maxIterations/maxDepth, not the parent's
+  spend pool") to state the child now shares the parent's pool (D61).
 
 ## Task List
 
-### Phase 1: the fix + its Session-level proof
-- [ ] **Task 1 (T1)** — `Session.resume` merges `suspendedRunOpts.limits`; RED: two Session-level
-  integration tests (below-default ceiling; tightened-env survival) in `test/session.test.ts`.
+### Phase 1: charge the tool-mediated single-turn paths (T1)
 
-### Checkpoint 1: Session layer proven
-- [ ] Focused `npx tsx --test test/session.test.ts` green; full suite green; `check`/`build`/`lint` clean.
+- **T1** — Charge `llm_query` and the `rlm_query` downgrade against the shared pool; refuse with a
+  marker on exhaustion.
+  - Tests (RED): #1 `llm_query` charges (consumed === Σ recordedCost); #2 `llm_query` refuses on a
+    tight budget (marker, no throw); #3 downgrade charges; #4 downgrade refuses.
+  - Implement (GREEN): add `budget`/`systemPromptTokens`-aware charging + refusal markers to
+    `onLLMQuery` and the downgrade branch of `onRLMQuery`.
 
-### Phase 2: the extension-layer signal pin
-- [ ] **Task 2 (T2)** — pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume`
-  (characterization test; no source change).
+### Checkpoint: after T1
 
-### Checkpoint 2: complete
-- [ ] Issue acceptance met; all tests green; ready for review.
+- [ ] `npm test`, `npm run check`, `npm run lint` green; `llm_query` + downgrade charge/refuse.
+
+### Phase 2: thread the pool into nested `runRlm` (T2)
+
+- **T2** — Pass the shared pool to the nested `runRlm`; update the D52 comment.
+  - Tests (RED): #5a nested loop's iterations deplete the parent's pool (consumed === Σ recordedCost
+    over parent + child); #5b a pool that cannot afford the child's second iteration surfaces
+    `[rlm_query error: budget_exhausted]` without throwing.
+  - Implement (GREEN): `budget: undefined` → `budget` in the nested call; fix the D52 comment.
+
+### Checkpoint: complete
+
+- [ ] All six new tests green; full suite + `tsc` + biome green; success criteria met.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Ambient `REPL_MAX_MEMORY_MB` in the outer `npm test` process would make the unfixed 512 MiB fallback wrong, so assertion 1 would not be RED | High (invalid test) | Describe-level `before`/`after` clears both `REPL_MAX_DURATION_SECS` and `REPL_MAX_MEMORY_MB` (D6), exactly like `test/extension.test.ts:207-231` |
-| Tightened-env test would not be RED if the env var is still set at resume time (`limitsConfig()` re-reads it) | High (invalid test) | The test deletes `REPL_MAX_MEMORY_MB` *before* `resume`, so the unfixed path reads the 512 MiB default and the 320 MiB allocation succeeds — while the fixed path uses the persisted 256 MiB and fails. The delete is the point of the test |
-| 32 MiB ceiling too tight for the suspend/resume machinery (snapshot dump, gated-tool replay) | Low | Bare session is ~8.7 MiB (`src/sandbox.ts:731`); the gated call runs before any allocation, so the suspend phase stays well under 32 MiB. If CI reveals otherwise, raise the ceiling to 64 MiB and the allocation to 256 MiB (still 4× apart) |
-| `bytearray` not available / type-check rejects the literal | Low | `bytearray` is a standard builtin; use a plain integer literal (`128 * 1024 * 1024`) to sidestep any underscore-literal parsing concern |
-| Extension pin test leaks the `ReplRunner.prototype.resume` stub | Med | Restore in `finally` (mandatory); safe because the extension test file runs sequentially (the `#178` chore is about *documenting* that assumption, not changing it) |
+| TDZ/subtle closure-capture bug if the coder mis-orders `budget`/`systemPromptTokens` | Runtime `ReferenceError` only on tool use | Documented above; tests drive the tool path so any misuse fails loudly in RED/GREEN |
+| Test sizing (tight-budget pins) fragile against prompt drift | Flaky budget tests | Follow the existing probe-then-size pattern (budget block test #1); assert on `recordedCost` equality, not magic numbers |
+| Scope bleed into #171/#168/#170 | Review churn, duplicated work | Explicit out-of-scope list in SPEC.md; coder contract forbids it |
+| Final synthesis pass remains un-charged (D44/D45) | Residual un-bounded single call at the cap | Recorded as residual risk; issue-monitor to recommend filing |
 
 ## Open Questions
 
-None blocking (SPEC "Open questions").
+None blocking.
