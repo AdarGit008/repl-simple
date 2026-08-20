@@ -1,69 +1,63 @@
-# Implementation Plan: issue #165 — bound tree spend on the shared `SpendBudget`
+# Implementation Plan: Close the two residual spend gaps left by #165 — issue #182
 
 ## Overview
 
-`runRlm` charges only its top-level iteration loop. This plan threads the single resolved
-`SpendBudget` pool through the two tool-mediated LLM paths (`llm_query`, the `rlm_query` downgrade)
-and the nested `runRlm`, so a configured budget is a hard ceiling on total tree spend. Refused
-tool calls degrade to a marker string (D4), never throw. Two sequential tasks, each RED → GREEN,
-each leaving the tree green.
+Two behavior changes plus one doc note, all in the RLM spend-accounting path:
+
+1. **D65** — a ≥1-token floor in `callCost` (or `tryCharge`) so no LLM call is ever free.
+2. **D64** — charge the D44/D45 synthesis pass against the shared pool; degrade to salvage on
+   refusal.
+3. **D66 (doc)** — note the `estimateTokens` lower-bound caveat on `RlmOptions.budget`.
+
+Source of truth: `SPEC.md` (D64–D66) + issue #182.
 
 ## Architecture Decisions
 
-Reference SPEC.md (D61–D63), not restated here. Key implementation facts the coder must respect:
-
-- **Closure capture of later-declared bindings.** The `onLLMQuery` / `onRLMQuery` closures are built
-  inside `createRLMTools({...})`, **before** `budget` (minted ~`src/rlm.ts:1110`) and
-  `systemPromptTokens` (~`:1120`) are declared as `const`. Both tool callbacks execute only during
-  `runInSandbox` inside the loop — after those bindings are initialised — so referencing them inside
-  the arrow-function bodies is safe (no TDZ violation; TS accepts deferred references). **Minimal-diff
-  approach:** keep the existing declaration order and reference `budget` + `systemPromptTokens` in the
-  closures. (Alternative — hoist `budget` minting above the registry and declare
-  `let systemPromptTokens` beside `let systemPrompt` — is acceptable but not required.)
-- **Reuse `callCost` (D62).** A tool call's cost is `callCost(systemPromptTokens,
-  [{role:"user", content}])` — never a bespoke estimate.
-- **Refusal markers (D63):** `"[llm_query refused: spend budget exhausted]"` and
-  `"[rlm_query refused: spend budget exhausted]"` as private module `const`s; tests pin the literals.
-- **Nested threading (D61):** replace `budget: undefined` with `budget` in the nested `runRlm` call
-  and update the stale D52 comment ("The child is bounded by maxIterations/maxDepth, not the parent's
-  spend pool") to state the child now shares the parent's pool (D61).
+- **D65 floor lands in `callCost`** (preferred per SPEC Assumption 3): `Math.max(1, systemPromptTokens
+  + Σ estimateTokens(content))`. Rationale: it is the single choke point every charged path already
+  goes through, so the floor is uniform with zero special-casing and `tryCharge`/`SpendBudget` stay
+  untouched. (Fallback if `callCost` proves unsuitable: floor inside `tryCharge`.)
+- **D64 synthesis charge uses the same `callCost`** as every other charged path (D62), charged
+  immediately before the final `llmClient.query`. On refusal the run salvages: it returns the last
+  iteration's extracted answer (the value the run had before the synthesis refinement), never
+  throwing and never emitting a bare synthesis-caused `budget_exhausted` status.
+- **Salvage is a graceful in-place degrade (D4)**, not a new error status. The accumulated answer is
+  already in scope at the synthesis site; the coder wires refusal → return-that-answer.
 
 ## Task List
 
-### Phase 1: charge the tool-mediated single-turn paths (T1)
+### Phase 1: Foundation (D65 — the ≥1-token floor)
 
-- **T1** — Charge `llm_query` and the `rlm_query` downgrade against the shared pool; refuse with a
-  marker on exhaustion.
-  - Tests (RED): #1 `llm_query` charges (consumed === Σ recordedCost); #2 `llm_query` refuses on a
-    tight budget (marker, no throw); #3 downgrade charges; #4 downgrade refuses.
-  - Implement (GREEN): add `budget`/`systemPromptTokens`-aware charging + refusal markers to
-    `onLLMQuery` and the downgrade branch of `onRLMQuery`.
+- [ ] **Task 1** — Enforce a ≥1-token minimum in `callCost`; no LLM call is ever free.
 
-### Checkpoint: after T1
+### Checkpoint: Foundation
+- [ ] `npm test`, `npm run check`, `npm run lint` all green.
 
-- [ ] `npm test`, `npm run check`, `npm run lint` green; `llm_query` + downgrade charge/refuse.
+### Phase 2: Core (D64 — synthesis charge + salvage)
 
-### Phase 2: thread the pool into nested `runRlm` (T2)
+- [ ] **Task 2** — Charge the D44/D45 synthesis pass and degrade to salvage on refusal.
 
-- **T2** — Pass the shared pool to the nested `runRlm`; update the D52 comment.
-  - Tests (RED): #5a nested loop's iterations deplete the parent's pool (consumed === Σ recordedCost
-    over parent + child); #5b a pool that cannot afford the child's second iteration surfaces
-    `[rlm_query error: budget_exhausted]` without throwing.
-  - Implement (GREEN): `budget: undefined` → `budget` in the nested call; fix the D52 comment.
+### Checkpoint: Core
+- [ ] Synthesis pass is charged; refusal salvages; full suite green.
 
-### Checkpoint: complete
+### Phase 3: Polish (D66 — doc note)
 
-- [ ] All six new tests green; full suite + `tsc` + biome green; success criteria met.
+- [ ] **Task 3** — Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget`.
+
+### Checkpoint: Complete
+- [ ] All SPEC success criteria met; `npm test`, `npm run check`, `npm run lint` green.
+- [ ] Ready for VERIFY (test-engineer) → REVIEW (code-reviewer) → SHIP (security-auditor).
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| TDZ/subtle closure-capture bug if the coder mis-orders `budget`/`systemPromptTokens` | Runtime `ReferenceError` only on tool use | Documented above; tests drive the tool path so any misuse fails loudly in RED/GREEN |
-| Test sizing (tight-budget pins) fragile against prompt drift | Flaky budget tests | Follow the existing probe-then-size pattern (budget block test #1); assert on `recordedCost` equality, not magic numbers |
-| Scope bleed into #171/#168/#170 | Review churn, duplicated work | Explicit out-of-scope list in SPEC.md; coder contract forbids it |
-| Final synthesis pass remains un-charged (D44/D45) | Residual un-bounded single call at the cap | Recorded as residual risk; issue-monitor to recommend filing |
+| Top-level loop charge interferes with "tight budget" RED tests (the code-gen call charges first) | Med | Coder sizes budgets against `recordedCost` of all prior calls; mirrors the existing "spend budget" test helpers; asserts `consumed` deltas, not absolutes, where needed |
+| Salvage plumbing ambiguity (which accumulated value to return) | Med | The last iteration's extracted answer is in scope at the synthesis site; coder reads the synthesis region and returns that value; pinned by the salvage RED test asserting the pre-synthesis answer |
+| Floor of exactly 1 token could distort the existing #165 `consumed === Σ recordedCost` assertions if those tests use empty prompts | Low | Existing tests use non-empty prompts, so `Math.max(1, …)` is a no-op there; coder runs the full suite to confirm no regression |
+| `#184` / `#171` / `#168` scope bleed (adjacent lines in `src/rlm.ts`) | Med | Coder touches only the synthesis charge site + `callCost` + `RlmOptions` doc; out-of-scope items are enumerated in SPEC.md Boundaries |
+| Line numbers in SPEC/issue are approximate | Low | Coder locates the synthesis pass and charge sites by symbol (`llmClient.query` after the cap, `callCost`), not by raw line number |
 
 ## Open Questions
 
-None blocking.
+None blocking (recorded in SPEC.md Assumptions).
