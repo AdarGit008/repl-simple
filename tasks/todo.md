@@ -42,6 +42,7 @@ scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` ar
   - [x] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
     `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean. Confirm
     the two #167 short-message tests still pass unchanged.
+  - [x] Phase 5 review fix: short-message pin now asserts no-truncation (recovery clause absent)
   - [x] Phase 4 coverage gaps closed (String(err) branch + positive truncation shape)
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
