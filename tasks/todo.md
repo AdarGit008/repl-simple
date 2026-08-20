@@ -48,7 +48,7 @@ Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in sc
     short-message tests (`:880`, `:1104-1115`) still pass unchanged (D5).
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T2 — Record the new surface in the truncation policy (D-spec G4)**
+- [x] **T2 — Record the new surface in the truncation policy (D-spec G4)**
   - No RED test (documentation). In `docs/truncation-policy.md`:
     1. Add an Implementation-record row to the table (`:372-391`):
        `| \`RlmResult.error\` (LLM provider error) | 1 KiB | 50/50 head+tail | #167 |`
@@ -59,7 +59,7 @@ Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in sc
        (`:435+`) explaining: the source choke point at `:1188`, the plain-`truncateText` (not
        `truncateWithSentinels`) choice because the public return is an API surface, and the
        deliberate neutral recovery clause (no Python re-run route for an LLM rejection).
-  - [ ] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
+  - [x] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
     + `npm run build` unaffected (doc-only). No test changes.
   - Files — `docs/truncation-policy.md`.
 
