@@ -44,7 +44,7 @@ scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` ar
     the two #167 short-message tests still pass unchanged.
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [ ] **T2 — Record the two tool-path surfaces in the truncation policy**
+- [x] **T2 — Record the two tool-path surfaces in the truncation policy**
   - No RED test (documentation). In `docs/truncation-policy.md`:
     1. Add an Implementation-record row to the table for the `llm_query` and downgraded-`rlm_query`
        provider-error surfaces (1 KiB, head-only, #184).
@@ -52,7 +52,7 @@ scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` ar
        explaining: the two source choke points (`onLLMQuery`, downgrade branch), the plain-
        `truncateText` (not `truncateWithSentinels`) choice because the message becomes a sandbox
        `RuntimeError`, head-only per D7, and the reused neutral recovery clause.
-  - [ ] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
+  - [x] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
     + `npm run build` unaffected (doc-only). No test changes.
   - Files — `docs/truncation-policy.md`.
 
