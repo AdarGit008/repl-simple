@@ -1,55 +1,36 @@
-# Todo — issue #182: close the two residual spend gaps left by #165
+# Todo — issue #166: enforce the D17 sentinel rule when options.systemPrompt is overridden
 
-Source of truth: `SPEC.md` (D64–D66) + `tasks/plan.md`.
+Source of truth: `SPEC.md` (D67) + `tasks/plan.md`.
 
-- [x] **T1 — Enforce a ≥1-token minimum in `callCost` (D65); no LLM call is ever free**
-  - RED: add failing test(s) in `test/rlm.test.ts` proving that with `systemPrompt: ""` and
-    `llm_query("")` the charge is ≥1 (not 0): a budget that affords exactly one empty call makes the
-    second empty `llm_query("")` refuse with `[llm_query refused: spend budget exhausted]`; assert
-    `consumed ≥ 1` per call. Account for the top-level code-gen charge (size budgets via the
-    existing `recordedCost` helpers).
-  - Implement (GREEN) in `src/rlm.ts` `callCost` (preferred): `Math.max(1, systemPromptTokens +
-    Σ estimateTokens(content))`. Fallback: floor inside `src/budget.ts` `tryCharge`. No
-    special-casing; uniform across all charged paths.
-  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green; existing #165 spend tests
-    (non-empty prompts) unaffected.
+- [ ] **T1 — Extract `SENTINEL_RULE`, append to overrides, interpolate into the default (D67)**
+  - RED: add failing tests in `test/rlm.test.ts` (extend the "Sentinel contract (D17)" block):
+    - **override carries the rule** — run `runRlm` with a custom `systemPrompt` lacking the sentinel
+      wording; assert `llm.calls()[0].systemPrompt` contains the D17 rule text and that the caller's
+      own prompt text appears **before** the rule text.
+    - **default unchanged / no duplication** — a run with no `systemPrompt` still emits a prompt whose
+      D17 section is byte-identical to the pre-change default, and the rule appears **exactly once**
+      in the default path.
+  - Implement (GREEN) in `src/rlm.ts`:
+    - Add a module-internal `SENTINEL_RULE` constant holding the D17 bullet verbatim.
+    - Interpolate it into `DEFAULT_RLM_SYSTEM_PROMPT` in its current position (second-to-last bullet,
+      before "- Be thorough.") — output byte-identical.
+    - Resolve the prompt as `options.systemPrompt ? \`${options.systemPrompt}\n${SENTINEL_RULE}\`
+      : (await buildSystemPrompt(registry))`.
+    - Update the `RlmOptions.systemPrompt` JSDoc to state the rule is always appended (callers need
+      not restate it).
+  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green; existing tool-naming and
+    fresh-sandbox prompt tests unaffected.
 
-- [x] **T2 — Charge the D44/D45 synthesis pass and degrade to salvage on refusal (D64)**
-  - RED: add failing tests:
-    - synthesis charges — a run with no SUBMIT (runs to the iteration cap) and a generous budget;
-      assert `result.budget.consumed` includes the synthesis call's cost and the final answer is the
-      synthesized answer.
-    - synthesis salvages — budget sized to afford the iterations but not the synthesis call; assert
-      the run returns the salvaged (pre-synthesis) answer, never throws, and status is not a bare
-      `budget_exhausted` caused by the synthesis charge.
-  - Implement (GREEN) in `src/rlm.ts`: `tryCharge(callCost(...))` immediately before the final
-    synthesis `llmClient.query`; on refusal return the last iteration's extracted answer (salvage).
-    Keep the omitted-budget path un-charged (D5).
-  - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
+## Checkpoint (after T1)
 
-- [x] **T3 — Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget` (D66, doc-only)**
-  - Add a JSDoc note on `RlmOptions.budget` (in `src/rlm.ts`): `estimateTokens` is a deterministic
-    lower bound (bytes ÷ 4) and under-counts non-ASCII/emoji/CJK up to ~1 token/byte; callers
-    needing a hard real-token bound must apply their own margin for non-English content.
-  - No behavior change, no test (D2 doc note convention).
-  - Verify: `npm run check`, `npm run lint` green (no test needed).
+- [ ] All SPEC success criteria met (D67).
+- [ ] Full suite, `tsc --noEmit`, and biome clean.
 
-## Checkpoint (after T3)
+## DoD
 
-- [x] All SPEC success criteria met (D64, D65, D66).
-- [x] Full suite, `tsc --noEmit`, and biome clean.
-
-  _Verify-phase coverage gap #1 closed (D64): added regression test
-  `runRlm() — answer provenance > 8. a charged synthesis query that throws still
-  counts its cost and salvages (D64)` in test/rlm.test.ts — full suite, `tsc --noEmit`,
-  and biome all green. Test-only change; src/ untouched._
-
-## DoD (from #182, reconciled)
-
-- [x] The synthesis pass charges the shared pool; refusal degrades to salvage (never throws, never a
-      bare synthesis-caused `budget_exhausted`).
-- [x] No LLM call is ever free: a ≥1-token floor applies uniformly across every charged path.
-- [x] `RlmOptions.budget` documents the `estimateTokens` lower-bound caveat.
-- [x] Both behaviors pinned by named tests (RED → GREEN).
-- [x] Out of scope (not touched): #171, #168, #184, #170; `budgetReport`/`SpendBudget`/public
-      `RlmResult` shapes.
+- [ ] A caller-supplied `systemPrompt` always carries the D17 sentinel rule (appended after the override).
+- [ ] The default prompt output is byte-identical to today (regression-pinned).
+- [ ] `RlmOptions.systemPrompt` JSDoc states the always-append contract.
+- [ ] Named tests (RED → GREEN) pin both the override and default paths.
+- [ ] Out of scope (not touched): #171, #168, #184, #170, #173; `truncateWithSentinels`, sentinel
+      constants, shared truncator, public `RlmResult` shapes.
