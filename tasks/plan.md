@@ -18,7 +18,8 @@ bounded value; short messages pass through byte-identical.
   D17 sentinels must not leak to callers. The model-facing nested error carries an unauthenticated
   `[…]` marker — accepted, #166's scope.
 - **D3 — `RLM_ERROR_MAX_BYTES = 1024`.** "Small cap"; 16 KiB is the sandbox `RunResult.error` budget
-  (`FEEDBACK_ERROR_MAX_BYTES`), a different field. Reuse `VALUE_HEAD_RATIO` (0.5).
+  (`FEEDBACK_ERROR_MAX_BYTES`), a different field. **Shape: head-only via `HEAD_ONLY_RATIO` (D7)** —
+  superseding the original `VALUE_HEAD_RATIO` (0.5) 50/50 split, which retained the request-context tail.
 - **D4 — `RLM_ERROR_RECOVERY = "The full provider error is not surfaced."`** Neutral for both
   audiences; `ERROR_RECOVERY` (Python re-run) is semantically wrong for an LLM rejection.
 - **D5 — existing short-message tests (`:880`, `:1104-1115`) stay GREEN, not rewritten.** `truncateText`
@@ -59,7 +60,7 @@ short-message assertions are the regression pins (D5) and must remain untouched.
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| 1 KiB cap truncates a legitimately useful short-ish provider error (e.g. a long request-ID tail the caller wants) | Low | Recorded assumption (D3); the head 50% keeps the human-readable prefix; veto point is the Phase 6 go/no-go |
+| 1 KiB cap truncates a legitimately useful short-ish provider error (e.g. a long request-ID tail the caller wants) | Low | Recorded assumption (D3); the head-only prefix keeps the human-readable error-type message; veto point is the Phase 6 go/no-go |
 | The two existing tests at `:880`/`:1104-1115` actually *do* break (e.g. `truncateText` is not a no-op under budget for these inputs) | Low | If RED/GREEN reveals this, the coder records it as a post-build finding and adjusts only those assertions — do not silently rewrite; report for the Phase 6 reconciliation |
 | `truncateText`'s elision marker pushes the emitted string slightly over 1024 bytes (marker + recovery bytes are additive) | Low | Assert `<= 1024 + tolerance` where tolerance is the measured marker+recovery size; or assert absence of the tail sentinel as the primary signal and treat the byte ceiling as approximate |
 | Doc task (T2) touches a doc with no test | Low | `npm run lint`/`check`/`build` unaffected; review the doc in Phase 5 for accuracy against the landed code |

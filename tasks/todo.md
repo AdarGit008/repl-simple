@@ -38,7 +38,7 @@ Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in sc
     ```ts
     error: truncateText(
       err instanceof Error ? err.message : String(err),
-      { maxBytes: RLM_ERROR_MAX_BYTES, headRatio: VALUE_HEAD_RATIO, recovery: RLM_ERROR_RECOVERY },
+      { maxBytes: RLM_ERROR_MAX_BYTES, headRatio: HEAD_ONLY_RATIO, recovery: RLM_ERROR_RECOVERY },
     ).text,
     ```
     Add a one-line JSDoc note to `RlmResult.error` (`:139-142`) that the message is truncated at
@@ -47,11 +47,15 @@ Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in sc
     `npm run check` + `npm run build` + `npm run lint` clean. Confirm the two existing
     short-message tests (`:880`, `:1104-1115`) still pass unchanged (D5).
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
+  - Post-review correction (Phase 5): switched `headRatio` to `HEAD_ONLY_RATIO` (head-only) — the
+    50/50 head+tail retained the provider request-context tail, defeating the redaction. Added a
+    RED tail-secret test and re-pinned the byte assertions as a range (`<= 1024`, `> 900`). The
+    assignment site is now `src/rlm.ts:1198` (was `:1188`).
 
 - [x] **T2 — Record the new surface in the truncation policy (D-spec G4)**
   - No RED test (documentation). In `docs/truncation-policy.md`:
     1. Add an Implementation-record row to the table (`:372-391`):
-       `| \`RlmResult.error\` (LLM provider error) | 1 KiB | 50/50 head+tail | #167 |`
+       `| \`RlmResult.error\` (LLM provider error) | 1 KiB | head-only | #167 |`
     2. Update the Non-goals line (`:342`) — it currently says "the `error` string is now capped
        (16 KiB, #144)" referring only to `RunResult.error`; add a clause distinguishing the
        RLM-level `RlmResult.error` (1 KiB, #167, plain `truncateText`, no sentinel wrap).

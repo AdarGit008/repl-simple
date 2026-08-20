@@ -34,6 +34,17 @@ The RED step is instead two **new** long-message tests (public return; nested re
 The monitor's "must be updated" wording is superseded by this finding; it is re-flagged to the
 monitor in the Phase 6 report.
 
+## Post-review correction (Phase 5 — head-only, not head+tail)
+
+The Phase 5 code review found that D3's 50/50 head+tail shape (`VALUE_HEAD_RATIO` = 0.5) **retains
+the final ~474 bytes** of a truncated provider error — exactly where provider request-context /
+retry-hints / request-IDs live — contradicting D3's own stated goal ("dropping long
+retry-hint/request-body tails"). Fix: switch to **head-only** (`HEAD_ONLY_RATIO`), so only the
+leading error-type prefix survives and the tail is dropped. This is recorded as **D7** and
+supersedes the `headRatio` wording in D3. Line references below that predate this fix cite the
+assignment site as `:1188` and the re-interpolation as `:1093`; after the fix they are `:1198` and
+`:1103` respectively (no semantic change — the numbers shifted because the fix added lines).
+
 ## Current state (fact base — verified by orchestrator, 2026-08-20)
 
 | Fact | Value |
@@ -85,8 +96,9 @@ redaction, not marker authentication. Tightening that is #166's scope, not this 
 
 A "small cap" per the issue, distinct from the 16 KiB `FEEDBACK_ERROR_MAX_BYTES` (sandbox
 `RunResult.error`). 1 KiB keeps a useful provider-error prefix (rate-limit/overloaded messages are
-short) while dropping long retry-hint/request-body tails. `headRatio` reuses `VALUE_HEAD_RATIO`
-(0.5) — value shape. Recorded as an assumption; veto point is the Phase 6 go/no-go.
+short) while dropping long retry-hint/request-body tails. **Shape: head-only (`HEAD_ONLY_RATIO`),
+per D7** — superseding the original 50/50 head+tail choice, which retained the very tail this
+redaction exists to drop. Recorded as an assumption; veto point is the Phase 6 go/no-go.
 
 ### D4 — Recovery clause is neutral, not `ERROR_RECOVERY`
 
@@ -102,6 +114,15 @@ truncation actually fires.
 `truncateText` is byte-identical under budget. `"boom"` and `"child llm failure"` are far under
 1 KiB, so `test/rlm.test.ts:880` and `:1104-1115` stay GREEN and become the "short message passes
 verbatim" pins. Do not rewrite their assertions; the RED tests are the two new long-message tests.
+
+### D7 — Head-only, not head+tail (Phase 5 review correction)
+
+`VALUE_HEAD_RATIO` (0.5) is a *value* shape — symmetric, "identified by both ends at once" — but a
+provider error message is chronological prose: the useful part is the leading error-type prefix,
+and the tail is where providers append retry hints, request bodies, and request IDs. The fix uses
+`HEAD_ONLY_RATIO` (imported from `src/truncate.ts`), dropping the tail entirely. A RED test pins it:
+a `TAIL-SECRET-REQID` marker at the very end of a 64 KiB error must not survive into
+`RlmResult.error`. This supersedes the D3 `headRatio` wording.
 
 ### D6 — The sentinel-forged-marker concern is #166's, not this flight's
 
@@ -156,7 +177,10 @@ RED tests (both must fail against current code, which returns/interpolates the f
    and does **not** contain `"NESTED-TAIL-SENTINEL"`. Today RED.
 
 GREEN: one line at `:1188` wraps the message in `truncateText(…, { maxBytes: RLM_ERROR_MAX_BYTES,
-headRatio: VALUE_HEAD_RATIO, recovery: RLM_ERROR_RECOVERY }).text`, plus the two constants.
+headRatio: HEAD_ONLY_RATIO, recovery: RLM_ERROR_RECOVERY }).text`, plus the two constants.
+
+Post-review RED test (D7): a `TAIL-SECRET-REQID` marker at the **very end** of a 64 KiB error must
+not survive into `RlmResult.error` — head-only drops the tail; head+tail would retain it.
 
 Regression pins that must stay GREEN: `test/rlm.test.ts:880` (short nested error verbatim) and
 `:1104-1115` (short return verbatim) — D5.
@@ -172,7 +196,7 @@ Regression pins that must stay GREEN: `test/rlm.test.ts:880` (short nested error
 
 ## Success criteria
 
-- `RlmResult.error` is truncated at 1 KiB (head 50%, neutral recovery) at the assignment site.
+- `RlmResult.error` is truncated at 1 KiB (head-only, neutral recovery) at the assignment site.
 - The nested `[rlm_query error: …]` re-interpolation carries the truncated message.
 - Short provider errors pass verbatim (existing `:880` and `:1104-1115` tests stay GREEN).
 - Two new RED-first tests pin the public-return and nested re-interpolation truncation.
