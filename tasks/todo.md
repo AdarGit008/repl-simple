@@ -60,22 +60,22 @@ scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` ar
 
 ## Checkpoint (after T2)
 
-- [ ] Issue acceptance met: both tool paths truncated head-only at 1 KiB before the sandbox
+- [x] Issue acceptance met: both tool paths truncated head-only at 1 KiB before the sandbox
       `RuntimeError`; `iterations[].result.error` bounded/redacted; short messages verbatim.
-- [ ] Two RED-first tests pin the llm_query and downgrade paths; one regression pin for short
+- [x] Two RED-first tests pin the llm_query and downgrade paths; one regression pin for short
       messages.
-- [ ] `docs/truncation-policy.md` records the two surfaces.
-- [ ] Full suite green; `check`/`build`/scoped-`lint` clean.
+- [x] `docs/truncation-policy.md` records the two surfaces.
+- [x] Full suite green; `check`/`build`/scoped-`lint` clean.
 
 ## DoD (from #184, reconciled)
 
-- [ ] Provider errors on the `llm_query` and downgraded-`rlm_query` paths are truncated at the
+- [x] Provider errors on the `llm_query` and downgraded-`rlm_query` paths are truncated at the
       source (head-only, ≤ 1 KiB) before they surface as a sandbox `RuntimeError`.
-- [ ] `iterations[].result.error` for these paths is bounded/redacted, not raw.
-- [ ] RED test: a request-context marker at the very end does not reach the model prompt via
+- [x] `iterations[].result.error` for these paths is bounded/redacted, not raw.
+- [x] RED test: a request-context marker at the very end does not reach the model prompt via
       `buildFeedback`, nor the caller via `iterations[].result.error`.
-- [ ] Short provider errors pass verbatim (regression pin).
-- [ ] No `truncateWithSentinels`; no change to `buildFeedback`'s `VALUE_HEAD_RATIO`.
-- [ ] No changes to `src/repl.ts`, `src/session.ts`, `src/sandbox.ts`, `src/truncate.ts`;
+- [x] Short provider errors pass verbatim (regression pin).
+- [x] No `truncateWithSentinels`; no change to `buildFeedback`'s `VALUE_HEAD_RATIO`.
+- [x] No changes to `src/repl.ts`, `src/session.ts`, `src/sandbox.ts`, `src/truncate.ts`;
       no #171/#182/#166 scope absorbed.
-- [ ] Truncation policy updated with the two new surfaces.
+- [x] Truncation policy updated with the two new surfaces.
