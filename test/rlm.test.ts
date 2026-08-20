@@ -909,6 +909,59 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
     // 1 — the budget is a hard ceiling, marker included, so no tolerance).
     assert.ok(!result.error!.includes("UNIQUE-TAIL-SENTINEL"));
     assert.ok(result.error!.includes("[…"), `no elision marker: ${result.error!.slice(0, 80)}`);
+    // Deterministic 1 KiB ceiling: a 64 KiB all-"A" payload with the marker in
+    // the elided middle collapses to 473 head bytes + marker + 474 tail bytes
+    // = exactly 1024 bytes (headRatio 0.5 keeps both ends, marker included).
+    assert.ok(new TextEncoder().encode(result.error!).length === 1024);
+    // headRatio 0.5 retains both head and tail — not a head-only cut.
+    assert.ok(
+      result.error!.startsWith("A"),
+      `truncated error lost its head: ${result.error!.slice(0, 40)}`,
+    );
+    assert.ok(
+      result.error!.endsWith("A"),
+      `truncated error lost its tail: ${result.error!.slice(-40)}`,
+    );
+    // The neutral recovery clause renders inside the elision marker.
+    assert.ok(
+      result.error!.includes("The full provider error is not surfaced."),
+      "recovery clause missing from the truncated error",
+    );
+  });
+
+  it("passes a short non-Error throw verbatim through the String(err) branch", async () => {
+    // D53's extraction branches on `err instanceof Error`: an Error carries
+    // `.message`, anything else is stringified. A short string throw must
+    // survive byte-for-byte (4 bytes, far under the 1 KiB cap).
+    const llm: LlmClient = {
+      async query() {
+        throw "boom";
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    assert.equal(result.status, "error");
+    assert.equal(result.error, "boom");
+  });
+
+  it("truncates a long non-Error throw via the String(err) branch", async () => {
+    // The String(err) branch feeds the same truncateText call as `err.message`:
+    // a long string throw must be cut to the 1 KiB ceiling exactly like an
+    // Error. The marker sits in the elided middle because headRatio 0.5 keeps
+    // the tail — a marker appended at the very end would survive truncation
+    // (the same pitfall the public-return test documents).
+    const llm: LlmClient = {
+      async query() {
+        throw `${"Z".repeat(32 * 1024)}NONERR-TAIL${"Z".repeat(32 * 1024)}`;
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    assert.equal(result.status, "error");
+    assert.ok(!result.error!.includes("NONERR-TAIL"), "non-Error tail marker leaked");
+    assert.ok(result.error!.includes("[…"), `no elision marker: ${result.error!.slice(0, 80)}`);
     assert.ok(new TextEncoder().encode(result.error!).length <= 1024);
   });
 
@@ -950,6 +1003,19 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
       `unexpected answer prefix: ${result.answer.slice(0, 120)}`,
     );
     assert.ok(!result.answer.includes("NESTED-TAIL-SENTINEL"));
+    // The re-interpolated answer is bounded: the fixed
+    // "outer: [rlm_query error: error] " prefix plus the ≤1 KiB truncated
+    // child error.
+    assert.ok(
+      new TextEncoder().encode(result.answer).length <=
+        1024 + new TextEncoder().encode("outer: [rlm_query error: error] ").length,
+    );
+    // The child's truncation carries the neutral recovery clause into the
+    // parent's answer.
+    assert.ok(
+      result.answer.includes("The full provider error is not surfaced."),
+      "nested recovery clause missing",
+    );
   });
 });
 
