@@ -63,8 +63,9 @@ export interface RlmOptions {
   /**
    * System prompt for the LLM. Defaults to a registry-built prompt
    * (`DEFAULT_RLM_SYSTEM_PROMPT` plus tool stubs and Python rules).
-   * The D17 sentinel-authentication rule is always appended after a
-   * caller-supplied prompt, so callers need NOT restate it (D67).
+   * The D17 sentinel-authentication rule is appended after any non-empty
+   * caller-supplied prompt (an empty string is preserved verbatim), so
+   * callers need NOT restate it (D67).
    */
   systemPrompt?: string;
   /** Max RLM iterations before giving up. Default: 10. */
@@ -1168,7 +1169,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   // non-empty caller-supplied prompt has the D17 sentinel rule appended after
   // it so the forged-elision-marker defense can never be dropped by omission
   // (D67); an empty-string override is preserved verbatim (D65's zero-token
-  // floor test) and the default path already carries the rule.
+  // floor test) and the default path already carries the rule. The guard must
+  // test options.systemPrompt (the option) — not the resolved systemPrompt,
+  // which is the non-empty built default and would double-append the rule on
+  // the default path (D67).
   systemPrompt = options.systemPrompt ?? (await buildSystemPrompt(registry));
   if (options.systemPrompt) {
     systemPrompt = `${options.systemPrompt}\n${SENTINEL_RULE}`;
