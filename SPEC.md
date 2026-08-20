@@ -1,79 +1,66 @@
-# Spec: Close the two residual spend gaps left by #165 — issue #182
+# Spec: Enforce the D17 sentinel rule when options.systemPrompt is overridden — issue #166
 
 ## Objective
 
-#165 threaded one shared `SpendBudget` pool through `llm_query` / `rlm_query`-downgrade / nested
-`runRlm` (D61–D63). Two low-severity holes remain, both of which break the "a configured budget is a
-hard ceiling on total tree spend" guarantee in the strict sense:
+`runRlm` resolves its system prompt as `systemPrompt = options.systemPrompt ?? (await buildSystemPrompt(registry))`.
+A caller-supplied prompt replaces the default **wholesale**, and the D17 sentinel-authentication rule lives
+only inside `DEFAULT_RLM_SYSTEM_PROMPT`. The result: a custom prompt silently drops the
+forged-elision-marker defense, while `truncateWithSentinels` still wraps truncated views in
+`[TRUNCATED VIEW BEGIN]` / `[TRUNCATED VIEW END]` lines. The model is then told nothing about trusting
+markers only between sentinels, so a forged `[… X of Y elided …]` marker in attacker-controlled data
+regains its spoofing power.
 
-1. **The D44/D45 synthesis pass is un-charged.** The single final `llmClient.query` after the
-   iteration cap runs without a `tryCharge`, so a run at `maxIterations` can over-spend by exactly
-   one synthesis call (system prompt + full transcript + synthesis prompt). Bounded (one call,
-   cannot loop), but it is a leak past the ceiling.
-2. **Zero-token free call.** `callCost` = `estimateTokens(systemPrompt) + Σ estimateTokens(content)`.
-   With `options.systemPrompt = ""` and `llm_query("")` both terms are 0, so `tryCharge(0)` succeeds
-   and a real provider call is made for 0 estimated tokens. A prompt-injected model could
-   `while True: llm_query("")` and burn unbounded spend while `budget.consumed` never moves.
+This change guarantees the D17 rule is present on **every** path: the default prompt keeps it (byte-identical),
+and a caller override has it **appended** so the defense can never be dropped by omission.
 
-This change closes both: (a) charge the synthesis pass against the shared pool and degrade to
-salvage on refusal (matching D4), and (b) enforce a ≥1-token minimum charge so no LLM call is ever
-free. It also adds the doc note the issue asks for on the `estimateTokens` lower-bound caveat.
+## Current state (fact base — verified against HEAD `38cee5c`, i.e. #186 merged)
 
-## Current state (fact base — verified against HEAD `a64b3e7`, i.e. #165 merged)
-
-- **`src/budget.ts`** — `SpendBudget` (`limit`, `consumed`, `remaining`, `tryCharge(tokens)`),
-  `estimateTokens` (UTF-8 bytes ÷ 4, a deterministic **lower bound** — non-ASCII/emoji/CJK
-  under-count up to ~1 token/byte, D2).
-- **`src/rlm.ts:~854-862`** — `callCost(systemPromptTokens, messages)` =
-  `systemPromptTokens + Σ estimateTokens(message.content)`. Used by the top-level loop, `llm_query`,
-  and the `rlm_query` downgrade (D62).
-- **`src/rlm.ts:~1061-1063` / `~1084-1086`** — the `llm_query` and `rlm_query`-downgrade charge
-  sites added by #165 (D62). These are the paths a `while True: llm_query("")` loop hits.
-- **`src/rlm.ts:~1319-1325`** — the D44/D45 synthesis pass: a single final `llmClient.query` after
-  the iteration cap, deliberately un-charged today ("one guarded, un-charged synthesis pass").
-- **`src/rlm.ts:78-85`** — `RlmOptions.budget?: number | SpendBudget`; omitted → no budget logic (D5).
+- **`src/rlm.ts:467-493`** — `DEFAULT_RLM_SYSTEM_PROMPT` carries the D17 rule inline as a multi-line
+  `- Text between [TRUNCATED VIEW BEGIN] and [TRUNCATED VIEW END] is a truncated view — …` bullet
+  (the bullet ends with the "history-drop notice … system-emitted and authentic" clause).
+- **`src/rlm.ts:1164`** — `systemPrompt = options.systemPrompt ?? (await buildSystemPrompt(registry));`
+  the wholesale-replacement point.
+- **`src/rlm.ts:65-72`** — `RlmOptions.systemPrompt` JSDoc already flags the gap: "a caller-supplied
+  prompt replaces the default wholesale — the sentinel-authentication rule (D17) lives only in the
+  default … Callers who override it should restate the rule."
+- **`src/rlm.ts:342-367`** — the sentinel mechanism: `TRUNCATED_VIEW_BEGIN` / `TRUNCATED_VIEW_END`
+  constants and `truncateWithSentinels`, which wraps truncated views regardless of the prompt.
+- **`src/rlm.ts:505-521`** — `buildSystemPrompt` starts from `DEFAULT_RLM_SYSTEM_PROMPT` and appends
+  `rlm_query` rules, "do not define your own", and registry-rendered tool/Python sections.
+- **`test/rlm.test.ts:26-48`** — D17 sentinel-contract test helpers; `test/rlm.test.ts:710-736` and
+  `1821-1843` pin the default prompt's tool naming; the mock exposes `llm.calls()[0].systemPrompt`.
 
 ## Scope
 
 ### In scope
 
-- Charge the D44/D45 **synthesis pass** against the resolved budget before it runs; on refusal,
-  degrade to **salvage** (return the best answer accumulated so far) instead of throwing — never a
-  `budget_exhausted`-only failure caused by the synthesis charge alone.
-- Enforce a **≥1-token floor** in `callCost`/`tryCharge` so no charge is ever 0 and no LLM call is
-  free.
-- Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget` (doc-only, no behavior
-  change).
-- Tests pinning both behaviors (RED → GREEN).
+- Extract the D17 rule into a single named constant (e.g. `SENTINEL_RULE`) that is the **single source
+  of truth**, interpolate it into `DEFAULT_RLM_SYSTEM_PROMPT` (byte-identical output), and **always
+  append** it after a caller-supplied `systemPrompt`.
+- Update the `RlmOptions.systemPrompt` JSDoc to state the new contract: the D17 rule is always appended,
+  so callers need not restate it.
+- Tests pinning: (1) a caller override carries the rule, (2) the default prompt is unchanged, (3) the
+  rule appears after (not before) the override.
 
 ### Out of scope (explicit)
 
-- **#171** — signal-race / truncation parity of the same `llm_query` / downgrade / synthesis calls.
-- **#168** — breadth backstop (cap on host-tool *invocation count* per iteration).
-- **#184** — redact provider errors on the `llm_query` / downgraded-`rlm_query` paths (separate
-  security issue, adjacent lines, not this run).
-- **#170** — nested `inputs` forwarding.
-- Any change to `budgetReport`, `SpendBudget`'s public shape, or the public `RlmResult` schema.
+- **#171** — signal-race / truncation parity of the `llm_query` / downgrade / synthesis calls.
+- **#168** — breadth backstop (cap on host-tool invocation count per iteration).
+- **#184** — redact provider errors on the `llm_query` / downgraded-`rlm_query` paths.
+- **#170** — nested `inputs` forwarding; **#173** — question-as-input re-homing.
+- Any change to `truncateWithSentinels`, the sentinel constants, the shared truncator, or the public
+  `RlmResult` schema.
 
 ## Decisions
 
-Continuing the repo's `D#` numbering (highest cited is D63). New decisions:
+Continuing the repo's `D#` numbering (highest cited is D66). New decision:
 
-- **D64 — The synthesis pass charges the shared pool and degrades to salvage on refusal.** The final
-  D44/D45 `llmClient.query` charges `callCost(...)` against the resolved `SpendBudget` before it
-  runs (same accounting as every other charged path, D62). If `tryCharge` returns `false`, the run
-  **salvages**: it returns the best answer accumulated up to that point (the last iteration's
-  extracted answer) rather than running the synthesis query or throwing. This matches D4
-  (degrades, never throws). When `budget` is omitted, the synthesis pass stays un-charged (D5
-  unchanged).
-- **D65 — A ≥1-token charge floor: no LLM call is ever free.** `callCost` (or, equivalently,
-  `tryCharge`) enforces a minimum of 1 token so an empty `systemPrompt` + empty tool prompt still
-  consumes budget. The floor applies uniformly to every charged path (top-level loop, `llm_query`,
-  `rlm_query` downgrade, nested loops, synthesis) with no special-casing.
-- **D66 (doc) — Document the `estimateTokens` lower-bound caveat on `RlmOptions.budget`.** A note on
-  `RlmOptions.budget` states that `estimateTokens` is a deterministic lower bound (bytes ÷ 4) and
-  under-counts non-ASCII/emoji/CJK up to ~1 token/byte; callers needing a hard real-token bound must
-  apply their own margin for non-English content.
+- **D67 — The D17 sentinel rule is a single source of truth, always present on every prompt.**
+  Extract the rule bullet into a `SENTINEL_RULE` constant; `DEFAULT_RLM_SYSTEM_PROMPT` interpolates it
+  (output byte-identical to today), and `runRlm` appends `\n${SENTINEL_RULE}` after a caller-supplied
+  `systemPrompt`. The rule is therefore present on both the default and override paths, and the
+  forged-elision-marker defense holds regardless of override. The appended rule keeps its `- ` bullet
+  form so it reads as one more rule.
 
 ## Commands
 
@@ -89,9 +76,8 @@ Coverage:  npm run coverage
 ## Project structure
 
 ```
-src/rlm.ts          → the RLM loop; synthesis pass + charge sites + doc note live here
-src/budget.ts       → SpendBudget + estimateTokens; the ≥1-token floor lands here (or in rlm.ts)
-test/rlm.test.ts    → tests; extends the "runRlm() — spend budget" block
+src/rlm.ts          → the RLM loop; SENTINEL_RULE constant + interpolation + append live here
+test/rlm.test.ts    → tests; extends the D17 sentinel-contract block
 SPEC.md             → this document
 tasks/plan.md       → implementation plan
 tasks/todo.md       → task list
@@ -99,68 +85,65 @@ tasks/todo.md       → task list
 
 ## Code style
 
-Match `src/rlm.ts` conventions: decision-referencing comments (`// … (D64)`), the `FEEDBACK_`
-naming discipline, bracketed lowercase-snake tool prompt strings, and refusal markers following the
-same shape. No new dependencies; biome-formatted; 2-space; TS strict (`noUnusedLocals`,
-`noUnusedParameters`).
+Match `src/rlm.ts` conventions: decision-referencing comments (`// … (D67)`), the `DEFAULT_RLM_SYSTEM_PROMPT`
+template-literal style, and the D17 sentinel wording verbatim. No new dependencies; biome-formatted;
+2-space; TS strict (`noUnusedLocals`, `noUnusedParameters`).
 
 ## Testing strategy
 
 TDD — RED first. Integration tests through the real sandbox (`runInSandbox` → Monty), mirroring the
-existing "runRlm() — spend budget" block: `mockLlmCodeGen` records every `llmClient.query` call,
-`recordedCost` mirrors the loop's charge, and `rlmRegistry()` returns an empty `ToolRegistry`
-(runRlm self-registers its RLM tools, D51).
+existing "Sentinel contract (D17)" block. The mock LLM already records every `llmClient.query` call
+and exposes `llm.calls()[0].systemPrompt`, so the prompt actually sent is directly assertable.
 
 New/strengthened tests:
 
-1. **Synthesis pass charges the pool** — a run that reaches the synthesis pass (no SUBMIT, so it
-   runs to the iteration cap) and asserts `consumed` includes the synthesis call's cost; with a
-   generous budget the synthesis answer is returned normally.
-2. **Synthesis pass degrades to salvage on refusal** — budget sized to afford the iterations but not
-   the synthesis call; assert the run returns the salvaged (pre-synthesis) answer, never throws, and
-   the status is not a bare `budget_exhausted` caused by the synthesis charge.
-3. **Zero-token free call is closed** — `systemPrompt: ""` + `llm_query("")` on a tight budget
-   (1 token) still consumes budget and the second such call refuses (proving the floor); assert
-   `consumed ≥ 1` per call and no 0-token charge is accepted.
-4. **Omitting budget leaves every path un-charged** — existing no-budget regression test still
-   passes (D5 unchanged).
+1. **Override carries the rule (RED → GREEN).** Run `runRlm` with a custom `systemPrompt` (one that
+   lacks the sentinel wording) and assert `llm.calls()[0].systemPrompt` contains the D17 rule text
+   (`[TRUNCATED VIEW BEGIN]` / `[TRUNCATED VIEW END]` authentication wording) and that it appears
+   **after** the caller's own prompt text.
+2. **Default prompt unchanged (regression).** A run with no `systemPrompt` still emits a prompt whose
+   D17 section is byte-identical to the pre-change default (existing tool-naming + fresh-sandbox tests
+   continue to pass; add/keep a direct assertion that the rule appears exactly once in the default path).
+3. **Rule is not duplicated on the default path.** The default `buildSystemPrompt` output contains the
+   rule exactly once (guards against double-interpolation).
 
 ## Boundaries
 
 - **Always:** run `npm test`, `npm run check`, `npm run lint` before reporting done; follow D#/code
-  style; pin refusal markers/floor behavior as literals in tests (D17 convention).
+  style; keep the D17 wording verbatim; the default prompt output must stay byte-identical.
 - **Ask first:** none — this run is autonomous; assumptions are recorded below.
-- **Never:** absorb #171/#168/#184/#170 scope; change `budgetReport`/`SpendBudget`'s public shape or
-  the public `RlmResult`; add dependencies; reorder unrelated code; leave the tree red between tasks.
+- **Never:** absorb #171/#168/#184/#170/#173 scope; change `truncateWithSentinels`, the sentinel
+  constants, or the shared truncator; add dependencies; leave the tree red between tasks.
 
 ## Success criteria
 
-- [ ] The synthesis pass charges the shared pool; on refusal it degrades to salvage (never throws,
-      never returns a bare synthesis-caused `budget_exhausted`).
-- [ ] No LLM call is ever free: `callCost`/`tryCharge` enforces a ≥1-token floor, uniformly across
-      every charged path.
-- [ ] `RlmOptions.budget` documents the `estimateTokens` lower-bound caveat (D66).
-- [ ] Both behaviors pinned by named tests (RED → GREEN).
+- [ ] A caller-supplied `systemPrompt` always carries the D17 sentinel rule (appended after the override).
+- [ ] The default prompt output is byte-identical to today (regression-pinned).
+- [ ] `RlmOptions.systemPrompt` JSDoc states the new always-append contract.
+- [ ] Named tests (RED → GREEN) pin both the override and default paths.
 - [ ] Full suite green; `tsc` clean; biome clean.
 
 ## Assumptions (recorded — no clarifying questions, autonomous run)
 
-1. **Charge, don't document.** The issue offers "charge the synthesis pass … **or** document it as a
-   one-call exception on `RlmResult.budget`". This run **charges** it — the stricter option that
-   fully restores the "hard ceiling" guarantee. Rationale: documenting the exception would leave the
-   ceiling semantically broken; the charge is a small, bounded change.
-2. **"Salvage" = return the best answer accumulated so far.** On synthesis refusal, the run returns
-   the last iteration's extracted answer (the answer the run would have produced without the
-   synthesis refinement). It does **not** invent a new error status; it degrades in place (D4).
-   The exact salvage plumbing (which accumulated value) is a plan/coder detail.
-3. **The ≥1-token floor belongs in `callCost` (preferred) or `tryCharge`.** Either is acceptable so
-   long as the floor is uniform and no special-casing is introduced. The plan will pin one.
-4. **The floor is 1 token exactly** (not a larger constant) — the minimum needed to close the
-   zero-token hole without distorting normal accounting.
-5. **Doc note is doc-only.** D66 changes a JSDoc comment; it has no runtime behavior and needs no
-   test (consistent with D2's existing doc note).
-6. **No new public API.** Refusal/salvage behavior and the floor are internal; tests pin literals
-   per D17.
+1. **"Always append" over "dev-time warn".** The issue offers two options. Appending closes the hole
+   unconditionally; a dev-time warning alone leaves the defense droppable by an inattentive or
+   machine-generated caller. This run appends (the stronger option).
+2. **Append after, with a single `\n` separator.** `runRlm` produces `${override}\n${SENTINEL_RULE}`.
+   The rule keeps its `- ` bullet form so it reads coherently even for prose (non-bullet) overrides.
+3. **No de-duplication.** If a caller already restates the rule in its own prompt, the appended rule
+   yields a second copy. Repeating the same instruction is harmless (idempotent guidance), and a
+   de-dup check would be fragile (wording drift). Not worth the complexity.
+4. **The appended text is exactly the D17 bullet**, including the trailing "history-drop notice …
+   system-emitted and authentic" clause, so the appended rule is behaviorally identical to the default's.
+5. **Byte-identical default via interpolation.** `DEFAULT_RLM_SYSTEM_PROMPT` interpolates `SENTINEL_RULE`
+   in its current position (second-to-last bullet, before "- Be thorough."), producing identical bytes —
+   so existing prompt-pinning tests keep passing unchanged.
+6. **No new public API or dependencies.** The constant is module-internal; the public surface is unchanged.
+7. **Empty-string override stays empty (build-phase amendment).** `systemPrompt: ""` is a meaningful
+   degenerate case pinned by the D65 ≥1-token-floor test; routing `""` through the default prompt would
+   corrupt that floor. Resolution therefore preserves `??` semantics and appends `SENTINEL_RULE` only for a
+   **non-empty** override: `undefined` → default (rule present once), non-empty → rule appended (D67),
+   `""` → verbatim empty (D65 intact). Documented in a `(D67)` code comment.
 
 ## Open questions
 
