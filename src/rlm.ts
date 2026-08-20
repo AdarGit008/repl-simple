@@ -1104,11 +1104,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           preamble: options.preamble,
           systemPrompt: options.systemPrompt,
           signal: options.signal,
-          // The child is bounded by maxIterations/maxDepth, not the parent's
-          // spend pool — a nested loop must not share/compete for the
-          // parent's SpendBudget (D52). `onIteration` is deliberately not
-          // forwarded: child iterations are the child's own.
-          budget: undefined,
+          // The child shares the parent's SpendBudget pool (D61): every
+          // nested loop's iterations charge the same pool, so a configured
+          // budget is a hard ceiling on total tree spend. `onIteration` is
+          // deliberately not forwarded: child iterations are the child's own.
+          budget,
           inputs: { context: merged },
         });
 

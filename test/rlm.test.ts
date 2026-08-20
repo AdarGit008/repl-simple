@@ -3800,6 +3800,62 @@ describe("runRlm() — spend budget", () => {
     assert.equal(result.answer, "[rlm_query refused: spend budget exhausted]");
     assert.equal(llm.calls().length, 1, "rlm_query must refuse before calling the LLM");
   });
+
+  it("12. nested rlm_query shares the parent's pool", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nnested = rlm_query("sub")\nSUBMIT("outer: " + nested)\n```',
+      '```python\nSUBMIT("from nested")\n```',
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: 1_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "outer: from nested");
+
+    // The child loop charges the same pool as the parent's code-gen, so the
+    // total consumed equals the sum of every recorded call's cost (D61).
+    assert.equal(llm.calls().length, 2);
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("13. a pool that cannot afford the child's second iteration surfaces budget_exhausted", async () => {
+    const parentCode = '```python\nnested = rlm_query("sub")\nSUBMIT("outer: " + nested)\n```';
+    const childFirst = "```python\nprint('child iteration 1')\n```";
+    const childSecond = '```python\nSUBMIT("child answer")\n```';
+    const codes = [parentCode, childFirst, childSecond];
+
+    // Probe the per-call costs once without a budget, then size the shared
+    // budget so the parent's code-gen + the child's FIRST iteration fit but the
+    // child's SECOND iteration does not (D61).
+    const { llm: probe } = mockLlmCodeGen(codes);
+    await runRlm("task", { llmClient: probe, registry: rlmRegistry(), maxIterations: 5 });
+    const calls = probe.calls();
+    assert.equal(calls.length, 3, "the probe must run the child's second iteration");
+    const affordable = recordedCost(calls[0]) + recordedCost(calls[1]);
+
+    const { llm } = mockLlmCodeGen(codes);
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      budget: affordable,
+    });
+
+    // No throw: the child's exhaustion surfaces through the parent's rlm_query
+    // error branch (D52), and the child stops before its second iteration.
+    assert.equal(result.status, "ok");
+    assert.ok(
+      result.answer.includes("[rlm_query error: budget_exhausted]"),
+      `answer should surface the child's budget exhaustion:\n${result.answer}`,
+    );
+    assert.equal(llm.calls().length, 2, "the child's second iteration must not run");
+  });
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {

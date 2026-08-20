@@ -18,7 +18,7 @@ Source of truth: `SPEC.md` (D61–D63) + `tasks/plan.md`.
     `onRLMQuery`.
   - Verify: `npm test` (full), `npm run check`, `npm run lint` all green.
 
-- [ ] **T2 — Thread the shared pool into nested `runRlm`; update the D52 comment**
+- [x] **T2 — Thread the shared pool into nested `runRlm`; update the D52 comment**
   - RED: add failing tests:
     - nested `rlm_query` shares the parent's pool — generous budget; assert
       `result.budget.consumed === Σ recordedCost(parent + child calls)`.
