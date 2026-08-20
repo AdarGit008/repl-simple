@@ -14,7 +14,7 @@ Source of truth: `SPEC.md` (D64–D66) + `tasks/plan.md`.
   - Verify: `npm test` (full), `npm run check`, `npm run lint` all green; existing #165 spend tests
     (non-empty prompts) unaffected.
 
-- [ ] **T2 — Charge the D44/D45 synthesis pass and degrade to salvage on refusal (D64)**
+- [x] **T2 — Charge the D44/D45 synthesis pass and degrade to salvage on refusal (D64)**
   - RED: add failing tests:
     - synthesis charges — a run with no SUBMIT (runs to the iteration cap) and a generous budget;
       assert `result.budget.consumed` includes the synthesis call's cost and the final answer is the
