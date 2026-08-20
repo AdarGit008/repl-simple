@@ -339,7 +339,7 @@ Rules:
 
 - Token-based budgets. Bytes are cheap, deterministic and tokenizer-independent.
 - Structure-aware `output` elision — Q4, blocked on #69.
-- Truncating `errorKind`. The `error` string is now capped (16 KiB, #144); `errorKind` stays uncapped as a small bounded enum string.
+- Truncating `errorKind`. The two `error` surfaces are now capped — `RunResult.error` (sandbox, 16 KiB, #144) and `RlmResult.error` (LLM provider error, 1 KiB, #167, plain `truncateText` with no sentinel wrap because the public return is an API surface); `errorKind` stays uncapped as a small bounded enum string.
 
 ---
 
@@ -387,6 +387,7 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `buildFeedback` `error` | 16 KiB | 50/50 head+tail | #144 |
 | `buildInitialPrompt` `question` | 64 KiB | 50/50 head+tail | #144 |
 | `runRlm` assistant reply (conversation copy) | 256 KiB | 50/50 head+tail | #145 |
+| `RlmResult.error` (LLM provider error) | 1 KiB | head-only | #167 |
 
 Every `truncateText` row in this table goes through one implementation, `src/truncate.ts`, per
 invariant 4 — the `#74`/`#144`/`#145` rows too, not only the four `#29`/`#34` rows. The conversation
@@ -444,6 +445,10 @@ derives from the budget via `formatSize` ("256.0KB"); the quoted error and outpu
 value budgets (the `> ` prefix doubles pathological newline-only lines — bounded, not a growth
 vector); and the aggregate input-preview cut is
 block-level elision over whole per-value previews (D15), so no cut can split a fence or a header.
+
+**#167 (RlmResult.error).** The LLM provider's rejection is bounded at the source. The D53 catch branch in `runRlm` — the `RlmResult.error` assignment site — no longer returns the provider message verbatim: it passes the message through the one shared `truncateText` at `RLM_ERROR_MAX_BYTES` (1 KiB, head-only) — keeps only the leading error-type prefix and drops the tail, where provider request-context / retry-hints / request-IDs live. The call is plain `truncateText`, not `truncateWithSentinels`, because `RlmResult.error` is a public API return read by the caller, not a model-facing view — a sentinel wrap would leak `[TRUNCATED VIEW BEGIN]`/`[TRUNCATED VIEW END]` into the caller's result (Exception 5's authentication is for prompt-bound views only). The recovery clause is deliberately neutral — "The full provider error is not surfaced." — rather than `ERROR_RECOVERY`, because an LLM client rejection never touches the sandbox: there is no Python to re-run, so "catch the exception and print the full traceback" is inapplicable (policy Q3 — never advertise a route that does not exist). The nested `rlm_query` error branch reads the already-bounded `nested.error`, so the truncation carries through the re-interpolation without editing the template.
+
+**Redaction shape (general rule):** redaction cuts are head-only (`HEAD_ONLY_RATIO`) — 50/50 head+tail is a *value* shape (identified by both ends at once) and keeps the tail, which is exactly where provider request-context / retry-hints / request-IDs live. Use head-only for anything whose goal is *redaction* rather than symmetric display.
 
 **Exception 3 — the conversation byte count uses `TextEncoder`, and that *is* byte measurement.**
 D2 writes the budget as `Buffer.byteLength`; `TextEncoder.encode().length` is UTF-8 byte measurement

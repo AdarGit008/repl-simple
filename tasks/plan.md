@@ -1,88 +1,57 @@
-# Implementation Plan: issue #177 — `repl_resume` re-applies the suspended run's clamped limits; pin the extension's signal forward
+# Implementation Plan: issue #167 — redact `RlmResult.error` before return and nested re-interpolation
 
 ## Overview
 
-`Session.run` persists the suspended run's raw `RunOptions` into `suspendedRunOpts`
-(`src/session.ts:366`), so the clamped limits granted to a `repl` call survive the suspension.
-`Session.resume` throws that record away: its `wrappedRunOpts` (`src/session.ts:435-439`) is built
-purely from the caller's `runOpts` and never reads `suspendedRunOpts`, so the resumed continuation
-runs under `limitsConfig()` defaults (30 s / 512 MiB) rather than the grant the original call was
-given. The fix is one field: merge `suspendedRunOpts.limits` in when the caller supplied none
-(D1). Separately, `repl_resume.execute` already forwards the abort `signal` to
-`ReplRunner.resume` (`extensions/repl-extension.ts:371-375`), but no test proves it — the second
-deliverable is a pin test at that extension seam (D2).
+`RlmResult.error` is assigned raw at `src/rlm.ts:1188` (`err.message`) and has exactly two
+consumers: the public `status: "error"` return, and the nested-feedback re-interpolation at
+`src/rlm.ts:1093` (`[rlm_query error: ${nested.status}] ${nested.error}`). Provider error text can
+carry request context (prompt snippets, request IDs, retry hints). The fix is a single choke point:
+truncate the message at the assignment site with the shared `truncateText` (invariant 4 — "the only
+place that cuts") at a 1 KiB cap, with a neutral recovery clause. Both consumers then read the
+bounded value; short messages pass through byte-identical.
 
 ## Architecture Decisions (SPEC D1–D6, not restated)
 
-- **D1 — fix lives in `Session.resume`, not the schema.** One merge field:
-  `limits: runOpts?.limits ?? this.suspendedRunOpts?.limits` (D4 precedence: caller wins via `??`;
-  `"unbounded"` is truthy and carries through). `onApproval`/`signal` stay caller-supplied.
-- **D2 — signal forwarding is a test-only gap** at the extension layer; `ReplRunner`→`Session`→sandbox
-  is already pinned (#150, D7 test 3). No `src/repl.ts` / `extensions/repl-extension.ts` change.
-- **D3 — `limits` field only.** No `mount`/`inputs`/`scriptName`/`maxStdoutBytes` (that is #84's).
-- **D5/D6 — env discipline.** `limitsConfig()` reads `process.env` at call time, so the Session-level
-  tests snapshot/clear `REPL_MAX_DURATION_SECS` / `REPL_MAX_MEMORY_MB` (the `before`/`after` pattern
-  in `test/extension.test.ts:207-231`), and the extension pin restores the stubbed prototype in `finally`.
+- **D1 — source choke point at `:1188`.** No edit at `:1093`; the re-interpolation reads the
+  already-bounded `nested.error`.
+- **D2 — plain `truncateText`, not `truncateWithSentinels`.** The public return is an API surface;
+  D17 sentinels must not leak to callers. The model-facing nested error carries an unauthenticated
+  `[…]` marker — accepted, #166's scope.
+- **D3 — `RLM_ERROR_MAX_BYTES = 1024`.** "Small cap"; 16 KiB is the sandbox `RunResult.error` budget
+  (`FEEDBACK_ERROR_MAX_BYTES`), a different field. **Shape: head-only via `HEAD_ONLY_RATIO` (D7)** —
+  superseding the original `VALUE_HEAD_RATIO` (0.5) 50/50 split, which retained the request-context tail.
+- **D4 — `RLM_ERROR_RECOVERY = "The full provider error is not surfaced."`** Neutral for both
+  audiences; `ERROR_RECOVERY` (Python re-run) is semantically wrong for an LLM rejection.
+- **D5 — existing short-message tests (`:880`, `:1104-1115`) stay GREEN, not rewritten.** `truncateText`
+  is byte-identical under budget; `"boom"` (4 B) and `"child llm failure"` (17 B) are far under 1 KiB.
 
-## Chosen test-observation mechanism (SPEC assumption 3)
+## Chosen test-observation mechanism
 
-**A below-default `maxMemory` observed as `RunError.errorKind === "memory"`** — the Option (i)
-behavioural seam, but with the *memory* knob instead of the *duration* knob the SPEC example named.
+Direct assertion on the public seam — the existing `runRlm()` tests already drive `runRlm` with a
+fake `LlmClient` (issue test 4 at `:1104`, the nested `rlm_query` test at `:855`). Two new tests:
 
-Why it proves the fix, deterministically:
+1. **Public return.** Fake `LlmClient.query` throws `Error("A".repeat(64 * 1024) + "UNIQUE-TAIL-SENTINEL")`.
+   Assert `status === "error"`, `result.error` lacks `UNIQUE-TAIL-SENTINEL`, contains `[…`, and its
+   UTF-8 byte length ≤ 1024 (+ the marker/recovery bytes — a small documented tolerance).
+2. **Nested re-interpolation.** Child `rlm_query` throws a huge message ending in
+   `NESTED-TAIL-SENTINEL`; parent does `SUBMIT("outer: " + result)`. Assert `answer` starts with
+   `"outer: [rlm_query error: error] "` and lacks `NESTED-TAIL-SENTINEL`.
 
-- The resumed worker's limits come from the same place as the run path:
-  `resumeSuspended` hands `{ limits: toResourceLimits(runOpts?.limits) }` to the checkout
-  (`src/sandbox.ts:1313`) and `hostDeadlineAt(runOpts?.limits)` (`:1308`). With
-  `runOpts.limits === undefined`, every knob falls back to `limitsConfig()` (`:752-762`).
-- `maxMemory` is enforced **on resumed instructions**, not just the first run:
-  `classifyResumeError`'s contract states a resume "may breach `maxDurationSecs` or `maxMemory` on any
-  instruction it executes after the resume" (`src/sandbox.ts:145`), and `runtimeKind` maps
-  `MontyRuntimeError` typeName `"MemoryError"` → `"memory"` (`:187-192`).
-- The assertion has **no timing dependence**: `bytearray(128 MiB)` against a 32 MiB ceiling fails at
-  the allocation; against the 512 MiB default it succeeds. Wide margins on both sides (128 MiB > 32 MiB
-  by 4×; 128 MiB + ~10 MiB baseline ≈ 138 MiB < 512 MiB). The discriminating signal is the error
-  *kind*, so the test is immune to message rewording.
-- The SUSPEND phase never allocates: the gated call is the first statement; the `bytearray(...)` line
-  executes only after the resume approves, so the 32 MiB ceiling comfortably survives the
-  suspend/resume machinery (~8.7 MiB bare session per `src/sandbox.ts:731`).
-
-Rejected alternatives:
-
-- **Option (i) via `maxDurationSecs` (busy loop → timeout):** `maxDurationSecs` is polled inside the
-  worker and advances only while the interpreter executes (`src/types.ts` `RunLimits` JSDoc), so the
-  moment a loop trips it is poll-granularity-dependent — flaky under load. Memory is a hard, immediate
-  failure.
-- **Option (ii) spy/seam:** `resumeSuspended` is an ESM named import in `src/session.ts:1`, not
-  reassignable from a test; the suite's only stub pattern is prototype stubbing
-  (`test/extension.test.ts:347-372`), which cannot reach a module-level binding without a new
-  abstraction — which the SPEC forbids for a single `??` merge field.
-- **Option (iii) dump/load serialisation:** `Session.dump()` already serializes `suspendedRunOpts.limits`
-  (`src/session.ts:542`), so that assertion is GREEN before the fix — it proves storage, not
-  re-application, and cannot be the RED test.
-
-**Post-build finding (correction).** The memory seam above does **not** discriminate the fix:
-verified in a scratch checkout with the one-line fix removed, both Session tests still pass — Monty's
-snapshot restore already preserves `maxMemory` (and `maxDurationSecs`, `gcInterval`,
-`maxRecursionDepth`) across resume (`node_modules/@pydantic/monty/dist/session.d.ts`: "The dump
-restores its own resource limits and type-check state"). The two Session tests are therefore
-**acceptance tests of an invariant Monty already guarantees**, not RED-for-the-fix tests. The fix's
-observable effect is limited to the host-side `maxWallClockSecs` knob (`hostDeadlineAt`,
-`src/sandbox.ts:771-773` / `:1308`), which the `repl`/`repl_resume` extension flow never sets — it
-is correctness hardening and the seam #84 will generalise.
+Both are RED today: the current code returns/interpolates the full 64 KiB message. The two existing
+short-message assertions are the regression pins (D5) and must remain untouched.
 
 ## Task List
 
-### Phase 1: the fix + its Session-level proof
-- [ ] **Task 1 (T1)** — `Session.resume` merges `suspendedRunOpts.limits`; RED: two Session-level
-  integration tests (below-default ceiling; tightened-env survival) in `test/session.test.ts`.
+### Phase 1: the fix + its RED-first tests
+- [ ] **Task 1 (T1)** — truncate `RlmResult.error` at the source (`src/rlm.ts:1188`); RED: two new
+  long-message tests in `test/rlm.test.ts`.
 
-### Checkpoint 1: Session layer proven
-- [ ] Focused `npx tsx --test test/session.test.ts` green; full suite green; `check`/`build`/`lint` clean.
+### Checkpoint 1: code + tests
+- [ ] Focused `npx tsx --test test/rlm.test.ts` green; full suite green; `check`/`build`/`lint` clean.
 
-### Phase 2: the extension-layer signal pin
-- [ ] **Task 2 (T2)** — pin `repl_resume.execute` forwards the abort `signal` to `ReplRunner.resume`
-  (characterization test; no source change).
+### Phase 2: policy documentation
+- [ ] **Task 2 (T2)** — record the new surface in `docs/truncation-policy.md` (Implementation-record
+  row, Non-goals line, short narrative).
 
 ### Checkpoint 2: complete
 - [ ] Issue acceptance met; all tests green; ready for review.
@@ -91,11 +60,11 @@ is correctness hardening and the seam #84 will generalise.
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Ambient `REPL_MAX_MEMORY_MB` in the outer `npm test` process would make the unfixed 512 MiB fallback wrong, so assertion 1 would not be RED | High (invalid test) | Describe-level `before`/`after` clears both `REPL_MAX_DURATION_SECS` and `REPL_MAX_MEMORY_MB` (D6), exactly like `test/extension.test.ts:207-231` |
-| Tightened-env test would not be RED if the env var is still set at resume time (`limitsConfig()` re-reads it) | High (invalid test) | The test deletes `REPL_MAX_MEMORY_MB` *before* `resume`, so the unfixed path reads the 512 MiB default and the 320 MiB allocation succeeds — while the fixed path uses the persisted 256 MiB and fails. The delete is the point of the test |
-| 32 MiB ceiling too tight for the suspend/resume machinery (snapshot dump, gated-tool replay) | Low | Bare session is ~8.7 MiB (`src/sandbox.ts:731`); the gated call runs before any allocation, so the suspend phase stays well under 32 MiB. If CI reveals otherwise, raise the ceiling to 64 MiB and the allocation to 256 MiB (still 4× apart) |
-| `bytearray` not available / type-check rejects the literal | Low | `bytearray` is a standard builtin; use a plain integer literal (`128 * 1024 * 1024`) to sidestep any underscore-literal parsing concern |
-| Extension pin test leaks the `ReplRunner.prototype.resume` stub | Med | Restore in `finally` (mandatory); safe because the extension test file runs sequentially (the `#178` chore is about *documenting* that assumption, not changing it) |
+| 1 KiB cap truncates a legitimately useful short-ish provider error (e.g. a long request-ID tail the caller wants) | Low | Recorded assumption (D3); the head-only prefix keeps the human-readable error-type message; veto point is the Phase 6 go/no-go |
+| The two existing tests at `:880`/`:1104-1115` actually *do* break (e.g. `truncateText` is not a no-op under budget for these inputs) | Low | If RED/GREEN reveals this, the coder records it as a post-build finding and adjusts only those assertions — do not silently rewrite; report for the Phase 6 reconciliation |
+| `truncateText`'s elision marker pushes the emitted string slightly over 1024 bytes (marker + recovery bytes are additive) | Low | Assert `<= 1024 + tolerance` where tolerance is the measured marker+recovery size; or assert absence of the tail sentinel as the primary signal and treat the byte ceiling as approximate |
+| Doc task (T2) touches a doc with no test | Low | `npm run lint`/`check`/`build` unaffected; review the doc in Phase 5 for accuracy against the landed code |
+| Overlap with #166/#171 (same file) | Med | Strictly scope T1 to `:1188` + constants + `RlmResult.error` JSDoc; do not touch `:1093` or the `systemPrompt`/downgrade blocks |
 
 ## Open Questions
 
