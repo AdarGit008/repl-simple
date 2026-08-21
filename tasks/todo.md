@@ -1,81 +1,42 @@
-# Todo — issue #184: redact provider errors on the llm_query / downgraded-rlm_query tool paths
+# Todo — issues #189, #190: one provider-error rule site, and the cause behind it
 
-Source of truth: `SPEC.md` (D1–D7) + `tasks/plan.md`. Each task is RED-first. One coder per task,
-fresh context, one commit per task. After each task the full suite must be green. Do **not** touch
-`buildFeedback`'s `VALUE_HEAD_RATIO`; do **not** touch `src/repl.ts` / `src/session.ts` /
-`src/sandbox.ts` / `src/truncate.ts`; do **not** use `truncateWithSentinels` for the provider
-message; do **not** rewrite the two #167 short-message tests; do **not** absorb #171/#182/#166
-scope. Only `src/rlm.ts`, `test/rlm.test.ts`, and `docs/truncation-policy.md` are in scope.
+Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Behaviour-preserving throughout: if any
+surface renders differently after this flight, that is a defect. Do **not** change
+`RLM_ERROR_MAX_BYTES`, `HEAD_ONLY_RATIO` or `RLM_ERROR_RECOVERY`; do **not** export either helper
+(#85); do **not** touch `buildFeedback`, `truncateWithSentinels`, `src/sandbox.ts` or
+`src/truncate.ts`; do **not** absorb #171, #191 or #192. Only `src/rlm.ts`, `test/rlm.test.ts` and
+`docs/truncation-policy.md` are in scope.
 
-- [x] **T1 — Truncate provider errors at the two tool paths (D1–D7)**
-  - [x] RED — add a new `describe("runRlm() — tool-path provider-error redaction (#184)")` block to
-    `test/rlm.test.ts`, reusing the local `rlmRegistry()` helper (`new ToolRegistry([])`). Three
-    tests, all RED today:
-    1. **llm_query path is truncated.** Inline fake `llmClient.query`: call 1 returns
-       `` ```python\nllm_query("hello")\nSUBMIT("done")\n``` ``; later calls throw
-       `new Error("A".repeat(64 * 1024) + "TAIL-SECRET-REQID")`. Run
-       `runRlm("q", { llmClient, registry: rlmRegistry(), maxIterations: 1 })`. Assert
-       `iterations.length === 1`; `!iterations[0].result.error!.includes("TAIL-SECRET-REQID")`; and
-       `!buildFeedback(iterations[0].result).includes("TAIL-SECRET-REQID")`. Today RED (raw 64 KiB
-       message reaches both surfaces).
-    2. **Downgrade path is truncated.** Same fake; run with `maxDepth: 1, depth: 1`; call 1 returns
-       `` ```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n``` ``. Same two assertions.
-       Today RED.
-    3. **Short message passes verbatim (regression pin).** Tool call throws `new Error("boom")`;
-       assert `iterations[0].result.error!.includes("boom")`. Green stays green after the fix
-       (`truncateText` is a no-op under budget).
-  - [x] GREEN — in `src/rlm.ts`, add a module-private helper beside the RLM provider-error
-    constants (`RLM_ERROR_MAX_BYTES` at `:187`, `RLM_ERROR_RECOVERY` at `:193`):
-    ```ts
-    /** Head-only truncation of a provider rejection before it surfaces as a sandbox RuntimeError. */
-    function redactProviderError(err: unknown): string {
-      return truncateText(
-        err instanceof Error ? err.message : String(err),
-        { maxBytes: RLM_ERROR_MAX_BYTES, headRatio: HEAD_ONLY_RATIO, recovery: RLM_ERROR_RECOVERY },
-      ).text;
-    }
-    ```
-    Wrap the two `llmClient.query` calls (`:1087-1091` in `onLLMQuery`; `:1111` in the downgrade
-    branch) in `try { return await llmClient.query(...) } catch (err) { throw new
-    Error(redactProviderError(err)); }`. Do **not** touch the `tryCharge` blocks or the budget
-    markers. Do **not** touch `buildFeedback`.
-  - [x] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
-    `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean. Confirm
-    the two #167 short-message tests still pass unchanged.
-  - [x] Phase 5 review fix: short-message pin now asserts no-truncation (recovery clause absent)
-  - [x] Phase 4 coverage gaps closed (String(err) branch + positive truncation shape)
+- [x] **T1 — One rule site, and the throw shape that carries the cause (D1–D5)**
+  - [x] `src/rlm.ts` — replace the inline `truncateText(...)` block at the `RlmResult.error`
+    assignment site (the D53 catch) with `error: redactProviderError(err),`.
+  - [x] `src/rlm.ts` — add `sandboxProviderError(err: unknown): Error` beside
+    `redactProviderError`, returning `new Error(redactProviderError(err), { cause: err })`, with
+    the boundary argument in its doc comment (A2). Both tool paths become
+    `throw sandboxProviderError(err);`.
+  - [x] `src/rlm.ts` — rewrite `redactProviderError`'s doc comment to name all three sites, so the
+    one-rule-site invariant is stated where it has to hold.
+  - [x] PINS — new `describe("runRlm() — provider-error rule consolidation (#189, #190)")` in
+    `test/rlm.test.ts`, with a `d53Redaction(thrown)` helper that runs the same rejection through
+    the D53 catch and a `toolTrace(result, tool)` helper that pulls the failed call's trace entry.
+    Four tests:
+    1. **llm_query path** — `trace.error` equals `d53Redaction(thrown)` for a 64 KiB rejection;
+       the tail marker is absent.
+    2. **Downgraded rlm_query path** — same, at `maxDepth: 1, depth: 1`.
+    3. **Cause adds nothing to the message (#190)** — short `"boom"` rejection: `trace.error` is
+       exactly `"boom"` and equals the D53 output (D5).
+    4. **Bare-string rejection** — the `String(err)` arm agrees across sites.
+  - [x] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green (1082, +4);
+    `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean.
+  - [x] Mutation-verify — drift the D53 site's cap to 512 B, confirm the new pins go red (3 of 4,
+    plus 3 pre-existing #167 tests), restore.
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [x] **T2 — Record the two tool-path surfaces in the truncation policy**
-  - No RED test (documentation). In `docs/truncation-policy.md`:
-    1. Add an Implementation-record row to the table for the `llm_query` and downgraded-`rlm_query`
-       provider-error surfaces (1 KiB, head-only, #184).
-    2. Append a short `**#184 (tool-path provider errors).**` narrative after the `#167` narrative
-       explaining: the two source choke points (`onLLMQuery`, downgrade branch), the plain-
-       `truncateText` (not `truncateWithSentinels`) choice because the message becomes a sandbox
-       `RuntimeError`, head-only per D7, and the reused neutral recovery clause.
-  - [x] Verify — re-read the edited sections for accuracy against the landed code; `npm run check`
-    + `npm run build` unaffected (doc-only). No test changes.
+- [x] **T2 — Record the consolidation in the truncation policy (D6)**
+  - [x] Cite `#189` alongside `#167` and `#184` on the two provider-error rows. No new row — no
+    new surface.
+  - [x] Append the `**#189 / #190 (one rule site, and the cause behind it).**` narrative after the
+    `#184` one: why two spellings of one rule was the defect, that behaviour is unchanged, the
+    `err.message`-only sandbox boundary that makes `cause` safe, and the equality shape of the pin.
+  - [x] Verify — re-read against the landed code; doc-only, no test changes.
   - Files — `docs/truncation-policy.md`.
-
-## Checkpoint (after T2)
-
-- [x] Issue acceptance met: both tool paths truncated head-only at 1 KiB before the sandbox
-      `RuntimeError`; `iterations[].result.error` bounded/redacted; short messages verbatim.
-- [x] Two RED-first tests pin the llm_query and downgrade paths; one regression pin for short
-      messages.
-- [x] `docs/truncation-policy.md` records the two surfaces.
-- [x] Full suite green; `check`/`build`/scoped-`lint` clean.
-
-## DoD (from #184, reconciled)
-
-- [x] Provider errors on the `llm_query` and downgraded-`rlm_query` paths are truncated at the
-      source (head-only, ≤ 1 KiB) before they surface as a sandbox `RuntimeError`.
-- [x] `iterations[].result.error` for these paths is bounded/redacted, not raw.
-- [x] RED test: a request-context marker at the very end does not reach the model prompt via
-      `buildFeedback`, nor the caller via `iterations[].result.error`.
-- [x] Short provider errors pass verbatim (regression pin).
-- [x] No `truncateWithSentinels`; no change to `buildFeedback`'s `VALUE_HEAD_RATIO`.
-- [x] No changes to `src/repl.ts`, `src/session.ts`, `src/sandbox.ts`, `src/truncate.ts`;
-      no #171/#182/#166 scope absorbed.
-- [x] Truncation policy updated with the two new surfaces.
