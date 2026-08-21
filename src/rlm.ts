@@ -196,6 +196,21 @@ const RLM_ERROR_MAX_BYTES = 1024;
  */
 const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
 
+/**
+ * Head-only truncation of a provider rejection before it surfaces as a sandbox
+ * RuntimeError (#184). The two tool paths (`onLLMQuery`, the downgrade branch
+ * of `onRLMQuery`) re-throw this bounded form, so both consumers — the
+ * caller-visible `iterations[].result.error` and the model-visible
+ * `buildFeedback` output — read a message whose request-context tail is gone.
+ */
+function redactProviderError(err: unknown): string {
+  return truncateText(err instanceof Error ? err.message : String(err), {
+    maxBytes: RLM_ERROR_MAX_BYTES,
+    headRatio: HEAD_ONLY_RATIO,
+    recovery: RLM_ERROR_RECOVERY,
+  }).text;
+}
+
 // ── Conversation budget ─────────────────────────────────────────
 //
 // The feedback caps bound each turn, but the conversation as a whole grows by
@@ -1106,11 +1121,15 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           const cost = callCost(systemPromptTokens, [{ role: "user", content: prompt }]);
           if (!budget.tryCharge(cost)) return LLM_QUERY_REFUSED;
         }
-        return await llmClient.query(
-          systemPrompt,
-          [{ role: "user", content: prompt }],
-          options.signal,
-        );
+        try {
+          return await llmClient.query(
+            systemPrompt,
+            [{ role: "user", content: prompt }],
+            options.signal,
+          );
+        } catch (err) {
+          throw new Error(redactProviderError(err));
+        }
       },
       onRLMQuery: async (query, context) => {
         const depth = options.depth ?? 0;
@@ -1130,7 +1149,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
             const cost = callCost(systemPromptTokens, [{ role: "user", content }]);
             if (!budget.tryCharge(cost)) return RLM_QUERY_REFUSED;
           }
-          return await llmClient.query(systemPrompt, [{ role: "user", content }], options.signal);
+          try {
+            return await llmClient.query(systemPrompt, [{ role: "user", content }], options.signal);
+          } catch (err) {
+            throw new Error(redactProviderError(err));
+          }
         }
 
         // Parent-context inheritance (A26, M16): the child sees the parent

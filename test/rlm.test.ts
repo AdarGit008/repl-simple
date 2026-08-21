@@ -1101,6 +1101,162 @@ describe("runRlm() — RlmResult.error redaction (#167)", () => {
   });
 });
 
+// ── Tool-path provider-error redaction (#184) ───────────────────
+
+describe("runRlm() — tool-path provider-error redaction (#184)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("truncates the llm_query tool-path provider error before it reaches both surfaces", async () => {
+    // The tool-mediated llm_query call throws a huge provider rejection. The
+    // raw message currently reaches the sandbox as a RuntimeError and lands
+    // whole in `iterations[0].result.error` (caller-visible) and — via
+    // buildFeedback's 50/50 head+tail cut — the model-visible feedback. The
+    // request-context marker at the very end must not survive either surface.
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw new Error(`${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`);
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].result.status, "error");
+    assert.ok(!result.iterations[0].result.error!.includes("TAIL-SECRET-REQID"));
+    assert.ok(!buildFeedback(result.iterations[0].result).includes("TAIL-SECRET-REQID"));
+    // Positive shape: truncation surfaced the neutral recovery clause and kept
+    // a 64+ run of the head "A"s (the tail marker is gone, not the message).
+    assert.ok(
+      result.iterations[0].result.error!.includes("The full provider error is not surfaced."),
+      "recovery clause missing from caller-visible error",
+    );
+    assert.ok(
+      buildFeedback(result.iterations[0].result).includes(
+        "The full provider error is not surfaced.",
+      ),
+      "recovery clause missing from model-visible feedback",
+    );
+    assert.match(result.iterations[0].result.error!, /A{64}/);
+  });
+
+  it("truncates the downgraded-rlm_query tool-path provider error before it reaches both surfaces", async () => {
+    // Same shape on the depth >= maxDepth downgrade branch of rlm_query: the
+    // tool call throws, and the marker at the very end must not survive
+    // either the caller-visible iteration error or the model-visible feedback.
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```';
+        throw new Error(`${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`);
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].result.status, "error");
+    assert.ok(!result.iterations[0].result.error!.includes("TAIL-SECRET-REQID"));
+    assert.ok(!buildFeedback(result.iterations[0].result).includes("TAIL-SECRET-REQID"));
+    // Positive shape: truncation surfaced the neutral recovery clause and kept
+    // a 64+ run of the head "A"s (the tail marker is gone, not the message).
+    assert.ok(
+      result.iterations[0].result.error!.includes("The full provider error is not surfaced."),
+      "recovery clause missing from caller-visible error",
+    );
+    assert.ok(
+      buildFeedback(result.iterations[0].result).includes(
+        "The full provider error is not surfaced.",
+      ),
+      "recovery clause missing from model-visible feedback",
+    );
+    assert.match(result.iterations[0].result.error!, /A{64}/);
+  });
+
+  it("truncates a bare-string (non-Error) provider rejection via the String(err) branch", async () => {
+    // The redactProviderError ternary is `err instanceof Error ? err.message :
+    // String(err)`; every other #184 test throws `new Error(...)`, leaving the
+    // String(err) branch unexercised. Throw a bare string so the String branch
+    // is what truncates the tail away.
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw `${"B".repeat(64 * 1024)}STRING-TAIL-SECRET`;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].result.status, "error");
+    assert.ok(!result.iterations[0].result.error!.includes("STRING-TAIL-SECRET"));
+    assert.ok(!buildFeedback(result.iterations[0].result).includes("STRING-TAIL-SECRET"));
+    // The recovery clause is only appended on truncation, so its presence
+    // proves the String(err) branch ran through the truncator.
+    assert.ok(
+      result.iterations[0].result.error!.includes("The full provider error is not surfaced."),
+      "recovery clause missing from caller-visible error",
+    );
+    assert.ok(
+      buildFeedback(result.iterations[0].result).includes(
+        "The full provider error is not surfaced.",
+      ),
+      "recovery clause missing from model-visible feedback",
+    );
+  });
+
+  it("passes a short tool-path provider error verbatim (regression pin)", async () => {
+    // The truncator is a no-op under the 1 KiB budget: a short provider
+    // rejection must survive byte-for-byte into the caller-visible error.
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw new Error("boom");
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].result.status, "error");
+    assert.ok(result.iterations[0].result.error!.includes("boom"));
+    // The recovery clause only appears on truncation; its absence proves the
+    // short error passed through un-truncated (not mutated by a sub-budget path).
+    assert.ok(
+      !result.iterations[0].result.error!.includes("The full provider error is not surfaced."),
+    );
+    assert.ok(!result.iterations[0].result.error!.includes("[…"));
+  });
+});
+
 // ── Abort semantics (#75) ───────────────────────────────────────
 
 describe("runRlm() — abort", () => {
