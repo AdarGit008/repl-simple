@@ -1317,7 +1317,6 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
 
   /** The `calls[]` trace entry the failed tool left on the iteration. */
   function toolTrace(result: RlmIteration["result"], tool: string) {
-    assert.ok("calls" in result, "run result carries no tool-call trace");
     const trace = result.calls.find((c) => c.tool === tool);
     assert.ok(trace, `no ${tool} entry in the tool-call trace`);
     assert.equal(trace.ok, false, `${tool} trace records success, not the rejection`);
@@ -1341,6 +1340,7 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
       maxIterations: 1,
     });
 
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
     const trace = toolTrace(result.iterations[0].result, "llm_query");
     const d53 = await d53Redaction(thrown);
     assert.equal(trace.error, d53);
@@ -1368,6 +1368,7 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
       depth: 1,
     });
 
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
     const trace = toolTrace(result.iterations[0].result, "rlm_query");
     const d53 = await d53Redaction(thrown);
     assert.equal(trace.error, d53);
@@ -1400,6 +1401,7 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
       maxIterations: 1,
     });
 
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
     const trace = toolTrace(result.iterations[0].result, "llm_query");
     assert.equal(trace.error, "boom");
     assert.equal(trace.error, await d53Redaction(thrown));
@@ -1424,6 +1426,7 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
       maxIterations: 1,
     });
 
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
     const trace = toolTrace(result.iterations[0].result, "llm_query");
     const d53 = await d53Redaction(thrown);
     assert.equal(trace.error, d53);
