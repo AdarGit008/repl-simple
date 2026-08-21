@@ -30,6 +30,14 @@ surface renders differently after this flight, that is a defect. Do **not** chan
     `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean.
   - [x] Mutation-verify — drift the D53 site's cap to 512 B, confirm the new pins go red (3 of 4,
     plus 3 pre-existing #167 tests), restore.
+  - [x] Pin what has no surface. `cause` is unobservable by construction — `src/sandbox.ts` reads
+    `err.message` off a tool throw and discards the Error, and `sandboxProviderError` is
+    module-private — so no behaviour test can tell `{ cause: err }` from its absence, and #190's
+    whole payload could be deleted with the suite green. Pinned at the source, the way test 6 pins
+    invariant 4. The same pin covers #189's half (both tool paths reach the one rule site rather
+    than re-spelling the throw), which the equality assertions cannot see because both of their
+    operands move together. Mutation-verified both ways: dropping `{ cause: err }` reds it, and so
+    does re-spelling one tool path's throw.
   - [x] Harden against a *shared* break. The equality pins agree when both sides are equally
     wrong: a stray `maxBytes: 16` inside `redactProviderError` collapsed every provider-error
     surface to `""` and all four tests still passed. Each long-rejection test now also anchors

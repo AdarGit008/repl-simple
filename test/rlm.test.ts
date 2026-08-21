@@ -1407,6 +1407,42 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
     assert.equal(trace.error, await d53Redaction(thrown));
   });
 
+  it("carries the cause, and throws it from one place (#189/#190, source pin)", () => {
+    // `cause` is unobservable from every public surface by construction:
+    // `src/sandbox.ts` reads `err.message` (plus the `HostToolError`
+    // python-type discriminator) off a tool throw and discards the Error
+    // itself, and `sandboxProviderError` is module-private. That is the
+    // design, not an oversight — but it also means no behaviour test can tell
+    // `{ cause: err }` from its absence, so #190's whole payload could be
+    // deleted with the suite still green.
+    //
+    // Pinned the way test 6 pins invariant 4: at the source, where an
+    // invariant that has no observable surface actually lives. The same pin
+    // covers #189's half — that both tool paths reach the one rule site
+    // rather than re-spelling the throw — which the equality assertions above
+    // cannot see, because both of their operands move together.
+    const rlmSource = readFileSync(
+      join(fileURLToPath(import.meta.url), "..", "..", "src", "rlm.ts"),
+      "utf-8",
+    );
+
+    assert.match(
+      rlmSource,
+      /function sandboxProviderError[\s\S]{0,200}?new Error\(\s*redactProviderError\(err\),\s*\{ cause: err \}\s*\)/,
+      "sandboxProviderError must carry the original rejection as `cause` (#190)",
+    );
+    assert.equal(
+      (rlmSource.match(/throw sandboxProviderError\(err\);/g) ?? []).length,
+      2,
+      "both tool paths must throw through sandboxProviderError",
+    );
+    assert.doesNotMatch(
+      rlmSource,
+      /throw new Error\(redactProviderError\(/,
+      "no tool path may re-spell the provider-error throw (#189)",
+    );
+  });
+
   it("redacts a bare-string rejection identically on the tool path and the D53 catch", async () => {
     // The `String(err)` arm of the shared helper, pinned across sites: a
     // non-Error throw has no `.message`, and the two paths must still agree.
