@@ -1,62 +1,70 @@
-# Implementation Plan: issues #189, #190 — one provider-error rule site, and the cause behind it
+# Implementation Plan: issue #171 — bound and race the three remaining provider calls
 
 ## Overview
 
-Two small, behaviour-preserving changes in `src/rlm.ts`, both closing #184 ship-report follow-ups:
+Two halves, both in `src/rlm.ts`, both confined to the three call sites the main loop already
+solved for itself:
 
-1. **#189** — the D53 top-level catch stops spelling the provider-error truncation out inline and
-   calls `redactProviderError(err)`, the helper #184 already introduced for the two tool paths.
-   After this, exactly one expression in the module names `RLM_ERROR_MAX_BYTES` /
-   `HEAD_ONLY_RATIO` / `RLM_ERROR_RECOVERY` together.
-2. **#190** — the two tool paths re-throw through a new `sandboxProviderError(err): Error`, which
-   builds `new Error(redactProviderError(err), { cause: err })`. The message crossing the sandbox
-   boundary is unchanged; the original rejection becomes reachable in-process.
+1. **Bound.** `llm_query`'s prompt, and the downgraded `rlm_query`'s query and context, go through
+   `truncateWithSentinels` at the main loop's own ceilings (SPEC A1/D1–D4), before the spend charge
+   (D5).
+2. **Race.** All three calls — `llm_query`, the downgrade, and the synthesis pass — are wrapped in
+   `raceAgainstSignal`, the same wrapper the main loop's own query has used since #75.
 
-Neither changes what any surface renders. The tests are therefore **drift pins**, not RED-first
-failures — see "On RED-first" below.
+## Architecture Decisions (SPEC D1–D7, not restated)
 
-## Architecture Decisions (SPEC D1–D6, not restated)
+- **D1/D2/D3** — `truncateWithSentinels`; two budgets on the downgrade; value shape.
+- **D4** — `DOWNGRADE_CONTEXT_RECOVERY`, because the downgrade has no sandbox to slice in.
+- **D5/D6** — bound before charge; `?? "(none)"` preserved byte-for-byte.
+- **D7** — no abort branch in the tool-path catches.
 
-- **D1/D2** — `redactProviderError` is the string rule; `sandboxProviderError` is the throw shape.
-- **D3** — `cause` is carried verbatim; it reaches no surface (A2).
-- **D4/D5** — equality pins at `calls[].error` against the D53 catch's output, long and short.
-- **D6** — the truncation policy records a consolidation, not a new surface.
+## What the race actually pins
 
-## On RED-first
+Established by measurement before the tests were written, because the obvious test is vacuous: an
+abort raised 10 ms after the tool call starts is caught by the sandbox's own cut-off either way, so
+a test that only asserts `status === "aborted"` passes without the change. The load-bearing
+difference is the **trace**, and it is deterministic when the abort is raised synchronously while
+the call is in flight:
 
-The repo's default is RED-first, and it does not fit a consolidation: before the change both sites
-compute the identical string, so no test can distinguish them. What the tests must catch is the
-**next** change — a cap or ratio applied at one site and not the other. That is exactly what the
-equality pins do, and it was verified by mutation rather than asserted: dropping the D53 site's cap
-to 512 B while the tool paths stayed at 1 KiB turned three of the four new tests red (plus three
-pre-existing #167 tests). Recorded in the ship report.
+| | un-raced | raced |
+|---|---|---|
+| run ends after | ~250 ms (`ABORT_SETTLE_GRACE_MS`) | ~1 ms |
+| `iterations[0].result.error` | `"execution aborted"` | `"RuntimeError"` |
+| `calls[]` | `[]` — the in-flight call is gone | the `llm_query` entry survives |
+
+4 runs each way, both tool paths. The synthesis pass is different again: un-raced it never returns
+at all, so its test is the only one in the file with an explicit timeout.
 
 ## Task List
 
-### Phase 1: the consolidation and the throw shape
-- [ ] **Task 1 (T1)** — D53 catch → `redactProviderError`; add `sandboxProviderError`; both tool
-      paths throw it (`src/rlm.ts`). Four equality/drift pins in `test/rlm.test.ts`.
+### Phase 1: bound the two tool-path prompts
+- [ ] **Task 1 (T1)** — `DOWNGRADE_CONTEXT_RECOVERY` + the tool-path budget note; bound
+      `llm_query`'s prompt and the downgrade's query/context before the charge (`src/rlm.ts`).
+      RED-first: ceiling, sentinel wrap, forged-sentinel neutralisation, two-budget independence,
+      `Context: (none)` regression pin, and the charge-what-you-send pin.
 
-### Checkpoint 1
-- [ ] Focused `npx tsx --test test/rlm.test.ts` green; full `npm test` green; `npm run check` +
-      `npm run build` clean; scoped lint (`npx biome check src extensions test`) clean.
-- [ ] Mutation-verify the drift pin: drift the D53 site's cap, confirm the new tests go red,
-      restore.
+### Phase 2: race the three calls
+- [ ] **Task 2 (T2)** — `raceAgainstSignal` on `onLLMQuery`, the downgrade branch, and the
+      synthesis pass. RED-first: trace survival on both tool paths, termination on the synthesis
+      pass, and a listener-balance pin over two `llm_query` calls.
 
-### Phase 2: the record
-- [ ] **Task 2 (T2)** — `docs/truncation-policy.md`: cite #189 on the two existing provider-error
-      rows, add the `#189 / #190` narrative after the `#184` one.
+### Checkpoint
+- [ ] RED verified against the PR-#193 head: 7 of the 10 new tests red, 3 green by design
+      (unwrapped pass-through, `Context: (none)`, listener balance).
+- [ ] Full `npm test` green; `npm run check` + `npm run build` + `npm run lint` clean;
+      `npm run coverage` floors met.
 
-### Checkpoint 2
-- [ ] Re-read the edited policy sections against the landed code. Doc-only; no test changes.
+### Phase 3: the record
+- [ ] **Task 3 (T3)** — three Implementation-record rows and a `#171` narrative in
+      `docs/truncation-policy.md`; correct the #184 narrative's throw spelling in passing.
 
 ## Files
 
-- `src/rlm.ts` — the two helpers and the three call sites.
-- `test/rlm.test.ts` — one new `describe` block, four tests.
-- `docs/truncation-policy.md` — two row citations, one narrative paragraph.
+- `src/rlm.ts` — one new recovery constant, three bounded interpolations, three race wraps.
+- `test/rlm.test.ts` — one new `describe` block, ten tests.
+- `docs/truncation-policy.md` — three rows, one narrative, one correction.
 
 ## Out of scope
 
-`#191` (marker size disclosure) and `#192` (the 1 KiB window) — both filed, both decisions rather
-than defects. `#171` stacks on this branch and is not part of this PR.
+The already-aborted-at-entry synthesis charge (SPEC non-goal 1), context growth across nesting
+depth, and #191/#192.

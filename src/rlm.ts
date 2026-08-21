@@ -298,6 +298,27 @@ const QUESTION_MAX_BYTES = 64 * 1024;
 const QUESTION_RECOVERY =
   "The question was truncated. Answer from the part shown and state the assumption if ambiguous.";
 
+// ── Tool-path prompt budgets (#171) ─────────────────────────────
+//
+// `llm_query(prompt)` and the downgraded `rlm_query(query, context)` build a
+// user message out of strings the *model* wrote, and hand it straight to the
+// provider. The main loop bounds its own question and inputs before they reach
+// a prompt; these two paths did not, so a runaway generation could send an
+// arbitrarily large body — and, because nothing neutralised the value, could
+// plant a `[TRUNCATED VIEW` pair the sub-LLM would then read as authentic
+// (D17). Both now go through `truncateWithSentinels` at the main loop's own
+// ceilings: the ask is a question (`QUESTION_MAX_BYTES`), the context is a
+// value (`INPUT_PREVIEW_VALUE_MAX_BYTES`).
+
+/**
+ * Route to an elided downgrade context. Deliberately NOT
+ * `INPUT_PREVIEW_RECOVERY`: the downgrade has no sandbox, so the context is
+ * not a named Python variable and "slice it in Python" is a route that does
+ * not exist here (policy Q3). Mirrors `QUESTION_RECOVERY`'s shape instead.
+ */
+const DOWNGRADE_CONTEXT_RECOVERY =
+  "The context was truncated. Answer from the part shown and state the assumption if ambiguous.";
+
 // ── Input-name validation (D20) ─────────────────────────────────
 //
 // Input keys are interpolated unescaped into the prompt header
@@ -1138,20 +1159,41 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     ...options.registry.list(),
     ...createRLMTools({
       onLLMQuery: async (prompt) => {
+        // #171: the prompt is the whole ask, written by the model — bound it
+        // exactly as the main loop bounds its question, and before anything
+        // else, so the charge below prices what actually goes out and a forged
+        // sentinel in the prompt is neutralised rather than trusted (D17).
+        const boundedPrompt = truncateWithSentinels(prompt, {
+          maxBytes: QUESTION_MAX_BYTES,
+          headRatio: VALUE_HEAD_RATIO,
+          recovery: QUESTION_RECOVERY,
+        });
         // D62/D63: a tool-mediated call charges the shared pool before it runs,
         // at the same per-call cost as the top-level loop. If it cannot charge,
         // the tool returns a refusal marker instead of calling the LLM.
         if (budget) {
-          const cost = callCost(systemPromptTokens, [{ role: "user", content: prompt }]);
+          const cost = callCost(systemPromptTokens, [{ role: "user", content: boundedPrompt }]);
           if (!budget.tryCharge(cost)) return LLM_QUERY_REFUSED;
         }
         try {
-          return await llmClient.query(
-            systemPrompt,
-            [{ role: "user", content: prompt }],
+          // #171: the same abort race the main loop runs (D32). The signal is
+          // still handed to the client so it can really cancel; the race is
+          // the safety net for a client that ignores it, and without it an
+          // abort could not end a run parked inside a tool call.
+          return await raceAgainstSignal(
+            llmClient.query(
+              systemPrompt,
+              [{ role: "user", content: boundedPrompt }],
+              options.signal,
+            ),
             options.signal,
           );
         } catch (err) {
+          // An abort arrives here as a DOMException, which is an Error whose
+          // 25-byte message the redaction passes through untouched — so the
+          // sandbox sees the same RuntimeError either way, and the original
+          // is still on `cause`. No abort branch: it would be code no test
+          // could tell from its absence.
           throw sandboxProviderError(err);
         }
       },
@@ -1162,10 +1204,28 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         // At the depth limit there is no sandbox to investigate in: downgrade
         // to a single llm_query ask (D52).
         if (depth >= maxDepth) {
+          // #171: `query` and `context` are both model-written and both land
+          // in the prompt verbatim. Bound them the way the main loop bounds
+          // the two things they correspond to — the question and one input
+          // value — and let `truncateWithSentinels` neutralise any sentinel
+          // pair the model planted (D17). The `?? "(none)"` rendering is
+          // preserved exactly: an omitted context is still the placeholder,
+          // an empty one still renders empty.
+          const contextText = context
+            ? truncateWithSentinels(context, {
+                maxBytes: INPUT_PREVIEW_VALUE_MAX_BYTES,
+                headRatio: VALUE_HEAD_RATIO,
+                recovery: DOWNGRADE_CONTEXT_RECOVERY,
+              })
+            : (context ?? "(none)");
           const content =
             `[rlm_query downgraded at max depth ${maxDepth}]\n` +
-            `Query: ${query}\n` +
-            `Context: ${context ?? "(none)"}`;
+            `Query: ${truncateWithSentinels(query, {
+              maxBytes: QUESTION_MAX_BYTES,
+              headRatio: VALUE_HEAD_RATIO,
+              recovery: QUESTION_RECOVERY,
+            })}\n` +
+            `Context: ${contextText}`;
           // D62/D63: the downgrade charges the shared pool before it runs, at
           // the same per-call cost as the top-level loop. If it cannot charge,
           // the tool returns a refusal marker instead of calling the LLM.
@@ -1174,7 +1234,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
             if (!budget.tryCharge(cost)) return RLM_QUERY_REFUSED;
           }
           try {
-            return await llmClient.query(systemPrompt, [{ role: "user", content }], options.signal);
+            // #171: the same abort race as the main loop and `llm_query`.
+            return await raceAgainstSignal(
+              llmClient.query(systemPrompt, [{ role: "user", content }], options.signal),
+              options.signal,
+            );
           } catch (err) {
             throw sandboxProviderError(err);
           }
@@ -1440,7 +1504,15 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   // included in `consumed` (D64).
   const report = budgetReport(budget, false);
   try {
-    const synthesized = await llmClient.query(systemPrompt, synthesisMessages, options.signal);
+    // #171: the last un-raced provider call. Without the race an abort during
+    // the synthesis pass could not end the run at all — the loop is over, so
+    // there is no next loop-top check to catch it. The rejection lands in the
+    // catch below and falls through to salvage, which is what an aborted
+    // synthesis was always meant to do.
+    const synthesized = await raceAgainstSignal(
+      llmClient.query(systemPrompt, synthesisMessages, options.signal),
+      options.signal,
+    );
     // An abort during the synthesis call folds into salvage (Assumption 5):
     // the loop already reached the cap, so the status stays max_iterations.
     if (!options.signal?.aborted) {
