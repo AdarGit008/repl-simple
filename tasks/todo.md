@@ -30,6 +30,11 @@ surface renders differently after this flight, that is a defect. Do **not** chan
     `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean.
   - [x] Mutation-verify — drift the D53 site's cap to 512 B, confirm the new pins go red (3 of 4,
     plus 3 pre-existing #167 tests), restore.
+  - [x] Harden against a *shared* break. The equality pins agree when both sides are equally
+    wrong: a stray `maxBytes: 16` inside `redactProviderError` collapsed every provider-error
+    surface to `""` and all four tests still passed. Each long-rejection test now also anchors
+    both sides to `assertRedactedShape` — head kept, tail gone, recovery clause present, 1 KiB
+    ceiling held — and the same mutation now turns 3 of the 4 red.
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
 - [x] **T2 — Record the consolidation in the truncation policy (D6)**

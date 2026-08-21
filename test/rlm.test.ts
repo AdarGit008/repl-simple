@@ -1290,6 +1290,31 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
     return result.error!;
   }
 
+  /**
+   * The absolute shape of a redacted 64 KiB rejection, checked without
+   * reference to any other site.
+   *
+   * Equality across sites is the drift pin, but equality alone is not a pin at
+   * all: two sites broken the same way agree perfectly. (Measured — a stray
+   * `maxBytes: 16` in the shared helper collapsed every surface to `""`, and
+   * the equality assertions all passed.) So each long-rejection test anchors
+   * both sides to this too: the head survives, the tail is gone, the recovery
+   * clause renders, and the 1 KiB ceiling holds.
+   */
+  function assertRedactedShape(message: string, filler: string): void {
+    const bytes = Buffer.byteLength(message, "utf8");
+    assert.ok(bytes <= 1024, `redacted message was ${bytes} bytes, over the 1 KiB ceiling`);
+    assert.ok(bytes > 900, `redacted message was only ${bytes} bytes — the head was not kept`);
+    assert.ok(
+      message.startsWith(filler.repeat(64)),
+      `redacted message lost its head: ${message.slice(0, 40)}`,
+    );
+    assert.ok(
+      message.includes("The full provider error is not surfaced."),
+      "redacted message lost its recovery clause",
+    );
+  }
+
   /** The `calls[]` trace entry the failed tool left on the iteration. */
   function toolTrace(result: RlmIteration["result"], tool: string) {
     assert.ok("calls" in result, "run result carries no tool-call trace");
@@ -1317,8 +1342,11 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
     });
 
     const trace = toolTrace(result.iterations[0].result, "llm_query");
-    assert.equal(trace.error, await d53Redaction(thrown));
+    const d53 = await d53Redaction(thrown);
+    assert.equal(trace.error, d53);
     assert.ok(!trace.error!.includes("TAIL-SECRET-REQID"));
+    assertRedactedShape(trace.error!, "A");
+    assertRedactedShape(d53, "A");
   });
 
   it("redacts the downgraded-rlm_query tool path to the exact string the D53 catch produces", async () => {
@@ -1341,8 +1369,11 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
     });
 
     const trace = toolTrace(result.iterations[0].result, "rlm_query");
-    assert.equal(trace.error, await d53Redaction(thrown));
+    const d53 = await d53Redaction(thrown);
+    assert.equal(trace.error, d53);
     assert.ok(!trace.error!.includes("TAIL-SECRET-REQID"));
+    assertRedactedShape(trace.error!, "A");
+    assertRedactedShape(d53, "A");
   });
 
   it("carries the cause without adding a byte to the message that crosses the sandbox (#190)", async () => {
@@ -1394,8 +1425,11 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
     });
 
     const trace = toolTrace(result.iterations[0].result, "llm_query");
-    assert.equal(trace.error, await d53Redaction(thrown));
+    const d53 = await d53Redaction(thrown);
+    assert.equal(trace.error, d53);
     assert.ok(!trace.error!.includes("STRING-TAIL-SECRET"));
+    assertRedactedShape(trace.error!, "B");
+    assertRedactedShape(d53, "B");
   });
 });
 
