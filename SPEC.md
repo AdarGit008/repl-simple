@@ -37,10 +37,13 @@ finding on the five items.
   existing `realpath`-checked helper (deterministic, no prompt fatigue); `http_get` is gated behind
   approval *and* hardened against SSRF (A45's defence-in-depth). A `gateReads` option is added so
   callers can choose gate-over-jail.
-- **AS5 — A37 approval model.** Preamble inclusion is approval-gated per file content-hash (prompt
-  once per hash, remember the decision). Default on a fresh clone is refuse: a hostile
-  `.pi/code-tools/x.py` must NOT execute without an explicit approval. Host-tool names shadowed by
-  preamble definitions are refused. Total preamble size and file count are capped.
+- **AS5 — A37 approval model (RECONCILED at HEAD).** The landed mechanism is a **project-trust gate**,
+  not per-file content-hash: preamble inclusion requires `isProjectTrusted()` (defaults `() => false`),
+  so a fresh clone refuses by default. A hostile `.pi/code-tools/x.py` must NOT execute without an
+  explicit trust decision. Host-tool names shadowed by preamble definitions are refused; total
+  preamble size and file count are capped. **Recorded residual (accepted, assessed in Phase 6):** once
+  a project is trusted, a later-added or rewritten `.pi/code-tools/*.py` auto-executes with no new
+  prompt — the per-hash re-prompt the original finding proposed is not implemented.
 - **AS6 — Line numbers are indicative.** `docs/actionable-items.md` line numbers are from commit
   `dfc1136` and may have drifted (a recurring gotcha in this repo). Coders locate by symbol and
   context, not by trusting the printed line.
@@ -120,7 +123,9 @@ Every item's fix must be accompanied by a test that fails without it. Full suite
 ### A34 — default timeout + abort plumbing
 - `toResourceLimits` defaults `maxDurationSecs` (30) and `maxMemory` when the caller passes none.
 - `_signal` threads `extensions/repl-extension.ts` → `ReplRunner.run/resume` → `RunOptions.signal`.
-- `maxDurationSecs`/`maxMemory`/`signal` are exposed as `repl` tool parameters with sane caps.
+- `maxDurationSecs`/`maxMemory` are exposed as `repl` tool parameters with sane caps; the abort
+  `signal` is threaded from Pi's own tool-call signal (not a model-supplied parameter — a model cannot
+  supply an `AbortSignal`).
 - Tests: `repl` with `while True: pass` returns a `TimeoutError` `RunError` within the default budget;
   the Pi process stays responsive.
 
@@ -145,8 +150,9 @@ Every item's fix must be accompanied by a test that fails without it. Full suite
   full suspend → resume → approve round trip works.
 
 ### A37 — no auto-execute of `.pi/code-tools`
-- Preamble inclusion is approval-gated per file content-hash (prompt once, remember per hash); a
-  hostile file does not execute without explicit approval.
+- Preamble execution is gated on project trust (defaults untrusted); a hostile file does not execute
+  without an explicit trust decision. (Mechanism reconciled: project-trust gate, not per-hash — see
+  AS5.)
 - Preamble definitions that shadow a registered host-tool name are refused.
 - `createToolStoreTools` is registered in `repl.ts` so `read_tool`/`delete_tool` are reachable.
 - The read loop is wrapped in `try` so one bad entry (e.g. `dir.py`) is skipped, not fatal.
