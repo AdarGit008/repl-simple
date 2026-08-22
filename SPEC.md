@@ -1,76 +1,109 @@
-# Spec: Bound and signal-race the llm_query / rlm_query-downgrade / synthesis LLM calls — issue #171
+# Spec: Early-return the synthesis pass when the signal is already aborted — issue #195
+
+Issue: https://github.com/AdarGit008/repl-simple/issues/195
+Source: #171 ship report, post-ship follow-up 1 (`tasks/ship-report.md`, Low). Stacked on #171
+(PR #194), which landed the race.
 
 ## Objective
 
-Three of `runRlm`'s five provider calls were second-class. The main loop bounds its question and
-its input previews before they reach a prompt, and races its own `llmClient.query` against the
-caller's signal. `llm_query`, the `depth >= maxDepth` downgrade of `rlm_query`, and the #76
-synthesis pass did neither.
+The cap-time synthesis pass in `runRlm` (`src/rlm.ts`) is wrapped in `raceAgainstSignal` (#171),
+but the `llmClient.query(systemPrompt, synthesisMessages, options.signal)` promise is constructed
+as an *argument* to that wrapper. So when the signal is already aborted when the pass is reached,
+the provider is still called — the full transcript leaves the process — and the budget is still
+charged, for a synthesis whose result is then thrown away.
 
-Two consequences, one per half:
+The main loop does not have this bug: it has a loop-top
+`if (options.signal?.aborted) return aborted();` before its charge. The synthesis pass sits after
+the loop and has no equivalent.
 
-- **Unbounded interpolation.** `prompt`, `query` and `context` are strings the *model* wrote, and
-  each lands in a user message verbatim. A runaway generation ships the lot to the provider. Worse,
-  nothing neutralised them: a model could plant a `[TRUNCATED VIEW BEGIN]` / `[TRUNCATED VIEW END]`
-  pair, and the sub-LLM — reading under the same system prompt that tells it to trust elision
-  markers between sentinels (D17) — would take a fabricated summary as authentic.
-- **No abort race.** On the two tool paths this is not a termination bug: the sandbox ends an
-  aborted run on its own. It is a *trace* bug. `ABORT_SETTLE_GRACE_MS` exists so the dispatch loop
-  can report the tool call that was in flight, and only "a run parked in a tool that will not
-  return" is cut off without that report (`src/sandbox.ts:776-788`). An un-raced `llm_query` against
-  a provider that never answers is exactly that run — so the caller is told nothing ran, while the
-  call really did run, really did reach the provider, and really was charged (D62). On the synthesis
-  pass it *is* a termination bug: the pass runs after the loop and outside the sandbox, so there is
-  no next loop-top check and no sandbox cut-off. Un-raced, it is the one call from which an aborted
-  run can never return.
-
-Success looks like: every model-written string reaching a provider is bounded and sentinel-
-authenticated at the main loop's own ceilings; every one of the five provider calls is raced; the
-budget charges what is actually sent; and an abort during any of the three leaves a complete
-result.
-
-Issue: https://github.com/AdarGit008/repl-simple/issues/171.
-Source: #78 (RLM convergence) review suggestion + #76 residual risk 1.
-Stacked on #189/#190 (PR #193), which touches the same two call sites.
+**Success looks like:** when `options.signal?.aborted` is already true at the synthesis pass, `runRlm`
+returns a salvaged result *without* calling the provider and *without* charging the budget, and the
+caller-observable result shape is unchanged from what the aborted-synthesis catch already produces
+today.
 
 ## Assumptions (recorded — autonomous run)
 
-- **A1 — The ceilings are borrowed, not invented.** The ask *is* a question, so `llm_query`'s
-  prompt and the downgrade's query take `QUESTION_MAX_BYTES` / `QUESTION_RECOVERY`. The downgrade's
-  context is one value, so it takes `INPUT_PREVIEW_VALUE_MAX_BYTES`. No new byte budget is minted.
-- **A2 — The synthesis messages are already bounded.** `boundConversation` caps the transcript and
-  `FINAL_SYNTHESIS_PROMPT` is a constant, so the synthesis pass needs the race and nothing else.
-- **A3 — The nested (non-downgraded) `rlm_query` needs nothing.** Its query goes through the
-  child's own `buildInitialPrompt` question bound, and its context is a real sandbox input whose
-  preview is bounded there.
+- **A1 — Same observable shape.** The early return reuses the D64 budget-refusal branch's exact
+  shape: `status: "max_iterations"`, `answer: extractBestAnswer(iterations)`, `answerSource:
+  "salvaged"`, `iterations` preserved. This is what the aborted-synthesis catch already lands on
+  (`src/rlm.ts`, final fall-through return), so a caller cannot tell the difference — only the
+  provider call and the charge disappear.
+- **A2 — Budget field is conditional.** The guard sits *outside* the existing `if (budget && …)`
+  block, so `budget` may be `undefined`. It therefore renders the budget with
+  `...(budget ? { budget: budgetReport(budget, false) } : {})`, matching the final fall-through
+  salvage's conditional `...(report ? … : {})` rather than the D64 refusal's unconditional field.
+- **A3 — Guard placement.** The guard goes before the charge (`tryCharge`). Building the local
+  `synthesisMessages` array is harmless (no provider call, no charge) and may occur before or after
+  the guard; the invariant is only "before the charge".
+- **A4 — "Already aborted" is entry-time.** The scope is the signal state when the synthesis pass is
+  entered (after the loop). An abort that lands *during* `llmClient.query` is #171's race and is
+  already handled; it is out of scope here.
+- **A5 — The test pins call count + charge.** The observable behaviour that changes is (a) zero
+  `llmClient.query` synthesis calls and (b) zero charge through an already-aborted synthesis. The
+  test asserts these. Per the issue's "Check while implementing" note, if an existing test pins a
+  call count through an aborted synthesis, that assertion is updated to reflect the removed call.
 
 ## Decisions
 
-- **D1 — Bound with `truncateWithSentinels`, not `truncateText`.** The recipient is an LLM under a
-  system prompt carrying the D17 rule, so a truncated view must be authenticated. The wrap is also
-  what neutralises a forged sentinel in the value — the security half of this change, and it
-  applies under budget too, where no truncation happens at all.
-- **D2 — Two budgets on the downgrade, not one.** A single shared ceiling would let a huge query
-  starve the context, or let a huge context ride the question's much larger allowance.
-- **D3 — Value shape (50/50 head+tail), not head-only.** The goal is to keep the ask legible from
-  both ends. Head-only is the *redaction* shape and belongs to the provider-error path.
-- **D4 — A new `DOWNGRADE_CONTEXT_RECOVERY`.** `INPUT_PREVIEW_RECOVERY` says the value is a named
-  Python variable to slice; at the downgrade there is no sandbox, so that route does not exist
-  (policy Q3). It mirrors `QUESTION_RECOVERY` instead.
-- **D5 — Bound before charging.** The charge is a before-the-call price on what the call will cost
-  (D62). Pricing the raw prompt once a ceiling exists bills a run for tokens it never sends, and can
-  refuse a call that would have fitted.
-- **D6 — The `?? "(none)"` rendering is preserved exactly.** An omitted context still renders the
-  placeholder; an empty one still renders empty. The placeholder is what distinguishes "no context"
-  from "empty context" for the sub-LLM.
-- **D7 — No abort branch in the two tool-path catches.** An abort arrives as a `DOMException`, which
-  is an `Error` whose 25-byte message the redaction passes through untouched, with the original on
-  `cause`. The sandbox sees the same `RuntimeError` either way, so a `if (signal.aborted) throw err`
-  branch would be code no test could distinguish from its absence.
+- **D1 — Early return, no call, no charge.** When `options.signal?.aborted` at the synthesis pass,
+  return immediately, mirroring the D64 refusal branch. The provider is never handed the transcript
+  and `tryCharge` is never reached.
+- **D2 — No new status or provenance values.** Reuse `status: "max_iterations"` and
+  `answerSource: "salvaged"`; do not mint a new `RlmResult["status"]` value or new `answerSource`.
+- **D3 — Budget reported uncharged.** `budgetReport(budget, false)` reports the budget as of the
+  abort point, with no synthesis charge folded in.
+- **D4 — TDD.** RED first: a test that fails at HEAD because the provider is called and the budget
+  is charged. Then the minimal guard.
 
 ## Non-goals
 
-- The synthesis pass still charges and still calls the provider when the signal is *already*
-  aborted at entry; the race rejects the result rather than preventing the call. Same shape as the
-  main loop, which relies on a loop-top check instead. Filed separately rather than widened here.
-- The unbounded growth of `merged` context across nesting depth, and #191/#192.
+- The race itself (`raceAgainstSignal` wrapping) — landed in #171.
+- The equivalent question for the two tool paths (`llm_query` and the max-depth `rlm_query`
+  downgrade) — their charge sits inside a tool the sandbox aborts anyway; explicitly out of scope
+  per the issue.
+- The main loop's already-aborted behaviour — it has its own loop-top check and is unchanged.
+- `docs/truncation-policy.md` — this is a control-flow change, not a truncation change; no policy
+  row or narrative is owed.
+- Sibling issues #191, #192, #173, #170.
+
+## Commands
+
+- Full suite: `npm test` (runs `tsx --test test/*.test.ts`)
+- Focused test: `npx tsx --test test/rlm.test.ts`
+- Build: `npm run build` (`tsc -p tsconfig.build.json`)
+- Type check: `npm run check` (`tsc --noEmit`)
+- Lint: `npm run lint` (`biome check --error-on-warnings`)
+- Coverage: `npm run coverage`
+
+## Project Structure
+
+- `src/rlm.ts` — implementation (the synthesis pass; only the early-return guard changes)
+- `test/rlm.test.ts` — the RED test and any assertion moved per A5
+
+## Testing Strategy
+
+- Framework: Node's built-in test runner via `tsx` (`node:test`).
+- One new test (or a focused extension of the existing synthesis-abort describe block) asserting
+  zero synthesis calls and zero charge through an already-aborted synthesis.
+- The existing "abort during synthesis folds into salvage" test must remain green.
+- Full suite + `check` + `build` + `lint` must be clean; coverage floors must hold.
+
+## Boundaries
+
+- **Always:** RED first; run the full suite and the static gates before reporting done; follow the
+  module's existing conventions (`extractBestAnswer`, `budgetReport`, the D64 refusal shape).
+- **Ask first (recorded, not asked — autonomous run):** new dependencies; changing the public
+  `RlmResult`/`RlmOptions` type surface; touching anything outside `src/rlm.ts` + `test/rlm.test.ts`.
+- **Never:** touch the two tool paths, the main-loop loop-top check, or the `raceAgainstSignal`
+  wrapper; no `git add -A`; no changes to `docs/`.
+
+## Success Criteria
+
+- [ ] **S1 (RED):** a test asserting zero synthesis `llmClient.query` calls and zero charge when the
+      signal is already aborted fails against HEAD.
+- [ ] **S2 (GREEN):** the early-return guard makes it pass.
+- [ ] **S3 (no regression):** `npm test` green; `npm run check`, `npm run build`, `npm run lint`
+      clean; `npm run coverage` floors met.
+- [ ] **S4 (unchanged shape):** the aborted-synthesis result still reports
+      `status: "max_iterations"`, `answerSource: "salvaged"`, and the salvaged answer, and the
+      existing abort-during-synthesis test stays green.
