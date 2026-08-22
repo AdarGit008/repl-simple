@@ -486,6 +486,13 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
     // connection would see. Resolve again and refuse unless the address set is
     // unchanged (order-insensitively).
     const second = await resolveAddresses(url.hostname);
+    // The second answer is validated too: a resolver that went public → private
+    // is refused by the set comparison below, but the blocked address it just
+    // revealed must be remembered before that refusal, or a later call answering
+    // public to both lookups would walk straight through.
+    for (const address of second) {
+      if (isBlockedAddress(address)) everPrivate.add(hostname);
+    }
     if (!sameAddressSet(first, second)) {
       throw new HostToolError(
         "PermissionError",
