@@ -82,6 +82,22 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // ── HTTP egress policy ───────────────────────────────────────────
 
 /**
+ * Hostnames that have ever resolved to a private or reserved address,
+ * remembered for the life of the process.
+ *
+ * A rebinding resolver answers differently per lookup: "public" to the
+ * validation lookup, "private" to the connection. Once a name has been seen
+ * pointing at a blocked address it is never trusted again, regardless of what
+ * a later lookup says. Keyed by case-normalized hostname.
+ */
+const everPrivate = new Set<string>();
+
+/** Test-only: clear the ever-private memory so tests stay isolated. */
+export function __resetEverPrivateForTests(): void {
+  everPrivate.clear();
+}
+
+/**
  * Is this a literal address `http_get` must refuse?
  *
  * The list is the set an SSRF reaches for: loopback, the RFC1918 and CGNAT
@@ -429,8 +445,19 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
         `host '${url.hostname}' is not on the http_get allowlist`,
       );
     }
+    // A name that has ever pointed at a blocked address is never trusted again:
+    // a rebinding resolver answers differently per lookup, so the next answer
+    // being public proves nothing. Refused before any new lookup happens.
+    const hostname = url.hostname.toLowerCase();
+    if (everPrivate.has(hostname)) {
+      throw new HostToolError(
+        "PermissionError",
+        `'${url.hostname}' previously resolved to a private or reserved address`,
+      );
+    }
     for (const address of await resolveAddresses(url.hostname)) {
       if (isBlockedAddress(address)) {
+        everPrivate.add(hostname);
         throw new HostToolError(
           "PermissionError",
           `'${url.hostname}' resolves to ${address}, a private or reserved address`,

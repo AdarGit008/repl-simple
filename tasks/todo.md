@@ -3,13 +3,13 @@
 Source of truth: `SPEC.md` + `tasks/plan.md`. One item = one coder dispatch = one orchestrator commit.
 Order is fixed: Task 1 → Task 2 → Task 3.
 
-- [ ] **Task 1 — Ever-private process-lifetime memory**
-  - [ ] RED — `test/builtins.test.ts`: a hostname that resolves to a private address is refused; a
+- [x] **Task 1 — Ever-private process-lifetime memory**
+  - [x] RED — `test/builtins.test.ts`: a hostname that resolves to a private address is refused; a
         later call where the same hostname resolves public is still refused (memory). Fails at HEAD.
-  - [ ] GREEN — module-scoped `Set<string>` (case-normalized hostname); `assertReachable` refuses
+  - [x] GREEN — module-scoped `Set<string>` (case-normalized hostname); `assertReachable` refuses
         members before lookup and records a hostname when any resolved address `isBlockedAddress`.
-  - [ ] Export a test-only reset helper; use it in tests for isolation.
-  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - [x] Export a test-only reset helper; use it in tests for isolation.
+  - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
 
 - [ ] **Task 2 — Two-lookups-agree detection**

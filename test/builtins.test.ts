@@ -1,10 +1,15 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostToolError, type HostTool } from "../src/types.js";
-import { createBuiltinTools, isBlockedAddress, type BuiltinToolsOptions } from "../src/builtins.js";
+import {
+  createBuiltinTools,
+  isBlockedAddress,
+  __resetEverPrivateForTests,
+  type BuiltinToolsOptions,
+} from "../src/builtins.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -807,6 +812,51 @@ describe("http_get — direct destinations", () => {
         return true;
       },
     );
+  });
+});
+
+describe("http_get — ever-private memory", () => {
+  const okFetch: typeof fetch = async () => new Response("body", { status: 200 });
+
+  function tool(lookupImpl: (h: string) => Promise<string[]>) {
+    return findTool(
+      createBuiltinTools({ root: "/tmp", fetchImpl: okFetch, lookupImpl }),
+      "http_get",
+    );
+  }
+
+  afterEach(() => {
+    __resetEverPrivateForTests();
+  });
+
+  it("refuses a hostname that resolves to a private address", async () => {
+    const httpGet = tool(async () => ["127.0.0.1"]);
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /private or reserved/,
+    );
+  });
+
+  it("still refuses a hostname that once resolved private, even when it later resolves public", async () => {
+    const answers = ["127.0.0.1", "93.184.216.34"];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return [answers.shift() ?? "93.184.216.34"];
+    });
+
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /private or reserved/,
+    );
+
+    // The same hostname now answers public — but it is remembered and refused
+    // before a second lookup, so the rebinding window stays closed.
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(lookups, 1, "the second call must be refused before resolving again");
   });
 });
 
