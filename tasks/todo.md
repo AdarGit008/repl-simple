@@ -16,3 +16,6 @@ Source of truth: `SPEC.md` (A1–A5, D1–D4) + `tasks/plan.md`. Only `src/rlm.t
   - [x] RED verified against HEAD (test fails before the guard).
   - [x] `npm test` green; `npm run check`, `npm run build`, `npm run lint` clean;
         `npm run coverage` floors met.
+- [x] Coverage-gap tests (test-engineer follow-up): added `test/rlm.test.ts` test 20
+      (budget-absent direction of the #195 guard — no budget field, no synthesis call) and pinned
+      `result.answer` to `"still working...\n"` in test 19 (salvaged value on the entry-time path).
