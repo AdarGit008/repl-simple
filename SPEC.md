@@ -1,109 +1,166 @@
-# Spec: Early-return the synthesis pass when the signal is already aborted — issue #195
+# Spec: STOP-SHIP — A33 → A34 → A35 → A36 → A37
 
-Issue: https://github.com/AdarGit008/repl-simple/issues/195
-Source: #171 ship report, post-ship follow-up 1 (`tasks/ship-report.md`, Low). Stacked on #171
-(PR #194), which landed the race.
+Source of truth for findings: `docs/actionable-items.md` (v2, commit `dfc1136`) and `docs/REVIEW.md`.
+Stacked, in this order, on one branch / one PR. These five gate everything: until they land, the
+`repl` tool corrupts its own output, cannot be cancelled, and exfiltrates without a prompt.
 
 ## Objective
 
-The cap-time synthesis pass in `runRlm` (`src/rlm.ts`) is wrapped in `raceAgainstSignal` (#171),
-but the `llmClient.query(systemPrompt, synthesisMessages, options.signal)` promise is constructed
-as an *argument* to that wrapper. So when the signal is already aborted when the pass is reached,
-the provider is still called — the full transcript leaves the process — and the budget is still
-charged, for a synthesis whose result is then thrown away.
+Close the five STOP-SHIP items so the shipped `repl` extension is safe to run against untrusted
+input:
 
-The main loop does not have this bug: it has a loop-top
-`if (options.signal?.aborted) return aborted();` before its charge. The synthesis pass sits after
-the loop and has no equivalent.
+- **A33** — the `runDispatchLoop` accumulator desync drops stdout after the first tool call, lies
+  about `stdoutTruncated`, and makes mid-run abort a no-op.
+- **A34** — `repl` has no default timeout and no plumbed abort signal, so `while True: pass` blocks
+  the Node event loop and needs `SIGKILL`.
+- **A35** — the bridged read tools (`read`/`grep`/`find`/`ls`) and `http_get` let sandboxed Python
+  exfiltrate arbitrary host files with zero prompts.
+- **A36** — three unguarded prologue resumes can wedge a session; two of the four shipped tools
+  (`repl_abandon`, `repl_resume`) are non-functional because suspension is unreachable.
+- **A37** — `.pi/code-tools/**/*.py` is auto-executed as a preamble on every run with full host-tool
+  access and no approval; a cloned repo is a code-execution delivery vector.
 
-**Success looks like:** when `options.signal?.aborted` is already true at the synthesis pass, `runRlm`
-returns a salvaged result *without* calling the provider and *without* charging the budget, and the
-caller-observable result shape is unchanged from what the aborted-synthesis catch already produces
-today.
+**Success looks like:** each item's acceptance criteria (below) is met by a RED→GREEN test, the full
+suite + static gates are green, and the Phase 6 security audit finds no remaining Critical/High
+finding on the five items.
 
 ## Assumptions (recorded — autonomous run)
 
-- **A1 — Same observable shape.** The early return reuses the D64 budget-refusal branch's exact
-  shape: `status: "max_iterations"`, `answer: extractBestAnswer(iterations)`, `answerSource:
-  "salvaged"`, `iterations` preserved. This is what the aborted-synthesis catch already lands on
-  (`src/rlm.ts`, final fall-through return), so a caller cannot tell the difference — only the
-  provider call and the charge disappear.
-- **A2 — Budget field is conditional.** The guard sits *outside* the existing `if (budget && …)`
-  block, so `budget` may be `undefined`. It therefore renders the budget with
-  `...(budget ? { budget: budgetReport(budget, false) } : {})`, matching the final fall-through
-  salvage's conditional `...(report ? … : {})` rather than the D64 refusal's unconditional field.
-- **A3 — Guard placement.** The guard goes before the charge (`tryCharge`). Building the local
-  `synthesisMessages` array is harmless (no provider call, no charge) and may occur before or after
-  the guard; the invariant is only "before the charge".
-- **A4 — "Already aborted" is entry-time.** The scope is the signal state when the synthesis pass is
-  entered (after the loop). An abort that lands *during* `llmClient.query` is #171's race and is
-  already handled; it is out of scope here.
-- **A5 — The test pins call count + charge.** The observable behaviour that changes is (a) zero
-  `llmClient.query` synthesis calls and (b) zero charge through an already-aborted synthesis. The
-  test asserts these. Per the issue's "Check while implementing" note, if an existing test pins a
-  call count through an aborted synthesis, that assertion is updated to reflect the removed call.
-
-## Decisions
-
-- **D1 — Early return, no call, no charge.** When `options.signal?.aborted` at the synthesis pass,
-  return immediately, mirroring the D64 refusal branch. The provider is never handed the transcript
-  and `tryCharge` is never reached.
-- **D2 — No new status or provenance values.** Reuse `status: "max_iterations"` and
-  `answerSource: "salvaged"`; do not mint a new `RlmResult["status"]` value or new `answerSource`.
-- **D3 — Budget reported uncharged.** `budgetReport(budget, false)` reports the budget as of the
-  abort point, with no synthesis charge folded in.
-- **D4 — TDD.** RED first: a test that fails at HEAD because the provider is called and the budget
-  is charged. Then the minimal guard.
-
-## Non-goals
-
-- The race itself (`raceAgainstSignal` wrapping) — landed in #171.
-- The equivalent question for the two tool paths (`llm_query` and the max-depth `rlm_query`
-  downgrade) — their charge sits inside a tool the sandbox aborts anyway; explicitly out of scope
-  per the issue.
-- The main loop's already-aborted behaviour — it has its own loop-top check and is unchanged.
-- `docs/truncation-policy.md` — this is a control-flow change, not a truncation change; no policy
-  row or narrative is owed.
-- Sibling issues #191, #192, #173, #170.
+- **AS1 — Order is fixed:** A33 → A34 → A35 → A36 → A37, per `docs/actionable-items.md` "Suggested
+  order". A34's abort half is dead until A33 lands (the abort flag is one of the desynced fields), so
+  A33 must precede A34.
+- **AS2 — A36 internal order:** A36 step 1 (guard the prologue resumes) MUST precede A36 step 3
+  (enable suspend) — otherwise we convert a dead code path into a session-wedging one. Steps 1 and 2
+  are independent of 3 and 4 and may land first.
+- **AS3 — Default timeout is 30 s.** A34 "suggest 30" is taken as the default `maxDurationSecs`.
+- **AS4 — A35 strategy is jail-first, gate-second.** Bridged read tools are jailed to `cwd` using the
+  existing `realpath`-checked helper (deterministic, no prompt fatigue); `http_get` is gated behind
+  approval *and* hardened against SSRF (A45's defence-in-depth). A `gateReads` option is added so
+  callers can choose gate-over-jail.
+- **AS5 — A37 approval model.** Preamble inclusion is approval-gated per file content-hash (prompt
+  once per hash, remember the decision). Default on a fresh clone is refuse: a hostile
+  `.pi/code-tools/x.py` must NOT execute without an explicit approval. Host-tool names shadowed by
+  preamble definitions are refused. Total preamble size and file count are capped.
+- **AS6 — Line numbers are indicative.** `docs/actionable-items.md` line numbers are from commit
+  `dfc1136` and may have drifted (a recurring gotcha in this repo). Coders locate by symbol and
+  context, not by trusting the printed line.
+- **AS7 — `npm test` is the source of truth for the suite.** The repo runs `tsx --test test/*.test.ts`
+  via `npm test`; there is no coverage-floor failure unless `npm run coverage` reports a breach.
 
 ## Commands
 
 - Full suite: `npm test` (runs `tsx --test test/*.test.ts`)
-- Focused test: `npx tsx --test test/rlm.test.ts`
+- Focused test: `npx tsx --test test/<file>.test.ts`
 - Build: `npm run build` (`tsc -p tsconfig.build.json`)
 - Type check: `npm run check` (`tsc --noEmit`)
 - Lint: `npm run lint` (`biome check --error-on-warnings`)
-- Coverage: `npm run coverage`
+- Coverage: `npm run coverage` (floors enforced by `scripts/coverage.mjs`)
 
 ## Project Structure
 
-- `src/rlm.ts` — implementation (the synthesis pass; only the early-return guard changes)
-- `test/rlm.test.ts` — the RED test and any assertion moved per A5
+- `src/sandbox.ts` — the dispatch loop, `DispatchAccumulators`, resource limits, prologue resumes (A33, A34, A36)
+- `src/repl.ts` — `ReplRunner`, session creation, the `.pi/code-tools` preamble read (A34, A36, A37)
+- `src/session.ts` — session state, approval cache/grants, suspend/resume (A36, A37)
+- `src/bridge.ts` — bridged host tools incl. `read`/`grep`/`find`/`ls`, `gateMutating` (A35)
+- `src/builtins.ts` — `http_get`, `read_file`, the `realpath` jail helper (A35)
+- `src/types.ts` — `RunOptions`, `SessionOptions`, approval/suspension types (A34, A36)
+- `src/index.ts` / `src/registry.ts` / `src/toolstore.ts` — registry and tool store wiring (A37)
+- `extensions/repl-extension.ts` — the four shipped Pi tools, approval dialog (A34, A36)
+- `tsconfig.json` — type-check program, `noUnusedParameters` (A33)
+- `.gitignore` — add `.pi/` (A37)
+- `test/*.test.ts` — tests; each item adds a RED test in the matching file
+
+## Code Style
+
+Follow existing module conventions exactly. No new abstraction without a third use site. The D64/D17
+sentinel and truncation helpers are canonical — reuse, do not re-implement. Type boundaries stay
+explicit (no gratuitous `any`/`unknown`/casts). Run `npm run lint` before reporting done.
 
 ## Testing Strategy
 
-- Framework: Node's built-in test runner via `tsx` (`node:test`).
-- One new test (or a focused extension of the existing synthesis-abort describe block) asserting
-  zero synthesis calls and zero charge through an already-aborted synthesis.
-- The existing "abort during synthesis folds into salvage" test must remain green.
-- Full suite + `check` + `build` + `lint` must be clean; coverage floors must hold.
+Node's built-in test runner via `tsx` (`node:test`). Per item, one RED test (or a focused extension of
+an existing describe block) that fails at HEAD and passes after the fix:
+
+- A33 → `test/sandbox.test.ts`: `print` after a loop-dispatched tool call, on both entry points;
+  abort fired mid-run during an async tool.
+- A34 → `test/repl.test.ts` (or `test/sandbox.test.ts`): `repl` with a busy-loop returns a
+  `TimeoutError` `RunError` within the default budget and the process stays responsive.
+- A35 → `test/bridge.test.ts` / `test/builtins.test.ts`: the exfil snippet (`read('/etc/hostname')`
+  + `http_get`) either prompts or fails; assert both halves.
+- A36 → `test/repl.test.ts` / `test/session.test.ts`: deny-with-uncaught-`PermissionError` returns a
+  `RunError` and leaves the session usable; suspend → resume → approve round trip.
+- A37 → `test/repl.test.ts`: a fresh clone with a hostile `.pi/code-tools/x.py` does not execute
+  without an explicit approval; an unreadable entry does not break the session.
+
+Every item's fix must be accompanied by a test that fails without it. Full suite + `check` + `build` +
+`lint` must be clean after each item; `npm run coverage` floors must hold.
 
 ## Boundaries
 
-- **Always:** RED first; run the full suite and the static gates before reporting done; follow the
-  module's existing conventions (`extractBestAnswer`, `budgetReport`, the D64 refusal shape).
-- **Ask first (recorded, not asked — autonomous run):** new dependencies; changing the public
-  `RlmResult`/`RlmOptions` type surface; touching anything outside `src/rlm.ts` + `test/rlm.test.ts`.
-- **Never:** touch the two tool paths, the main-loop loop-top check, or the `raceAgainstSignal`
-  wrapper; no `git add -A`; no changes to `docs/`.
+- **Always:** RED first; run the full suite and static gates before reporting done; reuse canonical
+  helpers (`realpath` jail, `truncateText`, the `DispatchAccumulators` struct); one item per dispatch.
+- **Ask first (recorded, not asked — autonomous run):** new dependencies; changes to the public
+  `RunOptions`/`SessionOptions`/tool type surface that break consumers; touching files outside an
+  item's declared file set.
+- **Never:** `git add -A`; git commands from coders; touching the two RLM tool paths, the
+  `raceAgainstSignal` wrapper, or `docs/`; auto-executing `.pi/code-tools` without approval (that is
+  the very bug A37 fixes); deleting the existing jail and replacing it with nothing.
 
-## Success Criteria
+## Success Criteria (per item)
 
-- [ ] **S1 (RED):** a test asserting zero synthesis `llmClient.query` calls and zero charge when the
-      signal is already aborted fails against HEAD.
-- [ ] **S2 (GREEN):** the early-return guard makes it pass.
-- [ ] **S3 (no regression):** `npm test` green; `npm run check`, `npm run build`, `npm run lint`
-      clean; `npm run coverage` floors met.
-- [ ] **S4 (unchanged shape):** the aborted-synthesis result still reports
-      `status: "max_iterations"`, `answerSource: "salvaged"`, and the salvaged answer, and the
-      existing abort-during-synthesis test stays green.
+### A33 — accumulator desync
+- `DispatchAccumulators` is the single mutable owner: `printCallback` writes `acc.stdout += …` and
+  `acc.stdoutTruncated = true`; `onAbort` writes `acc.aborted = true`.
+- The now-unused `maxStdout` and `printCallback` parameters at the `runDispatchLoop` signature are
+  deleted.
+- `noUnusedParameters` is enabled in `tsconfig.json` and `npm run check` stays clean.
+- Tests: `print` after a loop-dispatched tool call is preserved on both entry points; a mid-run abort
+  during an async tool stops the loop.
+
+### A34 — default timeout + abort plumbing
+- `toResourceLimits` defaults `maxDurationSecs` (30) and `maxMemory` when the caller passes none.
+- `_signal` threads `extensions/repl-extension.ts` → `ReplRunner.run/resume` → `RunOptions.signal`.
+- `maxDurationSecs`/`maxMemory`/`signal` are exposed as `repl` tool parameters with sane caps.
+- Tests: `repl` with `while True: pass` returns a `TimeoutError` `RunError` within the default budget;
+  the Pi process stays responsive.
+
+### A35 — close the read/egress surface
+- Bridged read tools are jailed to `cwd` (same `realpath`-checked helper as `builtins.read_file`), or
+  gated; a `gateReads` option is added to `BridgeOptions`.
+- `http_get` is gated behind approval or restricted to an explicit allowlist, and hardened with SSRF
+  defences (loopback/link-local/RFC1918/`::1`/metadata blocked per hop, `redirect: "manual"`,
+  `AbortSignal.timeout`).
+- Test: the `read('/etc/hostname')` + `http_get` exfil snippet either prompts or fails; both halves
+  asserted.
+
+### A36 — guard resumes, reachable suspension
+- The three prologue `snapshot.resume()` calls are wrapped exactly as the shared loop wraps its eleven
+  resumes (catch `MontyRuntimeError`).
+- `ReplRunner.resume` catches the no-suspension case and returns a friendly string (matching the
+  no-session branch).
+- `ctx.ui.confirm` is replaced with `ctx.ui.select` offering approve / deny / decide-later, returning
+  `"suspend"` for the third; `Session.resume`'s `decision` widens from `boolean`.
+- `formatResult`'s suspended branch names the `sessionId`.
+- Tests: deny-with-uncaught-`PermissionError` returns a `RunError` and leaves the session usable; a
+  full suspend → resume → approve round trip works.
+
+### A37 — no auto-execute of `.pi/code-tools`
+- Preamble inclusion is approval-gated per file content-hash (prompt once, remember per hash); a
+  hostile file does not execute without explicit approval.
+- Preamble definitions that shadow a registered host-tool name are refused.
+- `createToolStoreTools` is registered in `repl.ts` so `read_tool`/`delete_tool` are reachable.
+- The read loop is wrapped in `try` so one bad entry (e.g. `dir.py`) is skipped, not fatal.
+- `.pi/` is added to `.gitignore`; total preamble size and file count are capped.
+- Test: fresh clone with hostile `.pi/code-tools/x.py` does not execute without an explicit prompt; an
+  unreadable entry does not break the session.
+
+## Non-goals
+
+- The two RLM tool paths, the `raceAgainstSignal` wrapper, and `docs/` — out of scope.
+- A4 (approval grants bind to command string, not content), A7 remainder, A45 as a standalone item —
+  A35 pulls in only the SSRF defence-in-depth that the egress fix needs.
+- Sibling issues outside A33–A37.
+
+## Open Questions
+
+None — all ambiguities recorded as assumptions AS1–AS7 above.
