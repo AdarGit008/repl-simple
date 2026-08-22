@@ -195,16 +195,15 @@ function isBlockedIpv6(groups: number[]): boolean {
 /**
  * Resolve a hostname to every address it answers with.
  *
- * **The rebinding window is open, and is accepted risk.** This resolves the
- * name, validates the addresses, and then hands `fetch` the *name* — so a
- * resolver that answers differently for the connection than it did for the
- * check reaches a destination that was never validated. Closing it means
- * connecting to the address we pinned, which for `fetch` means supplying a
- * custom `lookup` through an `undici` dispatcher: a new production dependency,
- * for an attack that needs control of an authoritative resolver *and* an
- * allowlisted-or-approved name pointing at it. The cheap half of the defence —
- * refusing the private ranges outright — is what is implemented here. Revisit
- * if `undici` ever arrives for another reason.
+ * **The rebinding window is narrowed, not closed.** `assertReachable` resolves
+ * twice and refuses unless the address set is unchanged (order-insensitively),
+ * and any hostname that has ever resolved to a private/reserved address is
+ * refused process-lifetime. But this still hands `fetch` the *name* — so a
+ * resolver that answers public to both lookups and private only at connect-time
+ * reaches a destination that was never validated. Closing that residual means
+ * connecting to the address we pinned, which for `fetch` requires supplying a
+ * custom `lookup` through an `undici` dispatcher. Revisit if `undici` ever
+ * arrives for another reason.
  */
 async function defaultLookup(hostname: string): Promise<string[]> {
   const results = await lookup(hostname, { all: true, verbatim: true });
