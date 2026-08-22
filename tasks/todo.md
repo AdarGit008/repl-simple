@@ -1,55 +1,48 @@
-# Todo — issues #189, #190: one provider-error rule site, and the cause behind it
+# Todo — issue #171: bound and race the three remaining provider calls
 
-Source of truth: `SPEC.md` (D1–D6) + `tasks/plan.md`. Behaviour-preserving throughout: if any
-surface renders differently after this flight, that is a defect. Do **not** change
-`RLM_ERROR_MAX_BYTES`, `HEAD_ONLY_RATIO` or `RLM_ERROR_RECOVERY`; do **not** export either helper
-(#85); do **not** touch `buildFeedback`, `truncateWithSentinels`, `src/sandbox.ts` or
-`src/truncate.ts`; do **not** absorb #171, #191 or #192. Only `src/rlm.ts`, `test/rlm.test.ts` and
-`docs/truncation-policy.md` are in scope.
+Source of truth: `SPEC.md` (D1–D7) + `tasks/plan.md`. Stacked on PR #193 (#189/#190), which owns
+the same two tool-path call sites. Do **not** mint a new byte budget (A1); do **not** use
+`truncateText` for the interpolations (D1 — the sentinel wrap is the security half); do **not**
+touch `buildInitialPrompt`, `boundConversation`, `src/sandbox.ts` or `src/truncate.ts`; do **not**
+change the `?? "(none)"` rendering (D6); do **not** absorb the already-aborted synthesis charge,
+#191 or #192. Only `src/rlm.ts`, `test/rlm.test.ts` and `docs/truncation-policy.md` are in scope.
 
-- [x] **T1 — One rule site, and the throw shape that carries the cause (D1–D5)**
-  - [x] `src/rlm.ts` — replace the inline `truncateText(...)` block at the `RlmResult.error`
-    assignment site (the D53 catch) with `error: redactProviderError(err),`.
-  - [x] `src/rlm.ts` — add `sandboxProviderError(err: unknown): Error` beside
-    `redactProviderError`, returning `new Error(redactProviderError(err), { cause: err })`, with
-    the boundary argument in its doc comment (A2). Both tool paths become
-    `throw sandboxProviderError(err);`.
-  - [x] `src/rlm.ts` — rewrite `redactProviderError`'s doc comment to name all three sites, so the
-    one-rule-site invariant is stated where it has to hold.
-  - [x] PINS — new `describe("runRlm() — provider-error rule consolidation (#189, #190)")` in
-    `test/rlm.test.ts`, with a `d53Redaction(thrown)` helper that runs the same rejection through
-    the D53 catch and a `toolTrace(result, tool)` helper that pulls the failed call's trace entry.
-    Four tests:
-    1. **llm_query path** — `trace.error` equals `d53Redaction(thrown)` for a 64 KiB rejection;
-       the tail marker is absent.
-    2. **Downgraded rlm_query path** — same, at `maxDepth: 1, depth: 1`.
-    3. **Cause adds nothing to the message (#190)** — short `"boom"` rejection: `trace.error` is
-       exactly `"boom"` and equals the D53 output (D5).
-    4. **Bare-string rejection** — the `String(err)` arm agrees across sites.
-  - [x] Verify — `npx tsx --test test/rlm.test.ts` green; full `npm test` green (1082, +4);
-    `npm run check` + `npm run build` clean; `npx biome check src extensions test` clean.
-  - [x] Mutation-verify — drift the D53 site's cap to 512 B, confirm the new pins go red (3 of 4,
-    plus 3 pre-existing #167 tests), restore.
-  - [x] Pin what has no surface. `cause` is unobservable by construction — `src/sandbox.ts` reads
-    `err.message` off a tool throw and discards the Error, and `sandboxProviderError` is
-    module-private — so no behaviour test can tell `{ cause: err }` from its absence, and #190's
-    whole payload could be deleted with the suite green. Pinned at the source, the way test 6 pins
-    invariant 4. The same pin covers #189's half (both tool paths reach the one rule site rather
-    than re-spelling the throw), which the equality assertions cannot see because both of their
-    operands move together. Mutation-verified both ways: dropping `{ cause: err }` reds it, and so
-    does re-spelling one tool path's throw.
-  - [x] Harden against a *shared* break. The equality pins agree when both sides are equally
-    wrong: a stray `maxBytes: 16` inside `redactProviderError` collapsed every provider-error
-    surface to `""` and all four tests still passed. Each long-rejection test now also anchors
-    both sides to `assertRedactedShape` — head kept, tail gone, recovery clause present, 1 KiB
-    ceiling held — and the same mutation now turns 3 of the 4 red.
+- [x] **T1 — Bound the two tool-path prompts (D1–D6)**
+  - [x] RED — six tests in a new `describe("runRlm() — tool-path prompt bounds and abort race
+    (#171)")`: the 64 KiB ceiling with its sentinel wrap and elision marker; an ordinary prompt
+    passing through byte-identically; a forged `[TRUNCATED VIEW …]` pair neutralised under budget;
+    the downgrade's two budgets holding independently; `Context: (none)` preserved; and the charge
+    priced on the bounded prompt rather than the raw one. Four RED, two green-by-design.
+  - [x] GREEN — `src/rlm.ts`: add `DOWNGRADE_CONTEXT_RECOVERY` plus the tool-path budget note after
+    `QUESTION_RECOVERY`; `boundedPrompt` in `onLLMQuery` and `boundedQuery` / `contextText` in the
+    downgrade branch, all via `truncateWithSentinels`; the charge reads the bounded string.
   - Files — `src/rlm.ts`, `test/rlm.test.ts`.
 
-- [x] **T2 — Record the consolidation in the truncation policy (D6)**
-  - [x] Cite `#189` alongside `#167` and `#184` on the two provider-error rows. No new row — no
-    new surface.
-  - [x] Append the `**#189 / #190 (one rule site, and the cause behind it).**` narrative after the
-    `#184` one: why two spellings of one rule was the defect, that behaviour is unchanged, the
-    `err.message`-only sandbox boundary that makes `cause` safe, and the equality shape of the pin.
-  - [x] Verify — re-read against the landed code; doc-only, no test changes.
+- [x] **T2 — Race the three calls (D7)**
+  - [x] MEASURE FIRST — the obvious abort test is vacuous on the two tool paths (the sandbox's own
+    cut-off ends the run either way). Established by 4 runs each way that the deterministic,
+    load-bearing difference is the dispatch trace, and that a *synchronous* abort while the call is
+    in flight makes it deterministic. Table in `tasks/plan.md`.
+  - [x] RED — four tests: the in-flight `llm_query` surviving in `calls[]`; the same for the
+    downgraded `rlm_query`; the synthesis pass terminating at all (the only test in the file with
+    an explicit `timeout`, because its RED state is a hang); and abort-listener balance across two
+    `llm_query` calls. Three RED, one green-by-design.
+  - [x] GREEN — `raceAgainstSignal` around all three `llmClient.query` calls. No abort branch in
+    the catches (D7).
+  - Files — `src/rlm.ts`, `test/rlm.test.ts`.
+
+- [x] **Checkpoint**
+  - [x] RED verified against the PR-#193 head: 7 of 10 red, 3 green by design.
+  - [x] `npm test` 1092/1092 (+10); `npm run check`, `npm run build`, `npm run lint` clean;
+    `npm run coverage` — all per-file floors met.
+
+- [x] **T3 — Record the three surfaces in the truncation policy**
+  - [x] Three Implementation-record rows (`llm_query` prompt 64 KiB; downgraded-`rlm_query` query
+    64 KiB; downgraded-`rlm_query` context 5 KiB — all 50/50 head+tail, all #171).
+  - [x] A `**#171 (the two tool-path prompts).**` narrative: the D17 forgery hole the raw paths
+    left open, why two budgets rather than one, why a value cut rather than a redaction cut, why
+    `DOWNGRADE_CONTEXT_RECOVERY` is not `INPUT_PREVIEW_RECOVERY`, and why the bound precedes the
+    charge.
+  - [x] In passing: the #184 narrative's `new Error(redactProviderError(err))` now also names the
+    `sandboxProviderError` spelling #190 gave it.
   - Files — `docs/truncation-policy.md`.
