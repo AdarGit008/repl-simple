@@ -115,6 +115,14 @@ correct from A33–A36).
 | A37 approval UI in headless run | No one to click | Hash-keyed approval defaults to refuse; tests assert no auto-execute (AS5) |
 | `noUnusedParameters` flags pre-existing dead params | `check` breaks on unrelated files | Enable after deleting the A33 params; if other files break, scope the fix to silence only truly-dead params or record a follow-up |
 
+## Reality Check (verified at HEAD `22b4245`)
+
+Every planned task was already landed on `main` by the 76 commits between `dfc1136` (where
+`docs/actionable-items.md` was written) and HEAD. The doc is stale; this flight is
+**verification-only**. Task→commit map in `tasks/todo.md`. Phase 3 (BUILD) has nothing to implement;
+Phases 4–6 (verify, review, audit) proceed as independent confirmation that the STOP-SHIP stack is
+genuinely closed and correct, plus any residual-gap recording.
+
 ## Open Questions
 
 None — ambiguities recorded as SPEC assumptions AS1–AS7.
