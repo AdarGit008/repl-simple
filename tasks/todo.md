@@ -21,9 +21,9 @@ Order is fixed: Task 1 → Task 2 → Task 3.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
   - Depends on: Task 1.
 
-- [ ] **Task 3 — Update `docs/http-egress.md`**
-  - [ ] Rewrite the "accepted risk" rebinding window text: interim hardening landed (ever-private +
+- [x] **Task 3 — Update `docs/http-egress.md`**
+  - [x] Rewrite the "accepted risk" rebinding window text: interim hardening landed (ever-private +
         two-lookups-agree), remaining residual is the undici custom-dispatcher connection pinning.
-  - [ ] No stale claims; `npm run lint` clean.
+  - [x] No stale claims; `npm run lint` clean.
   - Files — `docs/http-egress.md`.
   - Depends on: Task 2.
