@@ -4993,6 +4993,100 @@ describe("runRlm() — spend budget", () => {
     assert.equal(llm.calls().length, 3, "the synthesis call must not run");
     assert.equal(result.budget?.consumed, investigationCost);
   });
+
+  it("19. an already-aborted signal at the synthesis pass makes no synthesis call and charges nothing (#195)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const controller = new AbortController();
+    const { llm } = mockLlmCodeGen([code, code, code]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: 1_000_000,
+      signal: controller.signal,
+      onIteration: (iteration) => {
+        // Abort at the very end of the final iteration, after the loop's
+        // post-iteration abort check has already passed. The SUBMIT check
+        // below it is the first thing to read `result.calls`, so a proxy on
+        // that array fires the abort in the gap between the loop and the
+        // synthesis pass — the loop completes normally and the synthesis pass
+        // is entered with `signal.aborted === true`, exactly the state the
+        // #195 guard exists for.
+        if (iteration.index === 2) {
+          const realCalls = iteration.result.calls;
+          iteration.result.calls = new Proxy(realCalls, {
+            get(target, prop) {
+              if (prop === "some") controller.abort();
+              return Reflect.get(target, prop);
+            },
+          });
+        }
+      },
+    });
+
+    // The loop reached its cap before the abort, so the run salvages with the
+    // same shape the aborted-synthesis catch produces (SPEC A1).
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.answer, "still working...\n");
+    assert.equal(result.iterations.length, 3);
+    assert.ok(controller.signal.aborted, "the signal must be aborted by synthesis entry");
+
+    // The synthesis query must never reach the provider: exactly the three
+    // loop iterations, no fourth synthesis call.
+    assert.equal(llm.calls().length, 3, "no synthesis query may run after an abort");
+
+    // And the budget must charge only the three investigation iterations —
+    // the discarded synthesis contributes nothing.
+    const investigationCost = llm
+      .calls()
+      .slice(0, 3)
+      .reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.ok(investigationCost > 0, "the investigation must be charged");
+    assert.equal(result.budget?.consumed, investigationCost);
+    assert.equal(result.budget?.limited, false);
+  });
+
+  it("20. an already-aborted signal at the synthesis pass with no budget omits the budget field (#195)", async () => {
+    const code = "```python\nprint('still working...')\n```";
+    const controller = new AbortController();
+    const { llm } = mockLlmCodeGen([code, code, code]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      signal: controller.signal,
+      onIteration: (iteration) => {
+        // Same landing as test 19: abort after the loop's post-iteration check
+        // but before the synthesis pass, so the pass is entered already
+        // aborted. Without a budget, the guard must omit the budget field.
+        if (iteration.index === 2) {
+          const realCalls = iteration.result.calls;
+          iteration.result.calls = new Proxy(realCalls, {
+            get(target, prop) {
+              if (prop === "some") controller.abort();
+              return Reflect.get(target, prop);
+            },
+          });
+        }
+      },
+    });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "salvaged");
+    assert.ok(controller.signal.aborted, "the signal must be aborted by synthesis entry");
+
+    // The synthesis query must never reach the provider: exactly the three
+    // loop iterations, no fourth synthesis call.
+    assert.equal(llm.calls().length, 3, "no synthesis query may run after an abort");
+
+    // The budget field is genuinely absent when no budget was configured —
+    // the guard's conditional spread omits it (SPEC A2).
+    assert.equal(result.budget, undefined);
+    assert.ok(!("budget" in result), "no budget field may be present");
+  });
 });
 
 describe("runRlm() — answer provenance (issue #76)", () => {

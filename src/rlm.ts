@@ -1487,6 +1487,20 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     { role: "user", content: FINAL_SYNTHESIS_PROMPT },
   ];
 
+  if (options.signal?.aborted) {
+    // #195: the signal was already aborted before the synthesis pass — salvage
+    // without calling the provider or charging the budget. Same shape as the
+    // D64 refusal branch, but the budget field is conditional because `budget`
+    // may be undefined here.
+    return {
+      status: "max_iterations",
+      answer: extractBestAnswer(iterations),
+      answerSource: "salvaged",
+      iterations,
+      ...(budget ? { budget: budgetReport(budget, false) } : {}),
+    };
+  }
+
   if (budget && !budget.tryCharge(callCost(systemPromptTokens, synthesisMessages))) {
     // Refusal → salvage (D64): return the last iteration's extracted answer
     // (the value the run already had before the synthesis refinement), never
