@@ -197,11 +197,20 @@ const RLM_ERROR_MAX_BYTES = 1024;
 const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
 
 /**
- * Head-only truncation of a provider rejection before it surfaces as a sandbox
- * RuntimeError (#184). The two tool paths (`onLLMQuery`, the downgrade branch
- * of `onRLMQuery`) re-throw this bounded form, so both consumers — the
- * caller-visible `iterations[].result.error` and the model-visible
- * `buildFeedback` output — read a message whose request-context tail is gone.
+ * The one provider-error redaction: head-only truncation of an LLM rejection
+ * before it leaves `runRlm` in any form (#167, #184, #189).
+ *
+ * All three sites that surface a provider message call this and nothing else,
+ * so the rule cannot split across them (#189 — the D53 catch spelled the same
+ * `truncateText` call out inline until it was consolidated here):
+ *
+ * 1. the D53 top-level catch → `RlmResult.error`, caller-visible;
+ * 2. `onLLMQuery` → a sandbox `RuntimeError`, via `sandboxProviderError`;
+ * 3. the `depth >= maxDepth` downgrade branch of `onRLMQuery` → likewise.
+ *
+ * Sites 2 and 3 reach two consumers each — the caller-visible
+ * `iterations[].result.error` and the model-visible `buildFeedback` output —
+ * and every one of them reads a message whose request-context tail is gone.
  */
 function redactProviderError(err: unknown): string {
   return truncateText(err instanceof Error ? err.message : String(err), {
@@ -209,6 +218,21 @@ function redactProviderError(err: unknown): string {
     headRatio: HEAD_ONLY_RATIO,
     recovery: RLM_ERROR_RECOVERY,
   }).text;
+}
+
+/**
+ * The Error a failed provider call re-throws from a host tool (#190). The
+ * message is the redacted form and nothing else — `src/sandbox.ts` maps a
+ * non-`HostToolError` tool throw to a Python `RuntimeError` carrying
+ * `err.message` verbatim, so the message is the only part that crosses into
+ * the sandbox and on to the model. `cause` keeps the original rejection —
+ * its subclass, any provider `status`/`code`, its stack — reachable to an
+ * in-process host debugging an outage. It is deliberately not part of any
+ * surfaced string: the sandbox boundary reads `message` only, so carrying the
+ * cause cannot re-open the leak #184 closed.
+ */
+function sandboxProviderError(err: unknown): Error {
+  return new Error(redactProviderError(err), { cause: err });
 }
 
 // ── Conversation budget ─────────────────────────────────────────
@@ -1128,7 +1152,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
             options.signal,
           );
         } catch (err) {
-          throw new Error(redactProviderError(err));
+          throw sandboxProviderError(err);
         }
       },
       onRLMQuery: async (query, context) => {
@@ -1152,7 +1176,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           try {
             return await llmClient.query(systemPrompt, [{ role: "user", content }], options.signal);
           } catch (err) {
-            throw new Error(redactProviderError(err));
+            throw sandboxProviderError(err);
           }
         }
 
@@ -1286,11 +1310,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       // completed before the failure and carry the message on `error`.
       return {
         status: "error",
-        error: truncateText(err instanceof Error ? err.message : String(err), {
-          maxBytes: RLM_ERROR_MAX_BYTES,
-          headRatio: HEAD_ONLY_RATIO,
-          recovery: RLM_ERROR_RECOVERY,
-        }).text,
+        error: redactProviderError(err),
         answer: extractBestAnswer(iterations),
         answerSource: "salvaged",
         iterations,

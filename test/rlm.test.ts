@@ -1257,6 +1257,221 @@ describe("runRlm() — tool-path provider-error redaction (#184)", () => {
   });
 });
 
+// ── One provider-error rule across all three sites (#189, #190) ──
+
+describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  /**
+   * The message the redaction must produce is not spelled out here: it is
+   * taken from the D53 catch, whose #167 tests already pin its shape. What
+   * these tests pin is that the *other two* sites produce the very same
+   * string — #184 routed them through `redactProviderError`, #189 finished the
+   * job by moving the D53 catch onto it too, and nothing may split the rule
+   * across the three again.
+   *
+   * The tool-path surface compared against it is `calls[].error`, the trace
+   * field that carries `err.message` verbatim out of `src/sandbox.ts`. It is
+   * the closest observable point to the throw: `result.error` is the same text
+   * after Python has wrapped it in a `RuntimeError:` prefix, so an equality
+   * pin there would compare the wrapping rather than the redaction.
+   */
+  async function d53Redaction(thrown: unknown): Promise<string> {
+    const llm: LlmClient = {
+      async query() {
+        throw thrown;
+      },
+    };
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 1 });
+    assert.equal(result.status, "error");
+    return result.error!;
+  }
+
+  /**
+   * The absolute shape of a redacted 64 KiB rejection, checked without
+   * reference to any other site.
+   *
+   * Equality across sites is the drift pin, but equality alone is not a pin at
+   * all: two sites broken the same way agree perfectly. (Measured — a stray
+   * `maxBytes: 16` in the shared helper collapsed every surface to `""`, and
+   * the equality assertions all passed.) So each long-rejection test anchors
+   * both sides to this too: the head survives, the tail is gone, the recovery
+   * clause renders, and the 1 KiB ceiling holds.
+   */
+  function assertRedactedShape(message: string, filler: string): void {
+    const bytes = Buffer.byteLength(message, "utf8");
+    assert.ok(bytes <= 1024, `redacted message was ${bytes} bytes, over the 1 KiB ceiling`);
+    assert.ok(bytes > 900, `redacted message was only ${bytes} bytes — the head was not kept`);
+    assert.ok(
+      message.startsWith(filler.repeat(64)),
+      `redacted message lost its head: ${message.slice(0, 40)}`,
+    );
+    assert.ok(
+      message.includes("The full provider error is not surfaced."),
+      "redacted message lost its recovery clause",
+    );
+  }
+
+  /** The `calls[]` trace entry the failed tool left on the iteration. */
+  function toolTrace(result: RlmIteration["result"], tool: string) {
+    const trace = result.calls.find((c) => c.tool === tool);
+    assert.ok(trace, `no ${tool} entry in the tool-call trace`);
+    assert.equal(trace.ok, false, `${tool} trace records success, not the rejection`);
+    return trace;
+  }
+
+  it("redacts the llm_query tool path to the exact string the D53 catch produces", async () => {
+    const thrown = new Error(`${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`);
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw thrown;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
+    const trace = toolTrace(result.iterations[0].result, "llm_query");
+    const d53 = await d53Redaction(thrown);
+    assert.equal(trace.error, d53);
+    assert.ok(!trace.error!.includes("TAIL-SECRET-REQID"));
+    assertRedactedShape(trace.error!, "A");
+    assertRedactedShape(d53, "A");
+  });
+
+  it("redacts the downgraded-rlm_query tool path to the exact string the D53 catch produces", async () => {
+    const thrown = new Error(`${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`);
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```';
+        throw thrown;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
+    const trace = toolTrace(result.iterations[0].result, "rlm_query");
+    const d53 = await d53Redaction(thrown);
+    assert.equal(trace.error, d53);
+    assert.ok(!trace.error!.includes("TAIL-SECRET-REQID"));
+    assertRedactedShape(trace.error!, "A");
+    assertRedactedShape(d53, "A");
+  });
+
+  it("carries the cause without adding a byte to the message that crosses the sandbox (#190)", async () => {
+    // `sandboxProviderError` attaches the original rejection as `cause`, and
+    // `src/sandbox.ts` maps a tool throw to a Python RuntimeError built from
+    // `err.message` alone. A short message is the sharpest pin available: it
+    // is under the 1 KiB budget, so the redaction is a no-op and the trace
+    // must read exactly what the provider threw — any cause text leaking into
+    // the message (a stringified `cause`, an appended chain) shows up here as
+    // an inequality, on the surface that reaches the model.
+    const thrown = new Error("boom");
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw thrown;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
+    const trace = toolTrace(result.iterations[0].result, "llm_query");
+    assert.equal(trace.error, "boom");
+    assert.equal(trace.error, await d53Redaction(thrown));
+  });
+
+  it("carries the cause, and throws it from one place (#189/#190, source pin)", () => {
+    // `cause` is unobservable from every public surface by construction:
+    // `src/sandbox.ts` reads `err.message` (plus the `HostToolError`
+    // python-type discriminator) off a tool throw and discards the Error
+    // itself, and `sandboxProviderError` is module-private. That is the
+    // design, not an oversight — but it also means no behaviour test can tell
+    // `{ cause: err }` from its absence, so #190's whole payload could be
+    // deleted with the suite still green.
+    //
+    // Pinned the way test 6 pins invariant 4: at the source, where an
+    // invariant that has no observable surface actually lives. The same pin
+    // covers #189's half — that both tool paths reach the one rule site
+    // rather than re-spelling the throw — which the equality assertions above
+    // cannot see, because both of their operands move together.
+    const rlmSource = readFileSync(
+      join(fileURLToPath(import.meta.url), "..", "..", "src", "rlm.ts"),
+      "utf-8",
+    );
+
+    assert.match(
+      rlmSource,
+      /function sandboxProviderError[\s\S]{0,200}?new Error\(\s*redactProviderError\(err\),\s*\{ cause: err \}\s*\)/,
+      "sandboxProviderError must carry the original rejection as `cause` (#190)",
+    );
+    assert.equal(
+      (rlmSource.match(/throw sandboxProviderError\(err\);/g) ?? []).length,
+      2,
+      "both tool paths must throw through sandboxProviderError",
+    );
+    assert.doesNotMatch(
+      rlmSource,
+      /throw new Error\(redactProviderError\(/,
+      "no tool path may re-spell the provider-error throw (#189)",
+    );
+  });
+
+  it("redacts a bare-string rejection identically on the tool path and the D53 catch", async () => {
+    // The `String(err)` arm of the shared helper, pinned across sites: a
+    // non-Error throw has no `.message`, and the two paths must still agree.
+    const thrown = `${"B".repeat(64 * 1024)}STRING-TAIL-SECRET`;
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw thrown;
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.iterations.length, 1, "the iteration never landed");
+    const trace = toolTrace(result.iterations[0].result, "llm_query");
+    const d53 = await d53Redaction(thrown);
+    assert.equal(trace.error, d53);
+    assert.ok(!trace.error!.includes("STRING-TAIL-SECRET"));
+    assertRedactedShape(trace.error!, "B");
+    assertRedactedShape(d53, "B");
+  });
+});
+
 // ── Abort semantics (#75) ───────────────────────────────────────
 
 describe("runRlm() — abort", () => {

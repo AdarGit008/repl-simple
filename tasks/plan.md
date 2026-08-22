@@ -1,52 +1,62 @@
-# Implementation Plan: issue #184 — redact provider errors on the llm_query / downgraded-rlm_query tool paths
+# Implementation Plan: issues #189, #190 — one provider-error rule site, and the cause behind it
 
 ## Overview
 
-`onLLMQuery` (`src/rlm.ts:1087`) and the `depth >= maxDepth` downgrade branch of `rlm_query`
-(`src/rlm.ts:1111`) call `llmClient.query` with no truncation. A provider rejection throws out of
-the tool into the sandbox as a Python `RuntimeError` (`src/sandbox.ts` maps the thrown `err.message`
-verbatim), and the raw message reaches both `buildFeedback` (16 KiB 50/50 → tail retained,
-model-visible) and `iterations[].result.error` (raw, caller-visible). The fix is one choke point per
-tool path: wrap the call, truncate head-only at 1 KiB with the existing `truncateText` + the three
-#167 constants, and re-throw a plain `Error`. Both consumers then read the bounded form; short
-messages pass byte-identical.
+Two small, behaviour-preserving changes in `src/rlm.ts`, both closing #184 ship-report follow-ups:
 
-## Architecture Decisions (SPEC D1–D7, not restated)
+1. **#189** — the D53 top-level catch stops spelling the provider-error truncation out inline and
+   calls `redactProviderError(err)`, the helper #184 already introduced for the two tool paths.
+   After this, exactly one expression in the module names `RLM_ERROR_MAX_BYTES` /
+   `HEAD_ONLY_RATIO` / `RLM_ERROR_RECOVERY` together.
+2. **#190** — the two tool paths re-throw through a new `sandboxProviderError(err): Error`, which
+   builds `new Error(redactProviderError(err), { cause: err })`. The message crossing the sandbox
+   boundary is unchanged; the original rejection becomes reachable in-process.
 
-- **D1/D2** — source choke points at the two call sites; plain `truncateText`, no sentinel wrap.
-- **D3/D4/D5** — reuse `RLM_ERROR_MAX_BYTES` (1024), `HEAD_ONLY_RATIO` (1), `RLM_ERROR_RECOVERY`.
-- **D6** — re-throw `new Error(truncated)`; `RuntimeError` semantics preserved (A4).
-- **D7** — module-private `redactProviderError(err: unknown): string` helper beside the RLM
-  provider-error constants; both call sites use it.
+Neither changes what any surface renders. The tests are therefore **drift pins**, not RED-first
+failures — see "On RED-first" below.
+
+## Architecture Decisions (SPEC D1–D6, not restated)
+
+- **D1/D2** — `redactProviderError` is the string rule; `sandboxProviderError` is the throw shape.
+- **D3** — `cause` is carried verbatim; it reaches no surface (A2).
+- **D4/D5** — equality pins at `calls[].error` against the D53 catch's output, long and short.
+- **D6** — the truncation policy records a consolidation, not a new surface.
+
+## On RED-first
+
+The repo's default is RED-first, and it does not fit a consolidation: before the change both sites
+compute the identical string, so no test can distinguish them. What the tests must catch is the
+**next** change — a cap or ratio applied at one site and not the other. That is exactly what the
+equality pins do, and it was verified by mutation rather than asserted: dropping the D53 site's cap
+to 512 B while the tool paths stayed at 1 KiB turned three of the four new tests red (plus three
+pre-existing #167 tests). Recorded in the ship report.
 
 ## Task List
 
-### Phase 1: the fix + its RED-first tests
-- [ ] **Task 1 (T1)** — truncate provider errors at the two tool paths (`src/rlm.ts`); RED-first:
-      two new long-message tests + one short-message regression pin in `test/rlm.test.ts`.
+### Phase 1: the consolidation and the throw shape
+- [ ] **Task 1 (T1)** — D53 catch → `redactProviderError`; add `sandboxProviderError`; both tool
+      paths throw it (`src/rlm.ts`). Four equality/drift pins in `test/rlm.test.ts`.
 
-### Checkpoint 1: code + tests
-- [ ] Focused `npx tsx --test test/rlm.test.ts` green; full `npm test` green;
-      `npm run check` + `npm run build` clean; scoped lint (`npx biome check src extensions test`)
-      clean.
+### Checkpoint 1
+- [ ] Focused `npx tsx --test test/rlm.test.ts` green; full `npm test` green; `npm run check` +
+      `npm run build` clean; scoped lint (`npx biome check src extensions test`) clean.
+- [ ] Mutation-verify the drift pin: drift the D53 site's cap, confirm the new tests go red,
+      restore.
 
-### Phase 2: policy documentation
-- [ ] **Task 2 (T2)** — record the two tool-path surfaces in `docs/truncation-policy.md`
-      (Implementation-record row + short narrative).
+### Phase 2: the record
+- [ ] **Task 2 (T2)** — `docs/truncation-policy.md`: cite #189 on the two existing provider-error
+      rows, add the `#189 / #190` narrative after the `#184` one.
 
-### Checkpoint 2: complete
-- [ ] Issue acceptance met; all tests green; ready for review.
+### Checkpoint 2
+- [ ] Re-read the edited policy sections against the landed code. Doc-only; no test changes.
 
-## Risks and Mitigations
+## Files
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| 1 KiB cap truncates a legitimately useful provider error | Low | Recorded assumption (A1/D3); head-only keeps the error-type prefix; veto point is Phase 6 |
-| Re-throwing `new Error` changes abort/error classification on the tool path | Low | A4/D6 — no reclassification; `err.message` already becomes `RuntimeError`; #171 owns signal-racing |
-| Double truncation (source + `buildFeedback`) | Low | Harmless — the source output is ≤ 1 KiB, so `buildFeedback`'s 16 KiB split passes it through unchanged |
-| Doc task (T2) has no test | Low | `check`/`build`/`lint` unaffected; doc reviewed in Phase 5 for accuracy |
-| Overlap with #171/#182 (same file) | Med | Strictly scope T1 to the two call sites + helper; do not touch budget/`tryCharge` or interpolation |
+- `src/rlm.ts` — the two helpers and the three call sites.
+- `test/rlm.test.ts` — one new `describe` block, four tests.
+- `docs/truncation-policy.md` — two row citations, one narrative paragraph.
 
-## Open Questions
+## Out of scope
 
-None blocking (SPEC "Open questions").
+`#191` (marker size disclosure) and `#192` (the 1 KiB window) — both filed, both decisions rather
+than defects. `#171` stacks on this branch and is not part of this PR.
