@@ -211,6 +211,22 @@ async function defaultLookup(hostname: string): Promise<string[]> {
   return results.map((r) => r.address);
 }
 
+/** Normalize an address for set comparison: trim and lowercase. */
+function normalizeAddress(address: string): string {
+  return address.trim().toLowerCase();
+}
+
+/** Order-insensitive equality between two address lists, treated as sets. */
+function sameAddressSet(first: string[], second: string[]): boolean {
+  const a = new Set(first.map(normalizeAddress));
+  const b = new Set(second.map(normalizeAddress));
+  if (a.size !== b.size) return false;
+  for (const address of a) {
+    if (!b.has(address)) return false;
+  }
+  return true;
+}
+
 /** Split and clean a comma-separated allowlist; empty entries drop out. */
 function parseAllowlist(raw: string | undefined): string[] {
   if (!raw) return [];
@@ -455,7 +471,8 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
         `'${url.hostname}' previously resolved to a private or reserved address`,
       );
     }
-    for (const address of await resolveAddresses(url.hostname)) {
+    const first = await resolveAddresses(url.hostname);
+    for (const address of first) {
       if (isBlockedAddress(address)) {
         everPrivate.add(hostname);
         throw new HostToolError(
@@ -463,6 +480,18 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
           `'${url.hostname}' resolves to ${address}, a private or reserved address`,
         );
       }
+    }
+
+    // Two-lookups-agree: a rebinding resolver answers differently per lookup,
+    // so the set the validation above saw is not necessarily the set the
+    // connection would see. Resolve again and refuse unless the address set is
+    // unchanged (order-insensitively).
+    const second = await resolveAddresses(url.hostname);
+    if (!sameAddressSet(first, second)) {
+      throw new HostToolError(
+        "PermissionError",
+        `'${url.hostname}' rebinding detected (address set changed between lookups)`,
+      );
     }
   }
 

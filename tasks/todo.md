@@ -12,12 +12,12 @@ Order is fixed: Task 1 → Task 2 → Task 3.
   - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
 
-- [ ] **Task 2 — Two-lookups-agree detection**
-  - [ ] RED — injected `lookupImpl` returning different address sets across two calls → refused;
+- [x] **Task 2 — Two-lookups-agree detection**
+  - [x] RED — injected `lookupImpl` returning different address sets across two calls → refused;
         identical (incl. reordered) sets → succeeds. Fails at HEAD.
-  - [ ] GREEN — `assertReachable` resolves a second time; order-insensitive set compare; mismatch →
+  - [x] GREEN — `assertReachable` resolves a second time; order-insensitive set compare; mismatch →
         fail closed with a distinct "rebinding detected" error.
-  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
   - Depends on: Task 1.
 

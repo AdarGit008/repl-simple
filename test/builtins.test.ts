@@ -860,6 +860,48 @@ describe("http_get — ever-private memory", () => {
   });
 });
 
+describe("http_get — two-lookups-agree", () => {
+  const okFetch: typeof fetch = async () => new Response("body", { status: 200 });
+
+  function tool(lookupImpl: (h: string) => Promise<string[]>) {
+    return findTool(
+      createBuiltinTools({ root: "/tmp", fetchImpl: okFetch, lookupImpl }),
+      "http_get",
+    );
+  }
+
+  afterEach(() => {
+    __resetEverPrivateForTests();
+  });
+
+  it("refuses when two consecutive lookups disagree", async () => {
+    const answers = [["93.184.216.34"], ["8.8.8.8"]];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return answers.shift() ?? ["8.8.8.8"];
+    });
+
+    await assertRefused(httpGet.execute({ url: "http://flip.example.com/" }), /rebinding detected/);
+    assert.equal(lookups, 2);
+  });
+
+  it("proceeds when the same set returns in a different order", async () => {
+    const answers = [
+      ["93.184.216.34", "8.8.8.8"],
+      ["8.8.8.8", "93.184.216.34"],
+    ];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return answers.shift() ?? ["8.8.8.8", "93.184.216.34"];
+    });
+
+    assert.equal(await httpGet.execute({ url: "http://stable.example.com/" }), "body");
+    assert.equal(lookups, 2);
+  });
+});
+
 describe("http_get — redirects", () => {
   /** A fetch that answers from a table and records every URL it was handed. */
   function routed(routes: Record<string, Response | (() => Response)>) {
