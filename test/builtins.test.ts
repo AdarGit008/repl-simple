@@ -1,10 +1,15 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostToolError, type HostTool } from "../src/types.js";
-import { createBuiltinTools, isBlockedAddress, type BuiltinToolsOptions } from "../src/builtins.js";
+import {
+  createBuiltinTools,
+  isBlockedAddress,
+  __resetEverPrivateForTests,
+  type BuiltinToolsOptions,
+} from "../src/builtins.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -807,6 +812,162 @@ describe("http_get — direct destinations", () => {
         return true;
       },
     );
+  });
+});
+
+describe("http_get — ever-private memory", () => {
+  const okFetch: typeof fetch = async () => new Response("body", { status: 200 });
+
+  function tool(lookupImpl: (h: string) => Promise<string[]>) {
+    return findTool(
+      createBuiltinTools({ root: "/tmp", fetchImpl: okFetch, lookupImpl }),
+      "http_get",
+    );
+  }
+
+  afterEach(() => {
+    __resetEverPrivateForTests();
+  });
+
+  it("refuses a hostname that resolves to a private address", async () => {
+    const httpGet = tool(async () => ["127.0.0.1"]);
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /private or reserved/,
+    );
+  });
+
+  it("still refuses a hostname that once resolved private, even when it later resolves public", async () => {
+    const answers = ["127.0.0.1", "93.184.216.34"];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return [answers.shift() ?? "93.184.216.34"];
+    });
+
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /private or reserved/,
+    );
+
+    // The same hostname now answers public — but it is remembered and refused
+    // before a second lookup, so the rebinding window stays closed.
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(lookups, 1, "the second call must be refused before resolving again");
+  });
+
+  it("refuses and remembers a hostname resolving to a mapped private IPv4 (::ffff:127.0.0.1)", async () => {
+    // `::ffff:127.0.0.1` is a spelling of loopback that walks past a v4-only
+    // list; it must be recognized as blocked AND remembered process-lifetime.
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return ["::ffff:127.0.0.1"];
+    });
+
+    await assertRefused(
+      httpGet.execute({ url: "http://mapped.example.com/" }),
+      /private or reserved/,
+    );
+    await assertRefused(
+      httpGet.execute({ url: "http://mapped.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(lookups, 1, "the second call must be refused before resolving again");
+  });
+});
+
+describe("http_get — two-lookups-agree", () => {
+  const okFetch: typeof fetch = async () => new Response("body", { status: 200 });
+
+  function tool(lookupImpl: (h: string) => Promise<string[]>) {
+    return findTool(
+      createBuiltinTools({ root: "/tmp", fetchImpl: okFetch, lookupImpl }),
+      "http_get",
+    );
+  }
+
+  afterEach(() => {
+    __resetEverPrivateForTests();
+  });
+
+  it("refuses when two consecutive lookups disagree", async () => {
+    const answers = [["93.184.216.34"], ["8.8.8.8"]];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return answers.shift() ?? ["8.8.8.8"];
+    });
+
+    await assertRefused(httpGet.execute({ url: "http://flip.example.com/" }), /rebinding detected/);
+    assert.equal(lookups, 2);
+  });
+
+  it("remembers a hostname whose SECOND lookup is private", async () => {
+    // A rebinding resolver answers public to the first lookup and private to the
+    // second. The set comparison refuses that call ("rebinding detected"), and the
+    // blocked address the second lookup revealed must be remembered — otherwise a
+    // later call answering public to BOTH lookups would walk straight through.
+    const answers = [
+      ["93.184.216.34"], // call 1, lookup 1
+      ["127.0.0.1"], //     call 1, lookup 2 — the rebinding answer
+      ["93.184.216.34"], // call 2, lookup 1 (must never happen)
+      ["93.184.216.34"], // call 2, lookup 2 (must never happen)
+    ];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return answers.shift() ?? ["93.184.216.34"];
+    });
+
+    await assertRefused(httpGet.execute({ url: "http://flip.example.com/" }), /rebinding detected/);
+
+    // Now the same hostname answers public to both lookups — but it is remembered
+    // and refused before any new lookup happens.
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(lookups, 2, "the second call must be refused before resolving again");
+  });
+
+  it("proceeds when the same set returns in a different order", async () => {
+    const answers = [
+      ["93.184.216.34", "8.8.8.8"],
+      ["8.8.8.8", "93.184.216.34"],
+    ];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return answers.shift() ?? ["8.8.8.8", "93.184.216.34"];
+    });
+
+    assert.equal(await httpGet.execute({ url: "http://stable.example.com/" }), "body");
+    assert.equal(lookups, 2);
+  });
+
+  it("second lookup returning an empty set is refused", async () => {
+    // Fail closed: a resolver that answers public then hands back no addresses
+    // must be refused (as an OSError), not hang and not surface an unhandled error.
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return lookups === 1 ? ["93.184.216.34"] : [];
+    });
+
+    await assert.rejects(
+      async () => httpGet.execute({ url: "http://empty.example.com/" }),
+      (e: unknown) => {
+        assert.ok(e instanceof HostToolError);
+        assert.equal((e as HostToolError).pythonType, "OSError");
+        assert.match((e as Error).message, /no addresses/);
+        return true;
+      },
+    );
+    assert.equal(lookups, 2);
   });
 });
 

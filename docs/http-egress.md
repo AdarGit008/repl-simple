@@ -66,21 +66,34 @@ the address policy runs on every request, in both modes:
 
 ---
 
-## Accepted risk: the DNS rebinding window
+## The DNS rebinding window: narrowed, not closed
 
-**The window is open.** `http_get` resolves the name, validates the addresses, and then hands `fetch`
-the *name* — so a resolver that answers one address for the check and another for the connection
-reaches a destination that was never validated.
+**The window is narrowed, not closed.** `http_get` resolves the name, validates the addresses, and
+then hands `fetch` the *name* — so the connection resolves again, independently of the check. Two
+interim layers now fail closed in front of that gap, both inside the address check:
 
-Closing it means connecting to the address that was validated, which for `fetch` means supplying a
-custom `lookup` through an `undici` dispatcher. `undici` is not a dependency of this package (Node's
-`fetch` uses its own bundled copy, which is not importable), so closing this costs a new production
-dependency.
+- **Ever-private memory.** A hostname that has ever resolved to a private or reserved address is
+  remembered for the life of the process, and every later call refuses it before looking it up again
+  — a later answer of "public" proves nothing about what the connection would get.
+- **Two lookups agree.** The name is resolved twice, and unless the two address sets are identical
+  (compared order-insensitively) the fetch is refused as possible DNS rebinding.
+
+What neither layer can see is the connection's own lookup. `fetch` is still handed the *hostname*, so
+a resolver that answers public to **both** validation lookups and private only to the connect-time
+lookup reaches a destination that was never validated. Closing that means connecting to the address
+that was validated — pinning the connection to the pre-validated IPs — which for `fetch` means
+supplying a custom `lookup` through an `undici` dispatcher. `undici` is not a dependency of this
+package (Node's `fetch` uses its own bundled copy, which is not importable), so closing it costs a
+new production dependency.
 
 That is not worth it here, yet. The attack needs control of an authoritative resolver **and** a name
 that is either allowlisted or approved by the user — by which point the attacker already has a
-sanctioned destination and does not need to rebind to reach it. The cheap half of the defence,
-refusing the private ranges outright, is implemented and is what stops the untargeted case.
+sanctioned destination and does not need to rebind to reach it.
+
+The two-lookups check takes an accepted false positive as its price: a genuinely non-deterministic
+public name (anycast failover, geo-DNS) that answers different sets to consecutive lookups is refused
+even though it never pointed private. Reordered-but-identical sets do **not** trip it — the
+comparison is order-insensitive, so round-robin rotation passes.
 
 **Revisit if** `undici` arrives as a dependency for another reason, or if `http_get` ever gains a
 mode where hostnames come from somewhere less trusted than the caller's own allowlist.

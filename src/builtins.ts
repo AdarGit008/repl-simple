@@ -82,6 +82,22 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // ── HTTP egress policy ───────────────────────────────────────────
 
 /**
+ * Hostnames that have ever resolved to a private or reserved address,
+ * remembered for the life of the process.
+ *
+ * A rebinding resolver answers differently per lookup: "public" to the
+ * validation lookup, "private" to the connection. Once a name has been seen
+ * pointing at a blocked address it is never trusted again, regardless of what
+ * a later lookup says. Keyed by case-normalized hostname.
+ */
+const everPrivate = new Set<string>();
+
+/** Test-only: clear the ever-private memory so tests stay isolated. */
+export function __resetEverPrivateForTests(): void {
+  everPrivate.clear();
+}
+
+/**
  * Is this a literal address `http_get` must refuse?
  *
  * The list is the set an SSRF reaches for: loopback, the RFC1918 and CGNAT
@@ -179,20 +195,35 @@ function isBlockedIpv6(groups: number[]): boolean {
 /**
  * Resolve a hostname to every address it answers with.
  *
- * **The rebinding window is open, and is accepted risk.** This resolves the
- * name, validates the addresses, and then hands `fetch` the *name* — so a
- * resolver that answers differently for the connection than it did for the
- * check reaches a destination that was never validated. Closing it means
- * connecting to the address we pinned, which for `fetch` means supplying a
- * custom `lookup` through an `undici` dispatcher: a new production dependency,
- * for an attack that needs control of an authoritative resolver *and* an
- * allowlisted-or-approved name pointing at it. The cheap half of the defence —
- * refusing the private ranges outright — is what is implemented here. Revisit
- * if `undici` ever arrives for another reason.
+ * **The rebinding window is narrowed, not closed.** `assertReachable` resolves
+ * twice and refuses unless the address set is unchanged (order-insensitively),
+ * and any hostname that has ever resolved to a private/reserved address is
+ * refused process-lifetime. But this still hands `fetch` the *name* — so a
+ * resolver that answers public to both lookups and private only at connect-time
+ * reaches a destination that was never validated. Closing that residual means
+ * connecting to the address we pinned, which for `fetch` requires supplying a
+ * custom `lookup` through an `undici` dispatcher. Revisit if `undici` ever
+ * arrives for another reason.
  */
 async function defaultLookup(hostname: string): Promise<string[]> {
   const results = await lookup(hostname, { all: true, verbatim: true });
   return results.map((r) => r.address);
+}
+
+/** Normalize an address for set comparison: trim and lowercase. */
+function normalizeAddress(address: string): string {
+  return address.trim().toLowerCase();
+}
+
+/** Order-insensitive equality between two address lists, treated as sets. */
+function sameAddressSet(first: string[], second: string[]): boolean {
+  const a = new Set(first.map(normalizeAddress));
+  const b = new Set(second.map(normalizeAddress));
+  if (a.size !== b.size) return false;
+  for (const address of a) {
+    if (!b.has(address)) return false;
+  }
+  return true;
 }
 
 /** Split and clean a comma-separated allowlist; empty entries drop out. */
@@ -429,13 +460,44 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
         `host '${url.hostname}' is not on the http_get allowlist`,
       );
     }
-    for (const address of await resolveAddresses(url.hostname)) {
+    // A name that has ever pointed at a blocked address is never trusted again:
+    // a rebinding resolver answers differently per lookup, so the next answer
+    // being public proves nothing. Refused before any new lookup happens.
+    const hostname = url.hostname.toLowerCase();
+    if (everPrivate.has(hostname)) {
+      throw new HostToolError(
+        "PermissionError",
+        `'${url.hostname}' previously resolved to a private or reserved address`,
+      );
+    }
+    const first = await resolveAddresses(url.hostname);
+    for (const address of first) {
       if (isBlockedAddress(address)) {
+        everPrivate.add(hostname);
         throw new HostToolError(
           "PermissionError",
           `'${url.hostname}' resolves to ${address}, a private or reserved address`,
         );
       }
+    }
+
+    // Two-lookups-agree: a rebinding resolver answers differently per lookup,
+    // so the set the validation above saw is not necessarily the set the
+    // connection would see. Resolve again and refuse unless the address set is
+    // unchanged (order-insensitively).
+    const second = await resolveAddresses(url.hostname);
+    // The second answer is validated too: a resolver that went public → private
+    // is refused by the set comparison below, but the blocked address it just
+    // revealed must be remembered before that refusal, or a later call answering
+    // public to both lookups would walk straight through.
+    for (const address of second) {
+      if (isBlockedAddress(address)) everPrivate.add(hostname);
+    }
+    if (!sameAddressSet(first, second)) {
+      throw new HostToolError(
+        "PermissionError",
+        `'${url.hostname}' rebinding detected (address set changed between lookups)`,
+      );
     }
   }
 
