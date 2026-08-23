@@ -295,8 +295,9 @@ Two TypeScript configs, deliberately:
 
 - **`tsconfig.json`** — what the compiler *checks*: `src/`, `test/` **and** `extensions/`. It is the
   default config, so editors and a bare `tsc` see the same program CI does.
-- **`tsconfig.build.json`** — what the compiler *emits*: `src/` and `test/`. `extensions/` is checked
-  but not built, because pi loads the `.ts` source directly through jiti and resolves `typebox` and
+- **`tsconfig.build.json`** — what the compiler *emits*: `src/` only, flat into `dist/` (its
+  `rootDir` is `src`, so `dist/` mirrors `src/`). `extensions/` is checked but not built, because pi
+  loads the `.ts` source directly through jiti and resolves `typebox` and
   `@earendil-works/pi-coding-agent` from its own install.
 
 `typebox` is a devDependency pinned to the exact version pi pins (`1.3.7`). It is a compile-time

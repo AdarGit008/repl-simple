@@ -1,13 +1,13 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createPiBridgeTools } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
 import { createToolStoreTools } from "../src/toolstore.js";
+import { createRLMTools } from "../src/rlm_tools.js";
+import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-fixture.js";
 
 /**
  * Task 3 (#82): the README must describe the API that actually ships, and the
@@ -20,59 +20,32 @@ import { createToolStoreTools } from "../src/toolstore.js";
  *    be exactly the tools the code registers — derived from the same creators
  *    the code uses (`createPiBridgeTools` / `createBuiltinTools` /
  *    `createToolStoreTools`), so a drift in either direction breaks.
- * 3. `npm pack` must include LICENSE and NOTICE.
+ * 3. The README's "REPL (direct)" and "RLM Loop" tables must match the tools
+ *    the extension registers and the tools `createRLMTools` registers (F3).
+ * 4. `npm pack` must include LICENSE and NOTICE, and NOTICE must actually
+ *    credit the two upstreams and the whitepaper (F8).
  */
-
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
- * Temp dir *inside* the repo (so Node's module resolution walks up to the
- * repo's own `node_modules` — SPEC AS6, never the registry), with the packed
- * tarball extracted at `<consumerDir>/node_modules/repl-simple/`. Same pattern
- * as packaging.test.ts.
+ * Populated by `createPackFixture` in `before`: the private staging package and
+ * the repo-internal consumer dir the tarball is extracted into (so Node's
+ * module resolution walks up to the repo's own `node_modules` — SPEC AS6,
+ * never the registry). Same fixture as packaging.test.ts, each in its own
+ * private temp dir so the two files (run concurrently by `node:test`) never
+ * `rm -rf` the same directory (F4).
  */
+let fixture: PackFixture;
+let pkgDir: string;
 let consumerDir: string;
 
 before(() => {
-  rmSync(join(REPO_ROOT, "dist"), { recursive: true, force: true });
-
-  const build = spawnSync("npm", ["run", "build"], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  assert.equal(
-    build.status,
-    0,
-    `npm run build failed:\n${build.stdout ?? ""}\n${build.stderr ?? ""}`,
-  );
-
-  const packDest = mkdtempSync(join(tmpdir(), "repl-simple-readme-pack-"));
-  const pack = spawnSync("npm", ["pack", "--pack-destination", packDest], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  });
-  assert.equal(pack.status, 0, `npm pack failed:\n${pack.stdout ?? ""}\n${pack.stderr ?? ""}`);
-  const tarball = join(packDest, "repl-simple-0.1.0.tgz");
-  assert.ok(existsSync(tarball), `expected tarball at ${tarball}\npack output: ${pack.stdout}`);
-
-  consumerDir = mkdtempSync(join(REPO_ROOT, ".tmp-readme-consumer-"));
-  const packedPkgDir = join(consumerDir, "node_modules", "repl-simple");
-  mkdirSync(packedPkgDir, { recursive: true });
-
-  const extract = spawnSync("tar", ["-xzf", tarball, "-C", packedPkgDir, "--strip-components=1"], {
-    encoding: "utf8",
-  });
-  assert.equal(
-    extract.status,
-    0,
-    `tar extract failed:\n${extract.stdout ?? ""}\n${extract.stderr ?? ""}`,
-  );
-
-  rmSync(packDest, { recursive: true, force: true });
+  fixture = createPackFixture("readme");
+  pkgDir = fixture.pkgDir;
+  consumerDir = fixture.consumerDir;
 });
 
 after(() => {
-  if (consumerDir) rmSync(consumerDir, { recursive: true, force: true });
+  fixture?.cleanup();
 });
 
 function readme(): string {
@@ -144,10 +117,43 @@ function registeredToolNames(): {
   };
 }
 
+/**
+ * The top-level tools the extension registers. Source of truth: the same list
+ * `test/extension-loader.test.ts` pins (`EXPECTED_TOOLS`), which drives pi's
+ * real loader — that test fails if the extension registers anything else, so
+ * this list is a faithful proxy for the real registration.
+ */
+const REPL_TOP_LEVEL_TOOLS = ["repl", "repl_resume", "repl_reset", "repl_abandon"];
+
+/** Tool names in the first markdown table under the README `heading` section. */
+function readmeTableToolNames(src: string, heading: string): string[] {
+  const start = src.indexOf(heading);
+  assert.ok(start >= 0, `README missing section '${heading}'`);
+  const nextHeading = src.indexOf("\n### ", start + heading.length);
+  const section = nextHeading >= 0 ? src.slice(start, nextHeading) : src.slice(start);
+
+  const names: string[] = [];
+  for (const line of section.split("\n")) {
+    if (!line.startsWith("|")) continue;
+    const match = line.match(/^\|\s*`([^`(]+)/);
+    if (match) names.push(match[1].trim());
+  }
+  assert.ok(names.length > 0, `README section '${heading}' has no documented tools`);
+  return names;
+}
+
+/** The RLM host tool names `createRLMTools` registers (what `runRlm` exposes). */
+function rlmRegisteredToolNames(): string[] {
+  return createRLMTools({
+    onLLMQuery: async () => "",
+    onRLMQuery: async () => "",
+  }).map((tool) => tool.name);
+}
+
 /** Paths `npm pack --dry-run --json` reports the tarball would contain. */
 function packFileList(): string[] {
   const pack = spawnSync("npm", ["pack", "--dry-run", "--json"], {
-    cwd: REPO_ROOT,
+    cwd: pkgDir,
     encoding: "utf8",
   });
   assert.equal(
@@ -209,6 +215,22 @@ describe("README truth (#82)", () => {
     );
   });
 
+  it("the README 'REPL (direct)' table matches the registered top-level tools (F3)", () => {
+    assert.deepEqual(
+      readmeTableToolNames(readme(), "### REPL (direct)"),
+      REPL_TOP_LEVEL_TOOLS,
+      "README 'REPL (direct)' table drifted from the extension's registered tools",
+    );
+  });
+
+  it("the README 'RLM Loop' table matches the tools runRlm registers (F3)", () => {
+    assert.deepEqual(
+      readmeTableToolNames(readme(), "### RLM Loop (auto-investigation)"),
+      rlmRegisteredToolNames(),
+      "README 'RLM Loop' table drifted from createRLMTools",
+    );
+  });
+
   it("npm pack includes LICENSE and NOTICE", () => {
     const files = packFileList();
     assert.ok(files.includes("LICENSE"), "tarball must include LICENSE");
@@ -216,5 +238,15 @@ describe("README truth (#82)", () => {
       files.includes("NOTICE"),
       "tarball must include NOTICE — add it to package.json `files` (npm does not auto-include it)",
     );
+  });
+
+  it("NOTICE credits the two upstreams and the whitepaper (F8)", () => {
+    const notice = readFileSync(join(REPO_ROOT, "NOTICE"), "utf8");
+    for (const required of ["pi-reepl", "pi-code-tool", "arXiv", "2512.24601"]) {
+      assert.ok(
+        notice.includes(required),
+        `NOTICE must credit "${required}" (upstream attribution)`,
+      );
+    }
   });
 });
