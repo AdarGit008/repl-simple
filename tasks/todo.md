@@ -15,14 +15,14 @@ Order is fixed: Task 1 → Task 2 → Task 3.
     `test/preamble.test.ts` (extend).
   - Depends on: None.
 
-- [ ] **Task 2 — Publishable manifest; stop shipping tests and docs (#81)**
-  - [ ] RED — `test/packaging.test.ts`: `npm pack` ships `dist/`/`src/`/`repl/`/`extensions/`/`LICENSE`
+- [x] **Task 2 — Publishable manifest; stop shipping tests and docs (#81)**
+  - [x] RED — `test/packaging.test.ts`: `npm pack` ships `dist/`/`src/`/`repl/`/`extensions/`/`LICENSE`
         and no `test/`/`docs/`/`plan-issue-9.md`; scratch consumer `import { ReplRunner } from
         "repl-simple"` + `getReplPreamble()` succeed (offline); every `src/index.ts` export is reachable
         from the packed artifact; `engines` matches `.nvmrc`. Fails at HEAD.
-  - [ ] GREEN — `package.json`: `main`/`types`/`exports`/`files`/`license` added; `private` removed.
+  - [x] GREEN — `package.json`: `main`/`types`/`exports`/`files`/`license` added; `private` removed.
         Delete `plan-issue-9.md`.
-  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `package.json`, delete `plan-issue-9.md`, `test/packaging.test.ts` (extend).
   - Depends on: Task 1.
 
