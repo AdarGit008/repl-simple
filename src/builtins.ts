@@ -88,13 +88,40 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
  * A rebinding resolver answers differently per lookup: "public" to the
  * validation lookup, "private" to the connection. Once a name has been seen
  * pointing at a blocked address it is never trusted again, regardless of what
- * a later lookup says. Keyed by case-normalized hostname.
+ * a later lookup says. Keyed by the normalized hostname (lowercase, single
+ * trailing dot stripped), so every spelling maps to one entry.
  */
 const everPrivate = new Set<string>();
+
+/** Ceiling on ever-private entries; saturation fails closed. */
+export const EVER_PRIVATE_MAX_ENTRIES = 1024;
+
+/** Normalized ever-private key: lowercase, single trailing dot stripped. */
+function everPrivateKey(hostname: string): string {
+  const lower = hostname.toLowerCase();
+  return lower.endsWith(".") ? lower.slice(0, -1) : lower;
+}
+
+/**
+ * Record a hostname as ever-private. Returns false at saturation (caller fails
+ * closed); the set never exceeds {@link EVER_PRIVATE_MAX_ENTRIES}.
+ */
+function rememberEverPrivate(hostname: string): boolean {
+  const key = everPrivateKey(hostname);
+  if (everPrivate.has(key)) return true;
+  if (everPrivate.size >= EVER_PRIVATE_MAX_ENTRIES) return false;
+  everPrivate.add(key);
+  return true;
+}
 
 /** Test-only: clear the ever-private memory so tests stay isolated. */
 export function __resetEverPrivateForTests(): void {
   everPrivate.clear();
+}
+
+/** Test-only: current size of the ever-private memory. */
+export function __everPrivateSizeForTests(): number {
+  return everPrivate.size;
 }
 
 /**
@@ -463,17 +490,22 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
     // A name that has ever pointed at a blocked address is never trusted again:
     // a rebinding resolver answers differently per lookup, so the next answer
     // being public proves nothing. Refused before any new lookup happens.
-    const hostname = url.hostname.toLowerCase();
+    const hostname = everPrivateKey(url.hostname);
     if (everPrivate.has(hostname)) {
       throw new HostToolError(
         "PermissionError",
         `'${url.hostname}' previously resolved to a private or reserved address`,
       );
     }
-    const first = await resolveAddresses(url.hostname);
+    const first = await resolveAddresses(hostname);
     for (const address of first) {
       if (isBlockedAddress(address)) {
-        everPrivate.add(hostname);
+        if (!rememberEverPrivate(hostname)) {
+          throw new HostToolError(
+            "PermissionError",
+            `ever-private memory saturated; refusing '${url.hostname}'`,
+          );
+        }
         throw new HostToolError(
           "PermissionError",
           `'${url.hostname}' resolves to ${address}, a private or reserved address`,
@@ -485,13 +517,20 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
     // so the set the validation above saw is not necessarily the set the
     // connection would see. Resolve again and refuse unless the address set is
     // unchanged (order-insensitively).
-    const second = await resolveAddresses(url.hostname);
+    const second = await resolveAddresses(hostname);
     // The second answer is validated too: a resolver that went public → private
     // is refused by the set comparison below, but the blocked address it just
     // revealed must be remembered before that refusal, or a later call answering
     // public to both lookups would walk straight through.
     for (const address of second) {
-      if (isBlockedAddress(address)) everPrivate.add(hostname);
+      if (isBlockedAddress(address)) {
+        if (!rememberEverPrivate(hostname)) {
+          throw new HostToolError(
+            "PermissionError",
+            `ever-private memory saturated; refusing '${url.hostname}'`,
+          );
+        }
+      }
     }
     if (!sameAddressSet(first, second)) {
       throw new HostToolError(

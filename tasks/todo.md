@@ -1,29 +1,28 @@
-# Todo — DNS-rebinding interim hardening (issue #199)
+# Todo — L1+L2 ever-private hardening (issue #199 residuals)
 
 Source of truth: `SPEC.md` + `tasks/plan.md`. One item = one coder dispatch = one orchestrator commit.
-Order is fixed: Task 1 → Task 2 → Task 3.
+Order is fixed: Task 1 → Task 2.
 
-- [x] **Task 1 — Ever-private process-lifetime memory**
-  - [x] RED — `test/builtins.test.ts`: a hostname that resolves to a private address is refused; a
-        later call where the same hostname resolves public is still refused (memory). Fails at HEAD.
-  - [x] GREEN — module-scoped `Set<string>` (case-normalized hostname); `assertReachable` refuses
-        members before lookup and records a hostname when any resolved address `isBlockedAddress`.
-  - [x] Export a test-only reset helper; use it in tests for isolation.
+- [x] **Task 1 — Normalize the ever-private key (L2)**
+  - [x] RED — `test/builtins.test.ts`: record a hostname under one spelling (`Example.COM.` resolving
+        private) → a later call under another spelling (`example.com`, `EXAMPLE.COM.`, `example.com.`)
+        is refused via memory before lookup. Fails at HEAD.
+  - [x] GREEN — single `everPrivateKey(hostname)` helper (lowercase + strip one trailing dot) used by
+        both the membership check and recording; the hostname passed to `lookupImpl` is normalized.
+  - [x] No false positive: a stable public hostname spelled with a trailing dot still resolves and
+        fetches.
   - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
 
-- [x] **Task 2 — Two-lookups-agree detection**
-  - [x] RED — injected `lookupImpl` returning different address sets across two calls → refused;
-        identical (incl. reordered) sets → succeeds. Fails at HEAD.
-  - [x] GREEN — `assertReachable` resolves a second time; order-insensitive set compare; mismatch →
-        fail closed with a distinct "rebinding detected" error.
+- [x] **Task 2 — Cap the ever-private set, fail closed at saturation (L1)**
+  - [x] RED — fill the set to `EVER_PRIVATE_MAX_ENTRIES` via injected private lookups (read the
+        constant, no magic number); assert the set never exceeds the cap and the next distinct
+        private-resolving hostname fails closed with a distinct "saturated" error and is not fetched.
+        Fails at HEAD.
+  - [x] GREEN — `rememberEverPrivate(hostname)` returns false at saturation; `assertReachable`
+        refuses with a distinct error and never fetches. Membership of an already-recorded hostname
+        still works at saturation.
+  - [x] Keep `__resetEverPrivateForTests` clearing the set; use it for isolation.
   - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
   - Depends on: Task 1.
-
-- [x] **Task 3 — Update `docs/http-egress.md`**
-  - [x] Rewrite the "accepted risk" rebinding window text: interim hardening landed (ever-private +
-        two-lookups-agree), remaining residual is the undici custom-dispatcher connection pinning.
-  - [x] No stale claims; `npm run lint` clean.
-  - Files — `docs/http-egress.md`.
-  - Depends on: Task 2.

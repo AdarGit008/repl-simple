@@ -8,6 +8,8 @@ import {
   createBuiltinTools,
   isBlockedAddress,
   __resetEverPrivateForTests,
+  __everPrivateSizeForTests,
+  EVER_PRIVATE_MAX_ENTRIES,
   type BuiltinToolsOptions,
 } from "../src/builtins.js";
 
@@ -878,6 +880,144 @@ describe("http_get — ever-private memory", () => {
     );
     assert.equal(lookups, 1, "the second call must be refused before resolving again");
   });
+
+  it("normalizes the ever-private key: every spelling maps to one entry", async () => {
+    const seen: string[] = [];
+    const httpGet = tool(async (h) => {
+      seen.push(h);
+      return seen.length === 1 ? ["127.0.0.1"] : ["93.184.216.34"];
+    });
+
+    // Record under one spelling: `Example.COM.` resolves private.
+    await assertRefused(httpGet.execute({ url: "http://Example.COM./" }), /private or reserved/);
+
+    // Any other spelling is refused from memory, before a new lookup happens.
+    for (const spelling of ["example.com", "EXAMPLE.COM.", "example.com."]) {
+      await assertRefused(httpGet.execute({ url: `http://${spelling}/` }), /previously resolved/);
+    }
+
+    assert.equal(seen.length, 1, "every other spelling must be refused before lookup");
+  });
+
+  it("a stable public hostname with a trailing dot still fetches", async () => {
+    const seen: string[] = [];
+    const httpGet = tool(async (h) => {
+      seen.push(h);
+      return ["93.184.216.34"];
+    });
+
+    assert.equal(await httpGet.execute({ url: "http://stable.example.com./" }), "body");
+    // `lookupImpl` receives the normalized hostname: the trailing dot is stripped.
+    assert.deepEqual(seen, ["stable.example.com", "stable.example.com"]);
+  });
+
+  it("__resetEverPrivateForTests empties the ever-private set", async () => {
+    const httpGet = tool(async () => ["127.0.0.1"]);
+    await assertRefused(
+      httpGet.execute({ url: "http://flip.example.com/" }),
+      /private or reserved/,
+    );
+    assert.ok(__everPrivateSizeForTests() > 0, "the memory must hold the refused hostname");
+
+    __resetEverPrivateForTests();
+    assert.equal(__everPrivateSizeForTests(), 0);
+  });
+});
+
+describe("http_get — ever-private saturation (L1)", () => {
+  afterEach(() => {
+    __resetEverPrivateForTests();
+  });
+
+  it("caps the ever-private set and fails closed at saturation", async () => {
+    let fetches = 0;
+    const fetchImpl: typeof fetch = async () => {
+      fetches++;
+      return new Response("body", { status: 200 });
+    };
+    const httpGet = findTool(
+      createBuiltinTools({
+        root: "/tmp",
+        fetchImpl,
+        lookupImpl: async () => ["127.0.0.1"],
+      }),
+      "http_get",
+    );
+
+    // Drive the real recording path to saturation: each distinct hostname
+    // resolves private, is refused, and is remembered process-lifetime.
+    for (let i = 0; i < EVER_PRIVATE_MAX_ENTRIES; i++) {
+      await assertRefused(
+        httpGet.execute({ url: `http://host${i}.example.com/` }),
+        /private or reserved/,
+      );
+    }
+
+    // (a) the set is exactly at the cap — it never exceeded it.
+    assert.equal(__everPrivateSizeForTests(), EVER_PRIVATE_MAX_ENTRIES);
+
+    // (b) the next distinct private-resolving hostname fails closed with a
+    // distinct "saturated" error and is never fetched.
+    await assertRefused(
+      httpGet.execute({ url: "http://overflow.example.com/" }),
+      /ever-private memory saturated/,
+    );
+    assert.equal(__everPrivateSizeForTests(), EVER_PRIVATE_MAX_ENTRIES);
+    assert.equal(fetches, 0, "nothing may be fetched once the memory is saturated");
+
+    // An already-recorded hostname is still refused at saturation: membership
+    // is checked before any lookup, unaffected by the cap.
+    await assertRefused(
+      httpGet.execute({ url: "http://host0.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(fetches, 0);
+  });
+
+  it("fails closed at saturation when a private address appears in the second lookup", async () => {
+    // The test above resolves private on the first lookup, so it throws before
+    // a second lookup ever runs. This one drives a distinct hostname
+    // public-then-private, so the fail-closed throw in the *second*-lookup loop
+    // is what refuses the request.
+    let fetches = 0;
+    const fetchImpl: typeof fetch = async () => {
+      fetches++;
+      return new Response("body", { status: 200 });
+    };
+    let overflowLookups = 0;
+    const httpGet = findTool(
+      createBuiltinTools({
+        root: "/tmp",
+        fetchImpl,
+        lookupImpl: async (h: string) => {
+          if (h !== "overflow.example.com") return ["127.0.0.1"];
+          overflowLookups++;
+          return overflowLookups === 1 ? ["93.184.216.34"] : ["127.0.0.1"];
+        },
+      }),
+      "http_get",
+    );
+
+    // Fill the set to the cap: every host${i} resolves private on its first
+    // lookup, is refused, and is remembered process-lifetime.
+    for (let i = 0; i < EVER_PRIVATE_MAX_ENTRIES; i++) {
+      await assertRefused(
+        httpGet.execute({ url: `http://host${i}.example.com/` }),
+        /private or reserved/,
+      );
+    }
+    assert.equal(__everPrivateSizeForTests(), EVER_PRIVATE_MAX_ENTRIES);
+
+    // The distinct hostname answers public first, then private: recording the
+    // private address fails closed because the memory is already saturated.
+    await assertRefused(
+      httpGet.execute({ url: "http://overflow.example.com/" }),
+      /ever-private memory saturated/,
+    );
+    assert.equal(overflowLookups, 2, "the second lookup must be the saturated one");
+    assert.equal(__everPrivateSizeForTests(), EVER_PRIVATE_MAX_ENTRIES);
+    assert.equal(fetches, 0, "nothing may be fetched once the memory is saturated");
+  });
 });
 
 describe("http_get — two-lookups-agree", () => {
@@ -929,6 +1069,36 @@ describe("http_get — two-lookups-agree", () => {
     // and refused before any new lookup happens.
     await assertRefused(
       httpGet.execute({ url: "http://flip.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(lookups, 2, "the second call must be refused before resolving again");
+  });
+
+  it("refuses a mixed second lookup and remembers the private address", async () => {
+    // First lookup public only; second lookup public + private. The two sets
+    // differ in size, so `sameAddressSet`'s size-mismatch early return refuses
+    // the call as rebinding — and the private address the mixed set revealed
+    // must be remembered, so a later call answering public to both lookups is
+    // refused from memory.
+    const answers = [
+      ["93.184.216.34"], //              call 1, lookup 1
+      ["93.184.216.34", "127.0.0.1"], // call 1, lookup 2 — mixed
+      ["93.184.216.34"], //              call 2, lookup 1 (must never run)
+      ["93.184.216.34"], //              call 2, lookup 2 (must never run)
+    ];
+    let lookups = 0;
+    const httpGet = tool(async () => {
+      lookups++;
+      return answers.shift() ?? ["93.184.216.34"];
+    });
+
+    await assertRefused(
+      httpGet.execute({ url: "http://mixed.example.com/" }),
+      /rebinding detected/,
+    );
+
+    await assertRefused(
+      httpGet.execute({ url: "http://mixed.example.com/" }),
       /previously resolved/,
     );
     assert.equal(lookups, 2, "the second call must be refused before resolving again");
