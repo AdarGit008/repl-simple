@@ -1,0 +1,36 @@
+# repl-simple — third-party notices
+
+This project includes code and designs derived from the following third-party
+projects, each under the MIT License, and follows the "Recursive Language
+Models" whitepaper. The MIT license text for repl-simple itself is in LICENSE.
+
+## pi-reepl
+
+https://github.com/ivanvza/pi-reepl
+
+MIT License
+
+Copyright (c) 2026 pi-reepl contributors
+
+Derived from: the RLM loop, the `repl_server.py` preamble, and the
+`llm_query`/`SUBMIT`/`context` design.
+
+## pi-code-tool
+
+https://github.com/josephkern/pi-code-tool
+
+MIT License
+
+Copyright (c) 2026 Joseph Kern
+
+Derived from: the code-mode architecture — `ToolRegistry`, builtins,
+session/replay cache, the toolstore (`.pi/code-tools`), the pi-tools bridge,
+and approval-gating/suspension.
+
+## Recursive Language Models
+
+Zhang, Kraska, Khattab (2025), "Recursive Language Models".
+arXiv:2512.24601 — https://arxiv.org/abs/2512.24601
+DOI: 10.48550/arXiv.2512.24601
+
+The RLM loop design follows this whitepaper.

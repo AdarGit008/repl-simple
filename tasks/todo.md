@@ -26,12 +26,12 @@ Order is fixed: Task 1 → Task 2 → Task 3.
   - Files — `package.json`, delete `plan-issue-9.md`, `test/packaging.test.ts` (extend).
   - Depends on: Task 1.
 
-- [ ] **Task 3 — Make the README true; add the missing attribution (#82)**
-  - [ ] RED — `test/readme.test.ts`: every README code sample executes; the README tool list matches
+- [x] **Task 3 — Make the README true; add the missing attribution (#82)**
+  - [x] RED — `test/readme.test.ts`: every README code sample executes; the README tool list matches
         the tools that actually register; `npm pack` includes `LICENSE` and any `NOTICE`. Fails at HEAD.
-  - [ ] GREEN — `README.md` corrected (tool list, sandbox limits, import example, `pi.extensions`
+  - [x] GREEN — `README.md` corrected (tool list, sandbox limits, import example, `pi.extensions`
         wording); upstream attribution added to `LICENSE`/`NOTICE` + RLM whitepaper credited, or the
         derivation claim recorded as unfounded with evidence.
-  - [ ] `npm test` + `check` + `build` + `lint` clean.
-  - Files — `README.md`, `LICENSE` (+ `NOTICE` if added), `test/readme.test.ts` (new).
+  - [x] `npm test` + `check` + `build` + `lint` clean.
+  - [x] Files — `README.md`, `LICENSE` (+ `NOTICE` if added), `test/readme.test.ts` (new).
   - Depends on: Task 2.

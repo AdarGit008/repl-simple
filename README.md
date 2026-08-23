@@ -2,6 +2,32 @@
 
 Pi extension — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
 
+## Sandbox
+
+Code runs in [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly), not a host
+Python, so the standard library is a fixed, closed set: **there are no third-party packages** and
+no way to install one, and most of the stdlib is absent.
+
+**Importable modules** — exactly these, verified against the pinned Monty 0.0.21. The code probes
+this at runtime (`probeImportableModules()` over `CANDIDATE_MODULES` in `src/registry.ts`), so the
+live answer follows the installed interpreter:
+
+`os`, `sys`, `json`, `re`, `datetime`, `math`, `typing`, `pathlib`, `asyncio`, `collections`,
+`itertools`, `dataclasses`
+
+Anything else — `time`, `random`, `subprocess`, `socket`, `functools`, `hashlib`, `requests`,
+`numpy` and the rest — is refused by Monty's type checker as an unresolved import, before any code
+runs. There is no `subprocess` or `socket`: sandboxed Python cannot spawn processes or open
+sockets, and filesystem access goes through the host tools (and, for embedded use, an explicit
+mount) — never through `open()` on arbitrary host paths.
+
+**Language limits.** A few Python features raise `NotImplementedError` instead of running:
+
+- **`yield`** — generators are not implemented.
+- **`match` statements** — pattern matching is not implemented.
+- **class inheritance and metaclasses** — a plain `class` with methods and `__init__` works, but
+  `class B(A)` raises `NotImplementedError`.
+
 ## Tools
 
 ### REPL (direct)
@@ -439,3 +465,16 @@ goes red rather than quietly dropping coverage.
 
 CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
 ubuntu-latest and macos-latest, for every push and pull request.
+
+## Attribution
+
+This project derives from two MIT-licensed upstreams and a whitepaper; the full notices are in
+[NOTICE](NOTICE):
+
+- **[pi-reepl](https://github.com/ivanvza/pi-reepl)** (Copyright (c) 2026 pi-reepl contributors) —
+  the RLM loop, the `repl_server.py` preamble, and the `llm_query`/`SUBMIT`/`context` design.
+- **[pi-code-tool](https://github.com/josephkern/pi-code-tool)** (Copyright (c) 2026 Joseph Kern) —
+  the code-mode architecture: `ToolRegistry`, builtins, session/replay cache, the toolstore
+  (`.pi/code-tools`), the pi-tools bridge, and approval-gating/suspension.
+- **[Recursive Language Models](https://arxiv.org/abs/2512.24601)** — Zhang, Kraska, Khattab
+  (2025), arXiv:2512.24601, DOI 10.48550/arXiv.2512.24601 — the RLM design this follows.

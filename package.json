@@ -19,7 +19,8 @@
     "dist",
     "src",
     "repl",
-    "extensions"
+    "extensions",
+    "NOTICE"
   ],
   "scripts": {
     "test": "tsx --test test/*.test.ts",
