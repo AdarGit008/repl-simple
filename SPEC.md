@@ -137,9 +137,14 @@ distinct error when `rememberEverPrivate` returns `false`. The resolution input 
   **not** fetch. It never means silently proceeding or silently dropping the record.
 - **AS4** — No new dependency; no change to `docs/http-egress.md` is required because the mechanism
   it describes is unchanged (the cap and normalization are implementation details of that mechanism).
-- **AS5** — Saturation is an availability cost, not a security hole: after saturation, hostnames
-  first appearing post-saturation are refused when private (as today) but are not remembered for a
-  later public lookup. Accepted and bounded by the cap; recorded as the shipping residual.
+- **AS5** — Saturation bounds the memory but degrades a defense-in-depth cross-attempt control:
+  after saturation, a hostname first appearing post-saturation is refused when private in the
+  current attempt but is not remembered for a later attempt. An attacker who controls an
+  allowlisted wildcard domain and fills the cap (~1024 attacker-visible refused fetches) could
+  rebind a fresh hostname across attempts. Bounded, requires detectable refusals to set up, and
+  grants nothing beyond the already-documented connect-time residual (`fetch` still connects to the
+  hostname, not the validated IPs). Refusal (not eviction) is the accepted fail-closed choice;
+  recorded as the shipping residual.
 - **AS6** — No real DNS in tests; all scenarios are simulated through `lookupImpl`.
 
 ## Open Questions
