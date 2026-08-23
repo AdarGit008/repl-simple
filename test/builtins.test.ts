@@ -878,6 +878,36 @@ describe("http_get — ever-private memory", () => {
     );
     assert.equal(lookups, 1, "the second call must be refused before resolving again");
   });
+
+  it("normalizes the ever-private key: every spelling maps to one entry", async () => {
+    const seen: string[] = [];
+    const httpGet = tool(async (h) => {
+      seen.push(h);
+      return seen.length === 1 ? ["127.0.0.1"] : ["93.184.216.34"];
+    });
+
+    // Record under one spelling: `Example.COM.` resolves private.
+    await assertRefused(httpGet.execute({ url: "http://Example.COM./" }), /private or reserved/);
+
+    // Any other spelling is refused from memory, before a new lookup happens.
+    for (const spelling of ["example.com", "EXAMPLE.COM.", "example.com."]) {
+      await assertRefused(httpGet.execute({ url: `http://${spelling}/` }), /previously resolved/);
+    }
+
+    assert.equal(seen.length, 1, "every other spelling must be refused before lookup");
+  });
+
+  it("a stable public hostname with a trailing dot still fetches", async () => {
+    const seen: string[] = [];
+    const httpGet = tool(async (h) => {
+      seen.push(h);
+      return ["93.184.216.34"];
+    });
+
+    assert.equal(await httpGet.execute({ url: "http://stable.example.com./" }), "body");
+    // `lookupImpl` receives the normalized hostname: the trailing dot is stripped.
+    assert.deepEqual(seen, ["stable.example.com", "stable.example.com"]);
+  });
 });
 
 describe("http_get — two-lookups-agree", () => {
