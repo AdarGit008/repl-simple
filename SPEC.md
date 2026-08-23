@@ -1,26 +1,31 @@
-# Spec: DNS-rebinding interim hardening for `http_get` — issue #199
+# Spec: L1+L2 ever-private hardening — issue #199 residuals
 
 ## Objective
 
-Close (interim) the DNS-rebinding TOCTOU in `http_get`: today the hostname is resolved and every
-returned address is validated against the blocklist (`assertReachable` in `src/builtins.ts`), but
-`fetch` is then handed the **hostname**, so the connect-time lookup can resolve to a different,
-unvalidated address. A resolver that answers "public" to the validation lookup and "private" to the
-connect lookup reaches a blocked destination.
+Harden the `everPrivate` process-lifetime memory added by issue #199 (DNS-rebinding interim
+hardening in `src/builtins.ts` `assertReachable`). Two residuals were recorded in
+`tasks/ship-report-199.md` and are now the scope of this flight:
 
-This is residual **R2** from the STOP-SHIP A33–A37 flight (severity **Low**, defense-in-depth).
-Primary SSRF defences (manual per-hop re-validation, 30 s timeout, 256 KiB cap, approval default) are
-already strong and **must not be weakened**.
+- **L1 — bound the memory.** `everPrivate` is currently unbounded and irreversible. A `*` wildcard
+  allowlist over an attacker-controlled domain can grow it monotonically for the life of the
+  process. Fix: a hard cap, with **fail-closed refusal at saturation**.
+- **L2 — normalize the key.** The ever-private key is not trailing-dot-normalized, so
+  `example.com` and `example.com.` are distinct entries and one spelling can evade the memory of the
+  other. Fix: strip a single trailing dot on the key *and* on the resolution input, and fold in the
+  existing case-normalization so every spelling maps to one key.
 
-Success = the interim no-new-dependency hardening described in issue #199 is implemented and tested:
-a rebinding attempt (or a hostname that has ever resolved to a private address) **fails closed**.
+This is defense-in-depth only. The primary SSRF defences (per-hop re-validation, 30 s timeout,
+256 KiB cap, approval default, blocklist) are unchanged, and neither layer may weaken them.
+
+Success = the `everPrivate` set is bounded and fails closed at saturation, and every spelling of a
+hostname (case + trailing dot) maps to a single memory entry, all covered by RED→GREEN tests with
+no real DNS.
 
 ## Tech Stack
 
 - TypeScript (Node >= 22.19.0), NodeNext modules, strict mode.
 - Test runner: `node:test` via `tsx --test`.
-- No new dependencies. `undici` (the long-term fix) is **not** added here — it stays behind the
-  documented revisit trigger.
+- No new dependencies.
 
 ## Commands
 
@@ -37,76 +42,106 @@ Coverage: npm run coverage               # per-file floors
 ## Project Structure
 
 ```
-src/builtins.ts          → http_get implementation: assertReachable, defaultLookup/lookupImpl,
-                           fetchImpl, isBlockedAddress (v4/v6), readResponseTextLimited
-test/builtins.test.ts    → unit tests for builtins incl. http_get + address policy
-docs/http-egress.md      → the egress policy decision record (must stay truthful)
+src/builtins.ts          → everPrivate set, __resetEverPrivateForTests, assertReachable,
+                           lookupImpl/defaultLookup, isBlockedAddress, fetchImpl
+test/builtins.test.ts    → unit tests for the ever-private memory and address policy
+docs/http-egress.md      → egress policy decision record (must stay truthful)
 ```
 
 ## Code Style
 
 Follow the existing `src/builtins.ts` conventions: small pure helpers, explicit types, JSDoc on
-exported symbols, `AbortSignal`-based timeouts, injectable seams for tests (e.g. the existing
-`lookupImpl`). No new abstractions unless they earn their complexity. Example shape:
+exported symbols, injectable seams for tests (`lookupImpl`), `AbortSignal`-based timeouts. No new
+abstractions unless they earn their complexity. Example shape:
 
 ```typescript
-/** Hostnames observed resolving to a blocked address, remembered process-lifetime. */
-const everPrivate = new Set<string>();
+/** Ceiling on ever-private entries; saturation fails closed. */
+export const EVER_PRIVATE_MAX_ENTRIES = 1024;
 
-export function assertReachable(url: URL, opts: EgressOptions): Promise<void> {
-  // 1. ever-private memory check
-  // 2. resolve (lookupImpl), validate against isBlockedAddress, record ever-private
-  // 3. second lookup, order-insensitive set compare (two-lookups-agree)
-  // fail closed on any mismatch / blocked address
+/** Normalized ever-private key: lowercase, single trailing dot stripped. */
+function everPrivateKey(hostname: string): string {
+  const lower = hostname.toLowerCase();
+  return lower.endsWith(".") ? lower.slice(0, -1) : lower;
+}
+
+/**
+ * Record a hostname as ever-private. Returns false at saturation (caller fails
+ * closed); the set never exceeds {@link EVER_PRIVATE_MAX_ENTRIES}.
+ */
+function rememberEverPrivate(hostname: string): boolean {
+  const key = everPrivateKey(hostname);
+  if (everPrivate.has(key)) return true;
+  if (everPrivate.size >= EVER_PRIVATE_MAX_ENTRIES) return false;
+  everPrivate.add(key);
+  return true;
 }
 ```
 
+`assertReachable` then (a) checks membership via `everPrivateKey(hostname)`, (b) records via
+`rememberEverPrivate` after each lookup that observed a blocked address, and (c) refuses with a
+distinct error when `rememberEverPrivate` returns `false`. The resolution input passed to
+`lookupImpl` is the normalized hostname (single trailing dot stripped).
+
 ## Testing Strategy
 
-- Unit tests in `test/builtins.test.ts`, using the existing `lookupImpl` injection (no real DNS).
-- RED first: a test that reproduces the rebinding window must fail at HEAD, then pass after the fix.
-- Cover: (a) first-lookup-private → refused and remembered; (b) later-lookup-public-after-private →
-  still refused via memory; (c) two-lookups-disagree → refused; (d) two-lookups-agree on a stable
-  public set → succeeds (no false positive on identical sets, incl. reordered = same set); (e)
-  existing blocklist behaviour unchanged.
-- No test may perform real network I/O.
+- Unit tests in `test/builtins.test.ts`, using the existing `lookupImpl` injection and
+  `__resetEverPrivateForTests`. No real DNS, ever.
+- RED first: each new test must fail at HEAD, then pass after the fix.
+- **L2 (normalization)** — record a hostname under one spelling (`Example.COM.` → private) and
+  assert a later call under any other spelling (`example.com`, `EXAMPLE.COM.`, `example.com.`) is
+  refused *before lookup* (memory hit). Also assert a stable public hostname with a trailing dot
+  still resolves and fetches (no false positive).
+- **L1 (bound)** — drive the real recording path to saturation (injected private lookups for
+  distinct hostnames, looping `EVER_PRIVATE_MAX_ENTRIES` times — read the constant, never a magic
+  number). Assert: the set never exceeds the cap; the next distinct private-resolving hostname
+  fails closed with a distinct "saturated" error and is **not** fetched. Assert a hostname already
+  in the set is still refused at saturation (membership is unaffected).
+- Keep the two #199 gaps from `tasks/verify-report-199.md` that touch this code: a second lookup
+  returning a **mixed** set (one public + one private) is refused and the private address is
+  remembered; and the case-normalization of the key is exercised.
 
 ## Boundaries
 
 - **Always:** RED→GREEN per task; run `npm test`, `npm run check`, `npm run build`, `npm run lint`
   after each change; fail closed (never weaken the blocklist, per-hop re-validation, timeout,
-  approval default, or 256 KiB cap); keep `docs/http-egress.md` truthful.
-- **Ask first:** adding dependencies (e.g. `undici`); changing CI config.
+  approval default, or 256 KiB cap); keep `docs/http-egress.md` truthful (only touch it if a claim
+  becomes stale).
+- **Ask first:** adding dependencies; changing CI config.
 - **Never:** commit secrets; weaken the SSRF blocklist; remove failing tests to make the suite pass.
 
 ## Success Criteria
 
-1. `assertReachable` refuses a hostname whose resolved address set differs across two consecutive
-   lookups (order-insensitive set comparison).
-2. `assertReachable` remembers, process-lifetime, any hostname that has ever resolved to a blocked
-   address, and refuses it on every subsequent call.
-3. A stable public hostname (identical address set on both lookups) still resolves and fetches.
-4. Existing blocklist / per-hop / timeout / approval / cap behaviour is byte-for-byte unchanged in
-   outcome.
-5. `docs/http-egress.md` updated to state the interim hardening and the remaining (undici-only)
-   residual.
+1. The `everPrivate` set never exceeds `EVER_PRIVATE_MAX_ENTRIES`; recording at saturation fails
+   closed with a distinct error and the request is refused, never fetched.
+2. `example.com`, `example.com.`, and any case variant resolve to a **single** ever-private entry:
+   recorded under one spelling, refused under all spellings, before lookup.
+3. A stable public hostname — including one spelled with a trailing dot — still resolves and
+   fetches (no false positive).
+4. Existing blocklist / per-hop / timeout / approval / cap / two-lookups-agree behaviour is
+   unchanged in outcome.
+5. `__resetEverPrivateForTests` still exists, still clears the set, and is used by the new tests for
+   isolation.
 6. Full suite green: `npm test`, `npm run check`, `npm run build`, `npm run lint`, coverage floors.
 
 ## Assumptions (recorded — autonomous run)
 
-- **AS1** No new dependency; `undici` custom-dispatcher `lookup` stays deferred to its revisit trigger.
-- **AS2** Both interim layers are implemented (ever-private + two-lookups-agree), each as its own
-  task/commit, because the issue lists them as "and/or" and both are cheap defense-in-depth.
-- **AS3** Ever-private memory is process-lifetime, module-scoped in `src/builtins.ts`, keyed by
-  case-normalized hostname; a test-only reset helper is exported for test isolation.
-- **AS4** Two-lookups-agree compares address **sets** order-insensitively. Genuinely
-  non-deterministic public address sets (anycast failover, geo-DNS) may false-positive and are
-  accepted as the interim heuristic's known cost — recorded as a residual. Round-robin reordering
-  (same set) does not trigger it.
-- **AS5** Detection fails closed with a distinct error message distinguishing "rebinding detected"
-  from "previously resolved to a private address".
-- **AS6** No real DNS in tests; all rebinding scenarios are simulated through `lookupImpl`.
+- **AS0 (setup)** — The base branch is `issue-199-dns-rebinding` (the code this flight hardens lives
+  there; `main` does not yet contain #199). Branching from an "up-to-date main" is interpreted as
+  "up-to-date with its remote"; the L1/L2 follow-up must stack on the #199 branch.
+- **AS1** — Cap is a named module constant `EVER_PRIVATE_MAX_ENTRIES = 1024`, exported for tests;
+  not env-configurable (kept minimal; env override can come later if needed).
+- **AS2** — L2 normalization is lowercase + strip a single trailing dot, applied both to the key and
+  to the hostname passed to `lookupImpl`. Only one trailing dot is stripped (an empty/non-hostname
+  result is not a valid host and is out of scope).
+- **AS3** — Fail-closed at saturation means: refuse the current request with a distinct error and do
+  **not** fetch. It never means silently proceeding or silently dropping the record.
+- **AS4** — No new dependency; no change to `docs/http-egress.md` is required because the mechanism
+  it describes is unchanged (the cap and normalization are implementation details of that mechanism).
+- **AS5** — Saturation is an availability cost, not a security hole: after saturation, hostnames
+  first appearing post-saturation are refused when private (as today) but are not remembered for a
+  later public lookup. Accepted and bounded by the cap; recorded as the shipping residual.
+- **AS6** — No real DNS in tests; all scenarios are simulated through `lookupImpl`.
 
 ## Open Questions
 
-None for this run — all ambiguities are recorded as AS1–AS6.
+None for this run — all ambiguities are recorded as AS0–AS6.
