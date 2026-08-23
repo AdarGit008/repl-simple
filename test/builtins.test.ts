@@ -8,6 +8,8 @@ import {
   createBuiltinTools,
   isBlockedAddress,
   __resetEverPrivateForTests,
+  __everPrivateSizeForTests,
+  EVER_PRIVATE_MAX_ENTRIES,
   type BuiltinToolsOptions,
 } from "../src/builtins.js";
 
@@ -907,6 +909,57 @@ describe("http_get — ever-private memory", () => {
     assert.equal(await httpGet.execute({ url: "http://stable.example.com./" }), "body");
     // `lookupImpl` receives the normalized hostname: the trailing dot is stripped.
     assert.deepEqual(seen, ["stable.example.com", "stable.example.com"]);
+  });
+});
+
+describe("http_get — ever-private saturation (L1)", () => {
+  afterEach(() => {
+    __resetEverPrivateForTests();
+  });
+
+  it("caps the ever-private set and fails closed at saturation", async () => {
+    let fetches = 0;
+    const fetchImpl: typeof fetch = async () => {
+      fetches++;
+      return new Response("body", { status: 200 });
+    };
+    const httpGet = findTool(
+      createBuiltinTools({
+        root: "/tmp",
+        fetchImpl,
+        lookupImpl: async () => ["127.0.0.1"],
+      }),
+      "http_get",
+    );
+
+    // Drive the real recording path to saturation: each distinct hostname
+    // resolves private, is refused, and is remembered process-lifetime.
+    for (let i = 0; i < EVER_PRIVATE_MAX_ENTRIES; i++) {
+      await assertRefused(
+        httpGet.execute({ url: `http://host${i}.example.com/` }),
+        /private or reserved/,
+      );
+    }
+
+    // (a) the set is exactly at the cap — it never exceeded it.
+    assert.equal(__everPrivateSizeForTests(), EVER_PRIVATE_MAX_ENTRIES);
+
+    // (b) the next distinct private-resolving hostname fails closed with a
+    // distinct "saturated" error and is never fetched.
+    await assertRefused(
+      httpGet.execute({ url: "http://overflow.example.com/" }),
+      /ever-private memory saturated/,
+    );
+    assert.equal(__everPrivateSizeForTests(), EVER_PRIVATE_MAX_ENTRIES);
+    assert.equal(fetches, 0, "nothing may be fetched once the memory is saturated");
+
+    // An already-recorded hostname is still refused at saturation: membership
+    // is checked before any lookup, unaffected by the cap.
+    await assertRefused(
+      httpGet.execute({ url: "http://host0.example.com/" }),
+      /previously resolved/,
+    );
+    assert.equal(fetches, 0);
   });
 });
 

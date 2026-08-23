@@ -14,15 +14,15 @@ Order is fixed: Task 1 → Task 2.
   - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
 
-- [ ] **Task 2 — Cap the ever-private set, fail closed at saturation (L1)**
-  - [ ] RED — fill the set to `EVER_PRIVATE_MAX_ENTRIES` via injected private lookups (read the
+- [x] **Task 2 — Cap the ever-private set, fail closed at saturation (L1)**
+  - [x] RED — fill the set to `EVER_PRIVATE_MAX_ENTRIES` via injected private lookups (read the
         constant, no magic number); assert the set never exceeds the cap and the next distinct
         private-resolving hostname fails closed with a distinct "saturated" error and is not fetched.
         Fails at HEAD.
-  - [ ] GREEN — `rememberEverPrivate(hostname)` returns false at saturation; `assertReachable`
+  - [x] GREEN — `rememberEverPrivate(hostname)` returns false at saturation; `assertReachable`
         refuses with a distinct error and never fetches. Membership of an already-recorded hostname
         still works at saturation.
-  - [ ] Keep `__resetEverPrivateForTests` clearing the set; use it for isolation.
-  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - [x] Keep `__resetEverPrivateForTests` clearing the set; use it for isolation.
+  - [x] `npm test` + `check` + `build` + `lint` clean.
   - Files — `src/builtins.ts`, `test/builtins.test.ts`.
   - Depends on: Task 1.
