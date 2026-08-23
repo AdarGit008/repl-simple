@@ -1,28 +1,37 @@
-# Todo — L1+L2 ever-private hardening (issue #199 residuals)
+# Todo — Bucket 10: Packaging and consumability (issues #79–#82)
 
 Source of truth: `SPEC.md` + `tasks/plan.md`. One item = one coder dispatch = one orchestrator commit.
-Order is fixed: Task 1 → Task 2.
+Order is fixed: Task 1 → Task 2 → Task 3.
 
-- [x] **Task 1 — Normalize the ever-private key (L2)**
-  - [x] RED — `test/builtins.test.ts`: record a hostname under one spelling (`Example.COM.` resolving
-        private) → a later call under another spelling (`example.com`, `EXAMPLE.COM.`, `example.com.`)
-        is refused via memory before lookup. Fails at HEAD.
-  - [x] GREEN — single `everPrivateKey(hostname)` helper (lowercase + strip one trailing dot) used by
-        both the membership check and recording; the hostname passed to `lookupImpl` is normalized.
-  - [x] No false positive: a stable public hostname spelled with a trailing dot still resolves and
-        fetches.
-  - [x] `npm test` + `check` + `build` + `lint` clean.
-  - Files — `src/builtins.ts`, `test/builtins.test.ts`.
-
-- [x] **Task 2 — Cap the ever-private set, fail closed at saturation (L1)**
-  - [x] RED — fill the set to `EVER_PRIVATE_MAX_ENTRIES` via injected private lookups (read the
-        constant, no magic number); assert the set never exceeds the cap and the next distinct
-        private-resolving hostname fails closed with a distinct "saturated" error and is not fetched.
+- [ ] **Task 1 — Make the build emit a usable dist/ (#80)**
+  - [ ] RED — `test/packaging.test.ts`: `npm run build` produces `dist/index.js` (not
+        `dist/src/index.js`); `dist/` contains no test files; `getReplPreamble()` works against the
+        built artifact; a missing preamble file yields a clear error naming the path, not an ENOENT.
         Fails at HEAD.
-  - [x] GREEN — `rememberEverPrivate(hostname)` returns false at saturation; `assertReachable`
-        refuses with a distinct error and never fetches. Membership of an already-recorded hostname
-        still works at saturation.
-  - [x] Keep `__resetEverPrivateForTests` clearing the set; use it for isolation.
-  - [x] `npm test` + `check` + `build` + `lint` clean.
-  - Files — `src/builtins.ts`, `test/builtins.test.ts`.
+  - [ ] GREEN — `tsconfig.build.json`: `rootDir: "src"`, `include` drops `test/`. `src/preamble.ts`:
+        guarded `readFileSync` with a path-naming error. `package.json`: `prepublishOnly` runs the build.
+  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - Files — `tsconfig.build.json`, `src/preamble.ts`, `package.json`, `test/packaging.test.ts` (new),
+    `test/preamble.test.ts` (extend).
+  - Depends on: None.
+
+- [ ] **Task 2 — Publishable manifest; stop shipping tests and docs (#81)**
+  - [ ] RED — `test/packaging.test.ts`: `npm pack` ships `dist/`/`src/`/`repl/`/`extensions/`/`LICENSE`
+        and no `test/`/`docs/`/`plan-issue-9.md`; scratch consumer `import { ReplRunner } from
+        "repl-simple"` + `getReplPreamble()` succeed (offline); every `src/index.ts` export is reachable
+        from the packed artifact; `engines` matches `.nvmrc`. Fails at HEAD.
+  - [ ] GREEN — `package.json`: `main`/`types`/`exports`/`files`/`license` added; `private` removed.
+        Delete `plan-issue-9.md`.
+  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - Files — `package.json`, delete `plan-issue-9.md`, `test/packaging.test.ts` (extend).
   - Depends on: Task 1.
+
+- [ ] **Task 3 — Make the README true; add the missing attribution (#82)**
+  - [ ] RED — `test/readme.test.ts`: every README code sample executes; the README tool list matches
+        the tools that actually register; `npm pack` includes `LICENSE` and any `NOTICE`. Fails at HEAD.
+  - [ ] GREEN — `README.md` corrected (tool list, sandbox limits, import example, `pi.extensions`
+        wording); upstream attribution added to `LICENSE`/`NOTICE` + RLM whitepaper credited, or the
+        derivation claim recorded as unfounded with evidence.
+  - [ ] `npm test` + `check` + `build` + `lint` clean.
+  - Files — `README.md`, `LICENSE` (+ `NOTICE` if added), `test/readme.test.ts` (new).
+  - Depends on: Task 2.
