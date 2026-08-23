@@ -12,6 +12,7 @@
     "test:contained": "node scripts/contained.mjs tsx --test test/*.test.ts",
     "mutation": "node scripts/contained.mjs --limit 12G stryker run; s=$?; node scripts/mutation-guard.mjs --report; r=$?; exit $((s>r?s:r))",
     "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "check": "tsc --noEmit",
     "coverage": "tsx scripts/coverage.mjs",
     "coverage:update": "tsx scripts/coverage.mjs --update",

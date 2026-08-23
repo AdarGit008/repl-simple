@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { getReplPreamble } from "../src/preamble.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getReplPreamble, readPreamble } from "../src/preamble.js";
 import { runRlm, type LlmClient } from "../src/rlm.js";
 import { ToolRegistry } from "../src/registry.js";
 
@@ -31,5 +33,34 @@ describe("getReplPreamble", () => {
     });
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "11");
+  });
+});
+
+// ── readPreamble guard ─────────────────────────────────────────
+
+describe("readPreamble guard", () => {
+  it("throws a clear error naming the path when the file is missing", () => {
+    const missingPath = join(tmpdir(), "repl-simple-missing-preamble.py");
+
+    assert.throws(
+      () => readPreamble(missingPath),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, "expected an Error, not a bare ENOENT throw");
+        assert.ok(
+          err.message.includes(missingPath),
+          `message should name the missing path "${missingPath}", got: ${err.message}`,
+        );
+        assert.ok(
+          err.message.includes("reinstall or rebuild"),
+          `message should name the likely cause, got: ${err.message}`,
+        );
+        const cause = (err as Error & { cause?: unknown }).cause;
+        assert.ok(
+          cause instanceof Error && (cause as NodeJS.ErrnoException).code === "ENOENT",
+          `expected the original ENOENT as cause, got: ${String(cause)}`,
+        );
+        return true;
+      },
+    );
   });
 });

@@ -3,15 +3,15 @@
 Source of truth: `SPEC.md` + `tasks/plan.md`. One item = one coder dispatch = one orchestrator commit.
 Order is fixed: Task 1 → Task 2 → Task 3.
 
-- [ ] **Task 1 — Make the build emit a usable dist/ (#80)**
-  - [ ] RED — `test/packaging.test.ts`: `npm run build` produces `dist/index.js` (not
+- [x] **Task 1 — Make the build emit a usable dist/ (#80)**
+  - [x] RED — `test/packaging.test.ts`: `npm run build` produces `dist/index.js` (not
         `dist/src/index.js`); `dist/` contains no test files; `getReplPreamble()` works against the
         built artifact; a missing preamble file yields a clear error naming the path, not an ENOENT.
         Fails at HEAD.
-  - [ ] GREEN — `tsconfig.build.json`: `rootDir: "src"`, `include` drops `test/`. `src/preamble.ts`:
+  - [x] GREEN — `tsconfig.build.json`: `rootDir: "src"`, `include` drops `test/`. `src/preamble.ts`:
         guarded `readFileSync` with a path-naming error. `package.json`: `prepublishOnly` runs the build.
-  - [ ] `npm test` + `check` + `build` + `lint` clean.
-  - Files — `tsconfig.build.json`, `src/preamble.ts`, `package.json`, `test/packaging.test.ts` (new),
+  - [x] `npm test` + `check` + `build` + `lint` clean.
+  - [x] Files — `tsconfig.build.json`, `src/preamble.ts`, `package.json`, `test/packaging.test.ts` (new),
     `test/preamble.test.ts` (extend).
   - Depends on: None.
 

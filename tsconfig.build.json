@@ -8,14 +8,15 @@
 // Compiling it here would put a second, unreferenced copy in dist/ whose
 // imports resolve differently from the one that actually runs.
 //
-// The `test/` include and the missing `rootDir` are inherited defects, not
-// choices — dist/ currently mirrors the repo as dist/src/ + dist/test/, which
-// is #80's job to fix. Kept identical here so this issue changes nothing about
-// what gets built.
+// The build emits `src/` only, flat into `dist/` (D1): `rootDir` anchors the
+// output at `src/`, so `dist/` mirrors `src/` (`dist/index.js`, no
+// `dist/src/`, no `dist/test/`). Tests and `extensions/` stay in the check
+// config (`tsconfig.json`) and are deliberately not emitted here.
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": false
+    "noEmit": false,
+    "rootDir": "src"
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }
