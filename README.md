@@ -209,6 +209,12 @@ pi's discovery path (`<cwd>/.pi/extensions/`, `<agentDir>/extensions/`) passes t
 straight to its module loader without expanding directories, so a directory entry registers zero
 tools. See [#37](https://github.com/AdarGit008/repl-simple/issues/37).
 
+In addition to `@pydantic/monty`, `repl-simple` requires the host pi environment to provide
+`@earendil-works/pi-coding-agent` — a **peer dependency** satisfied by pi itself, which supplies it at
+runtime. It is deliberately *not* a regular dependency: that would let the registry install a second
+copy alongside the one pi already owns. It stays in `devDependencies` so local development's types
+and factories match the host's, exactly as upstream pi-code-tool does.
+
 Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
 `@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. 0.0.21
 also ships a wasm runtime at `@pydantic/monty/wasm` that looks like a way around this and is not:

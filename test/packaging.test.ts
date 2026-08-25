@@ -223,6 +223,8 @@ interface Manifest {
   license?: string;
   scripts?: Record<string, string>;
   engines?: { node?: string };
+  peerDependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
 }
 
 function readManifest(): Manifest {
@@ -257,5 +259,30 @@ describe("manifest", () => {
     for (const required of ["dist", "src", "repl", "extensions", "NOTICE"]) {
       assert.ok(pkg.files?.includes(required), `files must include "${required}"`);
     }
+  });
+
+  it("declares @earendil-works/pi-coding-agent as a peer dependency (host-provided)", () => {
+    // `dist/index.js` eagerly imports `dist/bridge.js`, which value-imports
+    // pi-coding-agent (createBashTool, etc.) — NOT type-only. That import is
+    // the only undeclared runtime dep of `dist/`, so a real consumer would get
+    // ERR_MODULE_NOT_FOUND unless the host pi environment supplies it. pi
+    // itself does, so it is a *peer* (satisfied by the host) and stays in
+    // devDependencies for local dev — the convention upstream pi-code-tool
+    // follows. A bare-declaring it in dependencies would let the registry
+    // install a second copy, drifting the types and factories away from the
+    // ones pi actually owns.
+    const pkg = readManifest();
+    const peer = pkg.peerDependencies?.["@earendil-works/pi-coding-agent"];
+    assert.ok(
+      typeof peer === "string" && peer.length > 0,
+      "peerDependencies must declare a non-empty @earendil-works/pi-coding-agent range",
+    );
+    // The same range as devDependencies keeps local dev and the host-provided
+    // peer on the same version line.
+    assert.equal(
+      peer,
+      pkg.devDependencies?.["@earendil-works/pi-coding-agent"],
+      "peerDependencies range must match devDependencies",
+    );
   });
 });
