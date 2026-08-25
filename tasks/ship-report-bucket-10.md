@@ -56,10 +56,30 @@ manifest-field pins, README import-block execution, tool-list↔code parity, LIC
   (correctly excluded from the tarball) and reference internal issue/ship commentary; secret scan found
   zero secrets. Decide repo visibility explicitly at publish time.
 
+## Post-ship CI fixes (found by running the PR through GitHub CI)
+
+Two CI-only correctness bugs, both missed by VERIFY/REVIEW/SHIP because those ran locally where
+`dist/` existed and the full `node_modules` (incl. devDeps) was present:
+
+- **Self-reference shadowing (fixed `fe83417`).** Adding `exports` activated Node package
+  self-reference (`name: "repl-simple"` + `exports`), so the scratch consumer (placed inside the
+  repo tree) resolved `import "repl-simple"` to the repo's own `dist/index.js`, never the packed
+  tarball. Passed locally only because the in-tree `dist/` existed. Fix: consumer moved to `tmpdir`
+  (outside the package tree) + `node_modules` mirrored for offline resolution; tests now assert
+  `import.meta.resolve("repl-simple")` targets the packed artifact.
+- **Undeclared runtime peer (fixed `e0cfd6c`).** `dist/bridge.js` eagerly value-imports
+  `@earendil-works/pi-coding-agent` (`createBashTool`, …), but it was `devDependencies`-only, so a
+  real `npm install repl-simple` consumer would hit `ERR_MODULE_NOT_FOUND` on import. Fix: declared
+  as a `peerDependencies` host-provided peer (matches `josephkern/pi-code-tool` convention), kept in
+  `devDependencies`. `@pydantic/monty` remains the only regular runtime dep.
+
 ## Rollback plan
 
 | Commit | Reverts |
 |---|---|
+| `e0cfd6c` | peerDependencies declaration (manifest + test + README note) |
+| `fe83417` | scratch-consumer self-reference fix (test fixture + 2 tests) |
+| `2ca0c70` | ship report (docs only) |
 | `946a0d8` | VERIFY coverage-gap fixes (tests + README config-truth only) |
 | `c0cb720` | README truth + NOTICE/LICENSE attribution |
 | `589e1ac` | manifest + `files`; restores `private: true` and `plan-issue-9.md` |
