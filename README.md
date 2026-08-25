@@ -2,6 +2,32 @@
 
 Pi extension — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
 
+## Sandbox
+
+Code runs in [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly), not a host
+Python, so the standard library is a fixed, closed set: **there are no third-party packages** and
+no way to install one, and most of the stdlib is absent.
+
+**Importable modules** — exactly these, verified against the pinned Monty 0.0.21. The code probes
+this at runtime (`probeImportableModules()` over `CANDIDATE_MODULES` in `src/registry.ts`), so the
+live answer follows the installed interpreter:
+
+`os`, `sys`, `json`, `re`, `datetime`, `math`, `typing`, `pathlib`, `asyncio`, `collections`,
+`itertools`, `dataclasses`
+
+Anything else — `time`, `random`, `subprocess`, `socket`, `functools`, `hashlib`, `requests`,
+`numpy` and the rest — is refused by Monty's type checker as an unresolved import, before any code
+runs. There is no `subprocess` or `socket`: sandboxed Python cannot spawn processes or open
+sockets, and filesystem access goes through the host tools (and, for embedded use, an explicit
+mount) — never through `open()` on arbitrary host paths.
+
+**Language limits.** A few Python features raise `NotImplementedError` instead of running:
+
+- **`yield`** — generators are not implemented.
+- **`match` statements** — pattern matching is not implemented.
+- **class inheritance and metaclasses** — a plain `class` with methods and `__init__` works, but
+  `class B(A)` raises `NotImplementedError`.
+
 ## Tools
 
 ### REPL (direct)
@@ -183,6 +209,12 @@ pi's discovery path (`<cwd>/.pi/extensions/`, `<agentDir>/extensions/`) passes t
 straight to its module loader without expanding directories, so a directory entry registers zero
 tools. See [#37](https://github.com/AdarGit008/repl-simple/issues/37).
 
+In addition to `@pydantic/monty`, `repl-simple` requires the host pi environment to provide
+`@earendil-works/pi-coding-agent` — a **peer dependency** satisfied by pi itself, which supplies it at
+runtime. It is deliberately *not* a regular dependency: that would let the registry install a second
+copy alongside the one pi already owns. It stays in `devDependencies` so local development's types
+and factories match the host's, exactly as upstream pi-code-tool does.
+
 Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
 `@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. 0.0.21
 also ships a wasm runtime at `@pydantic/monty/wasm` that looks like a way around this and is not:
@@ -269,8 +301,9 @@ Two TypeScript configs, deliberately:
 
 - **`tsconfig.json`** — what the compiler *checks*: `src/`, `test/` **and** `extensions/`. It is the
   default config, so editors and a bare `tsc` see the same program CI does.
-- **`tsconfig.build.json`** — what the compiler *emits*: `src/` and `test/`. `extensions/` is checked
-  but not built, because pi loads the `.ts` source directly through jiti and resolves `typebox` and
+- **`tsconfig.build.json`** — what the compiler *emits*: `src/` only, flat into `dist/` (its
+  `rootDir` is `src`, so `dist/` mirrors `src/`). `extensions/` is checked but not built, because pi
+  loads the `.ts` source directly through jiti and resolves `typebox` and
   `@earendil-works/pi-coding-agent` from its own install.
 
 `typebox` is a devDependency pinned to the exact version pi pins (`1.3.7`). It is a compile-time
@@ -439,3 +472,16 @@ goes red rather than quietly dropping coverage.
 
 CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
 ubuntu-latest and macos-latest, for every push and pull request.
+
+## Attribution
+
+This project derives from two MIT-licensed upstreams and a whitepaper; the full notices are in
+[NOTICE](NOTICE):
+
+- **[pi-reepl](https://github.com/ivanvza/pi-reepl)** (Copyright (c) 2026 pi-reepl contributors) —
+  the RLM loop, the `repl_server.py` preamble, and the `llm_query`/`SUBMIT`/`context` design.
+- **[pi-code-tool](https://github.com/josephkern/pi-code-tool)** (Copyright (c) 2026 Joseph Kern) —
+  the code-mode architecture: `ToolRegistry`, builtins, session/replay cache, the toolstore
+  (`.pi/code-tools`), the pi-tools bridge, and approval-gating/suspension.
+- **[Recursive Language Models](https://arxiv.org/abs/2512.24601)** — Zhang, Kraska, Khattab
+  (2025), arXiv:2512.24601, DOI 10.48550/arXiv.2512.24601 — the RLM design this follows.

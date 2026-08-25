@@ -1,17 +1,33 @@
 {
   "name": "repl-simple",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Pi extension — sandboxed Python execution via Monty",
   "keywords": [
     "pi-package"
+  ],
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "repl",
+    "extensions",
+    "NOTICE"
   ],
   "scripts": {
     "test": "tsx --test test/*.test.ts",
     "test:contained": "node scripts/contained.mjs tsx --test test/*.test.ts",
     "mutation": "node scripts/contained.mjs --limit 12G stryker run; s=$?; node scripts/mutation-guard.mjs --report; r=$?; exit $((s>r?s:r))",
     "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "check": "tsc --noEmit",
     "coverage": "tsx scripts/coverage.mjs",
     "coverage:update": "tsx scripts/coverage.mjs --update",
@@ -29,6 +45,9 @@
   },
   "dependencies": {
     "@pydantic/monty": "0.0.21"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",

@@ -1,73 +1,85 @@
-# Implementation Plan: L1+L2 ever-private hardening — issue #199 residuals
+# Implementation Plan: Bucket 10 — Packaging and consumability
 
-Source of truth: `SPEC.md`. Stacked on branch `issue-199-l1-l2-everprivate-hardening`.
-One task = one coder dispatch = one orchestrator commit. Order is fixed: Task 1 → Task 2.
+Source of truth: `SPEC.md`. Stacked on branch `issue-bucket-10-packaging`.
+One task = one coder dispatch = one orchestrator commit. Order is fixed: Task 1 → Task 2 → Task 3.
 
 ## Overview
 
-The #199 `everPrivate` memory in `src/builtins.ts` has two recorded residuals: it is **unbounded**
-(L1) and its key is **not trailing-dot-normalized** (L2). This flight adds a hard cap with
-fail-closed refusal at saturation (L1) and a single normalized key — lowercase + one trailing dot
-stripped — applied to both the memory key and the resolution input (L2). Both are defense-in-depth;
-no primary SSRF defence changes, no new dependency.
+Make `repl-simple` installable. Three dependent fixes, bottom-up: (1) the build must emit a flat,
+usable `dist/`; (2) the manifest must declare that `dist/` and stop shipping tests/docs; (3) the
+README and LICENSE must describe and credit what now actually works. Each task lands its own tests
+RED→GREEN; no task depends on a later one.
 
 ## Architecture Decisions
 
-- **D1 — Cap as a named module constant.** `EVER_PRIVATE_MAX_ENTRIES = 1024`, exported so tests read
-  the real value instead of a magic number. Not env-configurable (AS1).
-- **D2 — Normalize once, use everywhere.** A single `everPrivateKey(hostname)` helper (lowercase +
-  strip one trailing dot) is the only way the key is formed; `rememberEverPrivate` and the
-  membership check both go through it. The hostname handed to `lookupImpl` is also normalized so
-  resolution and memory agree on one spelling.
-- **D3 — Fail closed at saturation.** `rememberEverPrivate(hostname)` returns `false` when the set
-  is at capacity and the key is absent; the caller refuses with a distinct "ever-private memory
-  saturated" error and never fetches. Membership of an already-present key still works at
-  saturation.
-- **D4 — Preserve the seam.** `__resetEverPrivateForTests` keeps its name and semantics (clears the
-  set); the new tests use it for isolation. Existing #199 behaviour (two-lookups-agree, blocklist,
-  per-hop, timeout, approval, cap) is untouched.
+- **D1 — `rootDir: "src"`, emit `src/` only.** `tsconfig.build.json` gets `rootDir: "src"` and drops
+  `test/**/*.ts` from `include`, so `dist/` mirrors `src/` (`dist/index.js`, no `dist/src/`, no
+  `dist/test/`). Follows the #21 split: `tsconfig.json` keeps checking `test/` + `extensions/`.
+- **D2 — Preamble ships at package root.** `getReplPreamble()` keeps resolving
+  `join(__dirname, "..", "repl", "repl_server.py")`; after D1 that is `<pkg>/repl/repl_server.py`,
+  shipped via `files`. No redundant `dist/repl/` copy.
+- **D3 — `files: ["dist", "src", "repl", "extensions"]`.** `src/` is required because
+  `extensions/repl-extension.ts` imports `../src/*.js` and pi loads it via jiti. (Recorded deviation
+  from #81's literal list — see SPEC AS3.)
+- **D4 — Guarded preamble read.** A missing `repl_server.py` throws an error naming the path and the
+  likely cause, never a bare ENOENT.
+- **D5 — Manifest.** `main: "dist/index.js"`, `types: "dist/index.d.ts"`, `exports` map,
+  `license: "MIT"`, drop `private: true`, add `prepublishOnly: "npm run build"`.
+- **D6 — Attribution resolved by investigation.** Credit upstream (`pi-reepl`/`pi-code-tool`,
+  `ivanvza`) + RLM whitepaper in `LICENSE`/`NOTICE`, or record the claim as unfounded with evidence.
 
 ## Task List
 
-### Phase 1: Key normalization (L2)
+### Phase 1: Usable build output (#80)
 
-- [ ] **Task 1** — Normalize the ever-private key (lowercase + single trailing dot), on both the key
-  and the resolution input.
-  - Acceptance: a hostname recorded under any spelling is refused under every spelling before
-    lookup; a stable public hostname (including a trailing-dot spelling) still fetches; the key
-    normalization is unit-covered.
-  - Verify: RED test (record `Example.COM.` private → later `example.com` refused via memory) fails
-    at HEAD, green after. `npm test`, `npm run check`, `npm run build`, `npm run lint`.
-  - Files: `src/builtins.ts`, `test/builtins.test.ts`.
-  - Depends on: None.
+- [ ] **Task 1** — Make `npm run build` emit a flat `dist/`; guard the preamble read.
+  - `rootDir: "src"`; drop `test/` from the build `include`; `getReplPreamble()` guarded; wire
+    `prepublishOnly`. Tests: `dist/index.js` (not `dist/src/index.js`); no test files in `dist/`;
+    `getReplPreamble()` works against the built artifact; missing file → clear error naming the path.
+  - Files: `tsconfig.build.json`, `src/preamble.ts`, `package.json`, `test/packaging.test.ts` (new),
+    `test/preamble.test.ts` (extend). Depends on: None.
 
 ### Checkpoint: after Task 1
-- [ ] Every spelling maps to one key; no false positive on a trailing-dot public host; suite + gates green.
+- [ ] `npm run build` emits `dist/index.js` + `dist/index.d.ts` with no `dist/src/` or `dist/test/`;
+      preamble resolves in-tree and from the build; gates green.
 
-### Phase 2: Bound the memory (L1)
+### Phase 2: Publishable manifest (#81)
 
-- [ ] **Task 2** — Cap the ever-private set; fail closed at saturation.
-  - Acceptance: the set never exceeds `EVER_PRIVATE_MAX_ENTRIES`; at saturation a new distinct
-    private-resolving hostname is refused with a distinct error and not fetched; an already-recorded
-    hostname is still refused at saturation; `__resetEverPrivateForTests` still clears the set.
-  - Verify: RED test (fill to cap via injected private lookups, next distinct private hostname fails
-    closed) fails at HEAD, green after. `npm test`, `npm run check`, `npm run build`, `npm run lint`.
-  - Files: `src/builtins.ts`, `test/builtins.test.ts`.
-  - Depends on: Task 1.
+- [ ] **Task 2** — Add `main`/`types`/`exports`/`files`/`license`; drop `private`; delete
+  `plan-issue-9.md`.
+  - Tests: `npm pack` ships `dist/`/`src/`/`repl/`/`extensions/`/`LICENSE` and no `test/`, `docs/`,
+    `plan-issue-9.md`; scratch consumer imports `ReplRunner` + calls `getReplPreamble()` (offline);
+    every `src/index.ts` export reachable from the packed artifact; `engines` matches `.nvmrc`.
+  - Files: `package.json`, delete `plan-issue-9.md`, `test/packaging.test.ts` (extend). Depends on: 1.
+
+### Checkpoint: after Task 2
+- [ ] Scratch consumer `import { ReplRunner } from "repl-simple"` + `getReplPreamble()` succeed
+      against the packed tarball, offline; tarball is clean; gates green.
+
+### Phase 3: README truth + attribution (#82)
+
+- [ ] **Task 3** — Make the README truthful; resolve attribution.
+  - Fix the README rows (tool list, sandbox limits, import example now real, `pi.extensions`
+    auto-load wording); document the sandbox's real capabilities/limits; add upstream attribution to
+    `LICENSE`/`NOTICE` and credit the RLM whitepaper (or record the claim as unfounded with evidence).
+  - Tests: every README code sample executes; README tool list matches registered tools; `npm pack`
+    includes `LICENSE`/`NOTICE`.
+  - Files: `README.md`, `LICENSE` (+ `NOTICE` if added), `test/readme.test.ts` (new). Depends on: 2.
 
 ### Checkpoint: complete
-- [ ] L1 and L2 landed; suite + coverage floors green; ready for VERIFY / REVIEW / SHIP.
+- [ ] All three tasks landed; full suite + coverage floors green; ready for VERIFY / REVIEW / SHIP.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Saturation = availability loss (new private hostnames post-saturation not remembered) | Low | Accepted and bounded (AS5); fail-closed refusal, distinct error, cap is a named constant |
-| Trailing-dot strip breaks a legitimately distinct hostname | Low | Only one trailing dot stripped; FQDN `example.com.` is DNS-equivalent to `example.com`; covered by a no-false-positive test |
-| Cap constant too low/high | Low | 1024 is generous for legitimate use, small enough to bound memory; exported for easy audit |
-| Test loops 1024× against the real path are slow | Low | Injected `lookupImpl` (no DNS), in-memory; negligible per iteration |
-| Both tasks touch the same functions → messy commits | Low | Separate tasks/commits; Task 2 builds on Task 1's helper |
+| Scratch-consumer test hits the registry | High (breaks offline CI) | Reuse repo `node_modules`/npm cache; never fetch (SPEC AS6) |
+| `files` without `src/` breaks the jiti extension path | High | D3 ships `src/`; extension-loader test stays green |
+| `rootDir: "src"` breaks an extension/test import | Med | Only the *build* config narrows; `tsconfig.json` still checks everything |
+| `npm pack` includes stray files via auto-include | Low | README/LICENSE auto-include is desired; assert the *absence* of test/docs/plans |
+| Attribution claim is unfounded | Low | D6: record as unfounded with evidence rather than invent credit |
+| `prepublishOnly` slows/breaks other flows | Low | It only fires on `npm publish`/`npm pack` (prepack), not `npm test`/`build` |
 
 ## Open Questions
 
-None — recorded as SPEC assumptions AS0–AS6.
+None — recorded as SPEC assumptions AS0–AS7.
