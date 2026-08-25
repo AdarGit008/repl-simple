@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -111,7 +112,10 @@ export function createPackFixture(tag: string): PackFixture {
   // repo's own `dist/index.js` (via `exports` + `name`), which in CI doesn't
   // exist — so the test would pass locally only because the repo `dist/` was
   // already built. In tmpdir the specifier must resolve through node_modules.
-  const consumerDir = mkdtempSync(join(tmpdir(), `repl-simple-${tag}-consumer-`));
+  // macOS tmpdir() is /var/... but import.meta.resolve() canonicalizes to
+  // /private/var/... (/var is a symlink to /private/var); realpathSync aligns
+  // them so pathToFileURL(consumerDir) matches the resolved URL. No-op elsewhere.
+  const consumerDir = realpathSync(mkdtempSync(join(tmpdir(), `repl-simple-${tag}-consumer-`)));
   const nodeModulesDir = join(consumerDir, "node_modules");
   mkdirSync(nodeModulesDir, { recursive: true });
   const packedPkgDir = join(nodeModulesDir, "repl-simple");
