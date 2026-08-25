@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createPiBridgeTools } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
 import { createToolStoreTools } from "../src/toolstore.js";
@@ -28,11 +29,11 @@ import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-f
 
 /**
  * Populated by `createPackFixture` in `before`: the private staging package and
- * the repo-internal consumer dir the tarball is extracted into (so Node's
- * module resolution walks up to the repo's own `node_modules` — SPEC AS6,
- * never the registry). Same fixture as packaging.test.ts, each in its own
- * private temp dir so the two files (run concurrently by `node:test`) never
- * `rm -rf` the same directory (F4).
+ * the tmpdir consumer dir the tarball is extracted into (so `repl-simple`
+ * resolves offline via the packed artifact and not via package self-reference —
+ * SPEC AS6, never the registry). Same fixture as packaging.test.ts, each in its
+ * own private temp dir so the two files (run concurrently by `node:test`)
+ * never `rm -rf` the same directory (F4).
  */
 let fixture: PackFixture;
 let pkgDir: string;
@@ -176,6 +177,7 @@ describe("README truth (#82)", () => {
 
     const script = [
       importStmt,
+      `console.log("resolved:" + import.meta.resolve("repl-simple"));`,
       `const __exports = { ${names.join(", ")} };`,
       `for (const [name, value] of Object.entries(__exports)) {`,
       `  if (value === undefined) throw new Error("README import '" + name + "' is undefined at runtime");`,
@@ -193,6 +195,17 @@ describe("README truth (#82)", () => {
       `README import block failed:\n${run.stdout ?? ""}\n${run.stderr ?? ""}`,
     );
     assert.ok(run.stdout.includes("readme-import-ok"), "consumer did not print its success marker");
+
+    // Prove the bare specifier resolved the PACKED artifact, not the repo's own
+    // dist via package self-reference (the consumer now lives in tmpdir and
+    // cannot self-reference the repo tree).
+    const resolvedLine = run.stdout.split("\n").find((l) => l.startsWith("resolved:"));
+    assert.ok(resolvedLine, 'consumer did not report import.meta.resolve("repl-simple")');
+    const resolved = resolvedLine.slice("resolved:".length);
+    assert.ok(
+      resolved.startsWith(pathToFileURL(join(consumerDir, "node_modules", "repl-simple")).href),
+      `bare "repl-simple" must resolve under the packed consumer (${resolved}), not the repo`,
+    );
   });
 
   it("the README tool lists exactly match the tools the code registers", () => {

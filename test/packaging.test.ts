@@ -26,9 +26,10 @@ import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-f
 
 /**
  * Populated by `createPackFixture` in `before`: the private staging package,
- * its built `dist/`, and the repo-internal consumer dir the tarball is
- * extracted into (so Node's module resolution walks up to the repo's own
- * `node_modules` for `@pydantic/monty` — SPEC AS6, never the registry).
+ * its built `dist/`, and the tmpdir consumer dir the tarball is extracted into
+ * (with the repo's own `node_modules` mirrored in so `repl-simple` resolves
+ * offline via the packed artifact and not via package self-reference — SPEC
+ * AS6, never the registry).
  */
 let fixture: PackFixture;
 let DIST: string;
@@ -165,6 +166,7 @@ describe("scratch consumer (offline, SPEC AS6)", () => {
     const script = [
       `import { ReplRunner } from "repl-simple";`,
       `import { getReplPreamble } from "repl-simple";`,
+      `console.log("resolved:" + import.meta.resolve("repl-simple"));`,
       `if (typeof ReplRunner !== "function") throw new Error("ReplRunner is not a function");`,
       `const preamble = getReplPreamble();`,
       `if (typeof preamble !== "string" || preamble.length === 0) throw new Error("preamble is empty");`,
@@ -182,6 +184,17 @@ describe("scratch consumer (offline, SPEC AS6)", () => {
       `consumer import failed:\n${run.stdout ?? ""}\n${run.stderr ?? ""}`,
     );
     assert.ok(run.stdout.includes("consumer-ok"), "consumer did not print its success marker");
+
+    // Prove the bare specifier resolved the PACKED artifact, not the repo's own
+    // dist via package self-reference (the consumer now lives in tmpdir and
+    // cannot self-reference the repo tree).
+    const resolvedLine = run.stdout.split("\n").find((l) => l.startsWith("resolved:"));
+    assert.ok(resolvedLine, 'consumer did not report import.meta.resolve("repl-simple")');
+    const resolved = resolvedLine.slice("resolved:".length);
+    assert.ok(
+      resolved.startsWith(pathToFileURL(join(consumerDir, "node_modules", "repl-simple")).href),
+      `bare "repl-simple" must resolve under the packed consumer (${resolved}), not the repo`,
+    );
   });
 });
 
