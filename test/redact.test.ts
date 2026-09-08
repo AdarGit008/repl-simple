@@ -149,11 +149,137 @@ describe("maskSecrets — Authorization / Bearer (family 2)", () => {
       gone: ["tokentokentoken"],
       kept: ["Content-Type: application/json"],
     },
+    {
+      // The verifier's probe: an alphanumeric schemeless value with the next
+      // header on the following line. The credential must go, whole.
+      name: "a schemeless alphanumeric value followed by the next header (the header-dump shape)",
+      input: "Authorization: abcdef1234567890XYZ\nX-Request-Id: 42",
+      gone: ["abcdef1234567890XYZ"],
+      kept: ["X-Request-Id: 42"],
+      exact: `Authorization: ${REDACTED}\nX-Request-Id: 42`,
+    },
+    {
+      name: "a header dump — every other header survives verbatim",
+      input:
+        "Host: api.example.com\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig\nX-Request-Id: 42\nContent-Type: application/json",
+      gone: ["eyJhbGciOiJIUzI1NiJ9"],
+      kept: ["Host: api.example.com\n", "\nX-Request-Id: 42\nContent-Type: application/json"],
+      exact: `Host: api.example.com\nAuthorization: Bearer ${REDACTED}\nX-Request-Id: 42\nContent-Type: application/json`,
+    },
+    {
+      name: "a schemeless header dump — every other header survives verbatim",
+      input:
+        "Host: api.example.com\nAuthorization: abcdef1234567890XYZ\nX-Request-Id: 42\nAccept: */*",
+      gone: ["abcdef1234567890XYZ"],
+      kept: ["Host: api.example.com\n", "\nX-Request-Id: 42\nAccept: */*"],
+      exact: `Host: api.example.com\nAuthorization: ${REDACTED}\nX-Request-Id: 42\nAccept: */*`,
+    },
+    {
+      name: "compact JSON",
+      input: '{"Authorization":"Bearer abc.def.ghi","Accept":"*/*"}',
+      gone: ["abc.def.ghi"],
+      kept: ['"Accept":"*/*"'],
+      exact: `{"Authorization":"Bearer ${REDACTED}","Accept":"*/*"}`,
+    },
+    {
+      name: "schemeless JSON",
+      input: '{"Authorization":"abcdef1234567890XYZ","Accept":"*/*"}',
+      gone: ["abcdef1234567890XYZ"],
+      kept: ['"Accept":"*/*"'],
+      exact: `{"Authorization":"${REDACTED}","Accept":"*/*"}`,
+    },
+    {
+      name: "a curl -H line",
+      input: "curl -H 'Authorization: Bearer abc123def456' https://api.example.com/v1",
+      gone: ["abc123def456"],
+      kept: ["curl -H 'Authorization: Bearer ", "' https://api.example.com/v1"],
+      exact: `curl -H 'Authorization: Bearer ${REDACTED}' https://api.example.com/v1`,
+    },
+    {
+      name: "a curl -H line with the GitHub `token` scheme (the prefix rule and this one compose)",
+      input:
+        'curl -H "Authorization: token ghp_abcdefghijklmnopqrstuvwxyz0123" https://api.github.com',
+      gone: ["abcdefghijklmnopqrstuvwxyz0123", "ghp_"],
+      kept: ['curl -H "Authorization: token ', '" https://api.github.com'],
+      exact: `curl -H "Authorization: token ${REDACTED}" https://api.github.com`,
+    },
+    {
+      // A scheme the rule does not know is indistinguishable from a
+      // credential followed by a word, so the pair goes together.
+      name: "an unknown scheme and its credential go together",
+      input: "Authorization: Bot MTIzNDU2Nzg5.abcdef.ghijkl\nX-Request-Id: 42",
+      gone: ["MTIzNDU2Nzg5.abcdef.ghijkl", "Bot"],
+      kept: ["X-Request-Id: 42"],
+      exact: `Authorization: ${REDACTED}\nX-Request-Id: 42`,
+    },
+    {
+      name: "a schemeless credential followed by prose — the next word goes with it (documented cost)",
+      input: "Authorization: abcdef1234567890XYZ for user 7",
+      gone: ["abcdef1234567890XYZ"],
+      kept: [" user 7"],
+      exact: `Authorization: ${REDACTED} user 7`,
+    },
   ];
 
   for (const c of CASES) {
     it(`masks ${c.name}`, () => assertMasked(c));
   }
+
+  it("masks both of two `;`-joined headers and keeps the separator", () => {
+    const out = maskSecrets(
+      "Authorization: Bearer aaaaaaaaaaaa; Authorization: Bearer bbbbbbbbbbbb",
+    );
+    assert.equal(out.masked, 2);
+    assert.equal(out.text, `Authorization: Bearer ${REDACTED}; Authorization: Bearer ${REDACTED}`);
+  });
+
+  it("the value ends at `,` as well", () => {
+    const out = maskSecrets(
+      "Authorization: Basic dXNlcjpwYXNz, Authorization: Bearer bbbbbbbbbbbb",
+    );
+    assert.equal(out.masked, 2);
+    assert.equal(out.text, `Authorization: Basic ${REDACTED}, Authorization: Bearer ${REDACTED}`);
+  });
+
+  it("every known scheme keeps its spelling; an unknown one goes with its credential", () => {
+    const KNOWN = [
+      "Basic",
+      "Bearer",
+      "Digest",
+      "Token",
+      "Negotiate",
+      "NTLM",
+      "HOBA",
+      "Mutual",
+      "AWS4-HMAC-SHA256",
+      "bearer",
+      "BASIC",
+    ];
+    for (const scheme of KNOWN) {
+      const out = maskSecrets(`Authorization: ${scheme} credential0123456789\nX-Request-Id: 42`);
+      assert.equal(out.text, `Authorization: ${scheme} ${REDACTED}\nX-Request-Id: 42`, scheme);
+      assert.equal(out.masked, 1, scheme);
+    }
+    for (const scheme of ["Bot", "SSWS", "OAuth", "ApiKey"]) {
+      const out = maskSecrets(`Authorization: ${scheme} credential0123456789\nX-Request-Id: 42`);
+      assert.equal(out.text, `Authorization: ${REDACTED}\nX-Request-Id: 42`, scheme);
+      assert.equal(out.masked, 1, scheme);
+    }
+  });
+
+  it("a scheme word with no credential is data", () => {
+    const text = "Authorization: Bearer\nX-Request-Id: 42";
+    const out = maskSecrets(text);
+    assert.equal(out.masked, 0);
+    assert.equal(out.text, text);
+  });
+
+  it("a bare Bearer never reads across a line: prose is left alone", () => {
+    const text = "the Bearer\nauthentication scheme is used";
+    const out = maskSecrets(text);
+    assert.equal(out.masked, 0);
+    assert.equal(out.text, text);
+  });
 
   it("a Bearer value shorter than 8 characters is data, not a token", () => {
     const out = maskSecrets("the bearer of this note");
@@ -360,6 +486,10 @@ const CORPUS: Array<{ name: string; text: string }> = [
   { name: "AKIA inside a word", text: "NAKIAMBA is a surname" },
   { name: "token count", text: "token count: 12 (tokens: 12)" },
   { name: "Authorization as a word", text: "authorization is required for this action" },
+  {
+    name: "401 challenge header",
+    text: 'WWW-Authenticate: Bearer realm="api", error="invalid_token"',
+  },
   { name: "PEM certificate", text: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----" },
   { name: "public key block", text: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----" },
   { name: "provider error", text: "429 rate limit exceeded; retry after 20s (request id req_1)" },
@@ -391,12 +521,15 @@ describe("maskSecrets / redact — idempotence", () => {
     'GITHUB_TOKEN="ghp_abcdefghijklmnopqrstuvwxyz0123"',
   ];
 
-  it("a second masking pass changes nothing", () => {
+  it("a second masking pass changes nothing and masks nothing", () => {
     for (const text of [...POSITIVES, ...CORPUS.map((c) => c.text)]) {
       const once = maskSecrets(text).text;
       const twice = maskSecrets(once);
       assert.equal(twice.text, once, `not idempotent for: ${text}`);
-      assert.equal(twice.masked === 0 || twice.text === once, true);
+      // `[REDACTED]` is not a value to any rule: the count is idempotent, not
+      // only the text — a caller logging `masked` sees the secrets, not the
+      // number of passes.
+      assert.equal(twice.masked, 0, `a second pass re-masked ${twice.masked} in: ${once}`);
     }
   });
 
@@ -467,6 +600,141 @@ describe("redact — masking composed with the head-only cut", () => {
     const out = redact("A".repeat(100), { maxBytes: 8, recovery: RECOVERY });
     assert.equal(out.text, "");
     assert.equal(out.truncated, true);
+  });
+});
+
+// ── Fuzz: random header, env and prose lines ────────────────────
+//
+// A seeded generator (a failure reproduces by seed) assembles documents of
+// one to three lines drawn from realistic non-secret material — response
+// headers, environment dumps, prose about tokens and keys, Python that is
+// not a credential — and asserts every one passes byte-identical. A second
+// generator plants a credential in a random header dump, in each header
+// shape the rule knows, and asserts it never survives whatever surrounds it.
+
+/** Numerical Recipes LCG — enough for a reproducible shuffle, not for anything else. */
+function lcg(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 0x1_0000_0000;
+  };
+}
+
+function pick<T>(rand: () => number, items: readonly T[]): T {
+  return items[Math.floor(rand() * items.length)] as T;
+}
+
+const HEADER_LINES = [
+  "Host: api.example.com",
+  "Content-Type: application/json",
+  "Content-Length: 128",
+  "Accept: */*",
+  "Accept-Encoding: gzip, deflate",
+  "User-Agent: curl/8.6.0",
+  "X-Request-Id: 42",
+  "X-RateLimit-Remaining: 17",
+  "Cache-Control: no-cache",
+  "Retry-After: 20",
+  "Date: Tue, 08 Sep 2026 12:00:00 GMT",
+  "Connection: keep-alive",
+];
+
+const ENV_LINES = [
+  "PATH=/usr/local/bin:/usr/bin:/bin",
+  "HOME=/home/user",
+  "SHELL=/bin/bash",
+  "LANG=en_US.UTF-8",
+  "TERM=xterm-256color",
+  "EDITOR=vim",
+  "TZ=UTC",
+  "PORT=8080",
+  "NODE_ENV=production",
+  "LOG_LEVEL=debug",
+  "monkey=banana",
+  "keyboard=on",
+  "turkey=hot",
+  "keyword=value",
+  "max_tokens=4096",
+  "tokens=12",
+  "passwords=3",
+  "key_id=7",
+  "tokenizer=gpt2",
+];
+
+const PROSE_LINES = [
+  "the bearer of bad news",
+  "authorization is required for this action",
+  "the token type is Bearer",
+  "authentication happens once per request",
+  "rotate the secret every 90 days",
+  "a password reset link was sent",
+  "the primary key is the id column",
+  "tokens are counted per request",
+  "see docs/redaction.md for the rules",
+  "429 rate limit exceeded; retry after 20s (request id req_1)",
+];
+
+const CODE_LINES = [
+  "request(model='x', max_tokens=4096, temperature=0)",
+  "tokens = ['a', 'b']",
+  "print(len(passwords))",
+  "d = dict(name=value, other=1)",
+  "for k, v in d.items():",
+  "x = 1 / 0",
+  "import os",
+  "commit 3770e46a0b1c2d3e4f5061728394a5b6c7d8e9f0",
+];
+
+const NEGATIVE_LINES = [...HEADER_LINES, ...ENV_LINES, ...PROSE_LINES, ...CODE_LINES];
+
+/** How many random documents each fuzz builds. Reported in the PR body. */
+const FUZZ_SAMPLES = 200;
+
+describe("maskSecrets — fuzz: random header, env and prose lines", () => {
+  it(`leaves ${FUZZ_SAMPLES} random one-to-three-line non-secret documents byte-identical`, () => {
+    const rand = lcg(20260908);
+    const offenders: string[] = [];
+    for (let i = 0; i < FUZZ_SAMPLES; i++) {
+      const lines = 1 + Math.floor(rand() * 3);
+      const text = Array.from({ length: lines }, () => pick(rand, NEGATIVE_LINES)).join("\n");
+      const out = maskSecrets(text);
+      if (out.masked !== 0 || out.text !== text) {
+        offenders.push(`${JSON.stringify(text)} -> ${JSON.stringify(out.text)}`);
+      }
+    }
+    assert.equal(offenders.length, 0, `false positives:\n${offenders.join("\n")}`);
+  });
+
+  it(`never lets the credential of ${FUZZ_SAMPLES} random header dumps survive, whatever surrounds it`, () => {
+    const rand = lcg(19700101);
+    const ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const token = (n: number) =>
+      Array.from({ length: n }, () => ALNUM[Math.floor(rand() * ALNUM.length)]).join("");
+    for (let i = 0; i < FUZZ_SAMPLES; i++) {
+      const credential = token(16 + Math.floor(rand() * 24));
+      const form = pick(rand, [
+        credential,
+        `Bearer ${credential}`,
+        `Basic ${credential}==`,
+        `Bot ${credential}`,
+        `Token ${credential}`,
+      ]);
+      const headers = Array.from({ length: 1 + Math.floor(rand() * 4) }, () =>
+        pick(rand, HEADER_LINES),
+      );
+      headers.splice(Math.floor(rand() * (headers.length + 1)), 0, `Authorization: ${form}`);
+      const text = headers.join("\n");
+      const out = maskSecrets(text);
+      assert.ok(
+        !out.text.includes(credential),
+        `credential survived in:\n${text}\n->\n${out.text}`,
+      );
+      for (const header of headers) {
+        if (header.startsWith("Authorization:")) continue;
+        assert.ok(out.text.includes(header), `header lost: ${header}\n${text}\n->\n${out.text}`);
+      }
+    }
   });
 });
 
