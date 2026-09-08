@@ -66,6 +66,25 @@ export interface BridgeOptions {
   edit?: EditToolOptions;
   /** Passed through to createWriteTool. */
   write?: WriteToolOptions;
+  /**
+   * Called after every successful built-in execution with the pi tool's own
+   * `details`, so they survive the bridge instead of being dropped with the
+   * rest of the `AgentToolResult` (#46): `read`, `grep`, `find`, `ls` and
+   * `bash` report their truncation, `bash` its full-output path, `edit` its
+   * diff and patch; `write` reports `undefined`. `HostTool.execute` still
+   * returns the text alone — that is the sandbox's contract — and this is the
+   * side channel for the rest. Not called when the tool throws: pi produces
+   * no result then, and the sandbox records the failure in the trace itself.
+   */
+  onDetails?: (event: BridgeToolDetails) => void;
+}
+
+/** What `BridgeOptions.onDetails` receives: the tool, the arguments pi ran with, and its `details`. */
+export interface BridgeToolDetails {
+  tool: string;
+  /** Jailed and prepared — the arguments the built-in tool actually saw. */
+  args: Record<string, unknown>;
+  details: unknown;
 }
 
 // ── Tool definitions ────────────────────────────────────────────
@@ -441,6 +460,8 @@ export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): H
             if (note === undefined) throw err;
             throw new Error(`${message}\n\n${note}`, { cause: err });
           });
+        // The details go out of band; the text is the return value (#46).
+        options.onDetails?.({ tool: spec.name, args: processed, details: result.details });
         // Extract text blocks from AgentToolResult.content
         const content: Array<{ type: string; text?: string }> = result.content;
         return content

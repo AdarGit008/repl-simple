@@ -441,28 +441,28 @@ describe("repl extension — the repl tool passes clamped limits (never 'unbound
   });
 
   /**
-   * Capture the `limits` argument the extension hands `ReplRunner.run`, with
-   * the sandbox path stubbed out. This pins what reaches the runner — the seam
-   * where an "unbounded" or an un-clamped value would show up — without
-   * driving a real sandbox execution.
+   * Capture the `limits` argument the extension hands `ReplRunner.runWithTrace`
+   * (the seam `run` is `.text` of, #46), with the sandbox path stubbed out.
+   * This pins what reaches the runner — the seam where an "unbounded" or an
+   * un-clamped value would show up — without driving a real sandbox execution.
    *
-   * Patches `ReplRunner.prototype.run` for the duration of the call — see the
-   * sequential assumption on `withPatchedPrototype` (#178).
+   * Patches `ReplRunner.prototype.runWithTrace` for the duration of the call —
+   * see the sequential assumption on `withPatchedPrototype` (#178).
    */
   async function runWithLimits(params: Record<string, unknown>): Promise<unknown[]> {
     const seen: unknown[] = [];
     const fakeRun = (async (
       _code: string,
-      _sessionId: string | undefined,
+      sessionId: string | undefined,
       _onApproval: unknown,
       _signal: AbortSignal | undefined,
       limits: unknown,
     ) => {
       seen.push(limits);
-      return "[result]\n1";
-    }) as unknown as typeof ReplRunner.prototype.run;
+      return { text: "[result]\n1", sessionId: sessionId ?? "default", status: "ok", calls: [] };
+    }) as unknown as typeof ReplRunner.prototype.runWithTrace;
 
-    await withPatchedPrototype(ReplRunner.prototype, "run", fakeRun, async () => {
+    await withPatchedPrototype(ReplRunner.prototype, "runWithTrace", fakeRun, async () => {
       const repl = (await loadTools()).find((t) => t.name === "repl");
       assert.ok(repl, "repl did not register");
       await repl.execute("clamp-1", params, undefined, undefined, {
@@ -1327,9 +1327,9 @@ describe("repl extension — suspension is reachable (#51)", () => {
 
 // ── repl_resume forwards the abort signal (#177 D2) ─────────────
 //
-// `repl_resume.execute` hands the abort `signal` to `ReplRunner.resume` as its
-// third positional argument (`extensions/repl-extension.ts:371-375`), but every
-// existing `repl_resume.execute(...)` test passes `undefined`. The deeper
+// `repl_resume.execute` hands the abort `signal` to `ReplRunner.resumeWithTrace`
+// (the seam `resume` is `.text` of, #46) as its third positional argument, but
+// every existing `repl_resume.execute(...)` test passes `undefined`. The deeper
 // `ReplRunner`→`Session`→sandbox signal path is already pinned (#150 "abort-rt",
 // D7 test 1); this pins the one unpinned hop — extension → `ReplRunner` — so a
 // future refactor cannot silently drop the signal on the floor. This is a
@@ -1347,20 +1347,21 @@ describe("repl extension — repl_resume forwards the abort signal (#177 D2)", (
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("passes the caller's abort signal through to ReplRunner.resume", async () => {
+  it("passes the caller's abort signal through to ReplRunner.resumeWithTrace", async () => {
     const controller = new AbortController();
     const seen: unknown[] = [];
-    // Patches `ReplRunner.prototype.resume` for the duration of the call —
-    // see the sequential assumption on `withPatchedPrototype` (#178).
+    // Patches `ReplRunner.prototype.resumeWithTrace` — the seam `resume` is
+    // `.text` of (#46) — for the duration of the call; see the sequential
+    // assumption on `withPatchedPrototype` (#178).
     const fakeResume = (async (
-      _sessionId: string,
+      sessionId: string,
       _onApproval: unknown,
       signal: AbortSignal | undefined,
     ) => {
       seen.push(signal);
-      return "[result]\n1";
-    }) as unknown as typeof ReplRunner.prototype.resume;
-    await withPatchedPrototype(ReplRunner.prototype, "resume", fakeResume, async () => {
+      return { text: "[result]\n1", sessionId, status: "ok", calls: [] };
+    }) as unknown as typeof ReplRunner.prototype.resumeWithTrace;
+    await withPatchedPrototype(ReplRunner.prototype, "resumeWithTrace", fakeResume, async () => {
       const resume = (await loadTools()).find((t) => t.name === "repl_resume");
       assert.ok(resume);
       await resume.execute("sig-1", { sessionId: "sig" }, controller.signal, undefined, {
@@ -2096,7 +2097,7 @@ type CallView = {
 
 type DetailsView = {
   sessionId: string;
-  status: string;
+  status: extension.ReplDetails["status"];
   calls: CallView[];
   omittedCalls: number;
   suspendedCall?: { tool: string; args: string };
@@ -2588,8 +2589,10 @@ describe("repl extension — formatTrace and the trace view (#46)", () => {
       }),
       { expanded: true },
     );
+    // The header counts every call the run made, listed or not — the marker
+    // says how many are missing, the header does not shrink to fit.
     assert.deepEqual(lines, [
-      "[trace] 1 host-tool call(s)",
+      "[trace] 6 host-tool call(s)",
       '  ✓ read("a.txt") 3ms',
       `  … 5 more call(s) not listed (trace capped at ${extension.TRACE_MAX_CALLS})`,
       '  ⏸ write("x.txt", "…") waiting for approval',

@@ -1,6 +1,8 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { maskSecrets, redact } from "../src/redact.js";
 import { ReplRunner } from "../src/repl.js";
+import type { RunTrace, TracedCall, TraceStatus } from "../src/repl.js";
 import { limitsConfig } from "../src/sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
 
@@ -22,6 +24,9 @@ import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.
 type ApprovalMode = "strict" | "yolo";
 
 const MODE_HELP = "Usage: /repl-approvals [strict|yolo]";
+
+/** The command that calls `ReplRunner.acceptPreamble()` (#198, decision 5). */
+export const ACCEPT_PREAMBLE_COMMAND = "repl-accept-preamble";
 
 // ── Approval dialog ──────────────────────────────────────────────
 
@@ -166,6 +171,391 @@ export function clampModelLimits(maxDurationSecs?: unknown, maxMemoryMiB?: unkno
   return limits;
 }
 
+// ── The trace on `details` (#46) ─────────────────────────────────
+//
+// Every host-tool call a `repl` / `repl_resume` call made is reported on the
+// tool result's `details` — the channel pi persists to the session file,
+// emits over RPC and hands to `renderResult` — so a jailed read and a gated
+// fetch are auditable after the fact instead of having to be believed. The
+// runner hands over the calls verbatim (`ReplRunner.runWithTrace`); this is
+// where they become display-safe, because `details` outlives the call: pi
+// writes it to disk. Arguments are masked with the shared redaction helper
+// and cut head-only; the built-in tools' own details are projected down to
+// their facts; results, `stdout` and return values are never in the trace.
+// Unordered relative to `stdout` — the interleave is wave 3's (decision 11).
+
+/** Byte ceiling on one call's rendered argument list, marker included. */
+export const TRACE_ARGS_MAX_BYTES = 256;
+
+/** Most calls one `details` carries; the rest are counted, head-only. */
+export const TRACE_MAX_CALLS = 1000;
+
+/**
+ * Characters of a string argument the renderer masks and shows. Nothing past
+ * the first few hundred bytes can reach a line of `TRACE_ARGS_MAX_BYTES`, so a
+ * 64 KiB `write` body is not masked whole — but the window is cut *after*
+ * masking, never before, so no token is split by the cut (D114).
+ */
+const TRACE_LEAF_WINDOW = 4096;
+
+/**
+ * Characters dropped from the end of a windowed leaf after masking: longer
+ * than any known token prefix plus the 16 characters masking needs to
+ * recognise one, so a token that straddled the window's edge leaves no
+ * prefix behind.
+ */
+const TRACE_LEAF_GUARD = 64;
+
+/** Rendered characters after which the argument renderer stops descending. */
+const TRACE_RENDER_CAP = 8192;
+
+/** Nesting the renderer follows before writing `…`. */
+const TRACE_DEPTH = 4;
+
+const TRACE_ARGS_RECOVERY = "The trace keeps only the head of the arguments.";
+const TRACE_ERROR_RECOVERY = "The trace keeps only the head of the error.";
+
+/** One host-tool call as `details` carries it: display-safe, JSON-safe. */
+export interface TraceCallView {
+  tool: string;
+  ok: boolean;
+  /** `true` approved, `false` denied; absent for an ungated call. */
+  approved?: boolean;
+  durationMs: number;
+  /** The argument list, rendered, masked and head-cut. */
+  args: string;
+  /** The failure, masked and head-cut. */
+  error?: string;
+  /** The built-in pi tool's own details, projected to their facts. */
+  details?: unknown;
+}
+
+/** `details` on all four tools: the trace, or an empty one with the tool's own status. */
+export interface ReplDetails {
+  sessionId: string;
+  status: TraceStatus | "reset" | "abandoned";
+  calls: TraceCallView[];
+  /** Calls past `TRACE_MAX_CALLS`, counted rather than listed. */
+  omittedCalls: number;
+  /** The call waiting for approval, when `status` is `suspended`. */
+  suspendedCall?: { tool: string; args: string };
+}
+
+/**
+ * Mask a string leaf whole, then window it.
+ *
+ * Masking runs over the whole window before anything is cut, so a token
+ * inside it is replaced entire; a token straddling the window's end is
+ * removed with the guard. Beyond the window the leaf is never looked at —
+ * it cannot reach a 256-byte line.
+ */
+function maskLeaf(text: string): string {
+  if (text.length <= TRACE_LEAF_WINDOW) return maskSecrets(text).text;
+  const masked = maskSecrets(text.slice(0, TRACE_LEAF_WINDOW)).text;
+  return masked.slice(0, Math.max(0, masked.length - TRACE_LEAF_GUARD));
+}
+
+/**
+ * A Python-ish repr with a work cap.
+ *
+ * Strings in JSON quotes — the spelling the approval dialog already uses —
+ * `None`, `True`, `False`, `{k: v}` for a dict (Monty hands one over as a
+ * `Map`), `{…}` for a set, `<bytes n>` for bytes. Every string leaf is masked
+ * on the way in. Rendering stops once the output is past `TRACE_RENDER_CAP`:
+ * the line is cut to `TRACE_ARGS_MAX_BYTES` anyway, and a deep structure must
+ * not cost more than that to show.
+ */
+class ArgRenderer {
+  private readonly parts: string[] = [];
+  private length = 0;
+
+  get text(): string {
+    return this.parts.join("");
+  }
+
+  get full(): boolean {
+    return this.length > TRACE_RENDER_CAP;
+  }
+
+  push(text: string): void {
+    if (this.full) return;
+    this.parts.push(text);
+    this.length += text.length;
+  }
+
+  value(value: unknown, depth: number): void {
+    if (this.full) return;
+    const scalar = this.scalar(value);
+    if (scalar !== undefined) {
+      this.push(scalar);
+    } else if (depth >= TRACE_DEPTH) {
+      this.push("…");
+    } else if (Array.isArray(value)) {
+      this.push("[");
+      this.list(value, depth);
+      this.push("]");
+    } else if (value instanceof Set) {
+      this.push("{");
+      this.list([...value], depth);
+      this.push("}");
+    } else {
+      this.push("{");
+      this.entries(value instanceof Map ? [...value] : Object.entries(value as object), depth);
+      this.push("}");
+    }
+  }
+
+  /** The repr of a non-container, or `undefined` for a container. */
+  private scalar(value: unknown): string | undefined {
+    if (value === null || value === undefined) return "None";
+    if (typeof value === "string") return JSON.stringify(maskLeaf(value));
+    if (typeof value === "boolean") return value ? "True" : "False";
+    if (typeof value === "number" || typeof value === "bigint") return String(value);
+    if (value instanceof Uint8Array) return `<bytes ${value.byteLength}>`;
+    if (typeof value !== "object") return `<${typeof value}>`;
+    return undefined;
+  }
+
+  private list(items: unknown[], depth: number): void {
+    items.forEach((item, i) => {
+      if (i > 0) this.push(", ");
+      this.value(item, depth + 1);
+    });
+  }
+
+  private entries(entries: Array<[unknown, unknown]>, depth: number): void {
+    entries.forEach(([key, value], i) => {
+      if (i > 0) this.push(", ");
+      this.value(key, depth + 1);
+      this.push(": ");
+      this.value(value, depth + 1);
+    });
+  }
+}
+
+/**
+ * Render a call's argument list the way the approval dialog spells a call:
+ * positional values, then `name=value` for keywords — masked, and cut
+ * head-only at `TRACE_ARGS_MAX_BYTES` with a magnitude-free marker.
+ */
+export function viewArgs(args: readonly unknown[], kwargs: Record<string, unknown>): string {
+  const renderer = new ArgRenderer();
+  args.forEach((arg, i) => {
+    if (i > 0) renderer.push(", ");
+    renderer.value(arg, 0);
+  });
+  Object.entries(kwargs).forEach(([name, value], i) => {
+    if (i > 0 || args.length > 0) renderer.push(", ");
+    renderer.push(`${name}=`);
+    renderer.value(value, 0);
+  });
+  return redact(renderer.text, { maxBytes: TRACE_ARGS_MAX_BYTES, recovery: TRACE_ARGS_RECOVERY })
+    .text;
+}
+
+/** A free-text field of the trace — an error, a path — masked and head-cut. */
+function viewText(text: string, recovery: string): string {
+  return redact(text, { maxBytes: TRACE_ARGS_MAX_BYTES, recovery }).text;
+}
+
+/** The only keys of a built-in tool's details whose string value is carried. */
+const DETAIL_STRING_KEYS = new Set(["fullOutputPath", "truncatedBy"]);
+
+/** Nesting the projection follows into a built-in tool's details. */
+const DETAIL_DEPTH = 3;
+
+/**
+ * Project a built-in tool's `details` down to its facts, fail-closed.
+ *
+ * Numbers, booleans and `null` survive anywhere; a string survives only
+ * under a key known to hold a path or a label, masked and cut; everything
+ * else — `TruncationResult.content`, which is the truncated body itself,
+ * `edit`'s `diff` and `patch`, any string a future tool adds — is dropped.
+ * Bodies never reach `details`. `undefined` when nothing is left.
+ */
+function viewDetails(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "object" || Array.isArray(value) || depth >= DETAIL_DEPTH) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (typeof inner === "string") {
+      if (DETAIL_STRING_KEYS.has(key)) out[key] = viewText(inner, TRACE_ARGS_RECOVERY);
+      continue;
+    }
+    const projected = viewDetails(inner, depth + 1);
+    if (projected !== undefined) out[key] = projected;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function viewCall(call: TracedCall): TraceCallView {
+  const view: TraceCallView = {
+    tool: call.tool,
+    ok: call.ok,
+    durationMs: call.durationMs,
+    args: viewArgs(call.args, call.kwargs),
+  };
+  if (call.approved !== undefined) view.approved = call.approved;
+  if (call.error !== undefined) view.error = viewText(call.error, TRACE_ERROR_RECOVERY);
+  const details = viewDetails(call.details);
+  if (details !== undefined) view.details = details;
+  return view;
+}
+
+/** The `details` for a `repl` / `repl_resume` result: the trace, display-safe. */
+export function buildDetails(trace: RunTrace): ReplDetails {
+  const kept = trace.calls.slice(0, TRACE_MAX_CALLS);
+  const details: ReplDetails = {
+    sessionId: trace.sessionId,
+    status: trace.status,
+    calls: kept.map(viewCall),
+    omittedCalls: trace.calls.length - kept.length,
+  };
+  if (trace.suspendedCall) {
+    details.suspendedCall = {
+      tool: trace.suspendedCall.tool,
+      args: viewArgs(trace.suspendedCall.args, trace.suspendedCall.kwargs),
+    };
+  }
+  return details;
+}
+
+/** The `details` for a tool that ran no code: the same shape, nothing to list. */
+function emptyDetails(sessionId: string, status: ReplDetails["status"]): ReplDetails {
+  return { sessionId, status, calls: [], omittedCalls: 0 };
+}
+
+/** What a built-in tool's projected details add to a call's line. */
+function detailNotes(details: unknown): string[] {
+  if (details === null || typeof details !== "object") return [];
+  const facts = details as Record<string, unknown>;
+  const notes: string[] = [];
+  const truncation = facts.truncation;
+  if (truncation !== null && typeof truncation === "object") {
+    const t = truncation as Record<string, unknown>;
+    if (t.truncated === true) {
+      notes.push(
+        `output truncated${typeof t.truncatedBy === "string" ? ` by ${t.truncatedBy}` : ""}`,
+      );
+    }
+  }
+  if (typeof facts.fullOutputPath === "string") notes.push(`full output: ${facts.fullOutputPath}`);
+  for (const [key, label] of [
+    ["entryLimitReached", "entry limit"],
+    ["matchLimitReached", "match limit"],
+    ["resultLimitReached", "result limit"],
+  ]) {
+    if (typeof facts[key] === "number") notes.push(`${label} ${facts[key]}`);
+  }
+  if (facts.linesTruncated === true) notes.push("long lines cut");
+  return notes;
+}
+
+function formatCall(call: TraceCallView): string {
+  const approval = call.approved === true ? " approved" : call.approved === false ? " denied" : "";
+  const error = call.error === undefined ? "" : ` — ${call.error}`;
+  const notes = detailNotes(call.details)
+    .map((note) => ` · ${note}`)
+    .join("");
+  const mark = call.ok ? "✓" : "✗";
+  return `  ${mark} ${call.tool}(${call.args})${approval} ${Math.round(call.durationMs)}ms${error}${notes}`;
+}
+
+/**
+ * The trace as lines: collapsed, one summary; expanded, one line per call,
+ * the omitted count, and the call waiting for approval. Pure — the component
+ * below is a container for what this returns.
+ */
+export function formatTrace(details: ReplDetails, options: { expanded: boolean }): string[] {
+  const total = details.calls.length + details.omittedCalls;
+  const waiting = details.suspendedCall;
+  if (total === 0 && waiting === undefined) return ["[trace] no host-tool calls"];
+
+  if (!options.expanded) {
+    let ok = 0;
+    let denied = 0;
+    let failed = 0;
+    for (const call of details.calls) {
+      if (call.ok) ok++;
+      else if (call.approved === false) denied++;
+      else failed++;
+    }
+    const pending = waiting === undefined ? "" : `; ${waiting.tool} waiting for approval`;
+    return [
+      `[trace] ${total} host-tool call(s): ${ok} ok, ${denied} denied, ${failed} failed${pending} — expand to list them`,
+    ];
+  }
+
+  const lines = [`[trace] ${total} host-tool call(s)`, ...details.calls.map(formatCall)];
+  if (details.omittedCalls > 0) {
+    lines.push(
+      `  … ${details.omittedCalls} more call(s) not listed (trace capped at ${TRACE_MAX_CALLS})`,
+    );
+  }
+  if (waiting !== undefined)
+    lines.push(`  ⏸ ${waiting.tool}(${waiting.args}) waiting for approval`);
+  return lines;
+}
+
+/**
+ * The result view: pi's `Component` (`pi-tui/tui.d.ts:10-31`) implemented
+ * structurally, because `@earendil-works/pi-tui` is nested under pi's own
+ * install and not resolvable from here. It holds lines and wraps them to the
+ * width; there is nothing to cache and nothing to invalidate.
+ */
+class TraceView {
+  private lines: string[] = [];
+
+  setLines(lines: string[]): void {
+    this.lines = lines;
+  }
+
+  render(width: number): string[] {
+    const columns = Math.max(1, Math.floor(width));
+    const out: string[] = [];
+    for (const line of this.lines) {
+      const chars = [...line];
+      if (chars.length === 0) {
+        out.push("");
+        continue;
+      }
+      for (let i = 0; i < chars.length; i += columns) {
+        out.push(chars.slice(i, i + columns).join(""));
+      }
+    }
+    return out;
+  }
+
+  invalidate(): void {
+    // Nothing is cached: `render` reads the lines every time.
+  }
+}
+
+/** Whether a result's `details` is a trace this extension built. */
+function isReplDetails(details: unknown): details is ReplDetails {
+  return (
+    details !== null && typeof details === "object" && Array.isArray((details as ReplDetails).calls)
+  );
+}
+
+/** `renderResult` for the two tools that run code: the result text, then the trace. */
+function renderTrace(
+  result: { content: Array<{ type: string; text?: string }>; details: unknown },
+  options: { expanded: boolean },
+  context: { lastComponent: unknown },
+): TraceView {
+  const view = context.lastComponent instanceof TraceView ? context.lastComponent : new TraceView();
+  const text = result.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("");
+  const body = text === "" ? [] : text.split("\n");
+  const trace = isReplDetails(result.details) ? formatTrace(result.details, options) : [];
+  view.setLines([...body, ...trace]);
+  return view;
+}
+
 /**
  * The slice of pi's `ExtensionContext` a lifecycle handler here reads
  * (`types.d.ts:209-249`): the directory the runner is keyed by, the trust
@@ -184,6 +574,17 @@ type SessionLifecycleHandler = (
   ctx: SessionLifecycleCtx,
 ) => void | Promise<void>;
 
+/**
+ * The slice of pi's `ExtensionCommandContext` a command here reads: the
+ * directory and the trust decision, so `/repl-accept-preamble` reaches the
+ * same runner a `repl` call would, and a way to answer.
+ */
+interface CommandCtx {
+  cwd: string;
+  isProjectTrusted(): boolean;
+  ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
+}
+
 /** Extension registration surface — the subset of pi's API this file uses. */
 interface ReplExtensionApi {
   registerTool: (tool: ReturnType<typeof defineTool>) => void;
@@ -191,10 +592,7 @@ interface ReplExtensionApi {
     name: string,
     options: {
       description?: string;
-      handler: (
-        args: string,
-        ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } },
-      ) => Promise<void>;
+      handler: (args: string, ctx: CommandCtx) => Promise<void>;
     },
   ) => void;
   /**
@@ -278,11 +676,15 @@ function withApprovalNotice(text: string, gate: ApprovalGate): string {
  * - `repl_reset` — clear session state
  * - `repl_abandon` — discard a pending suspension
  *
- * One command:
+ * Two commands:
  * - `/repl-approvals [strict|yolo]` — read or set the approval mode
+ * - `/repl-accept-preamble` — accept the saved tools as they are now (#198)
  *
  * And two lifecycle handlers, `session_start` and `session_shutdown`, that
  * bind every REPL session to the Pi conversation that created it (#60).
+ *
+ * Every tool result carries the trace of the host-tool calls it made on
+ * `details`, and the two tools that run code render it (#46).
  */
 export default function (pi: ReplExtensionApi) {
   let approvalMode: ApprovalMode = "strict";
@@ -408,6 +810,16 @@ export default function (pi: ReplExtensionApi) {
         );
       }
       if (closed === "deny-remaining") {
+        // Chosen at the last gated call: the answer refused that call, and
+        // there was nothing after it to refuse — say so, rather than count
+        // zero later calls.
+        if (deniedUnasked === 0) {
+          return (
+            `[approvals denied] The user chose "Deny remaining" at an approval dialog; it was ` +
+            "the last gated call in this run, so nothing else was denied. Do not retry it — " +
+            "ask the user how to proceed."
+          );
+        }
         return (
           `[approvals denied] The user chose "Deny remaining" at an approval dialog, so ` +
           `${deniedUnasked} later gated call(s) in this call were denied without asking (each ` +
@@ -449,6 +861,70 @@ export default function (pi: ReplExtensionApi) {
         );
       } else {
         ctx.ui.notify("repl approvals: strict — every gated call asks.", "info");
+      }
+    },
+  });
+
+  // ── /repl-accept-preamble (#198, decision 5) ───────────────
+  //
+  // A trusted project's saved tools are checked against the set the trust
+  // decision covered; a file added or changed since is withheld until the
+  // set is accepted again. `save_tool` re-saves one under its own dialog;
+  // this is the user's word for the whole current set. It goes through
+  // `getRunner` so the trust cell is refreshed on the way in, and prints one
+  // line per outcome — nothing is accepted silently, and nothing is refused
+  // without its reason.
+
+  pi.registerCommand(ACCEPT_PREAMBLE_COMMAND, {
+    description:
+      "Accept the project's saved tools (.pi/code-tools) as they are now, so files added or " +
+      "changed since the project was trusted load in new sessions.",
+    handler: async (_args, ctx) => {
+      const outcome = await getRunner(ctx).runner.acceptPreamble();
+      switch (outcome.status) {
+        case "accepted": {
+          const names = outcome.accepted.length === 0 ? "(none)" : outcome.accepted.join(", ");
+          ctx.ui.notify(
+            `repl: accepted ${outcome.accepted.length} saved tool(s) as the current set: ${names}. ` +
+              `Recorded in ${outcome.manifestPath}. Live sessions keep the preamble they were ` +
+              "built with — run repl with a new sessionId to load the accepted set.",
+            "info",
+          );
+          return;
+        }
+        case "untrusted":
+          ctx.ui.notify(
+            "repl: this project is not trusted, so its saved tools were not read and nothing " +
+              "was accepted. Trust the project in pi first.",
+            "warning",
+          );
+          return;
+        case "refused": {
+          const offenders = outcome.refused
+            .map((r) => `${r.file} binds ${r.symbols.map((s) => `'${s}'`).join(", ")}`)
+            .join("; ");
+          ctx.ui.notify(
+            `repl: the preamble was refused and nothing was accepted: ${offenders} — those names ` +
+              `are host tools. Fix the file(s), then run /${ACCEPT_PREAMBLE_COMMAND} again.`,
+            "error",
+          );
+          return;
+        }
+        case "store-unavailable":
+          ctx.ui.notify(
+            `repl: the accepted-set manifest could not be written (${outcome.reason}); nothing ` +
+              "was accepted. Set REPL_PREAMBLE_STORE_DIR to a writable directory outside the " +
+              "project.",
+            "error",
+          );
+          return;
+        case "unreadable":
+          ctx.ui.notify(
+            `repl: .pi/code-tools could not be read (${outcome.reason}); nothing was accepted ` +
+              "and the accepted set was left as it was.",
+            "error",
+          );
+          return;
       }
     },
   });
@@ -561,7 +1037,7 @@ export default function (pi: ReplExtensionApi) {
         // learns an id it will have to dispose (#60).
         entry.sessionIds.add(sessionId);
         const gate = makeOnApproval(ctx, signal);
-        const text = await entry.runner.run(
+        const trace = await entry.runner.runWithTrace(
           params.code,
           sessionId,
           gate.onApproval,
@@ -569,9 +1045,12 @@ export default function (pi: ReplExtensionApi) {
           clampModelLimits(params.maxDurationSecs, params.maxMemory),
         );
         return {
-          content: [{ type: "text" as const, text: withApprovalNotice(text, gate) }],
-          details: {},
+          content: [{ type: "text" as const, text: withApprovalNotice(trace.text, gate) }],
+          details: buildDetails(trace),
         };
+      },
+      renderResult(result, options, _theme, context) {
+        return renderTrace(result, options, context);
       },
     }),
   );
@@ -596,15 +1075,18 @@ export default function (pi: ReplExtensionApi) {
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         // A fresh gate, so the dialog count restarts here (#35).
         const gate = makeOnApproval(ctx, signal);
-        const text = await getRunner(ctx).runner.resume(
+        const trace = await getRunner(ctx).runner.resumeWithTrace(
           params.sessionId ?? "default",
           gate.onApproval,
           signal,
         );
         return {
-          content: [{ type: "text" as const, text: withApprovalNotice(text, gate) }],
-          details: {},
+          content: [{ type: "text" as const, text: withApprovalNotice(trace.text, gate) }],
+          details: buildDetails(trace),
         };
+      },
+      renderResult(result, options, _theme, context) {
+        return renderTrace(result, options, context);
       },
     }),
   );
@@ -655,7 +1137,7 @@ export default function (pi: ReplExtensionApi) {
 
         return {
           content: [{ type: "text" as const, text: parts.join(" ") }],
-          details: {},
+          details: emptyDetails(sessionId, existed ? "reset" : "no-session"),
         };
       },
     }),
@@ -689,15 +1171,16 @@ export default function (pi: ReplExtensionApi) {
         // session that does not exist reads as a bug report about the one
         // the caller meant, and the two states need different next moves:
         // one is "run some code", the other is "the pause is over" (#48).
+        const outcome = r.abandon(sessionId);
         const text = {
           abandoned: `Suspension in session '${sessionId}' abandoned. The suspended code was dropped; the session is ready for new code.`,
           "nothing-pending": `Session '${sessionId}' exists but has no pending approval. Nothing to abandon.`,
           "no-session": `No session '${sessionId}' exists. Nothing to abandon — run some code first.`,
-        }[r.abandon(sessionId)];
+        }[outcome];
 
         return {
           content: [{ type: "text" as const, text }],
-          details: {},
+          details: emptyDetails(sessionId, outcome),
         };
       },
     }),

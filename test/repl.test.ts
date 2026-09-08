@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process";
 import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { ReplRunner } from "../src/repl.js";
+import { ToolRegistry } from "../src/registry.js";
 import type { ApprovalDecision, RunLimits } from "../src/types.js";
 // A namespace import, not named: the #198 helpers do not exist on main, and a
 // named ESM import of a missing export fails at link time — which would fail
@@ -2226,6 +2227,10 @@ describe("ReplRunner — limits and signal reach RunOptions (D7 test 3)", () => 
     const original = target.createSession.bind(runner);
     target.createSession = async () => ({
       session: stubSession,
+      // The trace's seams (#46): nothing is recorded or aligned here.
+      registry: new ToolRegistry(),
+      sink: { records: [] },
+      view: { unaccepted: new Map(), acceptedSince: new Set() },
       trusted: false, // matches the default isProjectTrusted () => false
       hasPreamble: false,
       busy: 0,
@@ -3186,18 +3191,20 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
 
   it("a suspended trace carries the calls so far and the waiting call; the resumed trace is the whole run and matches resume()", async () => {
     const code = "read('hello.txt')\nwrite('s.txt', 'v')\nread('hello.txt')";
-    // Two sessions in lockstep, one through each API: the texts must agree at
+    // Two runners over the same cwd, the same session id in each, one
+    // through each API: the texts — which name the session — must agree at
     // both steps.
-    const plainPaused = await runner.run(code, "s-plain", suspend);
-    const tracedPaused = await runner.runWithTrace(code, "s-traced", suspend);
+    const plain = new ReplRunner(cwd);
+    const plainPaused = await plain.run(code, "s", suspend);
+    const tracedPaused = await runner.runWithTrace(code, "s", suspend);
     assert.equal(tracedPaused.text, plainPaused);
     assert.equal(tracedPaused.status, "suspended");
     assert.deepEqual(outline(tracedPaused), [["read", true, undefined]]);
     assert.equal(tracedPaused.suspendedCall?.tool, "write");
     assert.deepEqual(tracedPaused.suspendedCall?.args, ["s.txt", "v"]);
 
-    const plainDone = await runner.resume("s-plain", approve);
-    const tracedDone = await runner.resumeWithTrace("s-traced", approve);
+    const plainDone = await plain.resume("s", approve);
+    const tracedDone = await runner.resumeWithTrace("s", approve);
     assert.equal(tracedDone.text, plainDone);
     assert.equal(tracedDone.status, "ok");
     assert.deepEqual(outline(tracedDone), [
@@ -3209,7 +3216,9 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
   });
 
   it("bridged details are merged, and stay aligned across a suspension", async () => {
-    const code = "read('big.txt')\nwrite('d.txt', 'x')\nread('hello.txt')";
+    // pi's read reports details only when it truncated, so both reads are
+    // over the line limit — with different offsets, so they are two calls.
+    const code = "read('big.txt')\nwrite('d.txt', 'x')\nread('big.txt', 2)";
     const paused = await runner.runWithTrace(code, "details", suspend);
     const big = paused.calls[0].details as { truncation?: { truncated: boolean } } | undefined;
     assert.equal(big?.truncation?.truncated, true, JSON.stringify(paused.calls[0]));
@@ -3220,11 +3229,13 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
       ["write", true, true],
       ["read", true, undefined],
     ]);
-    const first = done.calls[0].details as { truncation?: { truncated: boolean } } | undefined;
-    const last = done.calls[2].details as { truncation?: { truncated: boolean } } | undefined;
+    type Details = { truncation?: { truncated: boolean; totalLines: number } } | undefined;
+    const first = done.calls[0].details as Details;
+    const last = done.calls[2].details as Details;
     assert.equal(first?.truncation?.truncated, true, "the pre-suspension read lost its details");
     assert.equal(done.calls[1].details, undefined, "pi's write has no details to merge");
-    assert.equal(last?.truncation?.truncated, false, "the post-suspension read lost its details");
+    assert.equal(last?.truncation?.truncated, true, "the post-suspension read lost its details");
+    assert.deepEqual(done.calls[2].args, ["big.txt", 2]);
   });
 
   it("replay-served entries are excluded from error and suspended results", async () => {

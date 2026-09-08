@@ -702,8 +702,8 @@ describe("createPiBridgeTools — pi's details survive the bridge (#46)", () => 
 
     // A refused read never reaches pi, and a failing edit produces no result:
     // neither emits an event.
-    await assert.rejects(findTool(tools, "read").execute({ path: "../outside.txt" }));
-    await assert.rejects(
+    await assert.rejects(async () => findTool(tools, "read").execute({ path: "../outside.txt" }));
+    await assert.rejects(async () =>
       findTool(tools, "edit").execute({
         path: "details-w.txt",
         edits: JSON.stringify([{ oldText: "nope", newText: "x" }]),
