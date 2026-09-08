@@ -119,6 +119,49 @@ describe("maskSecrets — known token prefixes (family 1)", () => {
     assert.equal(out.masked, 0);
     assert.equal(out.text, "sk-short and ghp_abc and AKIA1234 and xoxb-12");
   });
+
+  it("a token glued to a preceding word still masks: the prefix is the evidence, not the boundary (W2-1 finding, D155)", () => {
+    // Measured at acadb19: `xxxghp_…` masked nothing, because the rule wanted
+    // a word boundary before the prefix. A write body that starts mid-word
+    // is the realistic shape.
+    for (const [glued, prefix] of [
+      [`xxx${"ghp_"}${KEY}`, "ghp_"],
+      [`tokengho_${KEY}`, "gho_"],
+      [`bodyghs_${KEY}`, "ghs_"],
+      [`Xgithub_pat_${KEY}`, "github_pat_"],
+      [`aglpat-${KEY}`, "glpat-"],
+      [`zxoxb-${KEY}`, "xoxb-"],
+      ["fooAKIAIOSFODNN7EXAMPLE", "AKIA"],
+      [`barAIzaSyA-${KEY}`, "AIza"],
+    ] as const) {
+      const out = maskSecrets(glued);
+      assert.equal(out.masked, 1, glued);
+      assert.equal(out.text, `${glued.slice(0, glued.indexOf(prefix))}${prefix}${REDACTED}`, glued);
+    }
+  });
+
+  it("`sk-` keeps its word boundary: without it, hyphenated prose is a key (recorded cost)", () => {
+    // `task-force-2024-report` is `sk-` followed by 17 token characters.
+    // Every other prefix has an underscore or a letter run no English word
+    // ends in; `sk` ends `task`, `risk`, `desk`, `disk`, `mask`.
+    for (const prose of [
+      "task-force-2024-report",
+      "risk-assessment-2025-final",
+      "desk-lamp-model-XR200-manual",
+      `xxxsk-${KEY}`,
+    ]) {
+      const out = maskSecrets(prose);
+      assert.equal(out.masked, 0, prose);
+      assert.equal(out.text, prose);
+    }
+    // A separator is a boundary: the realistic shapes all mask (once each —
+    // a `TOKEN=` or `KEY=` name in front would compose with family 4).
+    for (const text of [`x=sk-${KEY}`, `"sk-${KEY}"`, `Bearer sk-${KEY}`, `id:sk-${KEY}`]) {
+      const out = maskSecrets(text);
+      assert.equal(out.masked, 1, text);
+      assert.ok(out.text.includes(`sk-${REDACTED}`), text);
+    }
+  });
 });
 
 // ── Pattern family 2: Authorization headers and Bearer values ────
@@ -413,6 +456,85 @@ describe("maskSecrets — Authorization / Bearer (family 2)", () => {
     assert.equal(
       maskSecrets("Authorization: Bearer abcdefghijklmnop").text,
       `Authorization: Bearer ${REDACTED}`,
+    );
+  });
+
+  it("trailing sentence punctuation is not evidence: a 15-letter word before a period is prose (W2-3 finding, D155)", () => {
+    // Measured at acadb19: `.` is a token character, so `implementations.`
+    // reached the 16-character test and masked one prose word.
+    for (const text of [
+      "the Bearer implementations.",
+      "the Bearer authentications.",
+      "the Bearer implementations...",
+      "the Bearer implementations. Then more.",
+    ]) {
+      const out = maskSecrets(text);
+      assert.equal(out.masked, 0, text);
+      assert.equal(out.text, text);
+    }
+    // A real token followed by a full stop keeps the full stop.
+    const out = maskSecrets("use bearer 0123456789abcdef.");
+    assert.equal(out.masked, 1);
+    assert.equal(out.text, `use bearer ${REDACTED}.`);
+  });
+
+  it("a Digest response hash is masked however long the uri before it is — the list is read per parameter, not through a window (W2-3 finding, D155)", () => {
+    // Measured at acadb19: a 4 200-character `uri=` put `response=` past the
+    // rule's 4 KiB window and the hash survived whole.
+    const uri = `/${"a".repeat(5000)}`;
+    const hash = "6629fae49393a05397450978507c4ef1";
+    const out = maskSecrets(`Authorization: Digest username="u", uri="${uri}", response="${hash}"`);
+    assert.equal(out.masked, 1);
+    assert.ok(!out.text.includes(hash), "the hash survived");
+    assert.equal(
+      out.text,
+      `Authorization: Digest username="u", uri="${uri}", response="${REDACTED}"`,
+    );
+  });
+
+  it("a Digest parameter is masked by its own name, never by a `name=` inside another parameter's value (W2-3 finding, D155)", () => {
+    // Measured at acadb19: `uri="/x?response=1"` lost its `1` and the count
+    // read 2 for one credential.
+    const out = maskSecrets(
+      'Authorization: Digest username="u", uri="/x?response=1", response="abc123"',
+    );
+    assert.equal(out.masked, 1);
+    assert.equal(
+      out.text,
+      `Authorization: Digest username="u", uri="/x?response=1", response="${REDACTED}"`,
+    );
+    const inner = 'Authorization: Digest username="nonce=zzz", realm="r", uri="/"';
+    const kept = maskSecrets(inner);
+    assert.equal(kept.masked, 0, "a value that merely contains `nonce=` is not a nonce");
+    assert.equal(kept.text, inner);
+  });
+
+  it("a quoted Digest value may hold spaces and commas; the list ends at `;` and at the line; an unclosed quote runs to the line's end", () => {
+    // Guards the tokenizer against regressing what the window did by accident.
+    const joined = maskSecrets(
+      'Authorization: Digest realm="my realm, inc", nonce="n1"; Authorization: Bearer bbbbbbbbbbbb\nX-Request-Id: 42',
+    );
+    assert.equal(joined.masked, 2);
+    assert.equal(
+      joined.text,
+      `Authorization: Digest realm="my realm, inc", nonce="${REDACTED}"; Authorization: Bearer ${REDACTED}\nX-Request-Id: 42`,
+    );
+    const open = maskSecrets(
+      'Authorization: Digest username="u", response="abc123\nX-Request-Id: 42',
+    );
+    assert.equal(open.masked, 1);
+    assert.equal(
+      open.text,
+      `Authorization: Digest username="u", response="${REDACTED}\nX-Request-Id: 42`,
+    );
+    // Bare and quoted parameters mix, and the count is one per credential.
+    const mixed = maskSecrets(
+      'Authorization: Digest username=u, nonce=n0nce, cnonce="c", qop=auth, response=abc, opaque=o',
+    );
+    assert.equal(mixed.masked, 3);
+    assert.equal(
+      mixed.text,
+      `Authorization: Digest username=u, nonce=${REDACTED}, cnonce="${REDACTED}", qop=auth, response=${REDACTED}, opaque=o`,
     );
   });
 });
@@ -1047,6 +1169,25 @@ describe("maskSecrets — bounded work on long inputs", () => {
       name: "many Digest parameters",
       text: 'Authorization: Digest nonce="a", response="b"\n'.repeat(20 * 1024),
     },
+    // The per-parameter Digest scan (D155): each header reads its own list
+    // once and stops at `;`, so a line of joined headers is linear; one
+    // header's list is linear in its length however it is shaped.
+    {
+      name: "many `;`-joined Digest headers on one line",
+      text: 'Authorization: Digest username="u", response="b"; '.repeat(20 * 1024),
+    },
+    {
+      name: "one Digest header with a 1 MiB uri",
+      text: `Authorization: Digest username="u", uri="/${"a".repeat(1024 * 1024)}", response="b"`,
+    },
+    {
+      name: "one Digest header with 60 000 parameters",
+      text: `Authorization: Digest ${Array.from({ length: 60_000 }, (_, i) => `p${i}=v${i}`).join(", ")}, response="b"`,
+    },
+    {
+      name: "one Digest header whose list ends in a run of unparseable tokens",
+      text: `Authorization: Digest username="u", response="b" ${"garbage ".repeat(128 * 1024)}`,
+    },
   ];
 
   for (const { name, text } of SHAPES) {
@@ -1121,5 +1262,12 @@ describe("docs/redaction.md — the linearity claim describes the shipped test",
       doc,
       new RegExp(`best of ${DENSITY.RUNS} interleaved runs, ${DENSITY.PASSES} passes each`),
     );
+  });
+
+  it("no longer records the retired 4 KiB Digest window or the sentence-punctuation cost (D155)", () => {
+    assert.doesNotMatch(doc, /4 KiB past/);
+    assert.doesNotMatch(doc, /at most 4 KiB/);
+    assert.match(doc, /one parameter at a time|per parameter/);
+    assert.match(doc, /glued/);
   });
 });

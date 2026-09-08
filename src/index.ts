@@ -119,13 +119,17 @@ export {
 } from "./rlm.js";
 
 // ── Repl ────────────────────────────────────────────────────────
-// The two outcome types are the return types of `abandon` and `reset`; a
-// caller that switches on them needs their names.
+// The outcome types are the return types of `abandon`, `reset`,
+// `runWithTrace` / `resumeWithTrace` (#46); a caller that switches on them,
+// or renders the trace, needs their names.
 export {
   ReplRunner,
   type AbandonOutcome,
   type ReplRunnerOptions,
   type ResetOutcome,
+  type RunTrace,
+  type TracedCall,
+  type TraceStatus,
 } from "./repl.js";
 
 // ── Truncation ──────────────────────────────────────────────────

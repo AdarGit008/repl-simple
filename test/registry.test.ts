@@ -196,8 +196,11 @@ describe("dead public API (#85)", () => {
   });
 
   it("the barrel does not re-export arg", () => {
+    // The whole word, anywhere in the file: a one-line
+    // `export { arg } from "./registry.js"` passed the previous line-shaped
+    // pin (W2-3 verifier). Nothing else in the barrel is spelled `arg`.
     const barrel = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
-    assert.doesNotMatch(barrel, /^\s*arg,?\s*$/m, "src/index.ts still lists `arg`");
+    assert.doesNotMatch(barrel, /\barg\b/, "src/index.ts still names `arg`");
   });
 
   it("CANDIDATE_MODULES is live: it is the default list probeImportableModules answers for", async () => {
@@ -255,17 +258,28 @@ describe("renderPythonToolRules", () => {
     );
   });
 
-  it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", {
-    todo:
-      "the rules say 'Class definitions and match statements are not supported'; measured on " +
-      "Monty 0.0.21 a plain class with __init__ and a method runs (A(3).get() -> 3) and only " +
-      "class inheritance / metaclasses / match raise NotImplementedError (README agrees). The " +
-      "line is model-facing prompt text, so rewording it is a behaviour change outside this " +
-      "chunk's scope (#86 comment sweep) — W3-2 rewords it to name inheritance and match.",
-  }, () => {
+  it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", async () => {
+    // Prompt text is behaviour (D156): the sentence describes the interpreter,
+    // so the interpreter is measured in the same test. W2-3 recorded this as
+    // a todo; the rewording is this chunk's.
     const rules = renderPythonToolRules(["json"]);
     assert.doesNotMatch(rules, /Class definitions .* are not supported/);
     assert.match(rules, /inheritance/);
+    assert.match(rules, /match/);
+
+    const registry = new ToolRegistry();
+    const plain = await runInSandbox(
+      "class A:\n    def __init__(self, v):\n        self.v = v\n    def get(self):\n        return self.v\nA(3).get()",
+      { registry },
+    );
+    assert.equal(plain.status, "ok", JSON.stringify(plain));
+    assert.equal(plain.status === "ok" ? String(plain.output) : "", "3");
+
+    const inherit = await runInSandbox("class A:\n    pass\nclass B(A):\n    pass\nB()", {
+      registry,
+    });
+    assert.equal(inherit.status, "error", JSON.stringify(inherit));
+    assert.match(inherit.status === "error" ? inherit.error : "", /NotImplementedError/);
   });
 });
 

@@ -17,6 +17,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { ReplRunner } from "../src/repl.js";
 import { ToolRegistry } from "../src/registry.js";
 import type { ApprovalDecision, RunLimits } from "../src/types.js";
@@ -518,6 +519,10 @@ describe("ReplRunner — every tool answers, in every state (#48)", () => {
     const out = await runner.resume("live", approve);
 
     assert.match(out, /nothing waiting for approval/i);
+    // The second sentence too: the #110 sweep found the StringLiteral
+    // mutant surviving because only the first was asserted
+    // (docs/mutation-testing.md, "Survivors worth naming").
+    assert.match(out, /Nothing was resumed — run code with repl to continue\./);
     // M7 turns the no-session guard into `if (true)`, so it would answer the
     // unknown-session sentence for a session that plainly exists.
     assert.doesNotMatch(out, /No session/i);
@@ -3566,5 +3571,33 @@ describe("ReplRunner — an unlistable directory and an unavailable store are bo
       cleanup();
       rmSync(storeParent, { recursive: true, force: true });
     }
+  });
+});
+
+// ── The public surface and the docs that describe it (W3-2, D157) ──
+//
+// Two text pins. A type re-export has no runtime to fail, so the barrel is
+// read as text; and docs/project-trust.md is normative for the accept
+// command, which has existed since W2-1.
+
+describe("ReplRunner — the trace types are public, and the trust doc knows the command exists", () => {
+  const here = fileURLToPath(new URL(".", import.meta.url));
+
+  it("src/index.ts re-exports RunTrace, TracedCall and TraceStatus beside ReplRunner (#46)", () => {
+    const barrel = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    for (const name of ["RunTrace", "TracedCall", "TraceStatus"]) {
+      assert.match(
+        barrel,
+        new RegExp(`\\btype ${name}\\b`),
+        `${name} is the return type of the public runWithTrace() and is not in the barrel`,
+      );
+    }
+  });
+
+  it("docs/project-trust.md no longer says /repl-accept-preamble is a later wave's", () => {
+    const doc = readFileSync(join(here, "..", "docs", "project-trust.md"), "utf-8");
+    assert.doesNotMatch(doc, /lands in the next\s+wave/);
+    assert.doesNotMatch(doc, /not in this wave/);
+    assert.match(doc, /\/repl-accept-preamble/);
   });
 });

@@ -9,6 +9,9 @@ step 6) · **Tree:** `b0d298d`
 > has measured. `thresholds.break` is still 58 and mutation is not part of CI, so nothing is
 > silently passing — but the floor is unverified until a full sweep re-baselines it. The per-file
 > analysis and the harness findings below remain valid for every file the migration did not touch.
+> The re-baseline is standalone infrastructure work (#175, session decision 17): the procedure —
+> fresh incremental cache, sharding, containment, the numbers to record — is
+> [`docs/mutation-rebaseline-runbook.md`](mutation-rebaseline-runbook.md).
 
 This document records the full Stryker runs on this repository: the score, what it cost, how to
 reproduce it, and the findings the runs turned up that are not about the score at all.
@@ -291,8 +294,9 @@ looking for it.
 
 ### What the fix costs you in memory
 
-Three mutants disable the RLM recursion depth guard at `rlm_loop.ts:223-227` — `depth ?? 0` to
-`depth && 0`, and the `depth >= maxDepth` comparison to `false` and to `depth < maxDepth`. Each
+Three mutants disable the RLM recursion depth guard at `rlm_loop.ts:223-227` (the guard now lives in
+`src/rlm.ts`, in `onRLMQuery`'s `depth >= maxDepth` branch — #78 deleted `rlm_loop.ts`) — `depth ?? 0`
+to `depth && 0`, and the `depth >= maxDepth` comparison to `false` and to `depth < maxDepth`. Each
 produces unbounded nested fan-out, and each drives one worker to **5.6 GB against a 667 MB baseline**.
 **[measured]** Nothing else bounds that nesting; `maxIterations` bounds iterations *within* a loop.
 
@@ -355,7 +359,16 @@ resume-method survivors, tracked under #47:
 - `src/repl.ts:230` — `StringLiteral` (the "nothing waiting for approval" message) — Survived.
 - `src/repl.ts:233` — `UpdateOperator` (`live.busy--`) — Survived.
 
-The #110 closure verified only `:210` and `:235`; these two are untracked elsewhere.
+**Both closed (W3-2, 2026-09-08), by hand-applied mutants on the current tree** (the #110 closure
+had verified only `:210` and `:235`):
+
+- The `UpdateOperator` — `live.busy--` → `live.busy++` in `resumeWithTrace`'s `finally` — is killed
+  by `test/repl.test.ts` "a pending suspension is never evicted — the pool exceeds its cap instead"
+  (#59): a session whose resume never marks it idle keeps its eviction protection, and the test's
+  "the abandoned protection kept the pool over cap" assertion reads `2 !== 1`. **[measured]**
+- The `StringLiteral` survived because every assertion matched only the first sentence
+  (`/nothing waiting for approval/i`); the M7 test in "every tool answers, in every state (#48)"
+  now asserts the second sentence too, so blanking the literal fails it. **[measured]**
 
 Three more equivalent-mutant notes, so nobody re-investigates them:
 

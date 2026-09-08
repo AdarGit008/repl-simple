@@ -10,6 +10,7 @@ import { maskSecrets, redact } from "./redact.js";
 import { HostToolError } from "./types.js";
 import type {
   HostTool,
+  RunError,
   RunResult,
   RunSuspended,
   RunOptions,
@@ -65,10 +66,11 @@ const REDACTED_RECOVERY = "The verbatim value is only in the unredacted dump.";
  *
  * One. An approval answers the question it was shown — "run *this* call?" —
  * and authorises nothing past it. The knob exists because #44 requires the
- * count to be a real, enforced ceiling rather than a comment, and because
- * bucket 5's richer dialog will want to hand out "allow the next N" grants
- * from a prompt that actually says so. Until such a prompt exists, the only
- * honest default is the number the current dialog implies.
+ * count to be a real, enforced ceiling rather than a comment, and so that a
+ * dialog offering "allow the next N" could hand out such a grant from a
+ * prompt that actually says so. #35's dialog added *deny remaining* and,
+ * deliberately, no such option (docs/approval-grants.md), so the only honest
+ * default is the number the shipped dialog implies.
  *
  * Note what this is *not*: it is not the escape hatch. A user who wants to
  * stop being asked switches approval mode (`/repl-approvals yolo`), which is
@@ -201,7 +203,7 @@ function cacheKey(toolName: string, args: Record<string, unknown>): string {
   return `${toolName}::${JSON.stringify(sorted)}`;
 }
 
-/** A replay-cached registry, plus the one question the approval gate asks it. */
+/** A replay-cached registry, plus what the session needs to know about what it did. */
 interface CachingRegistry {
   registry: ToolRegistry;
   /**
@@ -219,6 +221,17 @@ interface CachingRegistry {
    * together.
    */
   willReplayKey(key: string): boolean;
+  /**
+   * One flag per `execute` the wrapped tools saw, in dispatch order: `true`
+   * when the call was answered from the cache and nothing ran, `false` when
+   * the tool executed — a cache miss, a call past the cursor, the call the
+   * cap refused, or a restored gated entry the user approved (D128), which
+   * advances the cursor and still runs. `withoutReplayedCalls` pairs this
+   * with the sandbox's trace positionally, so a trace entry is dropped
+   * because *this* invocation was served, never because its key matches an
+   * entry that was (D154d).
+   */
+  invocations: boolean[];
 }
 
 /**
@@ -238,6 +251,7 @@ function createCachingRegistry(
   capacity: number,
 ): CachingRegistry {
   let replayIndex = 0;
+  const invocations: boolean[] = [];
 
   const tools = parent.list().map((tool): HostTool => {
     const originalExecute = tool.execute;
@@ -251,11 +265,15 @@ function createCachingRegistry(
         const entry = replayEntries[replayIndex];
         if (entry.key === key) {
           replayIndex++;
-          if (!entry.restored || !tool.requiresApproval) return entry.result;
+          if (!entry.restored || !tool.requiresApproval) {
+            invocations.push(true);
+            return entry.result;
+          }
           // A gated call restored from a file. The gate did not treat it as a
           // replay, so the user was asked and — this code being reached —
           // said yes. It runs for real, and its real result replaces the
           // file's in place: this is the last time the file speaks for it.
+          invocations.push(false);
           const real = await originalExecute(args);
           entry.result = real;
           entry.restored = undefined;
@@ -265,6 +283,10 @@ function createCachingRegistry(
         // execution. This can happen if code changed between runs
         // (e.g., a snippet was removed). Fall through to real exec.
       }
+
+      // Logged before the cap and the execution: a refusal and a throw are
+      // both traced by the sandbox as this invocation, `ok: false`.
+      invocations.push(false);
 
       // 2. The cap, before the side effect (A17). Deterministic on replay:
       //    the same transcript fills the same cache to the same point.
@@ -296,6 +318,7 @@ function createCachingRegistry(
       replayIndex < replayEntries.length &&
       replayEntries[replayIndex].key === key &&
       !replayEntries[replayIndex].restored,
+    invocations,
   };
 }
 
@@ -427,9 +450,15 @@ function expectBoolean(value: unknown, path: string): boolean {
   return value;
 }
 
+/**
+ * A byte count: a non-negative *safe* integer. `Number.isInteger(1e308)` is
+ * true, and one such stdout mark emptied the next run's output while two
+ * summed to `Infinity` and re-emitted the whole transcript (D154b, measured);
+ * a count no file could have measured is refused, not carried.
+ */
 function expectCount(value: unknown, path: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    fail(path, "must be a non-negative integer");
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    fail(path, "must be a non-negative safe integer");
   }
   return value;
 }
@@ -521,13 +550,29 @@ function suspendedState(value: unknown, path: string): SuspendedState {
     "stdoutBytes",
     "preGateCache",
   ]);
+  const stdout = expectString(raw.stdout, `${path}.stdout`);
+  const stdoutTruncated = expectBoolean(raw.stdoutTruncated, `${path}.stdoutTruncated`);
+  const stdoutBytes = expectCount(raw.stdoutBytes, `${path}.stdoutBytes`);
+  // The one mark the dump carries a length for. The figure counts the live
+  // stream the call printed and `stdout` is the same stream rendered, so
+  // unless the rendering cut it the two agree to the byte (D154b, measured
+  // across a partial line, UTF-8 and a re-suspension). Cut, the rendering
+  // carries a marker that can outweigh the dropped tail, so nothing is
+  // asserted beyond the safe-integer bound.
+  const retained = Buffer.byteLength(stdout, "utf8");
+  if (!stdoutTruncated && stdoutBytes !== retained) {
+    fail(
+      `${path}.stdoutBytes`,
+      `is ${stdoutBytes} but ${path}.stdout holds ${retained} bytes and nothing was truncated`,
+    );
+  }
   return {
     snapshot: expectBase64(raw.snapshot, `${path}.snapshot`),
     suspendedCall: approvalRequest(raw.suspendedCall, `${path}.suspendedCall`),
-    stdout: expectString(raw.stdout, `${path}.stdout`),
-    stdoutTruncated: expectBoolean(raw.stdoutTruncated, `${path}.stdoutTruncated`),
+    stdout,
+    stdoutTruncated,
     calls: traces(raw.calls, `${path}.calls`),
-    stdoutBytes: expectCount(raw.stdoutBytes, `${path}.stdoutBytes`),
+    stdoutBytes,
     preGateCache: cacheEntries(raw.preGateCache, `${path}.preGateCache`, MAX_CACHE_ENTRIES),
   };
 }
@@ -577,6 +622,12 @@ function validateSessionDump(json: string): SessionDump {
   if (stdoutBytes.length !== snippets.length) {
     fail("stdoutBytes", `has ${stdoutBytes.length} entries for ${snippets.length} snippets`);
   }
+  // The marks are summed into the one figure handed to the sandbox; a sum
+  // past the safe range is a mark no run could have measured (D154b).
+  const mark = stdoutBytes.reduce((sum, bytes) => sum + bytes, 0);
+  if (!Number.isSafeInteger(mark)) {
+    fail("stdoutBytes", `sums to ${mark}, past Number.MAX_SAFE_INTEGER`);
+  }
   const dump: SessionDump = {
     version: CURRENT_VERSION,
     snippets,
@@ -590,6 +641,21 @@ function validateSessionDump(json: string): SessionDump {
   if (top.suspended !== undefined) {
     dump.suspended = suspendedState(top.suspended, "suspended");
     dump.suspendedCode = expectString(top.suspendedCode, "suspendedCode");
+    // One cap over both lists, plus the entry the continuation records for
+    // the suspended call itself: a dump the cache could not admit that call
+    // into is one whose approval can never be honoured, and it is refused
+    // here by name rather than at resume as "the cache is full" (D154c,
+    // measured: 1023 + 1 loaded and the approved call was refused).
+    const cached = dump.callCache.length;
+    const preGate = dump.suspended.preGateCache.length;
+    if (cached + preGate + 1 > MAX_CACHE_ENTRIES) {
+      fail(
+        "callCache",
+        `(${cached} entries) and suspended.preGateCache (${preGate}) hold ${cached + preGate} ` +
+          `together, and the suspended call needs one more: the replay cache holds ` +
+          `${MAX_CACHE_ENTRIES} entries at most`,
+      );
+    }
   }
   return dump;
 }
@@ -744,18 +810,7 @@ export class Session {
   private async runNow(code: string, runOpts?: RunOptions): Promise<RunResult> {
     // The snippet cap, before anything runs and before the pending
     // suspension is touched: nothing about the session changes on a refusal.
-    if (this.snippets.length >= MAX_SNIPPETS) {
-      return {
-        status: "error",
-        errorKind: "unavailable",
-        error:
-          `session holds ${MAX_SNIPPETS} snippets, the replay cap; nothing ran. ` +
-          "Reset the session (repl_reset, or Session.reset()) to continue.",
-        stdout: "",
-        stdoutTruncated: false,
-        calls: [],
-      };
-    }
+    if (this.snippets.length >= MAX_SNIPPETS) return this.snippetCapRefusal("nothing ran");
 
     // Before anything replays: the old call is over, whatever it was waiting
     // for. Doing this first is what keeps `snippets` in execution order.
@@ -776,9 +831,6 @@ export class Session {
     // reason (#61).
     const lineOffset = this.prefixLineCount();
 
-    // Record the cache length BEFORE this run (for trace filtering)
-    const priorEntryCount = this.callCacheEntries.length;
-
     // A grant belongs to one call. The discard above already cleared the only
     // path that can leave one behind — a suspension that was never resumed —
     // and this keeps that true however the previous call ended.
@@ -787,8 +839,13 @@ export class Session {
     // New entries discovered during this run
     const newEntries: CacheEntry[] = [];
 
-    // Build caching registry with the current replay list
-    const { registry: cachingRegistry, willReplayKey } = createCachingRegistry(
+    // Build caching registry with the current replay list. Its invocation
+    // log is what tells this call's trace apart from the replayed one.
+    const {
+      registry: cachingRegistry,
+      willReplayKey,
+      invocations,
+    } = createCachingRegistry(
       this.sandboxOptions.registry,
       this.callCacheEntries,
       newEntries,
@@ -815,7 +872,7 @@ export class Session {
 
     // Every outcome reports this call's calls, not the replayed ones (A16,
     // D125) — the error trace and the suspension used to carry both.
-    const calls = this.withoutReplayedCalls(result.calls, priorEntryCount);
+    const calls = this.withoutReplayedCalls(result.calls, invocations);
     const inputNames = Object.keys(runOpts?.inputs ?? {});
 
     // Post-process based on result
@@ -913,6 +970,17 @@ export class Session {
     const pending = this.pending;
     if (!pending) {
       throw new Error("No suspended execution to resume");
+    }
+    // The snippet cap, here as in `run()` (D154a): a successful continuation
+    // appends a snippet, and a session at the cap has no room for it — it
+    // would dump into a file `load()` refuses. Refused before the dialog and
+    // before anything runs; the suspension stays pending, and `reset()` or
+    // `abandon()` is the way out. Only a hand-built dump can get here: a
+    // live session refuses at the cap before it can suspend.
+    if (this.snippets.length >= MAX_SNIPPETS) {
+      return this.snippetCapRefusal(
+        "the continuation did not run and the call is still waiting for its decision",
+      );
     }
     const suspendedCall = pending.result.suspendedCall;
 
@@ -1274,6 +1342,24 @@ export class Session {
   // ── Private helpers ────────────────────────────────────────
 
   /**
+   * The `RunError` a call at the snippet cap gets, from `run()` and from
+   * `resume()` alike (A17, D154a): `unavailable`, because nothing ran and the
+   * code is not the reason; `detail` says what did not happen.
+   */
+  private snippetCapRefusal(detail: string): RunError {
+    return {
+      status: "error",
+      errorKind: "unavailable",
+      error:
+        `session holds ${MAX_SNIPPETS} snippets, the replay cap; ${detail}. ` +
+        "Reset the session (repl_reset, or Session.reset()) to continue.",
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [],
+    };
+  }
+
+  /**
    * Run one call after every call queued before it (D131).
    *
    * The queue never rejects: a failed call is handed to its own caller and
@@ -1442,57 +1528,62 @@ export class Session {
   }
 
   /**
-   * Remove ToolCallTrace entries that were served from the replay
-   * cache (the first `priorEntryCount` entries in the cache), whatever the
-   * outcome of the run: the trace of an error, and of a suspension, is this
-   * call's as much as the trace of a success is (A16, D125).
+   * The trace entries that were served from the replay cache, removed —
+   * whatever the outcome of the run: the trace of an error, and of a
+   * suspension, is this call's as much as the trace of a success is (A16,
+   * D125).
    *
-   * We match by resolving each trace entry's args/kwargs via
-   * `resolveToolArgs`, building the cache key, and checking whether
-   * it matches one of the prior cache entries.
+   * Positional, never by key (D154d). The caching registry logs one flag per
+   * `execute` it saw, in dispatch order; the sandbox pushes one trace entry
+   * per `execute` (a return, a throw, a `SubmitSignal`) plus one for each of
+   * the two calls that never reach it — a resolution failure and a denial.
+   * Walking the trace, the entries that reached the registry are paired with
+   * the log in order and the served ones dropped. A key comparison dropped a
+   * restored gated entry the user approved: its key matched the entry it
+   * replaced, and it had executed (measured, P1). The surviving entries are
+   * the sandbox's own objects, every field intact.
    */
-  private withoutReplayedCalls(calls: ToolCallTrace[], priorEntryCount: number): ToolCallTrace[] {
-    if (priorEntryCount === 0) return calls;
+  private withoutReplayedCalls(
+    calls: ToolCallTrace[],
+    invocations: readonly boolean[],
+  ): ToolCallTrace[] {
+    if (!invocations.includes(true)) return calls;
 
-    const registry = this.sandboxOptions.registry;
-    const filtered: ToolCallTrace[] = [];
-
-    // Build a lookup of the prior cache keys (in order) for matching
-    const priorKeys = this.callCacheEntries.slice(0, priorEntryCount).map((e) => e.key);
-    let keyIdx = 0;
-
+    const kept: ToolCallTrace[] = [];
+    let next = 0;
     for (const call of calls) {
-      if (keyIdx >= priorKeys.length) {
-        // All prior entries consumed — keep remaining calls
-        filtered.push(call);
+      if (!this.reachedRegistry(call)) {
+        kept.push(call);
         continue;
       }
-
-      const tool = registry.get(call.tool);
-      if (!tool) {
-        filtered.push(call);
-        continue;
-      }
-
-      let resolved: Record<string, unknown>;
-      try {
-        resolved = resolveToolArgs(tool, call.args, call.kwargs);
-      } catch {
-        filtered.push(call);
-        continue;
-      }
-
-      const key = cacheKey(call.tool, resolved);
-      if (key === priorKeys[keyIdx]) {
-        // Matches a prior cache entry — skip
-        keyIdx++;
-      } else {
-        // No match — keep (shouldn't normally happen if replay is
-        // deterministic, but be safe)
-        filtered.push(call);
-      }
+      // A trace shorter than the log (an abort mid-execute) pairs what it
+      // has; a longer one cannot happen, and its tail would be kept.
+      const served = next < invocations.length && invocations[next];
+      next++;
+      if (!served) kept.push(call);
     }
+    return kept;
+  }
 
-    return filtered;
+  /**
+   * Whether a trace entry stands for an `execute` the caching registry saw.
+   *
+   * The two entries that never got there: a denial — the gate refused, and
+   * the sandbox says so with `approved: false` — and a resolution failure,
+   * which the sandbox records with the arguments it could not resolve, so
+   * resolving them again throws again. Resolution is deterministic on the
+   * arguments, and the caching registry mirrors this registry's tools, so a
+   * tool unknown here was never wrapped either.
+   */
+  private reachedRegistry(call: ToolCallTrace): boolean {
+    if (call.approved === false) return false;
+    const tool = this.sandboxOptions.registry.get(call.tool);
+    if (!tool) return false;
+    try {
+      resolveToolArgs(tool, call.args, call.kwargs);
+    } catch {
+      return false;
+    }
+    return true;
   }
 }

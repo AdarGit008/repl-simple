@@ -128,8 +128,8 @@ what it cannot read. It is the *execution* that waits.
 **Accepting the current set.** Three spellings, all deliberate:
 
 - `ReplRunner.acceptPreamble()` re-hashes everything that loads and rewrites the manifest — the
-  host's explicit accept. The pi command that calls it, `/repl-accept-preamble`, lands in the next
-  wave; until then embedders call it directly.
+  host's explicit accept. The pi command that calls it is `/repl-accept-preamble`
+  (`extensions/repl-extension.ts`, since W2-1); embedders call the method directly.
 - `save_tool` records the hash of what it wrote, and `delete_tool` drops the entry — **in a trusted
   project**. The agent writes these files, so its own writes never withhold — and `save_tool`'s
   approval dialog is the consent. Re-saving a withheld file from inside `repl` is therefore a valid
@@ -200,8 +200,8 @@ never against the spelling the store was given.
 - **`.pi/` is now in this repository's `.gitignore`** so these files do not travel from here. That
   protects other people from us; project trust is what protects us from them.
 - **The accepted set is not a second trust dialog.** It withholds what changed and names it; it
-  does not re-confirm anything. Accepting is an explicit call (or a `save_tool` under its own
-  dialog), and the pi command for it is not in this wave.
+  does not re-confirm anything. Accepting is an explicit call — `/repl-accept-preamble` in pi,
+  `ReplRunner.acceptPreamble()` for an embedder — or a `save_tool` under its own dialog.
 - **A removed file is reported, not enforced.** Its manifest entry stays until the set is accepted
   again, so a file that reappears with its accepted bytes loads quietly — by design, and worth
   knowing.

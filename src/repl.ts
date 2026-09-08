@@ -42,8 +42,9 @@ import type {
 // gated call and how it was decided — was dropped on the floor, so a jailed
 // read and a gated fetch could be believed but not seen. `runWithTrace` and
 // `resumeWithTrace` return the same text plus the calls; the string API is
-// `.text` of the same call (decision 11: additive, byte-identical, and
-// unordered — the `seq` that interleaves the trace with `stdout` is wave 3's).
+// `.text` of the same call (decision 11: additive and byte-identical). The
+// trace is in dispatch order; its position relative to `stdout` is the
+// sandbox's to report, per call, not this runner's to reconstruct.
 
 /**
  * One host-tool call as the trace reports it: the sandbox's entry, plus the
@@ -112,11 +113,10 @@ interface ExecutionRecord {
  * The recorder every host tool in a session reports into.
  *
  * It sits *inside* `Session`'s replay cache, so a call served from the cache
- * never reaches it: the records are exactly the executions, which is what the
- * sandbox's `calls` cannot say on their own — `Session` strips replayed
- * entries from an ok result and from nothing else (measured: an error result
- * lists every replayed read ahead of the failure, a suspended and a resumed
- * result likewise).
+ * never reaches it: the records are exactly the executions. `Session` strips
+ * replayed entries from every outcome (D125), but its trace carries no
+ * `details` — the bridged tool's own report travels this way, matched to the
+ * execution it came from.
  */
 interface ExecutionSink {
   records: ExecutionRecord[];
@@ -174,8 +174,9 @@ function recordExecutions(tool: HostTool, sink: ExecutionSink): HostTool {
  * the earlier snippets before the new code runs, and the replay cursor never
  * advances on a mismatch. This is exact under deterministic replay and
  * degrades, on a non-deterministic transcript, to a swap of `details`
- * between two calls with identical arguments — the bound
- * `Session.filterCachedCalls` has too.
+ * between two calls with identical arguments. (`Session.withoutReplayedCalls`
+ * has already dropped the served entries, positionally, before the calls
+ * reach here; this alignment is about the details.)
  */
 function alignTrace(
   calls: readonly ToolCallTrace[],
@@ -630,8 +631,8 @@ export class ReplRunner {
    * what would run — and writes the manifest. This is the explicit half of
    * the accepted-set model: the first trusted load accepts implicitly, and
    * everything that changes afterwards waits for this call. The pi command
-   * that exposes it lands separately; `save_tool` is the in-band path
-   * meanwhile, its approval dialog being the consent.
+   * that exposes it is `/repl-accept-preamble` (`extensions/repl-extension.ts`);
+   * `save_tool` is the in-band path, its approval dialog being the consent.
    *
    * Live sessions are not rebuilt: they keep the preamble they were built
    * with, exactly as they keep a deleted tool, and the notice that named the
@@ -1083,12 +1084,6 @@ function limitNotice(skipped: string[]): string {
   );
 }
 
-/**
- * Render a filename inside a model-facing notice.
- *
- * The shared escaper lives in `toolstore.ts` — `escapeNoticeName` — so the
- * tools and every notice render attacker-controlled filenames the same way.
- */
 /**
  * What the model is told when the preamble was refused for shadowing (#54).
  *

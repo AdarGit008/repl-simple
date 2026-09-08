@@ -53,10 +53,10 @@ newline, so a header dump is masked one header at a time and prose on the next l
 
 | # | Shape | Example → result | Notes |
 |---|---|---|---|
-| 1 | Known token prefixes: `sk-` (incl. `sk-ant-`), `ghp_` `gho_` `ghu_` `ghs_` `ghr_` `github_pat_`, `glpat-`, `xox[abprs]-`, `AKIA`, `AIza`, followed by ≥ 16 token characters | `sk-abc…xyz` → `sk-[REDACTED]` | Prefix kept so the reader learns the credential's kind. Shorter than 16 → data (`sk-1`). |
+| 1 | Known token prefixes: `sk-` (incl. `sk-ant-`), `ghp_` `gho_` `ghu_` `ghs_` `ghr_` `github_pat_`, `glpat-`, `xox[abprs]-`, `AKIA`, `AIza`, followed by ≥ 16 token characters | `sk-abc…xyz` → `sk-[REDACTED]`; `xxxghp_abc…xyz` → `xxxghp_[REDACTED]` | Prefix kept so the reader learns the credential's kind. Shorter than 16 → data (`sk-1`). No word boundary is required before the prefix — a token glued to a preceding word still masks — except for `sk-`, which keeps one: `sk` ends `task`, `risk`, `desk` and `disk`, and `task-force-2024-report` is `sk-` plus seventeen token characters. An `sk-` key glued to a *letter* is therefore data (a separator, quote, space or `:` before it is a boundary). |
 | 2a | `Authorization:` (or `Proxy-Authorization:`) header value, plain or JSON-quoted | `Authorization: Bearer eyJ…` → `Authorization: Bearer [REDACTED]`; `Authorization: Bearer "eyJ…"` → `Authorization: Bearer "[REDACTED]"`; `Authorization: abc123…` → `Authorization: [REDACTED]`; `Authorization: Bot abc…` → `Authorization: [REDACTED]` | A known scheme is kept: `Basic`, `Bearer`, `Digest`, `Token`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `AWS4-HMAC-SHA256` (any case); a credential quoted after the scheme keeps its quotes. An unknown first token followed by a second on the same line — a scheme this rule does not know, or a credential followed by a word — is masked *with* that second token: the two are indistinguishable, and keeping the first would leak a `Bot`/`SSWS`/`OAuth` credential. A lone value is masked whole. The value ends at end of line, whitespace, a quote, `;` or `,`, so `Authorization: Bearer a; Authorization: Bearer b` masks both and keeps the `;`. A known scheme with nothing after it is data. |
-| 2a, Digest | `Authorization: Digest <parameters>` | `Authorization: Digest username="u", realm="r", nonce="dcd9…", uri="/x", response="6629…"` → `… nonce="[REDACTED]", uri="/x", response="[REDACTED]"` | A parameter list, not a token: the values of `response`, `nonce` and `cnonce` — the replayable parts — are masked (quoted, bare, or JSON-escaped), each counted once; `username`, `realm`, `uri`, `qop`, `nc`, `opaque` and `algorithm` survive as the context that says which request failed. A header with none of the three is untouched. The list is read to the end of the line, at most 4 KiB past `Digest`. A `Digest` followed by a bare token instead of parameters takes the generic row above. `WWW-Authenticate: Digest …` is a challenge, not a credential, and is data. |
-| 2b | Bare `Bearer <token>` on one line, where the token looks like a credential: ≥ 8 token characters, **and** either ≥ 16 of them or a digit / `_` / `-` somewhere, **and** not a run of lowercase letters | `curl -H 'bearer 0123…'` → `bearer [REDACTED]`; `the Bearer authentication scheme is used` → unchanged | The word matches in any case; the lowercase-word test is case-sensitive. "the bearer of" is data (too short); "the Bearer authentication scheme" is data (a word); "the Bearer\nauthentication scheme" is data (next line). Inside a header the same token masks regardless — the header's name is the evidence there. |
+| 2a, Digest | `Authorization: Digest <parameters>` | `Authorization: Digest username="u", realm="r", nonce="dcd9…", uri="/x", response="6629…"` → `… nonce="[REDACTED]", uri="/x", response="[REDACTED]"` | A parameter list, not a token: the values of `response`, `nonce` and `cnonce` — the replayable parts — are masked (quoted, bare, or JSON-escaped), each counted once; `username`, `realm`, `uri`, `qop`, `nc`, `opaque` and `algorithm` survive as the context that says which request failed. A header with none of the three is untouched. The list is read one parameter at a time: a quoted value runs to its closing quote (spaces and commas inside it included, or to the end of the line if it was never closed), a bare one to the next separator, and the list ends at `;`, at a newline or at the first token that is not a parameter — so there is no window, a hash after a 1 MiB `uri=` is masked, and a parameter is masked by its own name only (`uri="/x?response=1"` and `username="nonce=zzz"` are one parameter each, untouched). A `Digest` followed by a bare token instead of parameters takes the generic row above. `WWW-Authenticate: Digest …` is a challenge, not a credential, and is data. |
+| 2b | Bare `Bearer <token>` on one line, where the token looks like a credential: ≥ 8 token characters, **and** either ≥ 16 of them not counting a trailing period or a digit / `_` / `-` somewhere, **and** not a run of lowercase letters | `curl -H 'bearer 0123…'` → `bearer [REDACTED]`; `use bearer 0123456789abcdef.` → `use bearer [REDACTED].`; `the Bearer authentication scheme is used` → unchanged; `the Bearer implementations.` → unchanged | The word matches in any case; the lowercase-word test is case-sensitive. "the bearer of" is data (too short); "the Bearer authentication scheme" is data (a word); "the Bearer\nauthentication scheme" is data (next line); a period is a token character (JWTs) but a trailing one is sentence punctuation — it neither counts toward the sixteen nor is masked. Inside a header the same token masks regardless — the header's name is the evidence there. |
 | 3 | PEM private-key block, `BEGIN … PRIVATE KEY` to `END …`, or from `BEGIN` to end of text when the `END` line is gone (the head-only case) | whole block → `[REDACTED PRIVATE KEY]` | `CERTIFICATE` and `PUBLIC KEY` blocks are not secrets and are untouched. The body scan stops at the next `-----BEGIN `: a `BEGIN` with no `END` before the next `BEGIN` is not a block, and the open-block rule then masks from the first such `BEGIN` to the end. |
 | 4 | `NAME=value` / `NAME: value` (quotes, `export`, spaces around the separator tolerated) where NAME is `KEY`, `TOKEN`, `SECRET`, `PASSWORD`/`PASSWD` or a name ending in one of them (`API_KEY`, `x-api-key`, `server.key`, `APIKEY`, `ACCESS_TOKEN`, `client_secret`, `DB_PASSWORD`) | `KEY=abc` → `KEY=[REDACTED]`; `export API_KEY='x'` → `export API_KEY='[REDACTED]'`; `"api_key": "x"` → `"api_key": "[REDACTED]"`; `f(KEY=abc)` → `f(KEY=[REDACTED])` | Decision 6's list, literally, any case. Bare `key` takes `=` only (below). The value stops at whitespace, a quote, `;`, `,` or `&`, and never *ends* in `)`, `]` or `}` — a code dump keeps its shape — while a bracket inside the value is part of it (`PASSWORD=ab)cd` masks whole). |
 
@@ -94,18 +94,22 @@ every positive fixture and the whole corpus.
 high-entropy string, a provider-specific prefix not in family 1, a credential whose name is not one
 of the four words (`AUTH=`, `CREDENTIAL=`), a value containing spaces (`password="my pass"` masks
 `my`), an all-lowercase-letter bearer token outside a header (`bearer abcdefghijklmnop` — no issued
-token has that shape; inside a header it masks), a Digest parameter more than 4 KiB past the scheme
-word. The masking is defence in depth on top of the head-only cut, not a proof; #192 accepts that
+token has that shape; inside a header it masks), an `sk-` key glued to a preceding letter
+(`xxxsk-…` — the boundary is what keeps `task-force-2024-report` as data; every other prefix masks
+glued). The masking is defence in depth on top of the head-only cut, not a proof; #192 accepts that
 the cut alone passes a short or leading secret, and `LlmClient` implementations are declared trusted
 host code precisely so the bound is about provider *responses*, not hostile clients.
 
 **False positives.** A word after `password:` in prose (`password: required` masks `required`), a
 key-file path (`server.key=/etc/ssl/server.key` masks the path), a URL query named `token`, Python's
 bare `key=` kwarg (above), a mixed-case or 16-plus-letter word after a bare `Bearer`
-(`Bearer AuthenticationScheme` masks the word), the word after a schemeless `Authorization:` value
-on the same line (`Authorization: abc123 for user 7` masks `for` with the credential — see 2a). The
-cost is one masked word; the alternative is a leaked credential, and every entry in the corpus is a
-realistic non-secret this rule set leaves alone.
+(`Bearer AuthenticationScheme` masks the word; a trailing period no longer counts, so
+`the Bearer implementations.` is data), the word after a schemeless `Authorization:` value on the
+same line (`Authorization: abc123 for user 7` masks `for` with the credential — see 2a), and — now
+that the prefixes need no boundary — a base64 or hex blob that happens to contain `AKIA`, `AIza` or
+a `gh?_` prefix followed by sixteen token characters (the rest of the blob is masked). The cost is
+one masked word or a corrupted blob; the alternative is a leaked credential, and every entry in the
+corpus is a realistic non-secret this rule set leaves alone.
 
 **Not a substitute for keeping secrets out.** `RlmOptions.inputs` are announced to the model in the
 prompt and readable from sandbox code; nothing here masks them, and nothing should — the contract is
@@ -118,7 +122,8 @@ text that already exists and is about to cross a boundary.
 | Site | Budget | Since |
 |---|---|---|
 | `redactProviderError` — the D53 catch, `llm_query` and downgraded `rlm_query` tool paths (`src/rlm.ts`) | 1 KiB | W1-5 (#191, #192) |
-| Trace export (#46) and session-dump export/display mode (#63) | per their specs | wave 2 |
+| The persisted trace — `buildDetails` in `extensions/repl-extension.ts` masks and cuts every call's arguments (#46, `docs/tool-trace.md`) | 256 bytes per argument | W2-1 |
+| `Session.dumpRedacted()` — the export/display form of a session dump (#63, `docs/session-replay.md`) | 4 KiB per cache result and per stdout | W2-2 |
 
 New redaction sites call `redact()`; calling `truncateText` directly for a redaction re-opens the
 drift #189 closed.

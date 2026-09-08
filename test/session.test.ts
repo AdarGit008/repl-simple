@@ -3071,3 +3071,304 @@ describe("Session — a denied restored gated call should not derail the replay 
     assert.equal(echoExecutions, 0, "the non-gated entry after the denial executed for real");
   });
 });
+
+// ── Wave-3 carry-overs: the W2-2 verifier's four findings (D154) ───
+//
+// Each was measured at `acadb19` with a hand-built or edited dump — none is
+// reachable from a live session — and each is a place where "reject, never
+// coerce" (D127) or "every outcome's trace is this call's" (D125) did not
+// hold. tasks/spec-w3-2.md records the measurements.
+
+/** A gated tool that counts real executions, under its own name. */
+function makeCountingGate(name: string): { tool: HostTool; executions: () => number } {
+  let executions = 0;
+  return {
+    tool: {
+      name,
+      description: "Needs approval; counts real executions",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `g:${args.x}:${++executions}`,
+    },
+    executions: () => executions,
+  };
+}
+
+/** `load()` must refuse `json` with a dump error naming what `expected` matches. */
+function assertRefused(
+  registry: ToolRegistry,
+  label: string,
+  json: string,
+  expected: RegExp,
+): void {
+  assert.throws(
+    () => Session.load(json, { registry }),
+    (e: unknown) =>
+      e instanceof Error &&
+      !(e instanceof TypeError) &&
+      /^Invalid session dump/.test(e.message) &&
+      expected.test(e.message),
+    `${label}: expected a rejection matching ${expected}`,
+  );
+}
+
+describe("Session — the snippet cap applies on resume too (D154a)", () => {
+  it("a within-cap dump plus a suspension cannot resume into a session load() would refuse", async () => {
+    const gate = makeCountingGate("gate_w32a");
+    const registry = new ToolRegistry([gate.tool]);
+    // A real suspension — the snapshot has to be Monty's — then the snippet
+    // list padded to the cap by hand, which no live session can do: run()
+    // refuses at the cap before it can suspend (probe P8).
+    const live = new Session({ registry });
+    suspended(await live.run('gate_w32a("x")', { onApproval: () => "suspend" }));
+    const dump = JSON.parse(live.dump());
+    dump.snippets = Array.from({ length: MAX_SNIPPETS }, (_, i) => `a${i} = ${i}`);
+    dump.stdoutBytes = dump.snippets.map(() => 0);
+    const session = Session.load(JSON.stringify(dump), { registry });
+    assert.equal(session.isSuspended(), true);
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "unavailable");
+    assert.match(result.error, new RegExp(`\\b${MAX_SNIPPETS}\\b`));
+    assert.match(result.error, /reset/i);
+    assert.equal(gate.executions(), 0, "the refused continuation executed the gated call");
+    assert.equal(session.isSuspended(), true, "the refusal consumed the suspension");
+    // Nothing was appended: the session is still one load() accepts.
+    assert.equal(JSON.parse(session.dump()).snippets.length, MAX_SNIPPETS);
+    assert.doesNotThrow(() => Session.load(session.dump(), { registry }));
+    // The way out.
+    session.reset();
+    ok(await session.run("1"));
+  });
+});
+
+describe("Session — stdout marks are bounded (D154b)", () => {
+  const registry = new ToolRegistry([makeEchoTool()]);
+  const dump = (snippets: string[], stdoutBytes: number[]) =>
+    JSON.stringify({ version: 2, snippets, stdoutBytes, callCache: [] });
+
+  it("a mark over Number.MAX_SAFE_INTEGER is refused by name, so no file can push the mark to Infinity", () => {
+    // Measured (probe P11): one 1e308 mark emptied the next run's stdout, two
+    // summed to Infinity and re-emitted the whole transcript.
+    assertRefused(registry, "1e308", dump(['print("A")'], [1e308]), /stdoutBytes\[0\]/);
+    assertRefused(registry, "2^53", dump(["x = 1"], [2 ** 53]), /stdoutBytes\[0\]/);
+    assertRefused(
+      registry,
+      "a safe pair whose sum is not",
+      dump(["x = 1", "y = 2"], [Number.MAX_SAFE_INTEGER, 1]),
+      /stdoutBytes/,
+    );
+    // The bound is the safe-integer range itself, not something tighter: a
+    // mark the dump does not carry a length for cannot be bounded further.
+    assert.doesNotThrow(() =>
+      Session.load(dump(["x = 1"], [Number.MAX_SAFE_INTEGER]), { registry }),
+    );
+  });
+
+  it("the suspension's mark equals the retained stdout's byte length when nothing was truncated", async () => {
+    // Measured on real dumps (spec): equal whenever `stdoutTruncated` is
+    // false — a partial line, UTF-8 and a re-suspension included — and
+    // strictly greater when it is true, where the marker can outweigh the
+    // dropped tail, so no relation is asserted there.
+    const gate = makeCountingGate("gate_w32b");
+    const reg = new ToolRegistry([gate.tool]);
+    const live = new Session({ registry: reg });
+    suspended(await live.run('print("héllo")\ngate_w32b("x")', { onApproval: () => "suspend" }));
+    const real = JSON.parse(live.dump());
+    assert.equal(real.suspended.stdoutTruncated, false);
+    assert.equal(real.suspended.stdoutBytes, 7, "héllo plus a newline is seven bytes");
+    assert.equal(real.suspended.stdoutBytes, Buffer.byteLength(real.suspended.stdout, "utf8"));
+
+    const edited = (patch: Record<string, unknown>) =>
+      JSON.stringify({ ...real, suspended: { ...real.suspended, ...patch } });
+    assertRefused(
+      reg,
+      "a mark under the retained stdout",
+      edited({ stdoutBytes: 3 }),
+      /suspended\.stdoutBytes/,
+    );
+    assertRefused(
+      reg,
+      "a mark over the retained stdout",
+      edited({ stdoutBytes: 1e6 }),
+      /suspended\.stdoutBytes/,
+    );
+    assertRefused(
+      reg,
+      "a mark over MAX_SAFE_INTEGER",
+      edited({ stdoutBytes: 1e308 }),
+      /suspended\.stdoutBytes/,
+    );
+    // A truncated rendering carries a marker, so only the safe-integer bound applies there.
+    assert.doesNotThrow(() =>
+      Session.load(edited({ stdoutTruncated: true, stdoutBytes: 1e6 }), { registry: reg }),
+    );
+    // The real dump loads and resumes: the check is about the file, not the run.
+    const restored = Session.load(edited({}), { registry: reg });
+    const resumed = await restored.resume({ onApproval: () => true });
+    ok(resumed);
+    assert.equal(resumed.stdout, "héllo\n");
+    assert.equal(gate.executions(), 1);
+  });
+});
+
+describe("Session — one combined replay-cache cap at load (D154c)", () => {
+  const gate = makeCountingGate("gate_w32c");
+  const registry = new ToolRegistry([gate.tool, makeEchoTool()]);
+
+  /**
+   * A real suspension with one pre-gate entry, its `callCache` padded to
+   * `cached` entries and its `preGateCache` to `preGate`.
+   */
+  async function paddedDump(cached: number, preGate = 1): Promise<string> {
+    const live = new Session({ registry });
+    suspended(await live.run('echo("pre")\ngate_w32c("x")', { onApproval: () => "suspend" }));
+    const dump = JSON.parse(live.dump());
+    assert.equal(dump.suspended.preGateCache.length, 1);
+    const entry = (i: number) => ({ key: `echo::{"text":"${i}"}`, result: String(i) });
+    dump.callCache = Array.from({ length: cached }, (_, i) => entry(i));
+    dump.suspended.preGateCache = [
+      ...dump.suspended.preGateCache,
+      ...Array.from({ length: preGate - 1 }, (_, i) => entry(cached + i)),
+    ];
+    return JSON.stringify(dump);
+  }
+
+  it("a dump whose cache plus pre-gate entries leave no room for the suspended call is refused by name (P9)", async () => {
+    // Measured: 1023 + 1 loaded, and the approved continuation was then
+    // refused with "session replay cache is full" — the suspended call's own
+    // entry needs the 1024th slot.
+    assertRefused(
+      registry,
+      "1023 + 1, suspended",
+      await paddedDump(MAX_CACHE_ENTRIES - 1),
+      new RegExp(`callCache[^]*preGateCache[^]*\\b${MAX_CACHE_ENTRIES}\\b`),
+    );
+    assertRefused(
+      registry,
+      "1000 + 25, suspended",
+      await paddedDump(MAX_CACHE_ENTRIES - 24, 25),
+      new RegExp(`callCache[^]*preGateCache[^]*\\b${MAX_CACHE_ENTRIES}\\b`),
+    );
+  });
+
+  it("one slot short of the cap loads, and the continuation records the suspended call as the last entry", async () => {
+    const session = Session.load(await paddedDump(MAX_CACHE_ENTRIES - 2), { registry });
+    const resumed = await session.resume({ onApproval: () => true });
+    ok(resumed);
+    assert.equal(gate.executions(), 1);
+    assert.equal(JSON.parse(session.dump()).callCache.length, MAX_CACHE_ENTRIES);
+  });
+});
+
+describe("Session — the trace keeps a restored gated call that ran for real (D154d)", () => {
+  it("P1 — an approved restored gated entry executed in this call, and `calls` says so", async () => {
+    const gate = makeCountingGate("gate_w32d");
+    const registry = new ToolRegistry([gate.tool]);
+    const s1 = new Session({ registry });
+    ok(await s1.run('v = gate_w32d("x")', { onApproval: () => true }));
+    assert.equal(gate.executions(), 1);
+
+    const s2 = Session.load(s1.dump(), { registry });
+    let asked = 0;
+    const result = await s2.run("v", {
+      onApproval: () => {
+        asked++;
+        return true;
+      },
+    });
+    ok(result);
+    assert.equal(asked, 1);
+    assert.equal(gate.executions(), 2);
+    assert.equal(result.output, "g:x:2");
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.args, c.ok, c.approved]),
+      [["gate_w32d", ["x"], true, true]],
+      "the call that ran for real was filtered as a replay",
+    );
+    // From then on the entry is the session's own: served silently, not listed.
+    const next = await s2.run("v");
+    ok(next);
+    assert.equal(gate.executions(), 2);
+    assert.deepEqual(next.calls, []);
+  });
+
+  it("served entries are dropped and executed ones kept, whatever their keys", async () => {
+    let echoExecutions = 0;
+    const echo: HostTool = {
+      ...makeEchoTool(),
+      execute: (args) => {
+        echoExecutions++;
+        return String(args.text);
+      },
+    };
+    const gate = makeCountingGate("gate_w32e");
+    const registry = new ToolRegistry([gate.tool, echo]);
+    const s1 = new Session({ registry });
+    ok(await s1.run('a = gate_w32e("x")\nb = echo("kept")', { onApproval: () => true }));
+    assert.equal(echoExecutions, 1);
+
+    // Restored: the gate asks and runs (an execution — kept); the echo is
+    // served from the file (dropped); the new code's echo, same key as the
+    // served one, runs for real (kept). A key-matching filter dropped the
+    // gate and could not tell the two echoes apart.
+    const s2 = Session.load(s1.dump(), { registry });
+    const result = await s2.run('c = echo("kept")\n(a, b, c)', { onApproval: () => true });
+    ok(result);
+    assert.equal(gate.executions(), 2);
+    assert.equal(
+      echoExecutions,
+      2,
+      "the restored echo entry was not served, or the new call did not run",
+    );
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.args, c.approved]),
+      [
+        ["gate_w32e", ["x"], true],
+        ["echo", ["kept"], undefined],
+      ],
+    );
+    // The kept entries are the sandbox's own objects: every field it wrote is
+    // still there (W3-1's `seq` rides through the same way).
+    for (const call of result.calls) {
+      for (const field of ["tool", "args", "kwargs", "durationMs", "ok"]) {
+        assert.ok(field in call, `${field} missing from a kept trace entry`);
+      }
+      assert.equal(typeof call.durationMs, "number");
+    }
+  });
+
+  it("a call that never reached the registry is neither served nor executed, and stays in the trace", async () => {
+    // Control, green on main by design: it pins the classification the
+    // positional filter relies on. A resolution failure in the prefix — a
+    // positional and a keyword for the same parameter, spelled with `**` so
+    // the type checker cannot see it — is traced by the sandbox and never
+    // reaches `execute`; the served echo after it is dropped, the failure is
+    // this call's, and the two are not confused.
+    let echoExecutions = 0;
+    const echo: HostTool = {
+      ...makeEchoTool(),
+      execute: (args) => {
+        echoExecutions++;
+        return String(args.text);
+      },
+    };
+    const registry = new ToolRegistry([echo]);
+    const session = new Session({ registry });
+    ok(
+      await session.run(
+        'try:\n    echo("a", **{"text": "b"})\nexcept TypeError:\n    pass\nv = echo("x")',
+      ),
+    );
+    assert.equal(echoExecutions, 1);
+    const result = await session.run("v");
+    ok(result);
+    assert.equal(echoExecutions, 1, "the served entry executed again");
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.ok]),
+      [["echo", false]],
+    );
+  });
+});
