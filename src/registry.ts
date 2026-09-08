@@ -296,19 +296,10 @@ async function parsesAsPython(source: string): Promise<boolean> {
 }
 
 // ── Argument helpers ────────────────────────────────────────────
-
-/** Positional-or-keyword argument lookup, Python-style. */
-export function arg(
-  args: unknown[],
-  kwargs: Record<string, unknown>,
-  index: number,
-  name: string,
-): unknown {
-  if (index < args.length && name in kwargs) {
-    throw new HostToolError("TypeError", `got multiple values for argument '${name}'`);
-  }
-  return index < args.length ? args[index] : kwargs[name];
-}
+//
+// Argument *resolution* — positional and keyword into one record — is
+// `resolveToolArgs` in src/sandbox.ts, the only resolver (#85, decision 14:
+// the `arg()` lookup that used to sit here had tests and no callers).
 
 /** Validate a value is a string, throwing HostToolError otherwise. */
 export function requireString(value: unknown, name: string): string {

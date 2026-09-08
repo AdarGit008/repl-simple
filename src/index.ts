@@ -23,14 +23,17 @@ export { HostToolError } from "./types.js";
 export { SpendBudget, estimateTokens } from "./budget.js";
 
 // ── Registry ────────────────────────────────────────────────────
+// The two report types are the return type of `ToolRegistry.degradedStubs()`
+// (#67); a caller that reads the report needs their names.
 export {
   ToolRegistry,
-  arg,
   requireString,
   CANDIDATE_MODULES,
   probeImportableModules,
   probeTypeCheckerGaps,
   renderPythonToolRules,
+  type DegradedStub,
+  type StubDegradationReport,
 } from "./registry.js";
 
 // ── Builtins ────────────────────────────────────────────────────
