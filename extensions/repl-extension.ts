@@ -515,13 +515,19 @@ class TraceView {
     const columns = Math.max(1, Math.floor(width));
     const out: string[] = [];
     for (const line of this.lines) {
-      const chars = [...line];
-      if (chars.length === 0) {
-        out.push("");
-        continue;
-      }
-      for (let i = 0; i < chars.length; i += columns) {
-        out.push(chars.slice(i, i + columns).join(""));
+      let rest = [...line];
+      if (rest.length === 0) out.push("");
+      while (rest.length > 0) {
+        if (rest.length <= columns) {
+          out.push(rest.join(""));
+          break;
+        }
+        // Break at the last space that fits, so a sentence wraps between
+        // words; a run with no space in it breaks at the width.
+        const space = rest.lastIndexOf(" ", columns);
+        const cut = space > 0 ? space : columns;
+        out.push(rest.slice(0, cut).join(""));
+        rest = rest.slice(space > 0 ? cut + 1 : cut);
       }
     }
     return out;
