@@ -107,17 +107,27 @@ const PEM_PRIVATE_KEY_BLOCK =
 const PEM_PRIVATE_KEY_OPEN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/g;
 
 /**
- * Family 4 — `NAME=value` / `NAME: value` where NAME says "secret": a name
- * ending in `_KEY` / `-KEY` / `.KEY`, the bare `APIKEY`, or a name ending in
- * `TOKEN` / `SECRET` / `PASSWORD` / `PASSWD`. Bare `key=` is deliberately
- * excluded — it is Python's sort kwarg and would corrupt any code dump — and
- * `\b` after the keyword keeps `max_tokens=`, `passwords=` and `tokenizer=`
- * as data. The value stops at whitespace, a quote, `;`, `,` or `&`, so the
- * terminator and whatever follows survive.
+ * Family 4 — `NAME=value` / `NAME: value` where NAME says "secret":
+ * decision 6's `KEY|TOKEN|SECRET|PASSWORD=value`, literally. NAME is the
+ * bare word (`KEY=`, `TOKEN=`, `SECRET=`, `PASSWORD=`, `PASSWD=`) or a name
+ * ending in it (`API_KEY`, `x-api-key`, `server.key`, `APIKEY`,
+ * `ACCESS_TOKEN`, `client_secret`, `DB_PASSWORD`). Case-insensitive; an
+ * optional quote and spaces around the separator (`export KEY="…"`,
+ * `"api_key": "…"`). A word boundary on both sides of the keyword keeps
+ * `monkey=`, `keyboard=`, `keyword=`, `key_id=`, `max_tokens=`,
+ * `passwords=` and `tokenizer=` as data. Bare `key` takes `=` only: `key:`
+ * is a JSON/YAML field name far more often than a credential, and the
+ * decision's literal is `KEY=value` (Python's `key=` kwarg therefore masks —
+ * the recorded cost). The value stops at whitespace, a quote, `;`, `,` or
+ * `&`, so the terminator and whatever follows survive; a value that is
+ * already `[REDACTED]` is not a value.
  */
+const SECRET_NAME = "[A-Za-z0-9_.-]";
 const SECRET_ASSIGNMENT = new RegExp(
-  String.raw`\b((?:[A-Za-z0-9_.-]{0,63}?[_.-]KEY|APIKEY|[A-Za-z0-9_.-]{0,64}?(?:TOKEN|SECRET|PASSWORD|PASSWD))\b["']?\s*[=:]\s*["']?)` +
-    String.raw`(?!${REDACTED_LITERAL})([^\s"';,&]+)`,
+  String.raw`\b((?:` +
+    String.raw`(?:${SECRET_NAME}{0,63}?[_.-]KEY|APIKEY|${SECRET_NAME}{0,64}?(?:TOKEN|SECRET|PASSWORD|PASSWD))\b["']?[ \t]*[=:]` +
+    String.raw`|KEY\b["']?[ \t]*=` +
+    String.raw`)[ \t]*["']?)(?!${REDACTED_LITERAL})([^\s"';,&]+)`,
   "gi",
 );
 

@@ -54,19 +54,26 @@ masked one header at a time and prose on the next line is prose.
 | 2a | `Authorization:` (or `Proxy-Authorization:`) header value, plain or JSON-quoted | `Authorization: Bearer eyJ…` → `Authorization: Bearer [REDACTED]`; `Authorization: abc123…` → `Authorization: [REDACTED]`; `Authorization: Bot abc…` → `Authorization: [REDACTED]` | A known scheme is kept: `Basic`, `Bearer`, `Digest`, `Token`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `AWS4-HMAC-SHA256` (any case). An unknown first token followed by a second on the same line — a scheme this rule does not know, or a credential followed by a word — is masked *with* that second token: the two are indistinguishable, and keeping the first would leak a `Bot`/`SSWS`/`OAuth` credential. A lone value is masked whole. The value ends at end of line, whitespace, a quote, `;` or `,`, so `Authorization: Bearer a; Authorization: Bearer b` masks both and keeps the `;`. A known scheme with nothing after it is data. |
 | 2b | Bare `Bearer <token>` (≥ 8 token chars) on one line | `curl -H 'bearer abc…'` → `Bearer [REDACTED]` | Case-insensitive. "the bearer of" is data (too short); "the Bearer\nauthentication scheme" is data (next line). |
 | 3 | PEM private-key block, `BEGIN … PRIVATE KEY` to `END …`, or from `BEGIN` to end of text when the `END` line is gone (the head-only case) | whole block → `[REDACTED PRIVATE KEY]` | `CERTIFICATE` and `PUBLIC KEY` blocks are not secrets and are untouched. The body scan stops at the next `-----BEGIN `: a `BEGIN` with no `END` before the next `BEGIN` is not a block, and the open-block rule then masks from the first such `BEGIN` to the end. |
-| 4 | `NAME=value` / `NAME: value` (quotes and spaces tolerated) where NAME ends in `_KEY`/`-KEY`/`.KEY`, is `APIKEY`, or ends in `TOKEN`/`SECRET`/`PASSWORD`/`PASSWD` | `API_KEY=abc` → `API_KEY=[REDACTED]`; `"api_key": "x"` → `"api_key": "[REDACTED]"` | Case-insensitive. The value stops at whitespace, a quote, `;`, `,` or `&`. |
+| 4 | `NAME=value` / `NAME: value` (quotes, `export`, spaces around the separator tolerated) where NAME is `KEY`, `TOKEN`, `SECRET`, `PASSWORD`/`PASSWD` or a name ending in one of them (`API_KEY`, `x-api-key`, `server.key`, `APIKEY`, `ACCESS_TOKEN`, `client_secret`, `DB_PASSWORD`) | `KEY=abc` → `KEY=[REDACTED]`; `export API_KEY='x'` → `export API_KEY='[REDACTED]'`; `"api_key": "x"` → `"api_key": "[REDACTED]"` | Decision 6's list, literally, any case. Bare `key` takes `=` only (below). The value stops at whitespace, a quote, `;`, `,` or `&`. |
 
 Rules compose: `GITHUB_TOKEN=ghp_…` is masked by family 1 and then family 4, ending as
 `GITHUB_TOKEN=[REDACTED]`.
 
 ### What family 4 deliberately does not match
 
-- **Bare `key=`.** It is Python's sort kwarg (`sorted(rows, key=lambda …)`) and `dict(key=value)`;
-  masking it would corrupt every code dump #63 exports. Compound names (`api_key`, `x-api-key`,
-  `secret.key`) and `apikey` are matched; `monkey=`, `turkey=` are not (no separator before `key`).
+- **Bare `key:`.** A field name — JSON `{"key": "id"}`, YAML `key: value` — far more often than a
+  credential, and the decision's literal is `KEY=value`, so the bare word takes `=` only. Compound
+  names (`api_key:`, `x-api-key:`) take both separators.
+- **Words that merely contain the keyword.** A word boundary on both sides: `monkey=`, `turkey=`,
+  `keyboard=`, `keyword=`, `key_id=`, `secret_id=` are data.
 - **Plurals and derivations.** `\b` after the keyword keeps `max_tokens=`, `passwords=`,
   `tokenizer=`, `password_hash=` as data.
 - **`PRIMARY KEY`** (SQL) — a space is not a separator.
+
+And what it matches on purpose, at a price: Python's bare `key=` kwarg. `sorted(rows, key=lambda r:
+r[1])` becomes `sorted(rows, key=[REDACTED] r: r[1])` — decision 6 lists `KEY=value` literally, and a
+credential named `KEY` outranks a kwarg's readability in a redacted dump. The exact output is pinned
+in the documented-costs table of `test/redact.test.ts`.
 
 ## Idempotence
 
@@ -86,7 +93,8 @@ the cut alone passes a short or leading secret, and `LlmClient` implementations 
 host code precisely so the bound is about provider *responses*, not hostile clients.
 
 **False positives.** A word after `password:` in prose (`password: required` masks `required`), a
-key-file path (`server.key=/etc/ssl/server.key` masks the path), a URL query named `token`, the word
+key-file path (`server.key=/etc/ssl/server.key` masks the path), a URL query named `token`, Python's
+bare `key=` kwarg (above), the word
 after a schemeless `Authorization:` value on the same line (`Authorization: abc123 for user 7` masks
 `for` with the credential — see 2a). The cost is one masked word; the alternative is a leaked
 credential, and every entry in the corpus is a realistic non-secret this rule set leaves alone.
