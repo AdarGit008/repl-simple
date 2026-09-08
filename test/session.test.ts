@@ -1,4 +1,7 @@
 import { after, before, describe, it } from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
@@ -1609,5 +1612,480 @@ describe("Session — a suspension does not outlive its call (#129)", () => {
 
     ok(await session.run("1 + 1"));
     assert.deepEqual(session.outstandingGrants(), [], "a grant outlived the call it belonged to");
+  });
+});
+
+// ── resume carries what it was suspended with (#84, #38) ─────────
+//
+// `Session.run` stores the options a run suspended with. `Session.resume` read
+// back only `limits` (#177) and spread the caller's fresh options for the
+// rest, so a resume through `ReplRunner` — which passes `{ onApproval, signal,
+// limits }` and nothing more — ran without the mount and the byte caps the
+// suspended run was given. `resumeSuspended` reads `mount`, `maxStdoutBytes`
+// and `maxOutputBytes` from what it is handed, so each is asserted by its
+// effect after the resume, never by inspecting a field. The rule is
+// caller-wins: `caller ?? suspended` (D74, matching #177 D4).
+
+describe("Session — resume carries what it was suspended with (#84, #38)", () => {
+  const gated: HostTool = {
+    name: "gated_carry",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `approved: ${args.x}`,
+  };
+
+  /** A temp dir holding one known file, cleaned up by the caller. */
+  function mountFixture(content = "MOUNTED\n"): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "session-mount-"));
+    writeFileSync(join(dir, "note.txt"), content);
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  const size = (s: string) => Buffer.byteLength(s, "utf8");
+
+  it("a mounted file is readable after a suspend/approve/resume round trip (#38 test 1, #84 test 2)", async () => {
+    // Mounts are lost twice by two mechanisms (#38's pinned comment): Monty's
+    // load needs them handed back (fixed at `resumeSuspended`), and the session
+    // has to remember what to hand. This passes only when both hold.
+    const { dir, cleanup } = mountFixture();
+    try {
+      const session = new Session({ registry: new ToolRegistry([gated]) });
+      suspended(
+        await session.run('gated_carry("x")\nopen("/data/note.txt").read()', {
+          onApproval: () => "suspend",
+          mount: { "/data": dir },
+        }),
+      );
+
+      // The shape `ReplRunner.resume` produces: no mount of its own.
+      const result = await session.resume({ onApproval: () => true });
+      ok(result);
+      assert.equal(result.output, "MOUNTED\n");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("the suspended run's maxStdoutBytes caps stdout printed after the resume", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    // Nothing is printed before the gate, so `truncatedBefore` cannot carry
+    // the flag across: only a cap in force *after* the resume can set it.
+    suspended(
+      await session.run('gated_carry("x")\nprint("A" * 5000)', {
+        onApproval: () => "suspend",
+        maxStdoutBytes: 10,
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    ok(result);
+    assert.equal(
+      result.stdoutTruncated,
+      true,
+      "the 32 KiB default replaced the suspended run's 10-byte cap",
+    );
+    assert.ok(size(result.stdout) <= 10, `${size(result.stdout)} bytes against a 10-byte cap`);
+  });
+
+  it("the suspended run's maxOutputBytes caps the value produced after the resume", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    suspended(
+      await session.run('gated_carry("x")\n"X" * 1000', {
+        onApproval: () => "suspend",
+        maxOutputBytes: 64,
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    ok(result);
+    assert.equal(
+      result.outputTruncated,
+      true,
+      "the 16 KiB default replaced the suspended run's 64-byte cap",
+    );
+    assert.ok(size(result.output) <= 64, `${size(result.output)} bytes against a 64-byte cap`);
+  });
+
+  it("a nested re-suspension still carries the mount (the re-suspend branch re-stores it)", async () => {
+    // Two gates: the first suspends on `run`; the first `resume` approves it
+    // and re-suspends on the second; only the second `resume` reaches the read.
+    // If the re-suspend branch stored the raw caller options, the second
+    // resume would have no mount to hand back.
+    const { dir, cleanup } = mountFixture();
+    try {
+      const session = new Session({ registry: new ToolRegistry([gated]) });
+      suspended(
+        await session.run('gated_carry("a")\ngated_carry("b")\nopen("/data/note.txt").read()', {
+          onApproval: () => "suspend",
+          mount: { "/data": dir },
+        }),
+      );
+      suspended(
+        await session.resume({
+          onApproval: (req) => (req.args[0] === "b" ? "suspend" : true),
+        }),
+      );
+
+      const result = await session.resume({ onApproval: () => true });
+      ok(result);
+      assert.equal(result.output, "MOUNTED\n");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("dump()/load() carries what the resume needs, and nothing JSON cannot (#84 test 5)", async () => {
+    const { dir, cleanup } = mountFixture();
+    try {
+      const registry = new ToolRegistry([gated]);
+      const controller = new AbortController();
+      const s1 = new Session({ registry });
+      suspended(
+        await s1.run('gated_carry("x")\nprint("A" * 5000)\nopen("/data/note.txt").read()', {
+          onApproval: () => "suspend",
+          mount: { "/data": dir },
+          maxStdoutBytes: 10,
+          signal: controller.signal,
+        }),
+      );
+
+      const json = s1.dump();
+      const parsed = JSON.parse(json);
+      // An `AbortSignal` serialises as `{}`. Persisting it would hand a plain
+      // object back as a signal after a restore; the dump must carry only
+      // what a resume reads.
+      assert.ok(
+        !("signal" in parsed.suspendedRunOpts),
+        "the dump persisted the suspended run's AbortSignal as {}",
+      );
+
+      // A dump written before this change has the raw shape, `{}` included.
+      // Loading one must not hand that `{}` to the sandbox either.
+      parsed.suspendedRunOpts.signal = {};
+      const s2 = Session.load(JSON.stringify(parsed), { registry });
+
+      const result = await s2.resume({ onApproval: () => true });
+      ok(result);
+      assert.equal(result.output, "MOUNTED\n", "the mount did not survive the round trip");
+      assert.equal(result.stdoutTruncated, true, "the cap did not survive the round trip");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("an explicit mount on the resume wins over the suspended one (D74, caller-wins)", async () => {
+    // A precedence pin, green with and without the merge: `resume` spreads
+    // the caller's options, so an explicit mount is forwarded either way.
+    // It pins the direction — a suspended-wins merge would read FROM_A.
+    const a = mountFixture("FROM_A\n");
+    const b = mountFixture("FROM_B\n");
+    try {
+      const session = new Session({ registry: new ToolRegistry([gated]) });
+      suspended(
+        await session.run('gated_carry("x")\nopen("/data/note.txt").read()', {
+          onApproval: () => "suspend",
+          mount: { "/data": a.dir },
+        }),
+      );
+
+      const result = await session.resume({ onApproval: () => true, mount: { "/data": b.dir } });
+      ok(result);
+      assert.equal(result.output, "FROM_B\n");
+    } finally {
+      a.cleanup();
+      b.cleanup();
+    }
+  });
+
+  it("an explicit maxStdoutBytes on the resume wins over the suspended one (D74)", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    suspended(
+      await session.run('gated_carry("x")\nprint("A" * 5000)', {
+        onApproval: () => "suspend",
+        maxStdoutBytes: 10,
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true, maxStdoutBytes: 100_000 });
+    ok(result);
+    assert.equal(result.stdoutTruncated, false, "the suspended 10-byte cap outranked the caller's");
+    assert.ok(result.stdout.includes("A".repeat(5000)));
+  });
+
+  it("inputs survive a suspension through the snapshot, not through the options (#84 test 3)", async () => {
+    // `feedStart` binds inputs as globals, so they are in the snapshot; a
+    // resume never re-supplies them and needs nothing carried. Pinned so the
+    // "not carried, by design" comment at `resume()` stays true.
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    suspended(
+      await session.run('gated_carry("x")\nname', {
+        onApproval: () => "suspend",
+        inputs: { name: "Alice" },
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    ok(result);
+    assert.equal(result.output, "Alice");
+  });
+
+  it("the suspended run's signal and onApproval are not carried: both come from the caller (#84 test 4)", async () => {
+    // The run's turn ends when it suspends. Its signal is aborted here to
+    // prove a stale one is not handed forward, and its callback — which would
+    // answer "suspend" again — must not be consulted a second time.
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    const controller = new AbortController();
+    let asked = 0;
+    suspended(
+      await session.run('gated_carry("x")', {
+        onApproval: () => {
+          asked++;
+          return "suspend";
+        },
+        signal: controller.signal,
+      }),
+    );
+    controller.abort();
+
+    const result = await session.resume({ onApproval: () => true });
+    ok(result);
+    assert.equal(result.output, "approved: x");
+    assert.equal(asked, 1, "the suspended run's onApproval was consulted again on resume");
+  });
+});
+
+// ── resume on an aborted or throwing continuation (#47 residuals) ──
+//
+// Bucket 5's two undelivered residuals (PR #107 "does not close #50"; PR #151
+// INFO #1): `Session.resume` awaited `onApproval` before any abort check, so a
+// pre-aborted resume still opened a dialog for a call the user had cancelled;
+// and it cleared the suspension only on the success path, so a continuation
+// that threw left the session pinned to it.
+
+describe("Session — resume on an aborted or throwing continuation leaves the session usable (#47)", () => {
+  let executions = 0;
+  const gated: HostTool = {
+    name: "gated_47",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => {
+      executions++;
+      return `approved: ${args.x}`;
+    },
+  };
+
+  /** Restores whatever the env held, including "was not set at all". */
+  async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    const saved = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, vars);
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  it("a resume whose signal is already aborted never asks onApproval (#47 residual 1)", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    suspended(await session.run('gated_47("x")', { onApproval: () => "suspend" }));
+    executions = 0;
+
+    const controller = new AbortController();
+    controller.abort();
+    let asked = 0;
+    const result = await session.resume({
+      signal: controller.signal,
+      onApproval: () => {
+        asked++;
+        return true;
+      },
+    });
+
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.equal(asked, 0, "a dialog was opened for a call the user had already cancelled");
+    assert.equal(executions, 0, "the gated call ran on an aborted resume");
+    // The call is over, as it is when the extension's own guard denies it.
+    assert.equal(session.isSuspended(), false);
+  });
+
+  it("a continuation that throws clears the suspension, so run() is clean and resume() says so (#47 residual 2)", async () => {
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    suspended(await session.run('gated_47("x")', { onApproval: () => "suspend" }));
+
+    // A 1 MB ceiling is below any live node process, so `assertMemoryHeadroom`
+    // throws out of `resumeSuspended` before anything runs — the one throw a
+    // caller can provoke deterministically.
+    await withEnv({ REPL_MEMORY_CEILING_MB: "1" }, async () => {
+      await assert.rejects(
+        () => session.resume({ onApproval: () => true }),
+        (e: Error) => e.name === "SandboxMemoryError",
+      );
+    });
+
+    assert.equal(
+      session.isSuspended(),
+      false,
+      "the session stayed pinned to a failed continuation",
+    );
+    await assert.rejects(
+      () => session.resume({ onApproval: () => true }),
+      /no suspended execution/i,
+    );
+
+    const after = await session.run("1 + 1");
+    ok(after);
+    assert.equal(after.output, "2");
+    assert.equal(
+      after.discardedSuspension,
+      undefined,
+      "run() reported discarding a suspension that had already ended",
+    );
+  });
+
+  it("a continuation that throws revokes the grants the call was holding", async () => {
+    // `grantUses: 2` is the only configuration that leaves a grant behind;
+    // suspend on the second tool so one is outstanding when the throw lands.
+    const second: HostTool = { ...gated, name: "gated_47b" };
+    const session = new Session({ registry: new ToolRegistry([gated, second]) }, undefined, {
+      grantUses: 2,
+    });
+    suspended(await session.run('gated_47("a")\ngated_47b("b")', { onApproval: () => "suspend" }));
+    suspended(
+      await session.resume({ onApproval: (req) => (req.tool === "gated_47" ? true : "suspend") }),
+    );
+    assert.equal(session.outstandingGrants().length, 1, "precondition: a grant is live");
+
+    await withEnv({ REPL_MEMORY_CEILING_MB: "1" }, async () => {
+      await assert.rejects(
+        () => session.resume({ onApproval: () => true }),
+        (e: Error) => e.name === "SandboxMemoryError",
+      );
+    });
+
+    assert.deepEqual(session.outstandingGrants(), [], "a grant outlived the call that threw");
+  });
+});
+
+// ── the two clocks across a suspension (#38) ─────────────────────
+//
+// `src/types.ts` used to say suspension resets the sandbox clock. Measured
+// (ship report): the compute budget is cumulative and travels *inside* the
+// snapshot — limit and elapsed both — so a resume can neither lift nor reset
+// it; the host wall clock is per-segment and restarts on every resume
+// (maintainer decision 1). One pin per clock, both load-independent; the
+// calibrated cumulative assertion is a `todo` (D77).
+
+describe("Session — the two clocks across a suspension (#38)", () => {
+  const gate: HostTool = {
+    name: "gate_38",
+    description: "Needs approval",
+    params: [],
+    returns: "str",
+    requiresApproval: true,
+    execute: () => "ok",
+  };
+
+  /** Host time, not compute: Monty's clock does not advance while it waits. */
+  function napTool(ms: number): HostTool {
+    return {
+      name: "nap",
+      description: "Sleeps on the host",
+      params: [],
+      returns: "str",
+      execute: () => new Promise((resolve) => setTimeout(() => resolve("napped"), ms)),
+    };
+  }
+
+  it("the host wall clock restarts on every resume (decision 1: per-segment)", async () => {
+    // 1.2 s of host time before the gate and 1.2 s after, under a 2 s budget.
+    // Per-segment, each side has 0.8 s to spare; a budget that spanned the
+    // suspension would reach the second nap with ~0.8 s left and time out.
+    const session = new Session({ registry: new ToolRegistry([gate, napTool(1200)]) });
+    suspended(
+      await session.run("nap()\ngate_38()\nnap()", {
+        onApproval: () => "suspend",
+        limits: { maxWallClockSecs: 2 },
+      }),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    ok(result);
+    assert.equal(result.output, "napped");
+  });
+
+  it("the snapshot pins the compute budget: a resume cannot lift it, so a gated-tool loop is bounded by the run that started it (#38 test 3)", async () => {
+    // The suspended run had 0.2 s of compute. The resume asks for 60 s and
+    // loops forever: it must die at the snapshot's 0.2 s by Monty's own
+    // `TimeoutError` — not at 60 s, and not by the host wall clock.
+    const session = new Session({ registry: new ToolRegistry([gate]) });
+    suspended(
+      await session.run("gate_38()\ni = 0\nwhile True:\n    i += 1", {
+        onApproval: () => "suspend",
+        limits: { maxDurationSecs: 0.2 },
+      }),
+    );
+
+    const started = Date.now();
+    const result = await session.resume({
+      onApproval: () => true,
+      limits: { maxDurationSecs: 60, maxWallClockSecs: 30 },
+    });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+    assert.match(
+      result.error,
+      /time limit exceeded/,
+      "the breach must be the sandbox's, not the host's",
+    );
+    assert.ok(Date.now() - started < 10_000, `returned in ${Date.now() - started}ms`);
+  });
+
+  it("the compute budget is cumulative across a suspension (#38 test 2)", {
+    todo:
+      "timing-calibrated: the only Session-level observable is breach-or-not, so this cannot be " +
+      "both load-robust and discriminating (iteration cost swung 111→165 ns on this shared host). " +
+      "Intended gate: promote to a plain test once it passes 20/20 under `npm run test:contained`. " +
+      "Measured 2026-09-08: a 493 ms burn under 0.5 s breached 16 ms into the resume; a 30 ms " +
+      "burn under 0.1 s breached at 100.00 ms total on a resume passed 60 s.",
+  }, async () => {
+    // Self-calibrating against the sandbox's own clock: count how far one
+    // loop body gets in 0.2 s of compute, then burn 0.4 B before the gate
+    // and 0.8 B after it. Cumulative → the resume times out; per-segment →
+    // it completes. The loop body is identical in all three runs.
+    const loop = (n: number) =>
+      `total = 0\nfor j in range(${n}):\n    total += j\n    if j % 10000 == 0:\n        print("t")`;
+    const calibration = new Session({ registry: new ToolRegistry() });
+    const probe = await calibration.run(loop(1_000_000_000), {
+      limits: { maxDurationSecs: 0.2, maxWallClockSecs: 30 },
+    });
+    err(probe);
+    assert.equal(probe.errorKind, "timeout");
+    const ticks = probe.stdout.split("t").length - 1;
+    assert.ok(ticks > 0, "calibration produced no ticks");
+    const iterationsPerSecond = (ticks * 10_000) / 0.2;
+
+    const budget = 1;
+    const session = new Session({ registry: new ToolRegistry([gate]) });
+    suspended(
+      await session.run(
+        `${loop(Math.round(0.4 * budget * iterationsPerSecond))}\ngate_38()\n${loop(
+          Math.round(0.8 * budget * iterationsPerSecond),
+        )}\ntotal`,
+        { onApproval: () => "suspend", limits: { maxDurationSecs: budget, maxWallClockSecs: 30 } },
+      ),
+    );
+
+    const result = await session.resume({ onApproval: () => true });
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+    assert.match(result.error, /time limit exceeded/);
   });
 });

@@ -55,6 +55,32 @@ interface SuspendedState {
   calls: ToolCallTrace[];
 }
 
+/**
+ * The run options a suspension keeps, and `resume()` hands back.
+ *
+ * Exactly the options `resumeSuspended` reads that describe *the run being
+ * continued* rather than the invocation continuing it: the resource limits,
+ * the mounts (host paths are not in the snapshot — a restore without them
+ * turns every read of a mounted file into `PermissionError`, #38), and the
+ * two byte caps. A `Pick`, not `RunOptions`, so that what survives a
+ * suspension is a list someone wrote down rather than whatever the caller
+ * happened to pass — and so a dump never carries an `AbortSignal` serialised
+ * as `{}` or a closure JSON silently dropped (#84).
+ *
+ * What is deliberately not here, and why, is at {@link Session.resume}.
+ */
+type CarriedRunOptions = Pick<RunOptions, "limits" | "mount" | "maxStdoutBytes" | "maxOutputBytes">;
+
+/** The carried subset of `opts`, with nothing else along for the ride. */
+function carriedRunOptions(opts: CarriedRunOptions | undefined): CarriedRunOptions {
+  return {
+    limits: opts?.limits,
+    mount: opts?.mount,
+    maxStdoutBytes: opts?.maxStdoutBytes,
+    maxOutputBytes: opts?.maxOutputBytes,
+  };
+}
+
 /** Wire format for Session.dump() / Session.load(). */
 interface SessionDump {
   version: number;
@@ -64,8 +90,12 @@ interface SessionDump {
   suspended?: SuspendedState;
   /** The code string that caused the suspension (needed for resume) */
   suspendedCode?: string;
-  /** RunOptions active when the suspension happened */
-  suspendedRunOpts?: RunOptions;
+  /**
+   * The carried run options (see {@link CarriedRunOptions}) active when the
+   * suspension happened. Dumps written before #84 hold the raw `RunOptions`
+   * shape; `load` narrows either to the carried subset.
+   */
+  suspendedRunOpts?: CarriedRunOptions;
 }
 
 // ── Caching helpers ─────────────────────────────────────────────
@@ -221,7 +251,7 @@ export class Session {
   private preamble: string | undefined;
   private suspended: RunSuspended | null = null;
   private suspendedCode: string | null = null;
-  private suspendedRunOpts: RunOptions | undefined;
+  private suspendedRunOpts: CarriedRunOptions | undefined;
   /**
    * Approvals granted by the user, live only for the current logical call.
    *
@@ -363,7 +393,7 @@ export class Session {
       // suspension is not carried into the state describing this one.
       this.suspended = result;
       this.suspendedCode = code;
-      this.suspendedRunOpts = runOpts;
+      this.suspendedRunOpts = carriedRunOptions(runOpts);
       // Don't add to snippets or cache — the snippet didn't complete
       return withDiscardNotice(result, discarded);
     } else {
@@ -380,11 +410,47 @@ export class Session {
    * Uses `runOpts.onApproval(suspendedCall)` to decide the suspended tool
    * call's fate. All three answers are honoured: approve, deny, and
    * `"suspend"` — "not now", which leaves the suspension exactly where it was.
-   * If no callback is provided, the call is denied.
+   * If no callback is provided, the call is denied. A caller whose `signal`
+   * is already aborted is not asked at all: an aborted turn has nobody left
+   * to answer a dialog, so the call is denied and the sandbox's abort gate
+   * reports `aborted` before anything runs (#47).
    *
-   * On success the original code is appended to the snippet list.
+   * **What the continuation runs with.** The run being continued was given
+   * options when it started; the call continuing it is a different
+   * invocation with options of its own. Four fields describe the run and are
+   * carried across the suspension — `limits`, `mount`, `maxStdoutBytes`,
+   * `maxOutputBytes` — and for each the rule is **the resume call wins**:
+   * `caller ?? suspended` (D74, matching #177 D4). A caller that says nothing
+   * gets what the run was given; a caller that says something is describing
+   * this invocation and is obeyed. Through `ReplRunner.resume`, which passes
+   * `{ onApproval, signal, limits }`, that means the mount and the byte caps
+   * come from the suspended run and the limits are re-clamped for this call.
    *
-   * @throws If there is no pending suspension.
+   * Not carried, by design:
+   * - `onApproval`, `signal`, `onPrint` — who is asking, whose turn can be
+   *   cancelled, whose terminal is watching. All three belong to the current
+   *   invocation, and a stale signal handed forward would abort a resume the
+   *   user just asked for.
+   * - `inputs` — bound as globals by `feedStart`, so they are in the snapshot
+   *   already and nothing re-supplies them.
+   * - `scriptName` — names the feed for the syntax and typing diagnostics
+   *   `feedStart` raises; a resume is past both.
+   * - `lineOffset` — the session's to compute, here as in `run()`.
+   *
+   * `limits.maxDurationSecs` and `maxMemory` are carried for the checkout,
+   * not for effect: the snapshot pins the budget the run started with,
+   * compute already spent included, and a resume can neither lift nor lower
+   * it (measured; see {@link RunLimits}). `maxWallClockSecs` is the one knob
+   * in `limits` a resume caller changes — it restarts on every resume.
+   *
+   * On success the original code is appended to the snippet list. Whatever
+   * happens — a result, a re-suspension, or a throw out of the sandbox — the
+   * suspension this call consumed is cleared, so a continuation that fails to
+   * start leaves the session usable rather than pinned to it (#47).
+   *
+   * @throws If there is no pending suspension, or if the sandbox refuses to
+   *   start (`SandboxMemoryError`); in the latter case the suspension is gone
+   *   and the grants the call was holding are revoked.
    */
   async resume(runOpts?: RunOptions): Promise<RunResult> {
     if (!this.suspended) {
@@ -397,7 +463,14 @@ export class Session {
     // was discarding it too (#51). Two layers each dropping the same value is
     // why both had to widen for either to matter.
     let decision: ApprovalDecision;
-    if (runOpts?.onApproval) {
+    if (runOpts?.signal?.aborted) {
+      // Before the callback, not after it: the extension guards this at its
+      // own dialog, the library entry did not, so a pre-aborted resume put a
+      // dialog on screen for a call already cancelled (#47, PR #151 INFO #1).
+      // Denied rather than deferred — the call is over — and `resumeSuspended`
+      // reports it as `aborted` before the tool or Python can run.
+      decision = false;
+    } else if (runOpts?.onApproval) {
       decision = await runOpts.onApproval(this.suspended.suspendedCall);
     } else {
       decision = false; // No callback → deny
@@ -432,30 +505,46 @@ export class Session {
     // The same gate as `run()`. With no replay entries its cache branch is
     // dead here, so every gated call in the resumed continuation is decided by
     // a grant or by the user — never by "something like it ran once".
+    const carried = this.suspendedRunOpts;
     const wrappedRunOpts: RunOptions = {
       ...runOpts,
-      limits: runOpts?.limits ?? this.suspendedRunOpts?.limits,
+      // The carried four, caller-wins — the rule is written in the doc above.
+      limits: runOpts?.limits ?? carried?.limits,
+      mount: runOpts?.mount ?? carried?.mount,
+      maxStdoutBytes: runOpts?.maxStdoutBytes ?? carried?.maxStdoutBytes,
+      maxOutputBytes: runOpts?.maxOutputBytes ?? carried?.maxOutputBytes,
       lineOffset: this.prefixLineCount(),
       onApproval: this.makeApprovalGate(runOpts?.onApproval, willReplayKey),
     };
 
-    const result = await resumeSuspended(
-      this.suspended,
-      decision,
-      { ...this.sandboxOptions, registry: cachingRegistry },
-      wrappedRunOpts,
-    );
+    // Saved before the sandbox is entered: the `finally` below clears it.
+    const suspendedCode = this.suspendedCode!;
+
+    let result: RunResult;
+    try {
+      result = await resumeSuspended(
+        this.suspended,
+        decision,
+        { ...this.sandboxOptions, registry: cachingRegistry },
+        wrappedRunOpts,
+      );
+    } catch (err) {
+      // A throw ends the call as surely as a result does — the memory guard
+      // refusing the checkout, say — and the grants belonged to that call.
+      this.grants.clear();
+      throw err;
+    } finally {
+      // Cleared whatever happened, and before any branch below re-suspends:
+      // a continuation that never started must not leave the session pinned
+      // to it, `isSuspended()` true and every `resume()` retrying into the
+      // same failure (#47).
+      this.suspended = null;
+      this.suspendedCode = null;
+      this.suspendedRunOpts = undefined;
+    }
 
     // The call is over unless it suspended again.
     if (result.status !== "suspended") this.grants.clear();
-
-    // Save copies before clearing
-    const suspendedCode = this.suspendedCode!;
-
-    // Clear suspension state
-    this.suspended = null;
-    this.suspendedCode = null;
-    this.suspendedRunOpts = undefined;
 
     if (result.status === "ok") {
       // Append cached tool calls (including the suspended call's result)
@@ -464,10 +553,12 @@ export class Session {
       this.prefixLineTotal += suspendedCode.split("\n").length;
       return result;
     } else if (result.status === "suspended") {
-      // Suspended again on a later gated call
+      // Suspended again on a later gated call. What it carries is what this
+      // continuation ran with — the merged options — so a later resume that
+      // says nothing gets the same mount and caps this one did.
       this.suspended = result;
       this.suspendedCode = suspendedCode;
-      this.suspendedRunOpts = { ...runOpts, limits: wrappedRunOpts.limits };
+      this.suspendedRunOpts = carriedRunOptions(wrappedRunOpts);
       return result;
     } else {
       // Error: don't add snippet
@@ -608,7 +699,9 @@ export class Session {
         calls: obj.suspended.calls,
       };
       session.suspendedCode = obj.suspendedCode;
-      session.suspendedRunOpts = obj.suspendedRunOpts;
+      // Narrowed on the way in: a dump from before #84 holds the raw options,
+      // `signal: {}` and all, and none of that may reach the sandbox.
+      session.suspendedRunOpts = carriedRunOptions(obj.suspendedRunOpts);
     }
 
     return session;

@@ -15,6 +15,7 @@ import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { SubmitSignal } from "../src/submit_signal.js";
+import { STDOUT_MAX_LINES } from "../src/truncate.js";
 import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -1879,6 +1880,84 @@ describe("stdout truncation — onPrint is not the model's budget (M9)", () => {
       `onPrint stopped at the model's cap: ${Buffer.byteLength(streamed)} bytes`,
     );
     assert.ok(streamed.includes("line 1999"), "the last line never reached onPrint");
+  });
+});
+
+// ── Exactly at the cap is within it (bucket 2, exit criterion 4) ──
+//
+// `Truncator.overBudget` compares with `>` on bytes and on lines. Mutating
+// either to `>=` left test/truncate.test.ts and this file green (#24's M11 and
+// M12 survivors): every test overshot the cap by a wide margin or stayed well
+// under it. These sit exactly on the boundary, on both entry points, so the
+// mutant fails. Guards — green immediately.
+
+describe("stdout truncation — exactly at the cap is not truncated (bucket 2, exit criterion 4)", () => {
+  const registry = new ToolRegistry();
+  const size = (s: string) => Buffer.byteLength(s, "utf8");
+  const gated: HostTool = {
+    name: "gated",
+    description: "Gated",
+    params: [],
+    returns: "str",
+    requiresApproval: true,
+    execute: () => "done",
+  };
+
+  it("runInSandbox: stdout of exactly maxStdoutBytes is whole and not truncated", async () => {
+    // Nine bytes of payload plus the newline `print` appends: 10 against 10.
+    const result = await runInSandbox('print("A" * 9)', { registry }, { maxStdoutBytes: 10 });
+    ok(result);
+    assert.equal(result.stdout, `${"A".repeat(9)}\n`);
+    assert.equal(size(result.stdout), 10);
+    assert.equal(result.stdoutTruncated, false, "exactly at the cap is within it");
+  });
+
+  it("resumeSuspended: stdout of exactly maxStdoutBytes after the resume is whole and not truncated", async () => {
+    const gatedRegistry = new ToolRegistry([gated]);
+    const susp = await runInSandbox(
+      'gated()\nprint("A" * 9)',
+      { registry: gatedRegistry },
+      { onApproval: () => "suspend", maxStdoutBytes: 10 },
+    );
+    suspended(susp);
+    assert.equal(susp.stdout, "", "nothing may be printed before the gate");
+
+    const result = await resumeSuspended(
+      susp,
+      true,
+      { registry: gatedRegistry },
+      { maxStdoutBytes: 10 },
+    );
+    ok(result);
+    assert.equal(result.stdout, `${"A".repeat(9)}\n`);
+    assert.equal(result.stdoutTruncated, false, "exactly at the cap is within it");
+  });
+
+  it("a multibyte stream landing exactly on the cap is not truncated", async () => {
+    // Four 2-byte characters plus the newline: 9 against 9.
+    const result = await runInSandbox('print("é" * 4)', { registry }, { maxStdoutBytes: 9 });
+    ok(result);
+    assert.equal(result.stdout, "éééé\n");
+    assert.equal(result.stdoutTruncated, false);
+  });
+
+  it("exactly STDOUT_MAX_LINES lines is not truncated, and one more is", async () => {
+    const atCap = await runInSandbox(
+      `for i in range(${STDOUT_MAX_LINES}):\n    print("x")`,
+      { registry },
+      { maxStdoutBytes: 64 * 1024 },
+    );
+    ok(atCap);
+    assert.equal(atCap.stdout, "x\n".repeat(STDOUT_MAX_LINES));
+    assert.equal(atCap.stdoutTruncated, false, "exactly the line budget is within it");
+
+    const over = await runInSandbox(
+      `for i in range(${STDOUT_MAX_LINES + 1}):\n    print("x")`,
+      { registry },
+      { maxStdoutBytes: 64 * 1024 },
+    );
+    ok(over);
+    assert.equal(over.stdoutTruncated, true, "one line past the budget is truncated");
   });
 });
 

@@ -56,12 +56,20 @@ export type ApprovalDecision = boolean | "suspend";
  * returns — Monty's clock cannot fire while the worker is idle awaiting our
  * answer — and the only thing that returns that run's pooled worker.
  *
- * **Suspension resets the sandbox clock.** A run that suspends for approval is
- * resumed against a fresh checkout, so `maxDurationSecs` starts over and a
- * script that trips a gated tool in a loop has no total ceiling from it.
- * `maxWallClockSecs` is per-call and does not span the suspension either. Neither
- * is a budget across a suspend/resume chain; a caller that needs one must keep
- * it (#38, #84).
+ * **Across a suspension the two clocks behave differently.** `maxDurationSecs`
+ * is a budget over the whole run: the snapshot a suspended run leaves behind
+ * carries the limit *and* the compute already spent, so the continuation
+ * resumes with what is left (measured: a 493 ms burn under a 0.5 s budget
+ * breached 16 ms into the resume) and a script that trips a gated tool in a
+ * loop cannot buy itself a fresh budget. Nor can whoever resumes it: the
+ * `limits` passed to a resume neither lift nor lower the snapshot's
+ * `maxDurationSecs` (measured: a 0.2 s snapshot resumed under 60 s died at
+ * 200 ms; a 60 s snapshot resumed under 0.1 s kept its 60 s). The memory
+ * ceiling travels the same way (#177). `maxWallClockSecs` is per-segment: it
+ * restarts on every resume, so each approved continuation gets a fresh window
+ * for its host-tool time (decision 1, 2026-09-08). This doc used to say the
+ * opposite — that suspension resets the sandbox clock — which was 0.0.18's
+ * behaviour and was measured false on 0.0.21 (#38, #84).
  *
  * **`maxAllocations` is deliberately absent.** Monty 0.0.18 accepted it and did
  * not enforce it — `{maxAllocations: 1000}` let a 500,000-iteration append loop
@@ -81,17 +89,39 @@ export interface RunLimits {
   maxRecursionDepth?: number;
 }
 
-/** Runtime options for a sandbox execution */
+/**
+ * Runtime options for a sandbox execution.
+ *
+ * Some describe the run and some describe the invocation, and the difference
+ * shows at a suspension: `Session.resume` carries `limits`, `mount`,
+ * `maxStdoutBytes` and `maxOutputBytes` from the suspended run (the resume
+ * call's own value wins where it gives one) and takes `onApproval`, `signal`
+ * and `onPrint` from the resume call alone. The rule and its reasons are at
+ * `Session.resume`.
+ */
 export interface RunOptions {
+  /**
+   * Bound as globals before the code runs. Part of the snapshot from then on,
+   * so a resume needs nothing re-supplied.
+   */
   inputs?: Record<string, string>;
+  /**
+   * Host directories mounted into the sandbox, virtual path → host path.
+   * Never stored in a snapshot; whoever resumes must hand it back, and
+   * `Session` does (#38, #84).
+   */
   mount?: Record<string, string>;
   signal?: AbortSignal;
   onPrint?: (text: string) => void;
   onApproval?: (request: ApprovalRequest) => ApprovalDecision | Promise<ApprovalDecision>;
-  /** Byte ceiling on `stdout`. Default 32 KiB. */
+  /** Byte ceiling on `stdout`. Default 32 KiB. Carried across a suspension by `Session`. */
   maxStdoutBytes?: number;
-  /** Byte ceiling on `output`. Default 16 KiB. */
+  /** Byte ceiling on `output`. Default 16 KiB. Carried across a suspension by `Session`. */
   maxOutputBytes?: number;
+  /**
+   * Name of the feed in syntax and typing diagnostics. Read when the code is
+   * first fed; a resume is past both kinds of diagnostic, so it is not carried.
+   */
   scriptName?: string;
   /**
    * Number of lines prepended before the caller's code in the assembled
@@ -182,7 +212,30 @@ export interface RunError {
   calls: ToolCallTrace[];
 }
 
-/** Suspended run result (waiting for approval) */
+/**
+ * Suspended run result (waiting for approval).
+ *
+ * The snapshot is the whole of the run's state: globals, `inputs` included,
+ * and the resource limits it started under together with the compute already
+ * spent against `maxDurationSecs` — so a resume continues the same budget and
+ * cannot lift it (see `RunLimits`). Two things are *not* in it and must be
+ * handed back by whoever resumes: the mounts, because host paths are never
+ * stored in a dump (a restore without them keeps running, having turned every
+ * read of a mounted file into `PermissionError`), and the byte caps on
+ * `stdout` and `output`, which are the host's. `Session` carries all of those
+ * across the suspension (see `Session.resume`); a caller of `resumeSuspended`
+ * directly is responsible for them itself.
+ *
+ * The host wall clock (`maxWallClockSecs`) does not span the suspension: it
+ * restarts on every resume, so each approved continuation gets a fresh
+ * window for its host-tool time (decision 1). There is no elapsed field here
+ * for that reason, and none for the compute budget because the snapshot
+ * already carries it.
+ *
+ * `stdout`, `stdoutTruncated` and `calls` are what the run produced up to the
+ * gate; a resume re-accumulates from them, so the final result reports the
+ * whole run.
+ */
 export interface RunSuspended {
   status: "suspended";
   suspendedCall: ApprovalRequest;
