@@ -281,6 +281,26 @@ const ASSISTANT_REPLY_MAX_BYTES = MAX_CONVERSATION_BYTES;
 const ASSISTANT_REPLY_RECOVERY =
   "Your previous reply exceeded the conversation budget and was truncated. Keep replies concise and re-state anything important.";
 
+// ── Synthesised answer cap (D101) ───────────────────────────────
+//
+// Every other `RlmResult.answer` source is bounded upstream — a submitted
+// answer is the sandbox's `output` (16 KiB), a salvaged one is `output` or
+// `stdout` (32 KiB) — but the cap-time synthesis reply was returned verbatim,
+// the one uncapped answer path. It is an API return, not a prompt-bound
+// view, so the cut is plain `truncateText` (no sentinel wrap — as
+// `RlmResult.error`), value-shaped because an answer is identified by both
+// ends.
+
+/** Byte ceiling on the synthesised answer (256 KiB, value shape). */
+const SYNTHESIS_ANSWER_MAX_BYTES = ASSISTANT_REPLY_MAX_BYTES;
+
+/**
+ * Route to an elided synthesised answer: there is none (policy Q3). The
+ * synthesis reply is not an iteration, so no `llmResponse` record keeps the
+ * raw text, and the caller cannot ask for the rest.
+ */
+const SYNTHESIS_ANSWER_RECOVERY = "The synthesised answer was truncated; the rest is not surfaced.";
+
 // ── Initial-prompt aggregate cap ───────────────────────────────
 //
 // Each input renders a whole block: a header plus a fenced per-value preview,
@@ -1583,7 +1603,12 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     if (!options.signal?.aborted) {
       return {
         status: "max_iterations",
-        answer: synthesized,
+        // D101: the one answer path nothing upstream bounds.
+        answer: truncateText(synthesized, {
+          maxBytes: SYNTHESIS_ANSWER_MAX_BYTES,
+          headRatio: VALUE_HEAD_RATIO,
+          recovery: SYNTHESIS_ANSWER_RECOVERY,
+        }).text,
         answerSource: "synthesised",
         iterations,
         ...(report ? { budget: report } : {}),
