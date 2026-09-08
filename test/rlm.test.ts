@@ -6148,6 +6148,32 @@ describe("runRlm() — the question is a sandbox input (#173)", () => {
     }
   });
 
+  it("a caller tool named `question` is refused before any query — the input would shadow it (the D51 rule)", async () => {
+    // Without the check the tool is merged, the sandbox global `question`
+    // (a str) shadows it, and `question("x")` is "TypeError: 'str' object is
+    // not callable" — the tool never runs and nothing says why.
+    const tool: HostTool = {
+      name: "question",
+      description: "caller-owned tool",
+      params: [{ name: "x", type: "str", description: "" }],
+      returns: "str",
+      execute: async () => "TOOL",
+    };
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(question("x"))\n```']);
+    await assert.rejects(
+      runRlm("hello world", {
+        llmClient: llm,
+        registry: new ToolRegistry([tool]),
+        maxIterations: 1,
+      }),
+      {
+        message:
+          "runRlm: tool 'question' conflicts with the reserved 'question' input — the sandbox variable would shadow the tool. Rename it.",
+      },
+    );
+    assert.equal(llm.calls().length, 0, "the collision must be rejected before any LLM query");
+  });
+
   it("renders the question once, with no `# Input` block, and announces the variable in the trailer", async () => {
     const question = "UNIQUE-QUESTION-TEXT-9f3a";
     const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
