@@ -52,7 +52,10 @@ export class ToolRegistry {
    * Compact stubs for monty's static type checker (`typeCheckStubs`).
    * A tool whose rendered stub does not parse degrades to `name: Any = None`
    * rather than corrupting the stub file for every other tool.
-   * Cached until the next add().
+   * Cached until the next add(); the validation behind it is also memoised
+   * per process by stub content (#169), so a fresh registry with the same
+   * tools — `runRlm` builds one per call and per nesting level — costs no
+   * worker round trip.
    */
   async renderTypeStubs(): Promise<string> {
     if (this.typeStubCache === null) {
@@ -68,9 +71,93 @@ export class ToolRegistry {
     }
     return await this.typeStubCache;
   }
+
+  /**
+   * Which tools the type checker cannot check as declared (#67).
+   *
+   * `tools` carries the two degradation paths that are ours, per tool:
+   * `unparseable` — the stub did not parse and fell back to `name: Any =
+   * None`, so nothing about a call to it is checked; `unknown-type` — a
+   * declared type name the checker cannot resolve (0.0.21 tolerates one
+   * silently), so that part of the signature is unchecked. The shipped
+   * registry has none of either; `runRlm` lists any it finds in the system
+   * prompt so the model knows which calls it must check itself.
+   *
+   * `checkerGaps` is the interpreter's path: runtime names the checker
+   * rejects, declared `Any` on purpose — each documented in
+   * `TY_GAP_REASONS`. Reported for completeness; they are not tools.
+   */
+  async degradedStubs(): Promise<StubDegradationReport> {
+    const stubs = this.list().map((tool) => typeStub(tool));
+    // The fallback line is exactly `name: Any = None`, which no healthy stub
+    // can contain (a healthy stub is a `def` and a `raise`), so the rendered
+    // text says which tools fell back without a second validation.
+    const renderedLines = new Set((await this.renderTypeStubs()).split("\n"));
+    const tools: DegradedStub[] = [];
+    for (const stub of stubs) {
+      if (renderedLines.has(anyFallback(stub.name))) {
+        tools.push({
+          name: stub.name,
+          kind: "unparseable",
+          detail: `stub did not parse; declared as \`${anyFallback(stub.name)}\` — no argument is checked`,
+        });
+        continue;
+      }
+      const unknown = stub.typeNames.filter((name) => !KNOWN_TYPE_NAMES.has(name));
+      if (unknown.length > 0) {
+        tools.push({
+          name: stub.name,
+          kind: "unknown-type",
+          detail: `unresolved type name${unknown.length > 1 ? "s" : ""} ${unknown
+            .map((name) => `\`${name}\``)
+            .join(", ")} — that part of the signature is not checked`,
+        });
+      }
+    }
+    return { tools, checkerGaps: await probeTypeCheckerGaps() };
+  }
+}
+
+/** One tool whose type-check stub is weaker than its signature (#67). */
+export interface DegradedStub {
+  name: string;
+  /** Path 1 (`unparseable`, the `Any` fallback) or path 3 (`unknown-type`). */
+  kind: "unparseable" | "unknown-type";
+  /** What degraded and what that leaves unchecked — prompt-ready. */
+  detail: string;
+}
+
+/** What `ToolRegistry.degradedStubs()` reports. */
+export interface StubDegradationReport {
+  /** Tools whose stub degraded. Empty on the shipped registry (pinned). */
+  tools: DegradedStub[];
+  /** Runtime names declared `Any` because the checker cannot resolve them (path 2). */
+  checkerGaps: string[];
 }
 
 // ── Stub rendering helpers ──────────────────────────────────────
+
+/**
+ * Type names the checker resolves without a stub: the four names
+ * `HostToolParam.type` can carry, the two `renderReturn` can emit, and the
+ * Python builtins a widened union would most plausibly add. A rendered name
+ * outside this set is reported as `unknown-type` (#67 path 3) rather than
+ * left for the checker to tolerate silently.
+ */
+const KNOWN_TYPE_NAMES = new Set([
+  "str",
+  "int",
+  "float",
+  "bool",
+  "bytes",
+  "None",
+  "list",
+  "dict",
+  "set",
+  "tuple",
+  "object",
+  "Any",
+]);
 
 function renderParams(tool: HostTool): string {
   return tool.params
@@ -78,17 +165,36 @@ function renderParams(tool: HostTool): string {
     .join(", ");
 }
 
-/** One tool's stub, and the `Any` fallback its name degrades to. */
+/**
+ * The Python spelling of a tool's return type. `"void"` is `HostTool`
+ * vocabulary for "returns nothing"; rendered verbatim it is an unresolved
+ * name the checker tolerates, which left every void tool's return type —
+ * SUBMIT's included — unchecked (#67 path 3). `None` is what it means.
+ */
+function renderReturn(tool: HostTool): string {
+  return tool.returns === "void" ? "None" : tool.returns;
+}
+
+/** The declaration a stub degrades to when it does not parse. */
+function anyFallback(name: string): string {
+  return `${name}: Any = None`;
+}
+
+/** One tool's stub, the type names it declares, and the name its `Any` fallback carries. */
 interface Stub {
   name: string;
   source: string;
+  /** Every type name the stub references, for the known-name check. */
+  typeNames: string[];
 }
 
 function typeStub(tool: HostTool): Stub {
   const params = renderParams(tool);
+  const returns = renderReturn(tool);
   return {
     name: tool.name,
-    source: `def ${tool.name}(${params}) -> ${tool.returns}:\n    raise NotImplementedError`,
+    source: `def ${tool.name}(${params}) -> ${returns}:\n    raise NotImplementedError`,
+    typeNames: [...tool.params.map((p) => p.type), returns],
   };
 }
 
@@ -112,16 +218,66 @@ function typeStub(tool: HostTool): Stub {
  * pass to find which stub is responsible. Type checking is off: a stub file
  * that parses is all this can still establish, and asking the checker instead
  * would flag `-> str` against a `raise NotImplementedError` body.
+ *
+ * Memoised per process by the joined stub text (#169): `runRlm` builds a
+ * fresh `ToolRegistry` per call and per nesting level, so the per-instance
+ * cache never hit across calls and every loop paid a worker round trip to
+ * validate stubs that had not changed. The memo stores the in-flight promise
+ * (concurrent first callers share one validation) and drops it on rejection —
+ * a failed validation is not an answer, and caching one would hand every
+ * later caller the same rejection for the life of the process. Bounded at
+ * `STUB_MEMO_MAX_ENTRIES` distinct stub sets, cleared wholesale beyond that.
  */
 async function validateStubs(stubs: Stub[]): Promise<string> {
   if (stubs.length === 0) return "";
   const whole = stubs.map((s) => s.source).join("\n");
+  const hit = stubMemo.get(whole);
+  if (hit !== undefined) return await hit;
+  if (stubMemo.size >= STUB_MEMO_MAX_ENTRIES) stubMemo.clear();
+  const pending = validateStubsUncached(stubs, whole).catch((err: unknown) => {
+    // Drop only our own entry: a clear-and-retry may already have replaced it.
+    if (stubMemo.get(whole) === pending) stubMemo.delete(whole);
+    throw err;
+  });
+  stubMemo.set(whole, pending);
+  return await pending;
+}
+
+async function validateStubsUncached(stubs: Stub[], whole: string): Promise<string> {
+  stubValidationRuns++;
   if (await parsesAsPython(whole)) return whole;
 
   const checked = await Promise.all(
-    stubs.map(async (s) => ((await parsesAsPython(s.source)) ? s.source : `${s.name}: Any = None`)),
+    stubs.map(async (s) => ((await parsesAsPython(s.source)) ? s.source : anyFallback(s.name))),
   );
   return checked.join("\n");
+}
+
+// ── Stub-validation memo (#169) ─────────────────────────────────
+//
+// Keyed by content, not by registry: two registries built from the same tools
+// render the same stub text and share one validation. The instance-level
+// promise cache on `ToolRegistry` stays for its in-flight `add()` semantics.
+
+/** Distinct stub sets remembered before the memo is cleared wholesale. */
+const STUB_MEMO_MAX_ENTRIES = 64;
+
+let stubMemo = new Map<string, Promise<string>>();
+let stubValidationRuns = 0;
+
+/**
+ * How many validations actually executed. Exists so the memo can be asserted
+ * with a counter rather than a timer — a timing-based test would pass on a
+ * fast machine with the memo removed.
+ */
+export function stubValidationInvocations(): number {
+  return stubValidationRuns;
+}
+
+/** Drops the memo and its counter. Without this the memoisation itself is untestable. */
+export function resetStubValidationMemo(): void {
+  stubMemo = new Map();
+  stubValidationRuns = 0;
 }
 
 /** Whether `source` is syntactically valid Python, per monty's own parser. */
@@ -272,9 +428,11 @@ export async function probeImportableModules(
 /**
  * Runtime names monty's bundled type checker historically didn't know.
  * Each is probed before being declared so the workaround self-prunes
- * once ty learns a name.
+ * once ty learns a name. Every entry has its reason in `TY_GAP_REASONS`
+ * (#67 path 2) — a test holds the two lists together, so the workaround
+ * list cannot grow unexamined.
  */
-const TY_GAP_CANDIDATES = [
+export const TY_GAP_CANDIDATES = [
   "open",
   "bytearray",
   "PermissionError",
@@ -282,6 +440,26 @@ const TY_GAP_CANDIDATES = [
   "IsADirectoryError",
   "NotADirectoryError",
 ];
+
+/**
+ * Why each `TY_GAP_CANDIDATES` entry is declared `Any` for the checker (#67
+ * path 2). All six were measured unresolved (`unresolved-reference`) on
+ * 0.0.21; the runtime provides every one of them. Declaring a name `Any`
+ * widens the same hole path 1 opens — a call through it is unchecked — so
+ * the list is deliberate and closed: adding a name means adding its reason.
+ */
+export const TY_GAP_REASONS: Readonly<Record<string, string>> = {
+  open: "a runtime builtin (raises PermissionError without a mount) that the checker's builtins stub omits",
+  bytearray: "a runtime builtin type the checker's builtins stub omits",
+  PermissionError:
+    "raised at runtime by `open` without a mount and by jailed host tools; the checker does not know the class, so `except PermissionError` would be flagged",
+  FileNotFoundError:
+    "raised at runtime by the file-reading host tools; unknown to the checker, so it could not be caught by name",
+  IsADirectoryError:
+    "raised at runtime by `read_file` on a directory; unknown to the checker, so it could not be caught by name",
+  NotADirectoryError:
+    "raised at runtime by `list_files` on a file; unknown to the checker, so it could not be caught by name",
+};
 
 /**
  * Names the interpreter provides at runtime that its type checker

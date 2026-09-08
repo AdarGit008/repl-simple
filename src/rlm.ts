@@ -610,6 +610,19 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
   const stubs = await registry.renderTypeStubs();
   const importableModules = await probeImportableModules();
   const rules = renderPythonToolRules(importableModules);
+  // #67 (D105): a tool whose stub degraded has no checked signature, so the
+  // model is told which calls it must check itself. Absent on a clean
+  // registry — the shipped prompt is byte-identical.
+  const { tools: unchecked } = await registry.degradedStubs();
+  const uncheckedSection =
+    unchecked.length > 0
+      ? [
+          "",
+          "## Unchecked Tools",
+          "The type checker cannot validate calls to these tools — check their arguments yourself:",
+          ...unchecked.map((tool) => `- ${tool.name} — ${tool.detail}`),
+        ]
+      : [];
 
   return [
     DEFAULT_RLM_SYSTEM_PROMPT,
@@ -620,6 +633,7 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
     "Call these as plain functions (no await, no import):",
     "",
     stubs || "(standard Python only)",
+    ...uncheckedSection,
     "",
     "## Python Rules",
     rules,

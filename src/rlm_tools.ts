@@ -98,6 +98,10 @@ function createSubmitTool(): HostTool {
         description: "The final answer to return.",
       },
     ],
+    // `"void"` is the HostTool spelling of "returns nothing" (the union in
+    // src/types.ts). The registry renders it as Python `None` — rendered
+    // verbatim, `-> void` was an unresolved name the checker tolerated, so
+    // SUBMIT's return type went unchecked (#67 path 3, D103).
     returns: "void",
     execute(_args) {
       const answer = _args.answer as string;
