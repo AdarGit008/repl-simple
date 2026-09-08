@@ -67,29 +67,79 @@ const TOKEN_PREFIX =
  *
  * - `<known scheme> <credential>` — the scheme survives (`Bearer`, `Basic`,
  *   …) because it identifies the failure without identifying the request;
- *   the credential does not.
+ *   the credential does not. The credential may itself be quoted
+ *   (`Bearer "…"`, non-standard but seen): the quote survives with the
+ *   scheme and the value inside it goes.
  * - `<token> <token>` with a scheme this rule does not know — `Bot`, `SSWS`,
  *   `OAuth`, or a credential followed by prose: indistinguishable, so the
  *   pair is masked whole. The cost is one word of prose in the rare second
  *   case; the alternative is a scheme word kept and a credential leaked.
  * - `<credential>` alone — line end, quote, `;` or `,` follows — masked whole.
  *
+ * `Digest` is the exception: its value is a parameter list in which only
+ * some parameters are credentials, so a `Digest` followed by a `name=`
+ * parameter is left to the Digest rule below (the first token is the tell)
+ * and only a `Digest` followed by a bare token is masked like the others.
+ *
  * A value ends at whitespace, a quote, `;` or `,`, so a `;`-joined list keeps
  * its separators and the next header keeps its name. A known scheme with no
  * credential after it on the line is data, and so is `[REDACTED]`.
  */
-const AUTH_SCHEMES = "Basic|Bearer|Digest|Token|Negotiate|NTLM|HOBA|Mutual|AWS4-HMAC-SHA256";
+const AUTH_PLAIN_SCHEMES = "Basic|Bearer|Token|Negotiate|NTLM|HOBA|Mutual|AWS4-HMAC-SHA256";
+const AUTH_SCHEMES = `${AUTH_PLAIN_SCHEMES}|Digest`;
 const AUTH_VALUE = String.raw`[^\s"';,]+`;
+/** A `name=` token — what a Digest parameter list starts with. */
+const AUTH_PARAMETER = String.raw`[^\s"';,=]+[ \t]*=`;
 const AUTHORIZATION_HEADER = new RegExp(
   String.raw`(\bAuthorization["']?[ \t]*:[ \t]*["']?)` +
-    String.raw`(?!(?:(?:${AUTH_SCHEMES})[ \t]+)?${REDACTED_LITERAL})` +
-    String.raw`(?:((?:${AUTH_SCHEMES})[ \t]+)${AUTH_VALUE}` +
+    String.raw`(?!(?:(?:${AUTH_SCHEMES})[ \t]+["']?)?${REDACTED_LITERAL})` +
+    String.raw`(?:((?:${AUTH_PLAIN_SCHEMES})[ \t]+["']?|Digest[ \t]+["']?(?!${AUTH_PARAMETER}))${AUTH_VALUE}` +
     String.raw`|(?!(?:${AUTH_SCHEMES})(?!${AUTH_VALUE}))${AUTH_VALUE}(?:[ \t]+${AUTH_VALUE})?)`,
   "gi",
 );
 
-/** Family 2b — a bare `Bearer <token>` outside a header line, on one line. The word keeps its spelling. */
-const BEARER_VALUE = /\b(Bearer)[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi;
+/**
+ * Family 2a, Digest — `Authorization: Digest <parameters>`. The replayable
+ * parts are the `response` hash and the two nonces; `username`, `realm`,
+ * `uri`, `qop`, `nc`, `opaque` and `algorithm` are the context a reader
+ * needs to see which request failed, so they survive. Each masked parameter
+ * counts once; a header carrying none of the three is left alone (the old
+ * rule masked `username=`, the parameter *name*, and kept the hash).
+ *
+ * The parameter list is read to the end of the line, at most 4 KiB past
+ * `Digest` — ten times a real one — so a line of `;`-joined headers costs
+ * one bounded scan per header rather than a rescan to the line's end for
+ * each. A quoted value may carry a JSON escape (`\"…\"`); the value class
+ * excludes backslashes, which no hex or base64 parameter contains.
+ */
+const DIGEST_HEADER = new RegExp(
+  String.raw`(\bAuthorization["']?[ \t]*:[ \t]*["']?Digest[ \t]+)(?=${AUTH_PARAMETER})([^\n]{0,4096})`,
+  "gi",
+);
+const DIGEST_PARAMETER = new RegExp(
+  String.raw`(\b(?:response|nonce|cnonce)[ \t]*=[ \t]*(?:\\?["'])?)(?!${REDACTED_LITERAL})([^\s"';,\\]+)`,
+  "gi",
+);
+
+/**
+ * Family 2b — a bare `Bearer <token>` outside a header line, on one line.
+ * The word keeps its spelling. Outside a header there is no name to anchor
+ * on, so the token has to carry the evidence: at least 8 token characters,
+ * and either 16 or more of them or a digit, underscore or dash somewhere,
+ * and not a run of lowercase letters — `the Bearer authentication scheme is
+ * used` is prose, `bearer 0123456789abcdef` is a token. Real bearer tokens
+ * are base64, hex or JWTs, so the lowercase-word exclusion costs a shape no
+ * issued token has (recorded in `docs/redaction.md`). The word is matched in
+ * any case without the `i` flag, which would make the lowercase test blind.
+ */
+const BEARER_TOKEN = "[A-Za-z0-9._~+/=-]";
+const BEARER_VALUE = new RegExp(
+  String.raw`\b([Bb][Ee][Aa][Rr][Ee][Rr])[ \t]+` +
+    String.raw`(?![a-z]+(?!${BEARER_TOKEN}))` +
+    String.raw`(?=${BEARER_TOKEN}{16}|${BEARER_TOKEN}*[0-9_-])` +
+    String.raw`${BEARER_TOKEN}{8,}`,
+  "g",
+);
 
 /**
  * Family 3a — a PEM private-key block, envelope included. The body scan is
@@ -119,15 +169,25 @@ const PEM_PRIVATE_KEY_OPEN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/g;
  * is a JSON/YAML field name far more often than a credential, and the
  * decision's literal is `KEY=value` (Python's `key=` kwarg therefore masks —
  * the recorded cost). The value stops at whitespace, a quote, `;`, `,` or
- * `&`, so the terminator and whatever follows survive; a value that is
- * already `[REDACTED]` is not a value.
+ * `&`, so the terminator and whatever follows survive, and it never *ends*
+ * in a closing bracket, brace or paren — `f(KEY=abc)` keeps its `)`,
+ * `sorted(rows, key=str.lower)` keeps its shape — while a bracket inside a
+ * value is part of it and goes with it. The one closing bracket a value may
+ * end in is the `]` of a `[REDACTED]` the prefix rule left there
+ * (`GITHUB_TOKEN=ghp_[REDACTED]` collapses whole). A value that is already
+ * `[REDACTED]` is not a value.
+ *
+ * The rule's constant is the largest here: a word boundary at every
+ * character of an alternating word/non-word run and up to ~130 lazy name
+ * expansions per position cost ~0.4 s per MiB of `a-a-a-…` (measured;
+ * linear, and every other shape is under 30 ms per MiB).
  */
 const SECRET_NAME = "[A-Za-z0-9_.-]";
 const SECRET_ASSIGNMENT = new RegExp(
   String.raw`\b((?:` +
     String.raw`(?:${SECRET_NAME}{0,63}?[_.-]KEY|APIKEY|${SECRET_NAME}{0,64}?(?:TOKEN|SECRET|PASSWORD|PASSWD))\b["']?[ \t]*[=:]` +
     String.raw`|KEY\b["']?[ \t]*=` +
-    String.raw`)[ \t]*["']?)(?!${REDACTED_LITERAL})([^\s"';,&]+)`,
+    String.raw`)[ \t]*["']?)(?!${REDACTED_LITERAL})([^\s"';,&]*${REDACTED_LITERAL}|[^\s"';,&]*[^\s"';,&)\]}])`,
   "gi",
 );
 
@@ -144,12 +204,13 @@ export interface MaskResult {
  * Replace every recognised secret in `text` with a redaction token.
  *
  * Rule order matters only where two rules can see the same bytes: the
- * header rule runs before the bare-`Bearer` rule so a header keeps its scheme,
- * and the token-prefix rule runs before the assignment rule so
+ * header rules run before the bare-`Bearer` rule so a header keeps its
+ * scheme, and the token-prefix rule runs before the assignment rule so
  * `GITHUB_TOKEN=ghp_…` collapses to `GITHUB_TOKEN=[REDACTED]` rather than
  * `GITHUB_TOKEN=ghp_[REDACTED]`. Idempotent in text and count: the prefix,
- * Bearer and PEM rules cannot match inside a replacement token, and the two
- * value-taking rules (header, assignment) refuse a value that already is one.
+ * Bearer and PEM rules cannot match inside a replacement token, and the
+ * three value-taking rules (header, Digest parameter, assignment) refuse a
+ * value that already is one.
  */
 export function maskSecrets(text: string): MaskResult {
   let masked = 0;
@@ -159,6 +220,11 @@ export function maskSecrets(text: string): MaskResult {
   };
   const out = text
     .replace(TOKEN_PREFIX, (_m, prefix: string) => count(`${prefix}${REDACTED}`))
+    .replace(
+      DIGEST_HEADER,
+      (_m, lead: string, parameters: string) =>
+        `${lead}${parameters.replace(DIGEST_PARAMETER, (_p, name: string) => count(`${name}${REDACTED}`))}`,
+    )
     .replace(AUTHORIZATION_HEADER, (_m, lead: string, scheme: string | undefined) =>
       count(`${lead}${scheme ?? ""}${REDACTED}`),
     )
