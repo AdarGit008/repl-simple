@@ -4,9 +4,9 @@ import {
   open,
   readdir,
   readFile,
-  realpath,
   rename,
   rm,
+  stat,
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
@@ -1468,10 +1468,21 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
   const root = resolve(cwd);
   const store = resolve(storeDir);
 
+  /**
+   * The canonical form of an existing path — symlinks followed.
+   *
+   * Through the jail, which is the one place in `src/` that follows links
+   * (the rule `test/bridge.test.ts` pins): a jail rooted at `path` hands back
+   * `path` itself canonicalised. Throws when the path cannot be resolved.
+   */
+  function canonical(path: string): Promise<string> {
+    return createPathJail(path, { allowAbsolute: true }).resolve(".");
+  }
+
   /** The project's canonical path. A project that does not exist keeps its resolved spelling. */
   async function canonicalRoot(): Promise<string> {
     try {
-      return await realpath(root);
+      return await canonical(root);
     } catch {
       return root;
     }
@@ -1480,21 +1491,23 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
   /**
    * The store's canonical path, through whatever part of it exists.
    *
-   * The path jail cannot answer this: its cheap textual check refuses a path
-   * outside the root *before* it looks at symlinks, and a symlink from
-   * outside the project into it is exactly the case here. So: walk up to the
-   * nearest ancestor `realpath` accepts and append the rest. A dangling
-   * symlink on the way is refused outright — `mkdir -p` would follow it, and
-   * where it points is not known until it does. The filesystem root always
-   * resolves, so the walk terminates.
+   * Asked of the jail directly, the question comes out wrong: its cheap
+   * textual check refuses a path outside the root *before* it follows links,
+   * and a link from outside the project into it is exactly the case here.
+   * So: walk up to the nearest ancestor that exists (`stat`, which follows
+   * links), canonicalise that through the jail, and append the rest. A
+   * dangling symlink on the way is refused outright — `mkdir -p` would
+   * follow it, and where it points is not known until it does. The
+   * filesystem root always exists, so the walk terminates.
    */
   async function canonicalStore(): Promise<string> {
     let current = store;
     let remainder = "";
     for (;;) {
+      let exists = false;
       try {
-        const real = await realpath(current);
-        return remainder === "" ? real : join(real, remainder);
+        await stat(current);
+        exists = true;
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code !== "ENOENT" && code !== "ENOTDIR") {
@@ -1502,6 +1515,10 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
             `cannot resolve the manifest store '${store}': ${(err as Error).message}`,
           );
         }
+      }
+      if (exists) {
+        const real = await canonical(current);
+        return remainder === "" ? real : join(real, remainder);
       }
       if (await isDanglingLink(current)) {
         throw new Error(
