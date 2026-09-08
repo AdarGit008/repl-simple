@@ -13,16 +13,206 @@ import {
   escapeNoticeName,
 } from "./toolstore.js";
 import type {
+  ManifestChange,
   RefusedTool,
   UnreadableTool,
+  UnacceptedReason,
   UnacceptedTool,
   PreambleFileIdentity,
   PreambleManifestStore,
   PreambleStatus,
   SavedToolsPreamble,
 } from "./toolstore.js";
-import type { SandboxOptions } from "./sandbox.js";
-import type { ApprovalRequest, ApprovalDecision, RunResult, RunLimits } from "./types.js";
+import { resolveToolArgs, type SandboxOptions } from "./sandbox.js";
+import type {
+  ApprovalRequest,
+  ApprovalDecision,
+  DiscardedSuspension,
+  HostTool,
+  RunErrorKind,
+  RunResult,
+  RunLimits,
+  ToolCallTrace,
+} from "./types.js";
+
+// ── The trace (#46) ────────────────────────────────────────────────
+//
+// `run` and `resume` return the text the model reads, and until #46 that was
+// all that left the runner: `RunResult.calls` — every ungated `read`, every
+// gated call and how it was decided — was dropped on the floor, so a jailed
+// read and a gated fetch could be believed but not seen. `runWithTrace` and
+// `resumeWithTrace` return the same text plus the calls; the string API is
+// `.text` of the same call (decision 11: additive, byte-identical, and
+// unordered — the `seq` that interleaves the trace with `stdout` is wave 3's).
+
+/**
+ * One host-tool call as the trace reports it: the sandbox's entry, plus the
+ * bridged pi tool's own `details` where there are any (#46).
+ *
+ * Verbatim and therefore **sensitive**: `args` carry whatever the script
+ * passed — a `write` body, a `bash` command line — exactly as the replay
+ * cache does (decision 13). The library's caller is trusted host code; the
+ * extension masks and cuts before anything reaches pi's session file.
+ */
+export interface TracedCall extends ToolCallTrace {
+  /**
+   * The built-in pi tool's own `details`, for the seven bridged tools:
+   * truncation facts, `bash`'s full-output path, `edit`'s diff and patch.
+   * `undefined` for a builtin or toolstore tool, for a bridged tool that
+   * returns none (`write`), and for a call that failed.
+   */
+  details?: unknown;
+}
+
+/**
+ * What a traced call ended in. The first three are the sandbox's; the other
+ * three are `resume`'s early returns, each with no calls: the session does
+ * not exist, it has nothing waiting, or a trust change during the pause
+ * rebuilt it and the pending call was dropped (see `resume`).
+ */
+export type TraceStatus =
+  | "ok"
+  | "error"
+  | "suspended"
+  | "no-session"
+  | "nothing-pending"
+  | "trust-changed";
+
+/** What `runWithTrace` / `resumeWithTrace` return: the text `run` / `resume` would, and the trace. */
+export interface RunTrace {
+  /** Exactly the string `run` / `resume` returns for the same call. */
+  text: string;
+  sessionId: string;
+  status: TraceStatus;
+  /** Present when `status` is `error`. */
+  errorKind?: RunErrorKind;
+  /**
+   * The host-tool calls that **executed** in this call, in dispatch order —
+   * for a resume, the whole run from its start. A call served from the replay
+   * cache executed nothing and is not listed (see `alignTrace`).
+   */
+  calls: TracedCall[];
+  /** The call waiting for approval, when `status` is `suspended`. */
+  suspendedCall?: ApprovalRequest;
+  /** A pending approval this run dropped, as `RunResult` reports it (#129). */
+  discardedSuspension?: DiscardedSuspension;
+}
+
+/** One real host-tool execution, as the session's recorder saw it. */
+interface ExecutionRecord {
+  tool: string;
+  /** The tool name and the resolved arguments — what the replay cache keys on too. */
+  key: string;
+  ok: boolean;
+  /** The bridged tool's `details`, handed over by `BridgeOptions.onDetails`. */
+  details?: unknown;
+}
+
+/**
+ * The recorder every host tool in a session reports into.
+ *
+ * It sits *inside* `Session`'s replay cache, so a call served from the cache
+ * never reaches it: the records are exactly the executions, which is what the
+ * sandbox's `calls` cannot say on their own — `Session` strips replayed
+ * entries from an ok result and from nothing else (measured: an error result
+ * lists every replayed read ahead of the failure, a suspended and a resumed
+ * result likewise).
+ */
+interface ExecutionSink {
+  records: ExecutionRecord[];
+  /** The bridge's `details` for the execution in flight, consumed by `recordExecutions`. */
+  pendingDetails?: unknown;
+}
+
+/** The key both sides of the alignment compute: tool name plus resolved arguments. */
+function executionKey(tool: string, resolved: Record<string, unknown>): string {
+  // A Monty int past 2^53 arrives as a BigInt, which JSON refuses; the replay
+  // cache fails such a call before it executes, so it can only ever be on the
+  // trace side, and it is spelled out rather than thrown on.
+  const json = JSON.stringify(resolved, (_key, value) =>
+    typeof value === "bigint" ? `${value}n` : value,
+  );
+  return `${tool}::${json}`;
+}
+
+/** Wrap `tool` so every real execution — success or throw — is recorded in `sink`. */
+function recordExecutions(tool: HostTool, sink: ExecutionSink): HostTool {
+  const execute = tool.execute;
+  return {
+    ...tool,
+    async execute(args) {
+      const key = executionKey(tool.name, args);
+      sink.pendingDetails = undefined;
+      try {
+        const result = await execute(args);
+        sink.records.push({ tool: tool.name, key, ok: true, details: sink.pendingDetails });
+        return result;
+      } catch (err) {
+        sink.records.push({ tool: tool.name, key, ok: false });
+        throw err;
+      } finally {
+        sink.pendingDetails = undefined;
+      }
+    },
+  };
+}
+
+/**
+ * The calls that executed, aligned with the recorder — per tool, from the end.
+ *
+ * A trace entry is real when a record with the same tool, outcome and key
+ * stands at the cursor; an `ok: true` entry with no such record was served
+ * from the replay cache and is dropped. An `ok: false` entry is always kept:
+ * the cache stores successes only, so a failure never replays — it consumes
+ * the cursor's record when that is a failure too, and a resolution failure
+ * (no record, since it never reached `execute`) consumes nothing. The key is
+ * not consulted for failures: the sandbox records a resolution failure with
+ * arguments it could not resolve, and a failure's record carries no details
+ * to misplace anyway.
+ *
+ * From the end because replayed entries come first: the transcript replays
+ * the earlier snippets before the new code runs, and the replay cursor never
+ * advances on a mismatch. This is exact under deterministic replay and
+ * degrades, on a non-deterministic transcript, to a swap of `details`
+ * between two calls with identical arguments — the bound
+ * `Session.filterCachedCalls` has too.
+ */
+function alignTrace(
+  calls: readonly ToolCallTrace[],
+  records: readonly ExecutionRecord[],
+  registry: ToolRegistry,
+): TracedCall[] {
+  const byTool = new Map<string, ExecutionRecord[]>();
+  for (const record of records) {
+    const list = byTool.get(record.tool) ?? [];
+    list.push(record);
+    byTool.set(record.tool, list);
+  }
+  const cursor = new Map<string, number>();
+  const kept: Array<TracedCall | undefined> = new Array(calls.length);
+
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const call = calls[i];
+    const list = byTool.get(call.tool) ?? [];
+    const index = cursor.get(call.tool) ?? list.length - 1;
+    const record = index >= 0 ? list[index] : undefined;
+
+    if (!call.ok) {
+      if (record?.ok === false) cursor.set(call.tool, index - 1);
+      kept[i] = { ...call };
+      continue;
+    }
+    // An ok entry resolved its arguments once already, in the sandbox, so the
+    // same resolution cannot throw here.
+    const tool = registry.get(call.tool);
+    const key = tool ? executionKey(call.tool, resolveToolArgs(tool, call.args, call.kwargs)) : "";
+    if (record?.ok && record.key === key) {
+      cursor.set(call.tool, index - 1);
+      kept[i] = record.details === undefined ? { ...call } : { ...call, details: record.details };
+    }
+  }
+  return kept.filter((call): call is TracedCall => call !== undefined);
+}
 
 // ── Outcomes ───────────────────────────────────────────────────────
 //
@@ -119,9 +309,29 @@ export interface ReplRunnerOptions {
   preambleStoreDir?: string;
 }
 
+/**
+ * The mutable half of a session's `PreambleStatus` (#198 carry-over).
+ *
+ * The tools answer from the view the session was built with; these two
+ * collections are the same objects the view holds, kept here so the agent's
+ * own `save_tool` / `delete_tool` and `acceptPreamble()` can move a name from
+ * "not accepted" to "accepted since" in place, instead of the list repeating
+ * a creation-time answer the manifest no longer supports.
+ */
+interface PreambleView {
+  unaccepted: Map<string, UnacceptedReason>;
+  acceptedSince: Set<string>;
+}
+
 /** A live session, plus what the preamble decision for it was. */
 interface LiveSession {
   session: Session;
+  /** The registry the session runs on — the trace resolves argument keys against it. */
+  registry: ToolRegistry;
+  /** The recorder of real host-tool executions (#46). */
+  sink: ExecutionSink;
+  /** The session's preamble view, for in-place refresh. */
+  view: PreambleView;
   /** The trust value this session's preamble was loaded (or withheld) under. */
   trusted: boolean;
   /** Whether that decision actually put saved code in front of every run. */
@@ -239,6 +449,9 @@ export class ReplRunner {
    * variable bindings, as if it never ran. Host-tool side effects that
    * executed before the abort (a file written, a `bash` command run) persist;
    * they are not rolled back (D4).
+   *
+   * The text of {@link runWithTrace}, and nothing else: the same call, so the
+   * two cannot differ by a byte (#46).
    */
   async run(
     code: string,
@@ -247,11 +460,33 @@ export class ReplRunner {
     signal?: AbortSignal,
     limits?: RunLimits | "unbounded",
   ): Promise<string> {
+    return (await this.runWithTrace(code, sessionId, onApproval, signal, limits)).text;
+  }
+
+  /**
+   * {@link run}, plus the trace: every host-tool call that executed, with its
+   * arguments, duration, outcome and approval status, and the bridged tool's
+   * own details (#46). Same parameters, same text. See {@link RunTrace} for
+   * what the calls carry, and why they are the caller's to redact.
+   */
+  async runWithTrace(
+    code: string,
+    sessionId = "default",
+    onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
+    signal?: AbortSignal,
+    limits?: RunLimits | "unbounded",
+  ): Promise<RunTrace> {
     const live = await this.getOrCreateSession(sessionId);
     live.busy++;
+    // A run is a fresh call. Records a suspension left behind are not this
+    // run's — `Session.run` drops that suspension anyway — unless another
+    // call is mid-flight on the session, whose records must not be pulled
+    // out from under it (calls on one session are sequential in practice:
+    // the extension serialises them, and #59 documents the library's stance).
+    if (live.busy === 1) live.sink.records = [];
     try {
       const result = await live.session.run(code, { onApproval, signal, limits });
-      return withNotice(live, formatResult(result, sessionId));
+      return this.traceOf(live, sessionId, result);
     } finally {
       live.busy--;
     }
@@ -272,6 +507,8 @@ export class ReplRunner {
    * Never throws: the model decides when to call `repl_resume`, so every state
    * it can believe it is in — no such session, session with nothing pending —
    * gets a sentence back rather than an exception (#48).
+   *
+   * The text of {@link resumeWithTrace}, and nothing else (#46).
    */
   async resume(
     sessionId: string,
@@ -279,34 +516,60 @@ export class ReplRunner {
     signal?: AbortSignal,
     limits?: RunLimits | "unbounded",
   ): Promise<string> {
+    return (await this.resumeWithTrace(sessionId, onApproval, signal, limits)).text;
+  }
+
+  /**
+   * {@link resume}, plus the trace (#46). A resumed result reports the whole
+   * run — the calls before the gate and after it — because that is what the
+   * sandbox accumulates. The three early returns are statuses of their own
+   * with no calls; see {@link TraceStatus}.
+   */
+  async resumeWithTrace(
+    sessionId: string,
+    onApproval?: (req: ApprovalRequest) => Promise<ApprovalDecision>,
+    signal?: AbortSignal,
+    limits?: RunLimits | "unbounded",
+  ): Promise<RunTrace> {
+    const noSession = (): RunTrace => ({
+      text: `No session '${sessionId}' exists. Run some code first.`,
+      sessionId,
+      status: "no-session",
+      calls: [],
+    });
     const live = this.sessions.get(sessionId);
-    if (!live) {
-      return `No session '${sessionId}' exists. Run some code first.`;
-    }
+    if (!live) return noSession();
     this.touch(sessionId, live);
     // Resuming replays the whole transcript, preamble included, so a trust
     // decision made during the pause has to be honoured here too — otherwise
     // revoking trust and answering the pending dialog runs the withdrawn code
     // anyway.
     if (await this.trustChangeDiscards(sessionId, live)) {
-      return trustChangedMessage(sessionId, live.session.isSuspended());
+      return {
+        text: trustChangedMessage(sessionId, live.session.isSuspended()),
+        sessionId,
+        status: "trust-changed",
+        calls: [],
+      };
     }
     // The trust check awaited; the entry may have been evicted in the gap
     // (D3 parity with `run`): a resumed call on a session the pool no longer
     // holds must not report a result for it.
-    if (this.sessions.get(sessionId) !== live) {
-      return `No session '${sessionId}' exists. Run some code first.`;
-    }
+    if (this.sessions.get(sessionId) !== live) return noSession();
     if (!live.session.isSuspended()) {
-      return (
-        `Session '${sessionId}' has nothing waiting for approval. ` +
-        `Nothing was resumed — run code with repl to continue.`
-      );
+      return {
+        text:
+          `Session '${sessionId}' has nothing waiting for approval. ` +
+          `Nothing was resumed — run code with repl to continue.`,
+        sessionId,
+        status: "nothing-pending",
+        calls: [],
+      };
     }
     live.busy++;
     try {
       const result = await live.session.resume({ onApproval, signal, limits });
-      return withNotice(live, formatResult(result, sessionId));
+      return this.traceOf(live, sessionId, result);
     } finally {
       live.busy--;
     }
@@ -322,7 +585,10 @@ export class ReplRunner {
     const live = this.sessions.get(sessionId);
     if (!live) return "no-session";
     this.touch(sessionId, live);
-    return live.session.abandon() ? "abandoned" : "nothing-pending";
+    if (!live.session.abandon()) return "nothing-pending";
+    // The dropped call's run is over; its records have nothing left to align.
+    live.sink.records = [];
+    return "abandoned";
   }
 
   /**
@@ -377,19 +643,50 @@ export class ReplRunner {
       root: this.cwd,
       hostToolNames: this.buildRegistry().hostToolNames,
     });
-    // A directory that cannot be listed is not an empty one. Accepting
-    // "nothing" here would be accepting a set the loader never saw (#198).
+    // A directory that cannot be listed — or that resolves outside the
+    // project — is not an empty one. Accepting "nothing" here would be
+    // accepting a set the loader never saw (#198).
+    if (load.escaped !== undefined) return { status: "unreadable", reason: load.escaped };
     if (load.unlistable !== undefined) return { status: "unreadable", reason: load.unlistable };
     if (load.refused.length > 0) return { status: "refused", refused: load.refused };
+    let manifestPath: string;
     try {
-      const manifestPath = await this.manifest.write(hashesOf(load.loadedIdentity));
-      return { status: "accepted", accepted: load.loaded, manifestPath };
+      manifestPath = await this.manifest.write(hashesOf(load.loadedIdentity));
     } catch (err) {
       return { status: "store-unavailable", reason: (err as Error).message };
     }
+    // Live sessions keep their preamble; their tools stop calling the files
+    // "not accepted" (#198 carry-over). Only names this accept covers move.
+    const accepted = new Set(load.loaded);
+    for (const live of this.sessions.values()) {
+      for (const name of [...live.view.unaccepted.keys()]) {
+        if (accepted.has(name)) applyManifestChange(live.view, { name, change: "accepted" });
+      }
+    }
+    return { status: "accepted", accepted: load.loaded, manifestPath };
   }
 
   // ── Private helpers ─────────────────────────────────────────
+
+  /**
+   * The trace for a finished `run` / `resume` call, and the recorder's next
+   * state: cleared once the call is over, kept across a suspension so the
+   * resumed result — which reports the whole run — aligns from its start.
+   */
+  private traceOf(live: LiveSession, sessionId: string, result: RunResult): RunTrace {
+    const calls = alignTrace(result.calls, live.sink.records, live.registry);
+    if (result.status !== "suspended") live.sink.records = [];
+    const trace: RunTrace = {
+      text: withNotice(live, formatResult(result, sessionId)),
+      sessionId,
+      status: result.status,
+      calls,
+    };
+    if (result.status === "error") trace.errorKind = result.errorKind;
+    if (result.status === "suspended") trace.suspendedCall = result.suspendedCall;
+    if (result.discardedSuspension) trace.discardedSuspension = result.discardedSuspension;
+    return trace;
+  }
 
   /**
    * The session for `sessionId`, built under the trust decision in force now.
@@ -553,10 +850,22 @@ export class ReplRunner {
    * tool exactly like a bridge or builtin name (#57). `acceptPreamble` uses
    * the same list, so what it accepts is what a session build would run.
    */
-  private buildRegistry(): { registry: ToolRegistry; hostToolNames: string[] } {
-    const bridgeTools = createPiBridgeTools(this.cwd, { gateMutating: true });
+  private buildRegistry(sink?: ExecutionSink): { registry: ToolRegistry; hostToolNames: string[] } {
+    // With a recorder, every tool reports its executions to it and the
+    // bridge hands over pi's details for the execution in flight (#46).
+    const bridgeTools = createPiBridgeTools(this.cwd, {
+      gateMutating: true,
+      onDetails: sink
+        ? (event) => {
+            sink.pendingDetails = event.details;
+          }
+        : undefined,
+    });
     const builtinTools = createBuiltinTools({ root: this.cwd });
-    const registry = new ToolRegistry([...bridgeTools, ...builtinTools]);
+    const tools = [...bridgeTools, ...builtinTools].map((tool) =>
+      sink ? recordExecutions(tool, sink) : tool,
+    );
+    const registry = new ToolRegistry(tools);
     const hostToolNames = [...registry.list().map((tool) => tool.name), ...TOOLSTORE_TOOL_NAMES];
     return { registry, hostToolNames };
   }
@@ -604,8 +913,17 @@ export class ReplRunner {
     else if (read.status === "unavailable") accepted = new Map();
     const load = await loadSavedTools({ root, hostToolNames, accepted });
 
-    if (load.unlistable !== undefined) {
-      return { load, notices: [unlistableNotice(load.unlistable)] };
+    // Nothing was seen, so nothing is compared or recorded — and a store
+    // that could not be used is reported alongside rather than after the
+    // directory becomes readable (#198 carry-over): one diagnostic each.
+    if (load.escaped !== undefined || load.unlistable !== undefined) {
+      const notices = [
+        load.escaped !== undefined
+          ? escapedNotice(load.escaped)
+          : unlistableNotice(load.unlistable ?? ""),
+      ];
+      if (read.status === "unavailable") notices.push(storeUnavailableNotice(read.reason));
+      return { load, notices };
     }
     if (load.refused.length > 0) return { load, notices: [] };
 
@@ -632,10 +950,14 @@ export class ReplRunner {
   }
 
   private async createSession(trusted: boolean): Promise<LiveSession> {
-    const { registry, hostToolNames } = this.buildRegistry();
+    const sink: ExecutionSink = { records: [] };
+    const { registry, hostToolNames } = this.buildRegistry(sink);
     const sandboxOpts: SandboxOptions = { registry };
 
     const notices: string[] = [];
+
+    // The two collections the tools and the runner keep current in place.
+    const view: PreambleView = { unaccepted: new Map(), acceptedSince: new Set() };
 
     let preamble = "";
     let preambleStatus: PreambleStatus;
@@ -650,6 +972,7 @@ export class ReplRunner {
       // The tool names, for the honest tool answers: `refused`/`unreadable`
       // carry `.py` file names, the status sets carry the names the tools and
       // the model use.
+      for (const u of load.unaccepted) view.unaccepted.set(u.name, u.reason);
       preambleStatus = {
         trusted: true,
         loaded: new Set(load.loaded),
@@ -658,7 +981,8 @@ export class ReplRunner {
         refused: new Set(load.refused.map((r) => r.file.slice(0, -3))),
         unreadable: new Set(load.unreadable.map((u) => u.file.slice(0, -3))),
         identity: load.loadedIdentity,
-        unaccepted: new Map(load.unaccepted.map((u) => [u.name, u.reason])),
+        unaccepted: view.unaccepted,
+        acceptedSince: view.acceptedSince,
       };
       // The accepted-set notices first: they are the security news.
       notices.push(...verified.notices);
@@ -678,7 +1002,8 @@ export class ReplRunner {
         skipped: new Set(),
         refused: new Set(),
         unreadable: new Set(),
-        unaccepted: new Map(),
+        unaccepted: view.unaccepted,
+        acceptedSince: view.acceptedSince,
       };
       if (withheld.length > 0) notices.push(untrustedNotice(withheld));
     }
@@ -689,19 +1014,24 @@ export class ReplRunner {
     // (#56) finally sees the live registry's names. The live trust callback
     // keeps the read gate honest across trust flips that keep the session,
     // and the manifest lets the agent's own writes keep the accepted set
-    // current (#198).
+    // current (#198) — and the view with it. Recorded like every other tool,
+    // so a replayed `list_saved_tools` is not a listed one (#46).
     for (const tool of createToolStoreTools({
       root: this.cwd,
       hostToolNames,
       preambleStatus,
       isTrusted: this.isProjectTrusted,
       manifest: this.manifest,
+      onManifestChange: (change) => applyManifestChange(view, change),
     })) {
-      registry.add(tool);
+      registry.add(recordExecutions(tool, sink));
     }
 
     return {
       session: new Session(sandboxOpts, preamble || undefined),
+      registry,
+      sink,
+      view,
       trusted,
       hasPreamble: preamble !== "",
       busy: 0,
@@ -709,6 +1039,18 @@ export class ReplRunner {
       notice: notices.length > 0 ? notices.join("\n\n") : undefined,
     };
   }
+}
+
+/**
+ * Move a name between the view's buckets after the manifest changed (#198
+ * carry-over): accepted — by the agent's own `save_tool`, or by
+ * `acceptPreamble()` — leaves "not accepted" for "accepted since"; removed
+ * leaves both, since the file is gone and the list no longer shows it.
+ */
+function applyManifestChange(view: PreambleView, change: ManifestChange): void {
+  view.unaccepted.delete(change.name);
+  if (change.change === "accepted") view.acceptedSince.add(change.name);
+  else view.acceptedSince.delete(change.name);
 }
 
 // ── Preamble notices ─────────────────────────────────────────────
@@ -803,6 +1145,41 @@ function unlistableNotice(reason: string): string {
   );
 }
 
+/**
+ * What the model is told when `.pi/code-tools` resolves outside the project
+ * root and was therefore not read (#198 carry-over). Before this the loader's
+ * empty answer was compared against the manifest and every accepted file
+ * was reported "no longer in .pi/code-tools" — true of the listing, false of
+ * the cause. Nothing is executed from behind the link, as before; the
+ * notice now says why, and the accepted set is left alone.
+ */
+function escapedNotice(reason: string): string {
+  return (
+    `[preamble unreadable] .pi/code-tools was not read: it resolves outside the project root ` +
+    `(${escapeNoticeName(reason)}). Saved tools are loaded only from inside the project — a ` +
+    "symlinked .pi or code-tools directory is not followed — so none is defined in this session, " +
+    "and calling one raises NameError. The accepted set was left as it was. Replace the link " +
+    "with a real directory, then run `repl` with a new `sessionId` to load the preamble."
+  );
+}
+
+/**
+ * What the model is told when the manifest store could not be used while the
+ * tools directory could not be read either (#198 carry-over). Nothing was
+ * withheld for the store — nothing loaded anyway — but a store that stays
+ * broken withholds everything the moment the directory is readable, so it is
+ * named now rather than then.
+ */
+function storeUnavailableNotice(reason: string): string {
+  return (
+    `[preamble unverified] The accepted-set manifest for this project could not be used either ` +
+    `(${escapeNoticeName(reason)}). Nothing was withheld for that — no saved tool loaded anyway — ` +
+    "but once .pi/code-tools is readable everything would be. The manifest store is " +
+    `${PREAMBLE_STORE_DIR_VAR} or, unset, the user's state dir (~/.local/state/repl-simple); fix ` +
+    "it too."
+  );
+}
+
 /** The manifest's shape from a load: tool name → sha256 of the bytes that loaded (#198). */
 function hashesOf(identity: ReadonlyMap<string, PreambleFileIdentity>): Map<string, string> {
   return new Map([...identity].map(([name, id]) => [name, id.sha256]));
@@ -844,8 +1221,9 @@ function changedNotice(unaccepted: UnacceptedTool[], removed: string[]): string 
         `changed since this project's saved tools were last accepted, and were NOT loaded: ` +
         `${names}. They are not defined in this session — calling one raises NameError. ` +
         `Review each with read_tool(); delete_tool() removes one; re-saving one with ` +
-        `save_tool() (which asks for approval) accepts it. The host accepts the whole current ` +
-        "set with ReplRunner.acceptPreamble(); then run `repl` with a new `sessionId` to load them.",
+        `save_tool() (which asks for approval) accepts it. The user accepts the whole current ` +
+        "set with /repl-accept-preamble in pi (the host API is ReplRunner.acceptPreamble()); " +
+        "then run `repl` with a new `sessionId` to load them.",
     );
   }
   if (removed.length > 0) {

@@ -76,6 +76,7 @@ function status(
     unreadable?: readonly string[];
     identity?: ReadonlyMap<string, PreambleFileIdentity>;
     unaccepted?: ReadonlyMap<string, UnacceptedReason>;
+    acceptedSince?: ReadonlySet<string>;
   } = {},
 ): PreambleStatus {
   return {
@@ -87,6 +88,7 @@ function status(
     unreadable: new Set(partial.unreadable ?? []),
     identity: partial.identity,
     unaccepted: partial.unaccepted,
+    acceptedSince: partial.acceptedSince,
   };
 }
 
@@ -3074,6 +3076,140 @@ describe("preamble manifest store — a store it cannot even resolve (#198)", ()
       }
       cleanup();
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Carry-overs from W1-4 (#198) ─────────────────────────────────
+
+describe("loadSavedTools — jail failures are reported, never thrown (#198 carry-over)", () => {
+  it("an escaping tools dir is `escaped`, with everything else empty", async () => {
+    const root = makeTempDir();
+    const outside = mkdtempSync(join(tmpdir(), "repl-toolstore-outside-"));
+    try {
+      writeFileSync(join(outside, "a.py"), "def a():\n    return 1\n");
+      mkdirSync(join(root, ".pi"));
+      symlinkSync(outside, join(root, ".pi", "code-tools"), "dir");
+
+      const load = await loadSavedTools({ root, accepted: new Map([["a", "0".repeat(64)]]) });
+      assert.match(load.escaped ?? "", /outside the project root/, JSON.stringify(load));
+      assert.equal(load.unlistable, undefined);
+      assert.equal(load.preamble, "");
+      assert.deepEqual(load.loaded, []);
+      assert.deepEqual(load.unaccepted, []);
+      assert.deepEqual(load.refused, []);
+      // The untrusted path keeps its names-or-nothing contract.
+      assert.deepEqual(await savedToolNames({ root }), []);
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("an unreadable .pi is `unlistable`, and savedToolNames answers [] without throwing", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    const opts: ToolStoreOptions = { root };
+    writeSavedTool(opts, "a", "def a():\n    return 1\n");
+    const pi = join(root, ".pi");
+    try {
+      chmodSync(pi, 0o000);
+      // `.pi` itself: the jail's realpath fails with EACCES before the tools
+      // directory is listed, which used to escape as an OSError.
+      const load = await loadSavedTools(opts);
+      assert.match(load.unlistable ?? "", /EACCES|permission/i, JSON.stringify(load));
+      assert.equal(load.escaped, undefined);
+      assert.deepEqual(load.loaded, []);
+      assert.deepEqual(await savedToolNames(opts), []);
+    } finally {
+      try {
+        chmodSync(pi, 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+    }
+  });
+});
+
+describe("the tools report an accepted-since file (#198 carry-over)", () => {
+  it("save_tool and delete_tool report a trusted manifest update through onManifestChange, and not otherwise", async () => {
+    const root = makeTempDir();
+    const storeDir = mkdtempSync(join(tmpdir(), "repl-store-"));
+    try {
+      const manifest = toolstore.createPreambleManifestStore(storeDir, root);
+      await manifest.write(new Map());
+      const changes: Array<{ name: string; change: string }> = [];
+      let trusted = true;
+      const tools = createToolStoreTools({
+        root,
+        manifest,
+        isTrusted: () => trusted,
+        onManifestChange: (change) => changes.push(change),
+      });
+      const save = findTool(tools, "save_tool");
+      const del = findTool(tools, "delete_tool");
+
+      await save.execute({ name: "add", code: "def add():\n    return 1", description: "adds" });
+      assert.deepEqual(changes, [{ name: "add", change: "accepted" }]);
+      await del.execute({ name: "add" });
+      assert.deepEqual(changes, [
+        { name: "add", change: "accepted" },
+        { name: "add", change: "removed" },
+      ]);
+
+      // Untrusted: the write happens, the manifest is left alone, nothing to report.
+      trusted = false;
+      await save.execute({ name: "add", code: "def add():\n    return 1", description: "adds" });
+      await del.execute({ name: "add" });
+      assert.equal(changes.length, 2, "an untrusted write reported a manifest change");
+
+      // No manifest on disk: both are silent no-ops, and report nothing.
+      trusted = true;
+      const bare = mkdtempSync(join(tmpdir(), "repl-store-"));
+      try {
+        const noManifest = createToolStoreTools({
+          root,
+          manifest: toolstore.createPreambleManifestStore(bare, root),
+          onManifestChange: (change) => changes.push(change),
+        });
+        await findTool(noManifest, "save_tool").execute({
+          name: "add",
+          code: "def add():\n    return 1",
+          description: "adds",
+        });
+        assert.equal(changes.length, 2, "a save with no manifest reported a manifest change");
+      } finally {
+        rmSync(bare, { recursive: true, force: true });
+      }
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("list_saved_tools and read_tool annotate a file accepted after the session started", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      const view = status({ loaded: [], acceptedSince: new Set(["add"]) });
+      const tools = createToolStoreTools({ root, preambleStatus: view });
+
+      assert.equal(
+        await findTool(tools, "list_saved_tools").execute({}),
+        "add [not loaded: accepted after this session started — loads in new sessions]",
+      );
+      const read = await findTool(tools, "read_tool").execute({ name: "add" });
+      assert.match(
+        read,
+        /^# NOTE: not loaded in this session — accepted after this session started; it loads in sessions created after this one/,
+        read,
+      );
+      assert.match(read, /def add/);
+    } finally {
+      cleanup();
     }
   });
 });

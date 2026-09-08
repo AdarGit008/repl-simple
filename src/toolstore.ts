@@ -79,6 +79,22 @@ export interface PreambleStatus {
    * caller that never handed the loader an accepted set).
    */
   unaccepted?: ReadonlyMap<string, UnacceptedReason>;
+  /**
+   * Names that were not running when the session was created and have been
+   * accepted since — by the agent's own `save_tool` in a trusted project, or
+   * by `ReplRunner.acceptPreamble()`. Still not defined in this session (live
+   * sessions are not rebuilt); they load in sessions created after the
+   * accept, and the tools say so instead of repeating the creation-time
+   * "not accepted" (#198 carry-over). Absent, nothing has been accepted
+   * since, or the view was built by hand.
+   */
+  acceptedSince?: ReadonlySet<string>;
+}
+
+/** What `save_tool` / `delete_tool` did to the accepted set, reported through `onManifestChange`. */
+export interface ManifestChange {
+  name: string;
+  change: "accepted" | "removed";
 }
 
 /**
@@ -162,6 +178,14 @@ export interface ToolStoreOptions {
    * appended to the reply, never thrown.
    */
   manifest?: PreambleManifestStore;
+  /**
+   * Tools only: called after `save_tool` or `delete_tool` actually updated
+   * the manifest — a trusted project, a manifest on disk, the write done —
+   * so the session's view can follow the change instead of repeating its
+   * creation-time answer (#198 carry-over). Never called for a write the
+   * manifest did not record.
+   */
+  onManifestChange?: (change: ManifestChange) => void;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -620,6 +644,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
           if (outcome === "updated") {
             manifestNote =
               " Its bytes are recorded as accepted, so new sessions load it without a notice.";
+            options.onManifestChange?.({ name, change: "accepted" });
           }
         } catch (err) {
           manifestNote =
@@ -687,7 +712,10 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
           const outcome = await options.manifest.update((files) => {
             files.delete(name);
           });
-          if (outcome === "updated") manifestNote = " It was removed from the accepted set.";
+          if (outcome === "updated") {
+            manifestNote = " It was removed from the accepted set.";
+            options.onManifestChange?.({ name, change: "removed" });
+          }
         } catch (err) {
           manifestNote =
             ` The accepted-set manifest could not be updated (${(err as Error).message}); ` +
@@ -776,7 +804,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     if (!isTrustedNow() || view.withheld.has(name)) return "project not trusted";
     // After the trust check: a session whose files were all withheld pending
     // acceptance has no preamble, so an untrust flip keeps it, and the list
-    // must still answer with the live decision (#198).
+    // must still answer with the live decision (#198). Accepted since the
+    // session started outranks the creation-time reason: the file is still
+    // not running here, but the next session loads it.
+    if (view.acceptedSince?.has(name)) {
+      return "accepted after this session started — loads in new sessions";
+    }
     const unaccepted = view.unaccepted?.get(name);
     if (unaccepted) return `not accepted — ${unaccepted} since the saved tools were last accepted`;
     // Trusted and in no category: either a benign sibling of a refused
@@ -848,6 +881,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     }
     if (view.skipped.has(name)) {
       return "# NOTE: not loaded in this session — the preamble limit was reached";
+    }
+    if (view.acceptedSince?.has(name)) {
+      return (
+        "# NOTE: not loaded in this session — accepted after this session started; it loads in " +
+        "sessions created after this one"
+      );
     }
     // Readable on purpose: trust is the read gate, acceptance is the
     // execution gate, and the model is being asked to review this code.
@@ -1048,8 +1087,25 @@ export interface SavedToolsPreamble {
    * it, and one that compares against the accepted set has nothing to call
    * removed (#198). Every other field is empty. Raw errno text — escape
    * before rendering into model-facing text.
+   *
+   * Also set — with the jail's message — when the directory's path could not
+   * be resolved at all: `.pi` itself unreadable, so the jail fails with
+   * `EACCES` before there is anything to list. Same meaning: unknown, not
+   * empty (#198 carry-over).
    */
   unlistable?: string;
+  /**
+   * Set when the tools directory resolves **outside the project root** — a
+   * symlinked `.pi` or `.pi/code-tools` — and was therefore not read: the
+   * containment refusal's message. Absent otherwise, like `unlistable`.
+   *
+   * Nothing loaded, and as with `unlistable` nothing is known: the files
+   * behind the link are not the project's, so a caller must not record
+   * acceptance from this load nor call the accepted files removed (#198
+   * carry-over). Every other field is empty. The message names the path;
+   * escape before rendering.
+   */
+  escaped?: string;
 }
 
 /**
@@ -1108,11 +1164,13 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
   // The same containment as the tools: a symlinked `.pi` must not let a
   // hostile repo list another project's tool names into the model context
   // (#57 pass 2 — this is the untrusted-notice path, zero trust required).
+  // Any other refusal from the jail — `.pi` itself unreadable, say — is
+  // "cannot see" too, and this function never throws (#198 carry-over).
   let dir: string;
   try {
     dir = await containedToolsDir(toolsDir, root);
   } catch (err) {
-    if (err instanceof HostToolError && err.pythonType === "PermissionError") return [];
+    if (err instanceof HostToolError) return [];
     throw err;
   }
 
@@ -1202,14 +1260,20 @@ export async function loadSavedTools(
 
   // Containment again, for the direct file access below: a symlinked `.pi`
   // must not execute code from outside the project the user trusted
-  // (#57 pass 2). An escaping dir loads nothing — loud refusal is the tools'
-  // job; the loader's is to not execute what the user never trusted.
+  // (#57 pass 2). An escaping dir loads nothing and says so in `escaped`, so
+  // the caller can name the cause rather than calling every accepted file
+  // removed; any other refusal from the jail — `.pi` itself unreadable — is
+  // `unlistable`: nothing loaded, nothing known, never a throw out of
+  // session creation (#198 carry-over).
   let dir: string;
   try {
     dir = await containedToolsDir(toolsDir, root);
   } catch (err) {
-    if (err instanceof HostToolError && err.pythonType === "PermissionError") {
-      return nothingLoaded();
+    if (err instanceof HostToolError) {
+      const reason = err.message;
+      return err.pythonType === "PermissionError"
+        ? { ...nothingLoaded(), escaped: reason }
+        : { ...nothingLoaded(), unlistable: reason };
     }
     throw err;
   }
@@ -1623,8 +1687,11 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       // Nothing there yet — the first trusted load will write it. ENOTDIR is
-      // the store path running through a file; the write will fail loudly.
-      if (code === "ENOENT" || code === "ENOTDIR") return { status: "absent" };
+      // the store path running through a file: no manifest can ever be there,
+      // so it is unavailable now rather than "absent" until a write fails —
+      // a load that writes nothing (an unlistable directory) would otherwise
+      // never learn the store is broken (#198 carry-over).
+      if (code === "ENOENT") return { status: "absent" };
       return {
         status: "unavailable",
         reason: `cannot read the manifest '${path}': ${(err as Error).message}`,
