@@ -6,14 +6,18 @@ import {
   rmSync,
   statSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   existsSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
   mkdirSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { basename, dirname, join, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import {
   createToolStoreTools,
   loadSavedTools,
@@ -24,7 +28,13 @@ import {
   TOOLSTORE_TOOL_NAMES,
   type ToolStoreOptions,
   type PreambleStatus,
+  type PreambleFileIdentity,
+  type UnacceptedReason,
 } from "../src/toolstore.js";
+// The #198 manifest helpers through a namespace import: they do not exist on
+// main, and a named ESM import of a missing export fails at link time, which
+// would fail every test in this file rather than the new ones.
+import * as toolstore from "../src/toolstore.js";
 import { HostToolError } from "../src/types.js";
 import type { HostTool } from "../src/types.js";
 import { runInSandbox } from "../src/sandbox.js";
@@ -64,7 +74,8 @@ function status(
     skipped?: readonly string[];
     refused?: readonly string[];
     unreadable?: readonly string[];
-    identity?: ReadonlyMap<string, { size: number; mtimeMs: number }>;
+    identity?: ReadonlyMap<string, PreambleFileIdentity>;
+    unaccepted?: ReadonlyMap<string, UnacceptedReason>;
   } = {},
 ): PreambleStatus {
   return {
@@ -75,7 +86,13 @@ function status(
     refused: new Set(partial.refused ?? []),
     unreadable: new Set(partial.unreadable ?? []),
     identity: partial.identity,
+    unaccepted: partial.unaccepted,
   };
+}
+
+/** sha256 of a file's bytes, hex — what the loader records and the manifest stores (#198). */
+function sha256Of(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 /** Where `opts` puts saved tools — the default the loader also computes. */
@@ -1012,6 +1029,7 @@ describe("loadSavedTools", () => {
         skipped: [],
         unreadable: [],
         refused: [],
+        unaccepted: [],
       });
     } finally {
       cleanup();
@@ -1029,6 +1047,7 @@ describe("loadSavedTools", () => {
         skipped: [],
         unreadable: [],
         refused: [],
+        unaccepted: [],
       });
     } finally {
       cleanup();
@@ -1883,9 +1902,10 @@ describe("loaded tools whose file changed after the session started (#57)", () =
   }
 
   /** The identity the loader records for the content it actually loaded. */
-  function identityOf(root: string, name: string): Map<string, { size: number; mtimeMs: number }> {
-    const st = statSync(join(root, ".pi", "code-tools", `${name}.py`));
-    return new Map([[name, { size: st.size, mtimeMs: st.mtimeMs }]]);
+  function identityOf(root: string, name: string): Map<string, PreambleFileIdentity> {
+    const path = join(root, ".pi", "code-tools", `${name}.py`);
+    const st = statSync(path);
+    return new Map([[name, { size: st.size, mtimeMs: st.mtimeMs, sha256: sha256Of(path) }]]);
   }
 
   it("list annotates a loaded tool whose file changed since", async () => {
@@ -2277,6 +2297,783 @@ describe("list_saved_tools reports an unreadable directory, not a deletion (#57,
         /* already gone */
       }
       cleanup();
+    }
+  });
+});
+
+// ── Content hash and the accepted set (#198) ─────────────────────
+//
+// `PreambleFileIdentity` was size + mtime — a rewrite detector for the
+// in-session annotations, not a proof. The accepted-set manifest needs a
+// proof: a same-size rewrite with a restored mtime is exactly the case a
+// compromised upstream would produce. The loader now hashes the bytes it
+// read through the O_NOFOLLOW fd, and partitions "would load" into loaded
+// and unaccepted when the caller hands it the accepted set.
+
+describe("loadSavedTools — content hash and the accepted set (#198)", () => {
+  it("records the sha256 of the bytes it loaded", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add(a, b):\n    return a + b\n");
+      const { loadedIdentity } = await loadSavedTools(opts);
+      assert.equal(loadedIdentity.get("add")?.sha256, sha256Of(join(toolsDirOf(opts), "add.py")));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("withholds what the accepted set does not know or knows differently, loads the rest", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add(a, b):\n    return a + b\n");
+      writeSavedTool(opts, "mul", "def mul(a, b):\n    return a * b\n");
+      writeSavedTool(opts, "new", "def new():\n    return 1\n");
+      const accepted = new Map([
+        ["add", sha256Of(join(toolsDirOf(opts), "add.py"))],
+        ["mul", "0".repeat(64)], // accepted once, rewritten since
+      ]);
+
+      const load = await loadSavedTools({ ...opts, accepted });
+      assert.deepEqual(load.loaded, ["add"]);
+      assert.deepEqual(load.unaccepted, [
+        { name: "mul", reason: "changed" },
+        { name: "new", reason: "added" },
+      ]);
+      assert.ok(load.preamble.includes("def add"));
+      assert.ok(!load.preamble.includes("def mul"), "a changed file was concatenated");
+      assert.ok(!load.preamble.includes("def new"), "an added file was concatenated");
+      assert.match(
+        load.preamble,
+        /not accepted: mul, new/,
+        "the header must name what was withheld",
+      );
+      assert.deepEqual([...load.loadedIdentity.keys()], ["add"]);
+      assert.deepEqual(load.skipped, []);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("loads everything when no accepted set is given — the caller owns the decision", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      const load = await loadSavedTools(opts);
+      assert.deepEqual(load.loaded, ["add"]);
+      assert.deepEqual(load.unaccepted, []);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("an empty accepted set withholds everything and loads nothing", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      writeSavedTool(opts, "sub", "def sub():\n    return 2\n");
+      const load = await loadSavedTools({ ...opts, accepted: new Map() });
+      assert.equal(load.preamble, "");
+      assert.deepEqual(load.loaded, []);
+      assert.equal(load.loadedIdentity.size, 0);
+      assert.deepEqual(load.unaccepted, [
+        { name: "add", reason: "added" },
+        { name: "sub", reason: "added" },
+      ]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a withheld file still counts toward the caps, so accepting never changes what fits", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      const a = "def a():\n    return 1\n";
+      writeSavedTool(opts, "a", a);
+      writeSavedTool(opts, "b", "def b():\n    return 2\n");
+
+      // File cap: `a` is withheld, and `b` is skipped by the cap — not loaded
+      // in `a`'s place, which would make accepting `a` unload `b`.
+      const files = await loadSavedTools(
+        { ...opts, accepted: new Map() },
+        { maxFiles: 1, maxBytes: DEFAULT_PREAMBLE_LIMITS.maxBytes },
+      );
+      assert.deepEqual(files.unaccepted, [{ name: "a", reason: "added" }]);
+      assert.deepEqual(files.skipped, ["b"]);
+      assert.deepEqual(files.loaded, []);
+
+      // Byte cap: the withheld `a` spends the budget `b` would have needed.
+      const bytes = await loadSavedTools(
+        { ...opts, accepted: new Map([["b", sha256Of(join(toolsDirOf(opts), "b.py"))]]) },
+        { maxFiles: DEFAULT_PREAMBLE_LIMITS.maxFiles, maxBytes: Buffer.byteLength(a) + 1 },
+      );
+      assert.deepEqual(bytes.unaccepted, [{ name: "a", reason: "added" }]);
+      assert.deepEqual(bytes.skipped, ["b"]);
+      assert.deepEqual(bytes.loaded, []);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a directory it cannot list is unlistable — nothing loaded, nothing known", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    const opts: ToolStoreOptions = { root };
+    try {
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      chmodSync(toolsDirOf(opts), 0o000);
+
+      // Not "no tools": the loader cannot see what is there, and a caller
+      // that recorded acceptance from this load would record an empty set
+      // over a real one. It says so, and loads nothing.
+      const load = await loadSavedTools(opts);
+      assert.match(load.unlistable ?? "", /EACCES|permission/i, JSON.stringify(load));
+      assert.equal(load.preamble, "");
+      assert.deepEqual(load.loaded, []);
+      assert.deepEqual(load.unaccepted, []);
+      assert.deepEqual(load.unreadable, []);
+
+      // With an accepted set: still unlistable, and nothing is called added,
+      // changed or removed — the comparison never ran.
+      const checked = await loadSavedTools({
+        ...opts,
+        accepted: new Map([["add", "a".repeat(64)]]),
+      });
+      assert.match(checked.unlistable ?? "", /EACCES|permission/i);
+      assert.deepEqual(checked.unaccepted, []);
+
+      // The safe half stays safe: names or nothing, never a throw.
+      assert.deepEqual(await savedToolNames(opts), []);
+    } finally {
+      try {
+        chmodSync(toolsDirOf(opts), 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+    }
+  });
+
+  it("a refused preamble reports nothing as unaccepted — nothing loads either way", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root, hostToolNames: ["read_file"] };
+      writeSavedTool(opts, "shadow", "def read_file(p):\n    return 'x'\n");
+      writeSavedTool(opts, "benign", "def benign():\n    return 1\n");
+      const load = await loadSavedTools({ ...opts, accepted: new Map() });
+      assert.equal(load.refused.length, 1);
+      assert.deepEqual(load.unaccepted, []);
+      assert.deepEqual(load.loaded, []);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── The accepted-set manifest (#198) ─────────────────────────────
+//
+// Kept OUTSIDE the project: `.pi/` is what the attacker writes, so a manifest
+// there would be a manifest the attacker rewrites. Keyed by the project's
+// real path; the store dir comes from the option, the env, or the user's
+// state dir, and is refused when it resolves inside the project.
+
+describe("preamble manifest store (#198)", () => {
+  function makeStoreDir(): string {
+    return mkdtempSync(join(tmpdir(), "repl-store-"));
+  }
+
+  it("resolves the store dir: option > env > XDG_STATE_HOME > ~/.local/state", () => {
+    const env = { REPL_PREAMBLE_STORE_DIR: "/env/store", XDG_STATE_HOME: "/xdg/state" };
+    assert.equal(toolstore.resolvePreambleStoreDir("/opt/store", env), "/opt/store");
+    assert.equal(toolstore.resolvePreambleStoreDir(undefined, env), "/env/store");
+    assert.equal(
+      toolstore.resolvePreambleStoreDir(undefined, { XDG_STATE_HOME: "/xdg/state" }),
+      join("/xdg/state", "repl-simple"),
+    );
+    const home = join(homedir(), ".local", "state", "repl-simple");
+    assert.equal(toolstore.resolvePreambleStoreDir(undefined, {}), home);
+    // The XDG spec: a relative or empty value is ignored.
+    assert.equal(
+      toolstore.resolvePreambleStoreDir(undefined, { XDG_STATE_HOME: "relative/state" }),
+      home,
+    );
+    assert.equal(
+      toolstore.resolvePreambleStoreDir("", { REPL_PREAMBLE_STORE_DIR: "", XDG_STATE_HOME: "" }),
+      home,
+    );
+  });
+
+  it("reads absent, writes, reads back, and updates in place", async () => {
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      const store = toolstore.createPreambleManifestStore(storeDir, root);
+      assert.deepEqual(await store.read(), { status: "absent" });
+      assert.equal(await store.update(() => {}), "absent", "nothing to update");
+
+      const files = new Map([["add", "a".repeat(64)]]);
+      const path = await store.write(files);
+      assert.equal(path, await store.manifestPath());
+      // Both sides canonical: the store hands out real paths, and a temp dir
+      // is a symlink away from its real path on macOS (/var → /private/var).
+      assert.ok(path.startsWith(join(realpathSync(storeDir), "preambles") + sep), path);
+      assert.match(path, /[0-9a-f]{64}\.json$/);
+      assert.deepEqual(await store.read(), { status: "ok", files });
+
+      // For humans: which project, and when.
+      const json = JSON.parse(readFileSync(path, "utf8"));
+      assert.equal(json.version, 1);
+      assert.equal(json.cwd, realpathSync(root));
+      assert.ok(Date.parse(json.acceptedAt) > 0, json.acceptedAt);
+
+      assert.equal(
+        await store.update((f) => {
+          f.set("mul", "b".repeat(64));
+          f.delete("add");
+        }),
+        "updated",
+      );
+      assert.deepEqual(await store.read(), {
+        status: "ok",
+        files: new Map([["mul", "b".repeat(64)]]),
+      });
+
+      // Written whole through a temp name and a rename; nothing left behind.
+      assert.deepEqual(readdirSync(join(storeDir, "preambles")), [basename(path)]);
+      if (process.platform !== "win32") {
+        assert.equal(statSync(path).mode & 0o777, 0o600);
+        assert.equal(statSync(join(storeDir, "preambles")).mode & 0o777, 0o700);
+      }
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a malformed manifest — fails closed, with a reason", async () => {
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      const store = toolstore.createPreambleManifestStore(storeDir, root);
+      const path = await store.manifestPath();
+      mkdirSync(dirname(path), { recursive: true });
+      const bad: [string, string][] = [
+        ["not json", "{"],
+        ["wrong version", JSON.stringify({ version: 2, files: {} })],
+        ["files not an object", JSON.stringify({ version: 1, files: [] })],
+        ["bad hash", JSON.stringify({ version: 1, files: { add: "nope" } })],
+        ["not an object", "null"],
+      ];
+      for (const [label, text] of bad) {
+        writeFileSync(path, text);
+        const read = await store.read();
+        assert.equal(read.status, "unavailable", label);
+        assert.match(JSON.stringify(read), /manifest/, label);
+        // An update must not overwrite what it could not read.
+        await assert.rejects(
+          store.update(() => {}),
+          /manifest/,
+          label,
+        );
+        assert.equal(readFileSync(path, "utf8"), text, `${label}: the update rewrote it`);
+      }
+
+      // A directory where the manifest should be.
+      rmSync(path);
+      mkdirSync(path);
+      assert.equal((await store.read()).status, "unavailable");
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a store inside the project — textually, via a symlink, via a dangling one", async () => {
+    const root = makeTempDir();
+    const outside = makeStoreDir();
+    try {
+      const inside = toolstore.createPreambleManifestStore(join(root, ".pi", "state"), root);
+      const read = await inside.read();
+      assert.equal(read.status, "unavailable");
+      assert.match(JSON.stringify(read), /inside the project/);
+      await assert.rejects(inside.write(new Map()), /inside the project/);
+      await assert.rejects(
+        inside.update(() => {}),
+        /inside the project/,
+      );
+      assert.equal(existsSync(join(root, ".pi")), false, "the refused store was created");
+
+      // The project root itself.
+      const self = toolstore.createPreambleManifestStore(root, root);
+      assert.equal((await self.read()).status, "unavailable");
+
+      // A store outside the project that is a symlink into it.
+      mkdirSync(join(root, "inner"));
+      symlinkSync(join(root, "inner"), join(outside, "link"));
+      const viaLink = toolstore.createPreambleManifestStore(join(outside, "link"), root);
+      assert.match(JSON.stringify(await viaLink.read()), /inside the project/);
+      await assert.rejects(viaLink.write(new Map()), /inside the project/);
+      assert.deepEqual(readdirSync(join(root, "inner")), [], "the symlinked store was written");
+
+      // A dangling symlink in the store path: mkdir -p would follow it into
+      // the project, so it is refused before anything is created.
+      symlinkSync(join(root, "later"), join(outside, "dangling"));
+      const viaDangling = toolstore.createPreambleManifestStore(
+        join(outside, "dangling", "deep"),
+        root,
+      );
+      assert.match(JSON.stringify(await viaDangling.read()), /dangling/);
+      await assert.rejects(viaDangling.write(new Map()), /dangling/);
+      assert.equal(existsSync(join(root, "later")), false, "mkdir followed the dangling link");
+
+      // A store that does not exist yet, outside: absent, and created on write.
+      const fresh = toolstore.createPreambleManifestStore(join(outside, "new", "deeper"), root);
+      assert.deepEqual(await fresh.read(), { status: "absent" });
+      await fresh.write(new Map());
+      assert.equal((await fresh.read()).status, "ok");
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("keys the manifest by the project's real path", async () => {
+    const root = makeTempDir();
+    const outside = makeStoreDir();
+    try {
+      symlinkSync(root, join(outside, "alias"));
+      const storeDir = join(outside, "store");
+      const direct = await toolstore.createPreambleManifestStore(storeDir, root).manifestPath();
+      const viaAlias = await toolstore
+        .createPreambleManifestStore(storeDir, join(outside, "alias"))
+        .manifestPath();
+      assert.equal(direct, viaAlias, "one project, two spellings, two manifests");
+
+      // A project directory that does not exist yet still gets a stable key.
+      const missing = join(root, "missing");
+      const first = await toolstore.createPreambleManifestStore(storeDir, missing).manifestPath();
+      assert.match(first, /[0-9a-f]{64}\.json$/);
+      assert.equal(
+        await toolstore.createPreambleManifestStore(storeDir, `${missing}/`).manifestPath(),
+        first,
+      );
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("a symlinked store dir is its target: canonical paths, one manifest", async () => {
+    // The Linux stand-in for macOS, where every temp dir is reached through
+    // /var → /private/var: the store is named by a link, and every path it
+    // hands out must be the canonical one — compared against a canonical
+    // expectation, never the link's spelling.
+    const root = makeTempDir();
+    const outside = makeStoreDir();
+    try {
+      const target = join(outside, "real");
+      mkdirSync(target);
+      const link = join(outside, "link");
+      symlinkSync(target, link);
+
+      const viaLink = toolstore.createPreambleManifestStore(link, root);
+      assert.equal(await viaLink.storeDir(), realpathSync(target));
+      const path = await viaLink.write(new Map([["add", "a".repeat(64)]]));
+      assert.ok(path.startsWith(join(realpathSync(target), "preambles") + sep), path);
+      assert.equal(path, await viaLink.manifestPath());
+      assert.equal(realpathSync(path), path, "the manifest path is not canonical");
+
+      // The target's spelling is the same store: one manifest, read back.
+      const direct = toolstore.createPreambleManifestStore(target, root);
+      assert.equal(await direct.storeDir(), await viaLink.storeDir());
+      assert.equal(await direct.manifestPath(), path);
+      assert.deepEqual(await direct.read(), {
+        status: "ok",
+        files: new Map([["add", "a".repeat(64)]]),
+      });
+      assert.deepEqual(readdirSync(join(target, "preambles")), [basename(path)]);
+      assert.deepEqual(readdirSync(link), ["preambles"]);
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves no temp file behind when the write fails", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    const dir = join(storeDir, "preambles");
+    try {
+      const store = toolstore.createPreambleManifestStore(storeDir, root);
+      const path = await store.write(new Map());
+      chmodSync(dir, 0o500);
+      await assert.rejects(store.write(new Map([["a", "a".repeat(64)]])), /EACCES|permission/i);
+      chmodSync(dir, 0o700);
+      assert.deepEqual(readdirSync(dir), [basename(path)]);
+      assert.deepEqual(
+        await store.read(),
+        { status: "ok", files: new Map() },
+        "the old manifest was damaged",
+      );
+    } finally {
+      try {
+        chmodSync(dir, 0o700);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("concurrent updates do not lose each other's entries", {
+    todo:
+      "update() is read-modify-write with no lock: two concurrent updates (two pi instances on " +
+      "one cwd, or two sessions saving at once) both read the same manifest and the later " +
+      "rename wins whole, dropping the other's entry. Intended approach: an O_EXCL lock file " +
+      "beside the manifest with a bounded wait, or a compare-and-swap on acceptedAt.",
+  }, async () => {
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      const store = toolstore.createPreambleManifestStore(storeDir, root);
+      await store.write(new Map());
+      await Promise.all([
+        store.update((f) => f.set("a", "a".repeat(64))),
+        store.update((f) => f.set("b", "b".repeat(64))),
+      ]);
+      const read = await store.read();
+      assert.equal(read.status, "ok");
+      if (read.status === "ok") assert.deepEqual([...read.files.keys()].sort(), ["a", "b"]);
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── The agent's own writes keep the manifest current (#198) ──────
+//
+// `save_tool` is the reason a per-file hash prompt was rejected (#52): the
+// hashes churn because the agent writes these files. So the agent's own
+// gated write records its hash, and its delete drops the entry — legitimate
+// churn never withholds. Only when a manifest exists: before the first
+// trusted load there is nothing to keep current.
+
+describe("save_tool and delete_tool keep the manifest (#198)", () => {
+  function makeStoreDir(): string {
+    return mkdtempSync(join(tmpdir(), "repl-store-"));
+  }
+
+  it("save_tool records the hash of the bytes it wrote; delete_tool forgets it", async () => {
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      const manifest = toolstore.createPreambleManifestStore(storeDir, root);
+      await manifest.write(new Map());
+      const tools = createToolStoreTools({ root, manifest });
+
+      const saved = await findTool(tools, "save_tool").execute({
+        name: "add",
+        code: "def add():\n    return 1",
+        description: "adds",
+      });
+      assert.match(saved, /saved/, saved);
+      assert.match(saved, /accepted/, `the reply must say the file is accepted: ${saved}`);
+      const after = await manifest.read();
+      assert.equal(after.status, "ok");
+      if (after.status === "ok") {
+        assert.equal(after.files.get("add"), sha256Of(join(root, ".pi", "code-tools", "add.py")));
+      }
+
+      const deleted = await findTool(tools, "delete_tool").execute({ name: "add" });
+      assert.match(deleted, /deleted/, deleted);
+      assert.match(deleted, /removed from the accepted set/, deleted);
+      assert.deepEqual(await manifest.read(), { status: "ok", files: new Map() });
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("without a manifest on disk, both are silent no-ops", async () => {
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      const manifest = toolstore.createPreambleManifestStore(storeDir, root);
+      const tools = createToolStoreTools({ root, manifest });
+
+      const saved = await findTool(tools, "save_tool").execute({
+        name: "add",
+        code: "def add():\n    return 1",
+        description: "adds",
+      });
+      assert.match(saved, /saved/);
+      assert.doesNotMatch(saved, /accepted/, `nothing to accept into: ${saved}`);
+      assert.deepEqual(await manifest.read(), { status: "absent" });
+
+      const deleted = await findTool(tools, "delete_tool").execute({ name: "add" });
+      assert.match(deleted, /deleted/);
+      assert.doesNotMatch(deleted, /accepted set/, deleted);
+      assert.deepEqual(await manifest.read(), { status: "absent" });
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an untrusted session leaves the manifest alone — save_tool and delete_tool alike", async () => {
+    // Acceptance authority is the trust decision plus explicit accepts. The
+    // write is approval-gated, so it may proceed; what it is not, while the
+    // project is untrusted, is an accept — otherwise a session that never
+    // held trust could put a file into the accepted set of one that does.
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      writeSavedTool({ root }, "add", "def add():\n    return 1\n");
+      const manifest = toolstore.createPreambleManifestStore(storeDir, root);
+      const accepted = new Map([["add", "a".repeat(64)]]);
+      const path = await manifest.write(accepted);
+      const before = readFileSync(path, "utf8");
+      const tools = createToolStoreTools({ root, manifest, isTrusted: () => false });
+
+      const saved = await findTool(tools, "save_tool").execute({
+        name: "planted",
+        code: "def planted():\n    return 1",
+        description: "saved untrusted",
+      });
+      assert.match(saved, /saved/, saved);
+      assert.match(saved, /once this project is trusted/, saved);
+      assert.doesNotMatch(
+        saved,
+        /recorded as accepted/,
+        `an untrusted save was an accept: ${saved}`,
+      );
+      assert.ok(
+        existsSync(join(root, ".pi", "code-tools", "planted.py")),
+        "the save itself failed",
+      );
+      assert.deepEqual(await manifest.read(), { status: "ok", files: accepted });
+      assert.equal(readFileSync(path, "utf8"), before, "the manifest was rewritten");
+
+      const deleted = await findTool(tools, "delete_tool").execute({ name: "add" });
+      assert.match(deleted, /deleted/, deleted);
+      assert.doesNotMatch(deleted, /accepted set/, deleted);
+      assert.deepEqual(await manifest.read(), { status: "ok", files: accepted });
+      assert.equal(readFileSync(path, "utf8"), before, "the manifest was rewritten");
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a manifest that cannot be updated is reported in the reply, never thrown", async () => {
+    const root = makeTempDir();
+    try {
+      // A store inside the project is refused on every operation.
+      const manifest = toolstore.createPreambleManifestStore(join(root, "state"), root);
+      const tools = createToolStoreTools({ root, manifest });
+
+      const saved = await findTool(tools, "save_tool").execute({
+        name: "add",
+        code: "def add():\n    return 1",
+        description: "adds",
+      });
+      assert.match(saved, /saved/, saved);
+      assert.match(saved, /could not be updated/, saved);
+      assert.match(saved, /withh/, "the reply must say what the failure costs");
+      assert.ok(existsSync(join(root, ".pi", "code-tools", "add.py")), "the save itself failed");
+
+      const deleted = await findTool(tools, "delete_tool").execute({ name: "add" });
+      assert.match(deleted, /deleted/, deleted);
+      assert.match(deleted, /could not be updated/, deleted);
+      assert.equal(existsSync(join(root, ".pi", "code-tools", "add.py")), false);
+      assert.equal(existsSync(join(root, "state")), false, "the refused store was created");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── The tools and the hash (#198) ───────────────────────────────
+
+describe("read_tool compares the hash it already has the bytes for (#198)", () => {
+  it("annotates a same-size, same-mtime rewrite", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      const path = join(toolsDirOf(opts), "same.py");
+      const stamp = new Date("2026-01-01T00:00:00Z");
+      writeSavedTool(opts, "same", "def same():\n    return 1\n");
+      utimesSync(path, stamp, stamp);
+      const identity = new Map([
+        [
+          "same",
+          { size: statSync(path).size, mtimeMs: statSync(path).mtimeMs, sha256: sha256Of(path) },
+        ],
+      ]);
+      const tools = createToolStoreTools({
+        root,
+        preambleStatus: status({ loaded: ["same"], identity }),
+      });
+
+      writeSavedTool(opts, "same", "def same():\n    return 2\n"); // same length
+      utimesSync(path, stamp, stamp);
+      assert.equal(
+        statSync(path).mtimeMs,
+        identity.get("same")?.mtimeMs,
+        "the test needs one mtime",
+      );
+
+      const read = await findTool(tools, "read_tool").execute({ name: "same" });
+      assert.match(read, /NOTE: the file changed after this session loaded it/, read);
+      assert.match(read, /return 2/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("list_saved_tools sees a same-size, same-mtime rewrite", {
+    todo:
+      "the list compares size + mtime (a cheap detector, documented as such) and misses a " +
+      "same-stat rewrite; read_tool hashes because it already has the bytes. Intended " +
+      "approach: hash on list only for entries whose size + mtime match, bounded by the " +
+      "preamble byte cap, so a list costs at most one preamble's worth of reads.",
+  }, async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      const path = join(toolsDirOf(opts), "same.py");
+      const stamp = new Date("2026-01-01T00:00:00Z");
+      writeSavedTool(opts, "same", "def same():\n    return 1\n");
+      utimesSync(path, stamp, stamp);
+      const st = statSync(path);
+      const identity = new Map([
+        ["same", { size: st.size, mtimeMs: st.mtimeMs, sha256: sha256Of(path) }],
+      ]);
+      const tools = createToolStoreTools({
+        root,
+        preambleStatus: status({ loaded: ["same"], identity }),
+      });
+      writeSavedTool(opts, "same", "def same():\n    return 2\n");
+      utimesSync(path, stamp, stamp);
+
+      const listed = await findTool(tools, "list_saved_tools").execute({});
+      assert.match(listed, /file changed since/, listed);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("tools annotate an unaccepted file (#198)", () => {
+  it("the list says not accepted — added / changed; read_tool reads it with a NOTE", async () => {
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      writeSavedTool(opts, "mul", "def mul():\n    return 2\n");
+      const view = status({
+        loaded: [],
+        unaccepted: new Map([
+          ["add", "added"],
+          ["mul", "changed"],
+        ]),
+      });
+      const tools = createToolStoreTools({ root, preambleStatus: view });
+
+      const listed = await findTool(tools, "list_saved_tools").execute({});
+      assert.equal(
+        listed,
+        [
+          "add [not loaded: not accepted — added since the saved tools were last accepted]",
+          "mul [not loaded: not accepted — changed since the saved tools were last accepted]",
+        ].join("\n"),
+      );
+
+      // Trust is the read gate; acceptance is the execution gate. The model
+      // must be able to read a file it is being asked to review.
+      const added = await findTool(tools, "read_tool").execute({ name: "add" });
+      assert.match(added, /^# NOTE: not loaded in this session — .*added/, added);
+      assert.match(added, /def add/);
+      const changed = await findTool(tools, "read_tool").execute({ name: "mul" });
+      assert.match(changed, /^# NOTE: not loaded in this session — .*changed/, changed);
+      assert.match(changed, /def mul/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("the live trust decision outranks the annotation", async () => {
+    // An ordering guard: a session whose files were all withheld pending
+    // acceptance has no preamble, so an untrust flip keeps it, and the tools
+    // must answer with the live decision before they look at the annotation.
+    // The untrusted half alone holds on main too (main answers "project not
+    // trusted" and ignores the map); the trusted half is what discriminates —
+    // the same view, one flip later, must show the annotation.
+    const root = makeTempDir();
+    try {
+      const opts: ToolStoreOptions = { root };
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      const view = status({ loaded: [], unaccepted: new Map([["add", "added"]]) });
+      let trusted = false;
+      const tools = createToolStoreTools({ root, preambleStatus: view, isTrusted: () => trusted });
+
+      assert.equal(
+        await findTool(tools, "list_saved_tools").execute({}),
+        "add [not loaded: project not trusted]",
+      );
+      await assert.rejects(
+        async () => findTool(tools, "read_tool").execute({ name: "add" }),
+        (err: unknown) => err instanceof HostToolError && err.pythonType === "PermissionError",
+      );
+
+      trusted = true;
+      assert.equal(
+        await findTool(tools, "list_saved_tools").execute({}),
+        "add [not loaded: not accepted — added since the saved tools were last accepted]",
+      );
+      const read = await findTool(tools, "read_tool").execute({ name: "add" });
+      assert.match(read, /^# NOTE: not loaded in this session — .*added/, read);
+      assert.match(read, /def add/);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("preamble manifest store — a store it cannot even resolve (#198)", () => {
+  it("reports the error as unavailable and refuses to write", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    const outside = mkdtempSync(join(tmpdir(), "repl-store-"));
+    const locked = join(outside, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try {
+      // realpath fails with EACCES, not ENOENT: the walk cannot tell what is
+      // behind the directory, and guessing "outside" would be the fail-open.
+      const store = toolstore.createPreambleManifestStore(join(locked, "store"), root);
+      const read = await store.read();
+      assert.equal(read.status, "unavailable");
+      assert.match(JSON.stringify(read), /cannot resolve the manifest store/);
+      await assert.rejects(store.write(new Map()), /cannot resolve the manifest store/);
+    } finally {
+      try {
+        chmodSync(locked, 0o700);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

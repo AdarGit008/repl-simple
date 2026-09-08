@@ -6,10 +6,21 @@ import {
   loadSavedTools,
   savedToolNames,
   createToolStoreTools,
+  createPreambleManifestStore,
+  resolvePreambleStoreDir,
+  PREAMBLE_STORE_DIR_VAR,
   TOOLSTORE_TOOL_NAMES,
   escapeNoticeName,
 } from "./toolstore.js";
-import type { RefusedTool, UnreadableTool, PreambleStatus } from "./toolstore.js";
+import type {
+  RefusedTool,
+  UnreadableTool,
+  UnacceptedTool,
+  PreambleFileIdentity,
+  PreambleManifestStore,
+  PreambleStatus,
+  SavedToolsPreamble,
+} from "./toolstore.js";
 import type { SandboxOptions } from "./sandbox.js";
 import type { ApprovalRequest, ApprovalDecision, RunResult, RunLimits } from "./types.js";
 
@@ -33,6 +44,31 @@ export interface ResetOutcome {
   /** Approval grants live at the moment of the reset. Empty for an unknown session. */
   revoked: GrantSummary[];
 }
+
+/**
+ * What `ReplRunner.acceptPreamble` did (#198).
+ *
+ * - `accepted`: the manifest now records the sha256 of every file that loads
+ *   — `accepted` names them, in load order. Live sessions keep the preamble
+ *   they were built with; a new `sessionId` loads the accepted set.
+ * - `untrusted`: nothing was read. The trust gate comes first: accepting
+ *   files the user never agreed to run would be the gate's own bypass.
+ * - `refused`: the preamble shadows a host tool (#54) and cannot be accepted
+ *   in part; the manifest is untouched.
+ * - `store-unavailable`: the manifest could not be written — the store is
+ *   inside the project, or unwritable — and nothing changed.
+ * - `unreadable`: `.pi/code-tools` exists but could not be listed (`EACCES`,
+ *   `EIO`), so nothing is known about what is there. Nothing was accepted
+ *   and the manifest is untouched: an empty set written here would erase the
+ *   acceptance record over a transient permission error, and report success
+ *   for a directory that was never seen.
+ */
+export type AcceptPreambleOutcome =
+  | { status: "accepted"; accepted: string[]; manifestPath: string }
+  | { status: "untrusted" }
+  | { status: "refused"; refused: RefusedTool[] }
+  | { status: "store-unavailable"; reason: string }
+  | { status: "unreadable"; reason: string };
 
 // ── Project trust ──────────────────────────────────────────────────
 
@@ -65,6 +101,22 @@ export interface ReplRunnerOptions {
    * option wins over both. Non-positive values fall back the same way (#59).
    */
   maxSessions?: number;
+
+  /**
+   * Where the accepted-set manifests live (#198).
+   *
+   * A trusted project's saved tools are hashed when they are first loaded,
+   * and the manifest is what every later session build compares against: a
+   * file added or rewritten since — pulled in by a compromised upstream,
+   * say — is withheld until the set is accepted again. The manifest must
+   * therefore live **outside** the project: `.pi/` is what the attacker
+   * writes. A store that resolves inside the project is refused, and the
+   * session fails closed.
+   *
+   * Defaults to `REPL_PREAMBLE_STORE_DIR`, then `$XDG_STATE_HOME/repl-simple`,
+   * then `~/.local/state/repl-simple`; an explicit option wins over all three.
+   */
+  preambleStoreDir?: string;
 }
 
 /** A live session, plus what the preamble decision for it was. */
@@ -150,11 +202,17 @@ export class ReplRunner {
   private cwd: string;
   private isProjectTrusted: () => boolean;
   private maxSessions: number;
+  /** This project's accepted-set manifest (#198). Never touched while the project is untrusted. */
+  private manifest: PreambleManifestStore;
 
   constructor(cwd: string, options: ReplRunnerOptions = {}) {
     this.cwd = cwd;
     this.isProjectTrusted = options.isProjectTrusted ?? (() => false);
     this.maxSessions = sessionCap(options.maxSessions);
+    this.manifest = createPreambleManifestStore(
+      resolvePreambleStoreDir(options.preambleStoreDir),
+      cwd,
+    );
   }
 
   // ── Public API ──────────────────────────────────────────────
@@ -296,6 +354,39 @@ export class ReplRunner {
    */
   liveSessionCount(): number {
     return this.sessions.size;
+  }
+
+  /**
+   * Accept the saved tools as they are on disk now (#198).
+   *
+   * Re-hashes every file that loads — with the same loader and the same
+   * host-tool names a session build uses, so what is accepted is exactly
+   * what would run — and writes the manifest. This is the explicit half of
+   * the accepted-set model: the first trusted load accepts implicitly, and
+   * everything that changes afterwards waits for this call. The pi command
+   * that exposes it lands separately; `save_tool` is the in-band path
+   * meanwhile, its approval dialog being the consent.
+   *
+   * Live sessions are not rebuilt: they keep the preamble they were built
+   * with, exactly as they keep a deleted tool, and the notice that named the
+   * withheld files says to run `repl` with a new `sessionId`.
+   */
+  async acceptPreamble(): Promise<AcceptPreambleOutcome> {
+    if (!this.isProjectTrusted()) return { status: "untrusted" };
+    const load = await loadSavedTools({
+      root: this.cwd,
+      hostToolNames: this.buildRegistry().hostToolNames,
+    });
+    // A directory that cannot be listed is not an empty one. Accepting
+    // "nothing" here would be accepting a set the loader never saw (#198).
+    if (load.unlistable !== undefined) return { status: "unreadable", reason: load.unlistable };
+    if (load.refused.length > 0) return { status: "refused", refused: load.refused };
+    try {
+      const manifestPath = await this.manifest.write(hashesOf(load.loadedIdentity));
+      return { status: "accepted", accepted: load.loaded, manifestPath };
+    } catch (err) {
+      return { status: "store-unavailable", reason: (err as Error).message };
+    }
   }
 
   // ── Private helpers ─────────────────────────────────────────
@@ -452,30 +543,109 @@ export class ReplRunner {
     return true;
   }
 
-  private async createSession(trusted: boolean): Promise<LiveSession> {
+  /**
+   * The registry a session starts with, and every host-tool name it will
+   * have.
+   *
+   * The shadowing gates (#54 load, #56 write) must see every host-tool name
+   * the session will have — including the toolstore's own, which are not in
+   * the registry yet: a preamble `def save_tool` would shadow the registered
+   * tool exactly like a bridge or builtin name (#57). `acceptPreamble` uses
+   * the same list, so what it accepts is what a session build would run.
+   */
+  private buildRegistry(): { registry: ToolRegistry; hostToolNames: string[] } {
     const bridgeTools = createPiBridgeTools(this.cwd, { gateMutating: true });
     const builtinTools = createBuiltinTools({ root: this.cwd });
     const registry = new ToolRegistry([...bridgeTools, ...builtinTools]);
+    const hostToolNames = [...registry.list().map((tool) => tool.name), ...TOOLSTORE_TOOL_NAMES];
+    return { registry, hostToolNames };
+  }
+
+  /**
+   * Load a trusted project's preamble against its accepted set (#198).
+   *
+   * Three manifest states, one load:
+   * - **absent** — the first load since trust. The trust dialog covered the
+   *   files present now, so everything loads and the manifest is written,
+   *   empty set included: a project trusted before it had any saved tools
+   *   must still catch the first one that appears. A write that fails is
+   *   not shrugged off — an acceptance that cannot be recorded would make
+   *   every later load "first-ever", and first-ever accepts — so the load
+   *   is redone with an empty accepted set, and everything is withheld.
+   * - **ok** — files the set does not cover are withheld and named; accepted
+   *   names that are in no bucket at all are reported as removed, notice
+   *   only.
+   * - **unavailable** — unreadable, malformed, inside the project: fail
+   *   closed, withhold everything that would have loaded, say why.
+   *
+   * Two things come before any of that. A refused preamble (#54) is the
+   * whole story: nothing loads, nothing is accepted, and the refusal notice
+   * says why. And a tools directory that cannot be listed loads nothing and
+   * **records nothing**: it is not an empty set — an implicit accept of a set
+   * the loader never saw would write `{}` over a real acceptance record on a
+   * transient EACCES, and a comparison against it would call every accepted
+   * file removed — so the manifest is left exactly as it was, and the model
+   * is told the directory could not be read.
+   *
+   * The unverified notice is delivered only when something was actually
+   * withheld: a project with nothing to load has nothing to be told.
+   */
+  private async loadVerifiedPreamble(
+    hostToolNames: readonly string[],
+  ): Promise<{ load: SavedToolsPreamble; notices: string[] }> {
+    const root = this.cwd;
+    const read = await this.manifest.read();
+
+    // What the loader compares against: the accepted set; nothing at all
+    // when the manifest cannot be trusted (everything is withheld); no
+    // comparison on a first-ever load (everything is accepted).
+    let accepted: ReadonlyMap<string, string> | undefined;
+    if (read.status === "ok") accepted = read.files;
+    else if (read.status === "unavailable") accepted = new Map();
+    const load = await loadSavedTools({ root, hostToolNames, accepted });
+
+    if (load.unlistable !== undefined) {
+      return { load, notices: [unlistableNotice(load.unlistable)] };
+    }
+    if (load.refused.length > 0) return { load, notices: [] };
+
+    if (read.status === "unavailable") {
+      return { load, notices: unverifiedNotices(read.reason, load.unaccepted) };
+    }
+
+    if (read.status === "absent") {
+      try {
+        await this.manifest.write(hashesOf(load.loadedIdentity));
+        return { load, notices: [] };
+      } catch (err) {
+        const withheld = await loadSavedTools({ root, hostToolNames, accepted: new Map() });
+        return {
+          load: withheld,
+          notices: unverifiedNotices((err as Error).message, withheld.unaccepted),
+        };
+      }
+    }
+
+    const removed = removedSince(read.files, load);
+    const changed = load.unaccepted.length > 0 || removed.length > 0;
+    return { load, notices: changed ? [changedNotice(load.unaccepted, removed)] : [] };
+  }
+
+  private async createSession(trusted: boolean): Promise<LiveSession> {
+    const { registry, hostToolNames } = this.buildRegistry();
     const sandboxOpts: SandboxOptions = { registry };
 
     const notices: string[] = [];
-
-    // The shadowing gates (#54 load, #56 write) must see every host-tool name
-    // the session will have — including the toolstore's own, which are not in
-    // the registry yet: a preamble `def save_tool` would shadow the registered
-    // tool exactly like a bridge or builtin name (#57).
-    const hostToolNames = [...registry.list().map((tool) => tool.name), ...TOOLSTORE_TOOL_NAMES];
 
     let preamble = "";
     let preambleStatus: PreambleStatus;
     if (trusted) {
       // The reserved names are the live registry's — never a hardcoded list.
       // A file that binds one of them refuses the whole preamble (#54), and
-      // the loader reports it with the offending file and symbols.
-      const load = await loadSavedTools({
-        root: this.cwd,
-        hostToolNames,
-      });
+      // the loader reports it with the offending file and symbols. The
+      // accepted-set check (#198) rides on the same load.
+      const verified = await this.loadVerifiedPreamble(hostToolNames);
+      const load = verified.load;
       preamble = load.preamble;
       // The tool names, for the honest tool answers: `refused`/`unreadable`
       // carry `.py` file names, the status sets carry the names the tools and
@@ -488,14 +658,18 @@ export class ReplRunner {
         refused: new Set(load.refused.map((r) => r.file.slice(0, -3))),
         unreadable: new Set(load.unreadable.map((u) => u.file.slice(0, -3))),
         identity: load.loadedIdentity,
+        unaccepted: new Map(load.unaccepted.map((u) => [u.name, u.reason])),
       };
+      // The accepted-set notices first: they are the security news.
+      notices.push(...verified.notices);
       if (load.refused.length > 0) notices.push(refusalNotice(load.refused));
       if (load.unreadable.length > 0) notices.push(unreadableNotice(load.unreadable));
       if (load.skipped.length > 0) notices.push(limitNotice(load.skipped));
     } else {
       // Names only. Reading the listing is not reading the files, and the
       // model needs the names or it will call a tool that is not defined and
-      // get a NameError it cannot explain.
+      // get a NameError it cannot explain. The manifest is not consulted
+      // either: an untrusted project never touches the store.
       const withheld = await savedToolNames({ root: this.cwd });
       preambleStatus = {
         trusted: false,
@@ -504,6 +678,7 @@ export class ReplRunner {
         skipped: new Set(),
         refused: new Set(),
         unreadable: new Set(),
+        unaccepted: new Map(),
       };
       if (withheld.length > 0) notices.push(untrustedNotice(withheld));
     }
@@ -512,12 +687,15 @@ export class ReplRunner {
     // answer from the status above — listing what actually loaded, refusing
     // reads the project never trusted — and the write-time shadowing check
     // (#56) finally sees the live registry's names. The live trust callback
-    // keeps the read gate honest across trust flips that keep the session.
+    // keeps the read gate honest across trust flips that keep the session,
+    // and the manifest lets the agent's own writes keep the accepted set
+    // current (#198).
     for (const tool of createToolStoreTools({
       root: this.cwd,
       hostToolNames,
       preambleStatus,
       isTrusted: this.isProjectTrusted,
+      manifest: this.manifest,
     })) {
       registry.add(tool);
     }
@@ -608,6 +786,98 @@ function unreadableNotice(unreadable: UnreadableTool[]): string {
     `NameError. Fix or remove the file(s) under .pi/code-tools, ` +
     "then run `repl` with a new `sessionId` to load the preamble."
   );
+}
+
+/**
+ * What the model is told when `.pi/code-tools` exists but could not be
+ * listed (#198): nothing loaded, and — the part that matters for the accepted
+ * set — nothing was recorded. The reason is an errno string, attacker-
+ * influenced through the path; it is escaped like every notice.
+ */
+function unlistableNotice(reason: string): string {
+  return (
+    `[preamble unreadable] .pi/code-tools could not be listed (${escapeNoticeName(reason)}), ` +
+    "so no saved tools were loaded — none is defined in this session, and calling one raises " +
+    "NameError. The accepted set was left as it was. Fix the directory's permissions, then run " +
+    "`repl` with a new `sessionId` to load the preamble."
+  );
+}
+
+/** The manifest's shape from a load: tool name → sha256 of the bytes that loaded (#198). */
+function hashesOf(identity: ReadonlyMap<string, PreambleFileIdentity>): Map<string, string> {
+  return new Map([...identity].map(([name, id]) => [name, id.sha256]));
+}
+
+/**
+ * Accepted names that this load found in no bucket at all (#198).
+ *
+ * A name that is merely unreadable, skipped by a cap, or withheld pending
+ * acceptance has its own notice; calling it "removed" as well would say the
+ * same thing twice, and the second time wrongly.
+ */
+function removedSince(accepted: ReadonlyMap<string, string>, load: SavedToolsPreamble): string[] {
+  const present = new Set([
+    ...load.loaded,
+    ...load.unaccepted.map((u) => u.name),
+    ...load.skipped,
+    ...load.unreadable.map((u) => u.file.slice(0, -3)),
+  ]);
+  return [...accepted.keys()].filter((name) => !present.has(name)).sort();
+}
+
+/**
+ * What the model is told when the saved tools differ from the accepted set
+ * (#198): added or changed files were withheld, removed ones are named.
+ *
+ * "Accept" has two in-band spellings the model can act on now — `save_tool`
+ * re-saves a file under an approval dialog, `delete_tool` removes one — and
+ * one for the host, `ReplRunner.acceptPreamble()`. Naming the reason per
+ * file (`added` / `changed`) is what lets the user tell a new helper from a
+ * rewritten one at a glance.
+ */
+function changedNotice(unaccepted: UnacceptedTool[], removed: string[]): string {
+  const parts: string[] = [];
+  if (unaccepted.length > 0) {
+    const names = unaccepted.map((u) => `${escapeNoticeName(u.name)} (${u.reason})`).join(", ");
+    parts.push(
+      `[preamble changed] ${unaccepted.length} saved tool(s) in .pi/code-tools were added or ` +
+        `changed since this project's saved tools were last accepted, and were NOT loaded: ` +
+        `${names}. They are not defined in this session — calling one raises NameError. ` +
+        `Review each with read_tool(); delete_tool() removes one; re-saving one with ` +
+        `save_tool() (which asks for approval) accepts it. The host accepts the whole current ` +
+        "set with ReplRunner.acceptPreamble(); then run `repl` with a new `sessionId` to load them.",
+    );
+  }
+  if (removed.length > 0) {
+    const names = removed.map(escapeNoticeName).join(", ");
+    parts.push(
+      `${parts.length === 0 ? "[preamble changed] " : ""}${removed.length} accepted saved ` +
+        `tool(s) are no longer in .pi/code-tools: ${names}. Nothing was withheld for that; ` +
+        "they are simply not defined in this session.",
+    );
+  }
+  return parts.join(" ");
+}
+
+/**
+ * What the model is told when the accepted set could not be consulted and
+ * everything that would have loaded was withheld instead (#198).
+ *
+ * Delivered only when something was withheld — an empty list is an empty
+ * array, and the caller pushes nothing. The reason is operator-facing (a
+ * path, an errno); it is escaped like every notice, since the store path is
+ * whatever the environment said it was.
+ */
+function unverifiedNotices(reason: string, withheld: UnacceptedTool[]): string[] {
+  if (withheld.length === 0) return [];
+  const names = withheld.map((u) => escapeNoticeName(u.name)).join(", ");
+  return [
+    `[preamble unverified] The accepted-set manifest for this project could not be used ` +
+      `(${escapeNoticeName(reason)}), so ${withheld.length} saved tool(s) that would have ` +
+      `loaded were withheld: ${names}. They are not defined in this session — calling one ` +
+      `raises NameError. The manifest store is ${PREAMBLE_STORE_DIR_VAR} or, unset, the user's ` +
+      "state dir (~/.local/state/repl-simple); fix it, then run `repl` with a new `sessionId`.",
+  ];
 }
 
 /**

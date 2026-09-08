@@ -1,6 +1,19 @@
-import { lstat, mkdir, open, readdir, rm, type FileHandle } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+  type FileHandle,
+} from "node:fs/promises";
 import { constants, type Stats } from "node:fs";
-import { join, resolve, extname } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve, extname, sep } from "node:path";
 import { requireString } from "./registry.js";
 import { createPathJail } from "./pathjail.js";
 import { HostToolError } from "./types.js";
@@ -49,7 +62,7 @@ export interface PreambleStatus {
   /** Names on disk whose files could not be loaded (#55). */
   unreadable: ReadonlySet<string>;
   /**
-   * The size and mtime of each loaded file as the loader saw them.
+   * The size, mtime and sha256 of each loaded file as the loader saw them.
    *
    * The snapshot records *names*; this records *which bytes* those names
    * stood for. A file overwritten after session creation is still "loaded"
@@ -59,12 +72,35 @@ export interface PreambleStatus {
    * that build the view by hand).
    */
   identity?: ReadonlyMap<string, PreambleFileIdentity>;
+  /**
+   * Names on disk that would have loaded but were withheld because they were
+   * added or changed since this project's saved tools were last accepted
+   * (#198). Absent, no acceptance check ran (a view built by hand, or a
+   * caller that never handed the loader an accepted set).
+   */
+  unaccepted?: ReadonlyMap<string, UnacceptedReason>;
 }
 
-/** Size and mtime of one loaded file — enough to notice a rewrite, no hashing. */
+/**
+ * Size, mtime and content hash of one loaded file.
+ *
+ * Size and mtime are the cheap rewrite detector the list uses; `sha256` is
+ * the proof — over the bytes read through the O_NOFOLLOW fd, so it describes
+ * what actually loaded — and is what the accepted-set manifest stores (#198).
+ */
 export interface PreambleFileIdentity {
   size: number;
   mtimeMs: number;
+  sha256: string;
+}
+
+/** Why a file was withheld from a trusted session: new since the accept, or rewritten since. */
+export type UnacceptedReason = "added" | "changed";
+
+/** One saved tool withheld pending acceptance (#198). */
+export interface UnacceptedTool {
+  name: string;
+  reason: UnacceptedReason;
 }
 
 export interface ToolStoreOptions {
@@ -104,9 +140,36 @@ export interface ToolStoreOptions {
    * and a standalone caller with neither gets today's ungated behavior.
    */
   isTrusted?: () => boolean;
+  /**
+   * Loader only: the accepted set, tool name → sha256 of the accepted bytes.
+   *
+   * Present, a file that would load but is absent from the map (`added`) or
+   * hashes differently (`changed`) is reported in `unaccepted` and **not**
+   * concatenated (#198). Absent, everything that fits loads — the caller
+   * owns the decision, as with `hostToolNames`. `ReplRunner` passes what the
+   * manifest store read; `undefined` on a first-ever load.
+   */
+  accepted?: ReadonlyMap<string, string>;
+  /**
+   * Tools only: the manifest `save_tool` and `delete_tool` keep current.
+   *
+   * The agent writes these files, so its own gated write records the hash of
+   * what it wrote and its delete drops the entry — legitimate churn never
+   * withholds (#198). Both touch the manifest only when one exists and only
+   * while `isTrusted()` says the project is trusted: acceptance authority is
+   * the trust decision plus explicit accepts, and a session that never held
+   * trust must not decide what a trusted one runs. A failed update is
+   * appended to the reply, never thrown.
+   */
+  manifest?: PreambleManifestStore;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/** sha256 of `bytes`, hex — the one hash the loader, `save_tool` and the manifest share. */
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
 
 /** Sanitize a tool name: alphanumeric + underscore, no path traversal. */
 function validateToolName(name: unknown): string {
@@ -537,14 +600,45 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         await target.close();
       }
 
+      // The agent's own write is accepted on the spot — in a trusted project.
+      // The approval dialog that gated this call is the consent the manifest
+      // records (#198), and the hash is over the exact bytes written, which
+      // is what the loader will read back. In an untrusted project the write
+      // still happens (it was approved) but it is not an accept: the file is
+      // withheld, with the notice, once the project is trusted, until the
+      // set is accepted. A manifest that cannot be updated costs a notice on
+      // the next session, never the save itself. One trust read for the
+      // update and the reply, so a flip between them cannot split the story.
+      const trusted = isTrustedNow();
+      let manifestNote = "";
+      if (options.manifest && trusted) {
+        const sha256 = sha256Hex(Buffer.from(content, "utf-8"));
+        try {
+          const outcome = await options.manifest.update((files) => {
+            files.set(name, sha256);
+          });
+          if (outcome === "updated") {
+            manifestNote =
+              " Its bytes are recorded as accepted, so new sessions load it without a notice.";
+          }
+        } catch (err) {
+          manifestNote =
+            ` The accepted-set manifest could not be updated (${(err as Error).message}); ` +
+            "new sessions will withhold it until the saved tools are accepted.";
+        }
+      }
+
       // Trust-aware: in an untrusted project a new session withholds the file
-      // until the project is trusted — claiming it "loads in new sessions"
-      // unconditionally would be the lie this issue exists to remove.
+      // until the project is trusted and the set is accepted — claiming it
+      // "loads in new sessions" unconditionally would be the lie this issue
+      // exists to remove.
       return (
         `Tool '${name}' saved.` +
-        (isTrustedNow()
+        (trusted
           ? " It loads in sessions created after this one — the current session's preamble is unchanged."
-          : " It will load in new sessions once this project is trusted.")
+          : " It will load in new sessions once this project is trusted and its saved tools are " +
+            "accepted — a save made while untrusted is not an accept.") +
+        manifestNote
       );
     },
   };
@@ -582,9 +676,28 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         throw new HostToolError("OSError", (err as Error).message);
       }
 
+      // Drop the accepted entry with the file, so the next session does not
+      // report the agent's own deletion as a removed tool (#198) — in a
+      // trusted project; an untrusted one leaves the manifest alone and the
+      // entry costs a removed notice once trusted. A stale entry costs a
+      // notice either way, so a failed update is reported, not thrown.
+      let manifestNote = "";
+      if (options.manifest && isTrustedNow()) {
+        try {
+          const outcome = await options.manifest.update((files) => {
+            files.delete(name);
+          });
+          if (outcome === "updated") manifestNote = " It was removed from the accepted set.";
+        } catch (err) {
+          manifestNote =
+            ` The accepted-set manifest could not be updated (${(err as Error).message}); ` +
+            "new sessions will report it as removed until the saved tools are accepted.";
+        }
+      }
+
       return (
         `Tool '${name}' deleted. It is gone from sessions created after this one; ` +
-        `the current session keeps any copy it loaded.`
+        `the current session keeps any copy it loaded.${manifestNote}`
       );
     },
   };
@@ -661,6 +774,11 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     // The live decision, not the snapshot: a tool that appears after an inert
     // untrust flip is "not trusted", not "saved after this session started".
     if (!isTrustedNow() || view.withheld.has(name)) return "project not trusted";
+    // After the trust check: a session whose files were all withheld pending
+    // acceptance has no preamble, so an untrust flip keeps it, and the list
+    // must still answer with the live decision (#198).
+    const unaccepted = view.unaccepted?.get(name);
+    if (unaccepted) return `not accepted — ${unaccepted} since the saved tools were last accepted`;
     // Trusted and in no category: either a benign sibling of a refused
     // preamble (the loader refuses the whole batch, #54) or a tool saved
     // after this session started. The loader's invariant — `loaded` is
@@ -731,6 +849,15 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
     if (view.skipped.has(name)) {
       return "# NOTE: not loaded in this session — the preamble limit was reached";
     }
+    // Readable on purpose: trust is the read gate, acceptance is the
+    // execution gate, and the model is being asked to review this code.
+    const unaccepted = view.unaccepted?.get(name);
+    if (unaccepted) {
+      return (
+        `# NOTE: not loaded in this session — the file was ${unaccepted} since this project's ` +
+        "saved tools were last accepted; review it, then accept the set to load it in new sessions"
+      );
+    }
     if (view.loaded.size === 0 && view.refused.size > 0) {
       return "# NOTE: not loaded in this session — the preamble was refused and nothing was loaded";
     }
@@ -796,13 +923,16 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         if (!st.isFile()) {
           throw new HostToolError("OSError", `tool '${name}' cannot be read: not a regular file`);
         }
-        const content = await handle.readFile("utf-8");
+        const raw = await handle.readFile();
+        const content = raw.toString("utf-8");
         if (!view || view.loaded.has(name)) {
           // The name is loaded — but the bytes may not be what loaded. The
           // session runs the old copy; presenting the new one unannotated
-          // would have the model reason about code that never ran.
+          // would have the model reason about code that never ran. The bytes
+          // are in hand, so this compares the hash, not the stat: a
+          // same-size rewrite with a restored mtime is still a rewrite (#198).
           const identity = view?.identity?.get(name);
-          if (identity && (st.size !== identity.size || st.mtimeMs !== identity.mtimeMs)) {
+          if (identity && identity.sha256 !== sha256Hex(raw)) {
             return (
               "# NOTE: the file changed after this session loaded it — " +
               "this session runs the earlier copy.\n\n" +
@@ -898,6 +1028,28 @@ export interface SavedToolsPreamble {
    * entry, not the batch (#55).
    */
   unreadable: UnreadableTool[];
+  /**
+   * Files that would have loaded but were withheld because the caller's
+   * `accepted` set does not cover their bytes (#198), in load order.
+   *
+   * Non-empty means the caller **must tell the model** which files were
+   * added or changed and how to accept them. Always `[]` when the loader ran
+   * without an accepted set, and when the preamble was refused (nothing
+   * loads either way, and the refusal is the story).
+   */
+  unaccepted: UnacceptedTool[];
+  /**
+   * Set when the tools directory exists but could not be listed (`EACCES`,
+   * `EIO`): the readdir error's message. Absent otherwise — never `undefined`
+   * as a key, so a load compares equal to a plain empty one.
+   *
+   * Nothing loaded and **nothing is known** about what is there. This is not
+   * an empty set: a caller that records acceptance must not write one from
+   * it, and one that compares against the accepted set has nothing to call
+   * removed (#198). Every other field is empty. Raw errno text — escape
+   * before rendering into model-facing text.
+   */
+  unlistable?: string;
 }
 
 /**
@@ -945,7 +1097,9 @@ export interface UnreadableTool {
  * model what was withheld, and reading a directory listing is not reading —
  * still less executing — the hostile file the listing names.
  *
- * Returns `[]` when the directory does not exist.
+ * Returns `[]` when the directory does not exist — and when it cannot be
+ * listed: names or nothing, never a throw. The loader is the caller that
+ * must not mistake "cannot see" for "empty"; it uses {@link listToolNames}.
  */
 export async function savedToolNames(options: ToolStoreOptions): Promise<string[]> {
   const root = resolve(options.root);
@@ -962,17 +1116,47 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
     throw err;
   }
 
+  try {
+    return await listToolNames(dir);
+  } catch {
+    return []; // Cannot be listed — nothing to name, and no error to raise here
+  }
+}
+
+/**
+ * The tool names in `dir`, sorted: the `.py` entries, extension dropped.
+ *
+ * A directory that is not there lists nothing. One that is there but cannot
+ * be listed — `EACCES`, `EIO` — throws the readdir error: "cannot see" is
+ * not "empty", and the one caller that records acceptance from a listing
+ * must be able to tell them apart (#198).
+ */
+async function listToolNames(dir: string): Promise<string[]> {
   let entries: string[];
   try {
     entries = await readdir(dir);
-  } catch {
-    return []; // Directory doesn't exist — no tools to name
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return [];
+    throw err;
   }
-
   return entries
     .filter((e) => extname(e) === ".py")
     .map((e) => e.slice(0, -3))
     .sort();
+}
+
+/** The loader's answer when nothing loaded and nothing is wrong with the directory. */
+function nothingLoaded(): SavedToolsPreamble {
+  return {
+    preamble: "",
+    loaded: [],
+    loadedIdentity: new Map(),
+    skipped: [],
+    unreadable: [],
+    refused: [],
+    unaccepted: [],
+  };
 }
 
 // ── loadSavedTools ────────────────────────────────────────────────
@@ -1025,41 +1209,41 @@ export async function loadSavedTools(
     dir = await containedToolsDir(toolsDir, root);
   } catch (err) {
     if (err instanceof HostToolError && err.pythonType === "PermissionError") {
-      return {
-        preamble: "",
-        loaded: [],
-        loadedIdentity: new Map(),
-        skipped: [],
-        unreadable: [],
-        refused: [],
-      };
+      return nothingLoaded();
     }
     throw err;
   }
 
-  const names = await savedToolNames({ root, toolsDir: dir });
-  if (names.length === 0)
-    return {
-      preamble: "",
-      loaded: [],
-      loadedIdentity: new Map(),
-      skipped: [],
-      unreadable: [],
-      refused: [],
-    };
+  // A directory that is there and cannot be listed is not an empty one:
+  // nothing is known about what it holds, and a caller that recorded
+  // acceptance from this load would record an empty set over a real one
+  // (#198). Say so, and load nothing — the accepted-set comparison never
+  // runs, so nothing is called added, changed or removed either.
+  let names: string[];
+  try {
+    names = await listToolNames(dir);
+  } catch (err) {
+    return { ...nothingLoaded(), unlistable: (err as Error).message };
+  }
+  if (names.length === 0) return nothingLoaded();
 
   const reservedNames = new Set(options.hostToolNames ?? []);
+  const accepted = options.accepted;
 
   const loaded: string[] = [];
   const loadedIdentity = new Map<string, PreambleFileIdentity>();
   const skipped: string[] = [];
   const refused: RefusedTool[] = [];
   const unreadable: UnreadableTool[] = [];
+  const unaccepted: UnacceptedTool[] = [];
   const sources: string[] = [];
   let bytes = 0;
 
   for (const name of names) {
-    if (loaded.length >= limits.maxFiles) {
+    // A withheld file counts toward both caps: "would load" is the stable
+    // set, so accepting a file never unloads a sibling that fit only because
+    // the file was withheld (#198).
+    if (loaded.length + unaccepted.length >= limits.maxFiles) {
       skipped.push(name);
       continue;
     }
@@ -1099,6 +1283,7 @@ export async function loadSavedTools(
     // outside the root or hanging.
     let content: string;
     let opened: Stats;
+    let sha256: string;
     try {
       const handle = await open(
         path,
@@ -1107,10 +1292,12 @@ export async function loadSavedTools(
       try {
         const st = await handle.stat();
         if (!st.isFile()) throw new Error("not a regular file");
-        content = await handle.readFile("utf-8");
+        const raw = await handle.readFile();
+        content = raw.toString("utf-8");
         // The identity must describe the bytes read through THIS fd — the
         // pre-open lstat above describes a path that may have been swapped
-        // since (#57 pass 2).
+        // since (#57 pass 2). The hash is over the same buffer (#198).
+        sha256 = sha256Hex(raw);
         opened = st;
       } finally {
         await handle.close();
@@ -1138,8 +1325,20 @@ export async function loadSavedTools(
     }
 
     bytes += size;
+
+    // The acceptance check comes last, after the caps have counted the file:
+    // a file the accepted set does not cover — new, or rewritten since — is
+    // withheld from the preamble but keeps its place in the budget (#198).
+    if (accepted !== undefined) {
+      const known = accepted.get(name);
+      if (known !== sha256) {
+        unaccepted.push({ name, reason: known === undefined ? "added" : "changed" });
+        continue;
+      }
+    }
+
     loaded.push(name);
-    loadedIdentity.set(name, { size: opened.size, mtimeMs: opened.mtimeMs });
+    loadedIdentity.set(name, { size: opened.size, mtimeMs: opened.mtimeMs, sha256 });
     sources.push(content);
   }
 
@@ -1149,7 +1348,8 @@ export async function loadSavedTools(
   // nothing silently. The caller must turn `refused` into a notice. The
   // unreadable entries from the same pass ride along: "nothing loaded" is the
   // whole truth either way. `skipped` stays `[]` by the #54 decision — the
-  // limits are never evaluated when a preamble is refused.
+  // limits are never evaluated when a preamble is refused — and so does
+  // `unaccepted`: nothing is accepted into a refused preamble.
   if (refused.length > 0)
     return {
       preamble: "",
@@ -1158,16 +1358,30 @@ export async function loadSavedTools(
       skipped: [],
       unreadable,
       refused,
+      unaccepted: [],
     };
 
   if (loaded.length === 0)
-    return { preamble: "", loaded: [], loadedIdentity: new Map(), skipped, unreadable, refused };
+    return {
+      preamble: "",
+      loaded: [],
+      loadedIdentity: new Map(),
+      skipped,
+      unreadable,
+      refused,
+      unaccepted,
+    };
 
   const header = [
     "# ── Loaded tools ──",
     `# ${loaded.length} tool(s) from ${dir}`,
     ...(skipped.length > 0
       ? [`# ${skipped.length} not loaded — preamble limit reached: ${skipped.join(", ")}`]
+      : []),
+    ...(unaccepted.length > 0
+      ? [
+          `# ${unaccepted.length} not loaded — not accepted: ${unaccepted.map((u) => u.name).join(", ")}`,
+        ]
       : []),
     "",
   ];
@@ -1179,5 +1393,310 @@ export async function loadSavedTools(
     skipped,
     unreadable,
     refused,
+    unaccepted,
+  };
+}
+
+// ── The accepted-set manifest (#198) ─────────────────────────────
+//
+// Project trust is one decision, made when the project is opened, and it
+// covered the saved tools present at that moment. Nothing re-checked that
+// set: a `.pi/code-tools/*.py` added or rewritten afterwards — a `git pull`
+// of a compromised upstream — loaded on the next session build with no
+// prompt and no notice. This is the memory of what the decision covered: the
+// sha256 of every file that loaded, keyed by the project, kept **outside**
+// the project. `.pi/` is what the attacker writes; a manifest there would be
+// a manifest the attacker rewrites.
+//
+// The runner passes the accepted set to the loader and withholds what
+// differs (decisions.md #5, variant c). The store is deliberately dumb —
+// read, write, update — so every decision about *what* to accept lives in
+// one place, `ReplRunner`.
+
+/** The env var naming the manifest store directory. */
+export const PREAMBLE_STORE_DIR_VAR = "REPL_PREAMBLE_STORE_DIR";
+
+/**
+ * Where the accepted-set manifests live.
+ *
+ * Explicit option > `REPL_PREAMBLE_STORE_DIR` > `$XDG_STATE_HOME/repl-simple`
+ * > `~/.local/state/repl-simple` — the same "option > env > default" rule as
+ * `maxSessions`. Per the XDG spec a relative or empty `XDG_STATE_HOME` is
+ * ignored; an empty option or env value is treated as unset.
+ */
+export function resolvePreambleStoreDir(
+  explicit?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (explicit) return explicit;
+  const fromEnv = env[PREAMBLE_STORE_DIR_VAR];
+  if (fromEnv) return fromEnv;
+  const xdg = env.XDG_STATE_HOME;
+  const base = xdg && isAbsolute(xdg) ? xdg : join(homedir(), ".local", "state");
+  return join(base, "repl-simple");
+}
+
+/** What a manifest read found. `unavailable` is the fail-closed signal: withhold, and say why. */
+export type PreambleManifestRead =
+  | { status: "absent" }
+  | { status: "ok"; files: Map<string, string> }
+  | { status: "unavailable"; reason: string };
+
+/**
+ * One project's accepted set, on disk.
+ *
+ * Every operation locates the manifest first and refuses a store that
+ * resolves inside the project — textually, or through a symlink once the
+ * path exists — before touching the filesystem. `read` reports that as
+ * `unavailable`; `write` and `update` throw, and the message says so.
+ */
+export interface PreambleManifestStore {
+  /**
+   * The store directory, canonical — symlinks followed through whatever part
+   * of it exists — and the one every path this store hands out is under. A
+   * temp dir on macOS is `/var/…` by name and `/private/var/…` in fact;
+   * compare against this, never against the spelling the store was given.
+   * Throws when the store is unavailable.
+   */
+  storeDir(): Promise<string>;
+  /** Where this project's manifest lives, or would. Throws when the store is unavailable. */
+  manifestPath(): Promise<string>;
+  /** The accepted set, `absent` before the first accept, `unavailable` when it cannot be trusted. */
+  read(): Promise<PreambleManifestRead>;
+  /** Replace the accepted set. Returns the manifest path. Throws when the store cannot be written. */
+  write(files: ReadonlyMap<string, string>): Promise<string>;
+  /**
+   * Read-modify-write. `absent` when there is no manifest to update — the
+   * first trusted load will accept what it finds, and there is nothing to
+   * keep current before that. Throws when the manifest cannot be read or
+   * written; a malformed manifest is never overwritten by an update.
+   */
+  update(mutate: (files: Map<string, string>) => void): Promise<"updated" | "absent">;
+}
+
+/** Bumped when the on-disk shape changes; an unknown version is `unavailable`, not guessed at. */
+const MANIFEST_VERSION = 1;
+
+/** Inside, or the container itself — never merely sharing its prefix. */
+function contains(candidate: string, container: string): boolean {
+  return candidate === container || candidate.startsWith(container + sep);
+}
+
+/** Whether `path` is a symlink whose target is missing — the one thing `mkdir -p` would follow blindly. */
+async function isDanglingLink(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/** The `files` object of a manifest, validated, or `undefined` for anything that is not one. */
+function parseManifest(text: string): Map<string, string> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const { version, files } = parsed as { version?: unknown; files?: unknown };
+  if (version !== MANIFEST_VERSION) return undefined;
+  if (typeof files !== "object" || files === null || Array.isArray(files)) return undefined;
+  const out = new Map<string, string>();
+  for (const [name, hash] of Object.entries(files)) {
+    if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return undefined;
+    out.set(name, hash);
+  }
+  return out;
+}
+
+/**
+ * The manifest store for one project.
+ *
+ * `storeDir` is the directory (see {@link resolvePreambleStoreDir}); the
+ * manifest is `<storeDir>/preambles/<sha256 of the project's real path>.json`,
+ * directory `0700`, file `0600`, written to a temp name and renamed so a
+ * reader never sees half a manifest. The key is the project's *real* path so
+ * one project reached through two spellings has one manifest — a different
+ * key would be a first-ever load, and a first-ever load accepts.
+ */
+export function createPreambleManifestStore(storeDir: string, cwd: string): PreambleManifestStore {
+  const root = resolve(cwd);
+  const store = resolve(storeDir);
+
+  /**
+   * The canonical form of an existing path — symlinks followed.
+   *
+   * Through the jail, which is the one place in `src/` that follows links
+   * (the rule `test/bridge.test.ts` pins): a jail rooted at `path` hands back
+   * `path` itself canonicalised. Throws when the path cannot be resolved.
+   */
+  function canonical(path: string): Promise<string> {
+    return createPathJail(path, { allowAbsolute: true }).resolve(".");
+  }
+
+  /** The project's canonical path. A project that does not exist keeps its resolved spelling. */
+  async function canonicalRoot(): Promise<string> {
+    try {
+      return await canonical(root);
+    } catch {
+      return root;
+    }
+  }
+
+  /**
+   * The store's canonical path, through whatever part of it exists.
+   *
+   * Asked of the jail directly, the question comes out wrong: its cheap
+   * textual check refuses a path outside the root *before* it follows links,
+   * and a link from outside the project into it is exactly the case here.
+   * So: walk up to the nearest ancestor that exists (`stat`, which follows
+   * links), canonicalise that through the jail, and append the rest. A
+   * dangling symlink on the way is refused outright — `mkdir -p` would
+   * follow it, and where it points is not known until it does. The
+   * filesystem root always exists, so the walk terminates.
+   */
+  async function canonicalStore(): Promise<string> {
+    let current = store;
+    let remainder = "";
+    for (;;) {
+      let exists = false;
+      try {
+        await stat(current);
+        exists = true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") {
+          throw new Error(
+            `cannot resolve the manifest store '${store}': ${(err as Error).message}`,
+          );
+        }
+      }
+      if (exists) {
+        const real = await canonical(current);
+        return remainder === "" ? real : join(real, remainder);
+      }
+      if (await isDanglingLink(current)) {
+        throw new Error(
+          `the manifest store '${store}' passes through a dangling symlink '${current}'`,
+        );
+      }
+      remainder = remainder === "" ? basename(current) : join(basename(current), remainder);
+      current = dirname(current);
+    }
+  }
+
+  /**
+   * Both spellings of both paths, as the jail does; then the key.
+   *
+   * Resolved afresh on every operation, not once: a store directory swapped
+   * for a symlink into the project between two sessions of one process must
+   * be refused by the next write, and a cached answer would let `mkdir -p`
+   * follow it. Everything returned is canonical — the store, the manifest
+   * directory and the manifest path — so no caller ever compares a real
+   * path with a spelled one.
+   */
+  async function locate(): Promise<{
+    path: string;
+    dir: string;
+    project: string;
+    store: string;
+  }> {
+    const project = await canonicalRoot();
+    const real = await canonicalStore();
+    if (contains(store, root) || contains(real, project)) {
+      throw new Error(
+        `the manifest store '${store}' is inside the project '${root}' — it must live outside ` +
+          `the repository (set ${PREAMBLE_STORE_DIR_VAR})`,
+      );
+    }
+    const key = createHash("sha256").update(project).digest("hex");
+    const dir = join(real, "preambles");
+    return { path: join(dir, `${key}.json`), dir, project, store: real };
+  }
+
+  async function readAt(path: string): Promise<PreambleManifestRead> {
+    let text: string;
+    try {
+      text = await readFile(path, "utf-8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Nothing there yet — the first trusted load will write it. ENOTDIR is
+      // the store path running through a file; the write will fail loudly.
+      if (code === "ENOENT" || code === "ENOTDIR") return { status: "absent" };
+      return {
+        status: "unavailable",
+        reason: `cannot read the manifest '${path}': ${(err as Error).message}`,
+      };
+    }
+    const files = parseManifest(text);
+    if (files === undefined) {
+      return { status: "unavailable", reason: `the manifest '${path}' is malformed` };
+    }
+    return { status: "ok", files };
+  }
+
+  async function writeAt(
+    path: string,
+    dir: string,
+    project: string,
+    files: ReadonlyMap<string, string>,
+  ): Promise<void> {
+    const body = `${JSON.stringify(
+      {
+        version: MANIFEST_VERSION,
+        cwd: project,
+        acceptedAt: new Date().toISOString(),
+        files: Object.fromEntries([...files].sort(([a], [b]) => a.localeCompare(b))),
+      },
+      null,
+      2,
+    )}\n`;
+    const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await writeFile(tmp, body, { mode: 0o600 });
+      await rename(tmp, path);
+    } catch (err) {
+      await rm(tmp, { force: true });
+      throw new Error(`cannot write the manifest '${path}': ${(err as Error).message}`);
+    }
+  }
+
+  return {
+    async storeDir() {
+      return (await locate()).store;
+    },
+
+    async manifestPath() {
+      return (await locate()).path;
+    },
+
+    async read() {
+      let path: string;
+      try {
+        ({ path } = await locate());
+      } catch (err) {
+        return { status: "unavailable", reason: (err as Error).message };
+      }
+      return readAt(path);
+    },
+
+    async write(files) {
+      const { path, dir, project } = await locate();
+      await writeAt(path, dir, project, files);
+      return path;
+    },
+
+    async update(mutate) {
+      const { path, dir, project } = await locate();
+      const current = await readAt(path);
+      if (current.status === "absent") return "absent";
+      if (current.status === "unavailable") throw new Error(current.reason);
+      mutate(current.files);
+      await writeAt(path, dir, project, current.files);
+      return "updated";
+    },
   };
 }
