@@ -195,7 +195,7 @@ RED commit (each fails against `main`'s `src/`, except the disclosed pins):
 | `suspended.stdoutBytes ≠ byteLength(stdout)` with `stdoutTruncated: false` rejected; equal loads; unequal with `true` loads | `test/session.test.ts` | main accepts the mismatch |
 | 1023 + 1 with a suspension refused at load naming both; 1022 + 1 loads and resumes to 1024 | `test/session.test.ts` | main loads 1023 + 1 |
 | approved restored gated call is in `calls` (P1); mixed restored `[gate, echo]` keeps the gate and drops the echo; served/executed pair with one key keeps the executed one; kept entries are the sandbox's objects, fields intact | `test/session.test.ts` | main filters by key |
-| `xxxghp_…` masks; `xxxsk-…` and `task-force-2024-report` are data | `test/redact.test.ts` | main: glued is data |
+| `xxxghp_…` masks (RED); `xxxsk-…` and `task-force-2024-report` are data (a recorded-cost pin, green on main once its fixtures avoid the `TOKEN=` composition — disclosed) | `test/redact.test.ts` | main: glued is data |
 | Digest `response` after a 5 000-char `uri` masks; `username="nonce=zzz"` untouched; `uri="/x?response=1"` survives with `masked 1`; quoted value with spaces | `test/redact.test.ts` | window / inner match |
 | `the Bearer implementations.` unchanged; `bearer 0123456789abcdef.` keeps its period | `test/redact.test.ts` | `.` counted |
 | bounded work: 1 MiB `;`-joined Digest headers, one Digest with a 1 MiB `uri`, one with 60 000 parameters | `test/redact.test.ts` | pins linearity (control, green on main) |

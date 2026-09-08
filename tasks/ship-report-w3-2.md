@@ -106,6 +106,15 @@ guard's exit-code reading or the memory of `maxFiles`; none is the stale claim.
   disclosed in the RED commit: the `/\barg\b/` pin, the second-sentence assertion (RED by blanking
   the literal: `docs/mutation-testing.md` records it), the quoted-Digest guard, the
   resolution-failure classification pin, the 1022 + 1 resume half, the four bounded-work shapes.
+- **RED re-run the verifier's way, at the final test files** (`git checkout acadb19 -- src
+  extensions` over `d9d7a2f`, the four files in one `tsx --test`): **463 tests, 448 pass, 12 fail,
+  3 todo** — the six Session tests (D154a–d), the four redaction rules (glued prefixes, the Digest
+  window, the Digest name anchor, the Bearer period), the class rule, the `RunTrace` barrel pin.
+  Two more tests joined the controls between RED and GREEN because their fixtures were corrected:
+  the `sk-` boundary pin (`test/redact.test.ts:143`, a recorded cost that main already honours
+  once the `TOKEN=` composition is kept out of it) and the resolution-failure classification pin
+  (its first fixture was a static type error). The two docs pins are green in this run because
+  `docs/` is not swapped — they are RED by commit order only.
 - **GREEN at `44eddb4`:** the four files 126/124/0/2 · 146/146/0/0 · 50/50/0/0 · 141/140/0/1;
   `test/readme.test.ts` 6/6 after the module map.
 - **Gates at `44eddb4`:** `npm run check` exit 0 · `npm run lint` exit 0 (Biome 61 files clean;
@@ -180,6 +189,13 @@ passing test.
   findings, not measured; the runbook says so and asks for `--dryRunOnly` first.
 - **`gh issue view --comments` / `gh issue edit` fail on this repo** (Projects-classic GraphQL
   deprecation); issues were read and #175's label and comment actions taken over the REST API.
+- **Integration note for the merge of W3-1 (`seq` / `stdoutOffset` on `ToolCallTrace`).** The
+  positional filter passes the sandbox's objects through, so the fields survive `Session.run`
+  unchanged. But `traces()` — the closed dump validator in `src/session.ts` — builds a
+  `ToolCallTrace` from the five persisted keys: if W3-1 makes either field *required* on the type,
+  `npm run check` fails on `main` after both merge until the validator accepts them (their PR body
+  hides the two from JSON with a `toJSON` and files that acceptance as a todo "for the owner of
+  `src/session.ts`"). One line each side once the merged shape is known; not guessed at here.
 
 ## Closing-comment drafts (for the orchestrator, after merge)
 
