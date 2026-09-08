@@ -10,6 +10,7 @@ import {
   clampModelLimits,
 } from "../extensions/repl-extension.js";
 import { ReplRunner } from "../src/repl.js";
+import { withPatchedPrototype } from "./support/prototype-patch.js";
 
 /**
  * Tests for `extensions/repl-extension.ts` — the only file a consumer of this
@@ -343,11 +344,13 @@ describe("repl extension — the repl tool passes clamped limits (never 'unbound
    * the sandbox path stubbed out. This pins what reaches the runner — the seam
    * where an "unbounded" or an un-clamped value would show up — without
    * driving a real sandbox execution.
+   *
+   * Patches `ReplRunner.prototype.run` for the duration of the call — see the
+   * sequential assumption on `withPatchedPrototype` (#178).
    */
   async function runWithLimits(params: Record<string, unknown>): Promise<unknown[]> {
     const seen: unknown[] = [];
-    const originalRun = ReplRunner.prototype.run;
-    ReplRunner.prototype.run = (async (
+    const fakeRun = (async (
       _code: string,
       _sessionId: string | undefined,
       _onApproval: unknown,
@@ -358,7 +361,7 @@ describe("repl extension — the repl tool passes clamped limits (never 'unbound
       return "[result]\n1";
     }) as unknown as typeof ReplRunner.prototype.run;
 
-    try {
+    await withPatchedPrototype(ReplRunner.prototype, "run", fakeRun, async () => {
       const repl = (await loadTools()).find((t) => t.name === "repl");
       assert.ok(repl, "repl did not register");
       await repl.execute("clamp-1", params, undefined, undefined, {
@@ -367,9 +370,7 @@ describe("repl extension — the repl tool passes clamped limits (never 'unbound
         hasUI: true,
         ui: { select: async () => APPROVE_CHOICE },
       });
-    } finally {
-      ReplRunner.prototype.run = originalRun;
-    }
+    });
     return seen;
   }
 
@@ -1237,8 +1238,9 @@ describe("repl extension — repl_resume forwards the abort signal (#177 D2)", (
   it("passes the caller's abort signal through to ReplRunner.resume", async () => {
     const controller = new AbortController();
     const seen: unknown[] = [];
-    const originalResume = ReplRunner.prototype.resume;
-    ReplRunner.prototype.resume = (async (
+    // Patches `ReplRunner.prototype.resume` for the duration of the call —
+    // see the sequential assumption on `withPatchedPrototype` (#178).
+    const fakeResume = (async (
       _sessionId: string,
       _onApproval: unknown,
       signal: AbortSignal | undefined,
@@ -1246,7 +1248,7 @@ describe("repl extension — repl_resume forwards the abort signal (#177 D2)", (
       seen.push(signal);
       return "[result]\n1";
     }) as unknown as typeof ReplRunner.prototype.resume;
-    try {
+    await withPatchedPrototype(ReplRunner.prototype, "resume", fakeResume, async () => {
       const resume = (await loadTools()).find((t) => t.name === "repl_resume");
       assert.ok(resume);
       await resume.execute("sig-1", { sessionId: "sig" }, controller.signal, undefined, {
@@ -1255,9 +1257,7 @@ describe("repl extension — repl_resume forwards the abort signal (#177 D2)", (
         hasUI: true,
         ui: { select: async () => APPROVE_CHOICE },
       });
-    } finally {
-      ReplRunner.prototype.resume = originalResume;
-    }
+    });
     assert.equal(seen.length, 1);
     assert.equal(seen[0], controller.signal);
   });
