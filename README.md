@@ -55,6 +55,13 @@ session is no longer suspended or busy. `repl_reset` also removes the session fr
 just its state: after a reset, `repl_resume` on that id says no session exists, and the next
 `repl` call recreates it.
 
+**Sessions belong to one Pi conversation.** When it ends — `/new`, `/resume`, `/fork`, or quitting
+pi — every REPL session is disposed, and a call that was still waiting for approval is reported as
+dropped: it never executed. The same `sessionId` in the next conversation is a new, empty REPL; the
+`repl` tool description says so, because the model cannot tell that from the string. Runners are
+keyed by working directory, so a conversation that spans directories gets a path jail, a preamble
+root and bridge tools rooted at each. See [#60](https://github.com/AdarGit008/repl-simple/issues/60).
+
 Concurrent `repl` calls on one `sessionId` share a single session creation — before #59, two
 overlapping calls each built a session and the loser was silently discarded while both reported
 success. See [#59](https://github.com/AdarGit008/repl-simple/issues/59).
@@ -139,12 +146,22 @@ the pi process; `/repl-approvals strict` and restarting both put it back. Nothin
 without a UI, in either mode. `repl_reset` reports the current mode.
 See [docs/approval-grants.md](docs/approval-grants.md).
 
-Every approval dialog offers **three answers**: approve, deny, and *decide later*. Deciding later
-suspends the session with the call still pending — `repl_resume` asks again, `repl_abandon` throws
-it away, and running new code discards it and says so. It is the answer for a call you want to think
-about, and it is the only reason `status: "suspended"` exists. Dismissing the dialog is not that
-answer: Escape, the timeout and an abort all **deny**.
+Every approval dialog offers **four answers**: approve, deny, *decide later*, and *deny remaining*.
+Deciding later suspends the session with the call still pending — `repl_resume` asks again,
+`repl_abandon` throws it away, and running new code discards it and says so. It is the answer for a
+call you want to think about, and it is the only reason `status: "suspended"` exists. Denying the
+remaining refuses the call on screen and every gated call after it in the same `repl` or
+`repl_resume` call, without asking again. Dismissing the dialog is neither of those: Escape, the
+timeout and an abort all **deny**.
 See [#51](https://github.com/AdarGit008/repl-simple/issues/51).
+
+Every approval dialog is also **counted**. One `repl` or `repl_resume` call opens at most **8**
+dialogs (`MAX_DIALOGS_PER_CALL`); gated calls past that are denied without a dialog, and the result
+ends with an `[approval cap]` paragraph so the model asks you rather than retrying. Only dialogs
+actually opened count — yolo mode, a headless run and a replayed call spend nothing — and the count
+restarts on every `repl_resume`. The dialog title says where it sits (`dialog 3 of 8`). A cap and a
+"deny remaining" only ever reduce what gets approved; nothing was added that makes approving easier.
+See [#35](https://github.com/AdarGit008/repl-simple/issues/35).
 
 Every approval dialog is also **answerable and bounded**. The four `repl` tools declare
 `executionMode: "sequential"`, so two of them never run at once — two dialogs open together leaves
