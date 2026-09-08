@@ -391,3 +391,383 @@ export function truncateText(
   t.push(text);
   return { text: t.render(), truncated: t.truncated };
 }
+
+// ── Value repr (#69 finding 1, D140) ──────────────────────────────
+//
+// `output` is the value of a snippet's last expression, rendered. It used to
+// be `String(value)`, which spelled a dict `[object Map]`, a list `1,2,3` and
+// `True` `true` — and made an empty dict and a populated one the same string.
+// The values arrive intact (a dict is a real `Map`, measured on 0.0.21), so
+// the loss was in the rendering, and the rendering is fixed here: Python's
+// spelling, and — because this module knows the budget — elision *between
+// the elements* of the outermost value instead of a cut through the flattened
+// text (Q4 of docs/truncation-policy.md).
+//
+// What the boundary loses is documented rather than hidden: a tuple arrives
+// as a list, `1.0` as `1`, `-0.0` as `0`, a frozenset as a set, `1e400` as
+// `inf` (Python's own literal is `inf` too), and a lone top-level `str` is
+// rendered verbatim — as `print` would, since inspecting text is what a REPL
+// is for — so `'1'` and `1` collide at the top level and nowhere else.
+
+/** Levels of nested container the elision descends when the outer ends fit nothing. */
+const ELIDE_DEPTH = 4;
+
+/** Monty's tag on the records it builds for values with no JS shape (`Exception`, `Type`). */
+function montyTag(value: object): string | undefined {
+  const tag = (value as { __monty_type__?: unknown }).__monty_type__;
+  return typeof tag === "string" ? tag : undefined;
+}
+
+/**
+ * The Python type name of a value that crossed the boundary — what a
+ * `TypeError` names (`must be str, not int`). Integral numbers are `int`:
+ * Monty hands `1.0` over as `1`, so the float is not knowable here.
+ */
+export function pythonTypeName(value: unknown): string {
+  if (value === null || value === undefined) return "NoneType";
+  switch (typeof value) {
+    case "boolean":
+      return "bool";
+    case "number":
+      return Number.isInteger(value) ? "int" : "float";
+    case "bigint":
+      return "int";
+    case "string":
+      return "str";
+    case "function":
+      return "function";
+    case "symbol":
+      return "symbol";
+    default:
+      break;
+  }
+  const obj = value as object;
+  if (obj instanceof Uint8Array) return "bytes";
+  if (Array.isArray(obj)) return "list";
+  if (obj instanceof Map) return "dict";
+  if (obj instanceof Set) return "set";
+  const tag = montyTag(obj);
+  if (tag === "Exception") {
+    const excType = (obj as { excType?: unknown }).excType;
+    return typeof excType === "string" ? excType : "Exception";
+  }
+  if (tag === "Type") return "type";
+  return tag ?? "object";
+}
+
+/** `repr()` of a number: Python names the non-finite ones; the rest JS spells the same way. */
+function reprNumber(value: number): string {
+  if (Number.isNaN(value)) return "nan";
+  if (!Number.isFinite(value)) return value > 0 ? "inf" : "-inf";
+  return String(value);
+}
+
+/**
+ * `repr()` of a string: single quotes unless the text holds a `'` and no
+ * `"`; the backslash, the quote, `\n`, `\r` and `\t` escaped by name; other
+ * C0/C1 controls and DEL as `\xNN`; a lone surrogate as `\uXXXX`; printable
+ * non-ASCII kept, as Python 3 keeps it.
+ */
+function reprString(text: string): string {
+  const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
+  let out = quote;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) as number;
+    if (ch === "\\") out += "\\\\";
+    else if (ch === quote) out += `\\${quote}`;
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      out += `\\x${code.toString(16).padStart(2, "0")}`;
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      out += `\\u${code.toString(16).padStart(4, "0")}`;
+    } else out += ch;
+  }
+  return out + quote;
+}
+
+/** `repr()` of bytes: `b'…'` with printable ASCII kept and everything else as `\xNN`. */
+function reprBytes(bytes: Uint8Array): string {
+  const quote = bytes.includes(0x27) && !bytes.includes(0x22) ? '"' : "'";
+  let out = `b${quote}`;
+  for (const byte of bytes) {
+    if (byte === 0x5c) out += "\\\\";
+    else if (byte === quote.charCodeAt(0)) out += `\\${quote}`;
+    else if (byte === 0x0a) out += "\\n";
+    else if (byte === 0x0d) out += "\\r";
+    else if (byte === 0x09) out += "\\t";
+    else if (byte >= 0x20 && byte < 0x7f) out += String.fromCharCode(byte);
+    else out += `\\x${byte.toString(16).padStart(2, "0")}`;
+  }
+  return out + quote;
+}
+
+/**
+ * The Python-style renderer, with a byte cap that bounds its work: past the
+ * cap nothing more is appended and `overflow` says so, which is how a caller
+ * learns "this does not fit" without rendering the rest. A container seen
+ * again while it is still open is a cycle, spelled `[...]` / `{...}` as
+ * Python spells it.
+ */
+class Repr {
+  private readonly parts: string[] = [];
+  private readonly open = new Set<object>();
+  private used = 0;
+  overflow = false;
+
+  constructor(private readonly cap: number) {}
+
+  get text(): string {
+    return this.parts.join("");
+  }
+
+  push(text: string): void {
+    if (this.overflow) return;
+    this.parts.push(text);
+    this.used += byteLength(text);
+    if (this.used > this.cap) this.overflow = true;
+  }
+
+  value(value: unknown): void {
+    if (this.overflow) return;
+    const scalar = Repr.scalar(value);
+    if (scalar !== undefined) {
+      this.push(scalar);
+      return;
+    }
+    const obj = value as object;
+    if (this.open.has(obj)) {
+      this.push(Array.isArray(obj) ? "[...]" : "{...}");
+      return;
+    }
+    this.open.add(obj);
+    try {
+      this.container(obj);
+    } finally {
+      this.open.delete(obj);
+    }
+  }
+
+  /** The repr of a non-container, or `undefined` for a container. */
+  private static scalar(value: unknown): string | undefined {
+    if (value === null || value === undefined) return "None";
+    switch (typeof value) {
+      case "boolean":
+        return value ? "True" : "False";
+      case "number":
+        return reprNumber(value);
+      case "bigint":
+        return value.toString();
+      case "string":
+        return reprString(value);
+      case "function":
+        return "<function>";
+      case "symbol":
+        return "<symbol>";
+      default:
+        break;
+    }
+    return value instanceof Uint8Array ? reprBytes(value) : undefined;
+  }
+
+  /** One element of a list or set, or one `key: value` of a dict. */
+  item(item: unknown, isEntry: boolean): void {
+    if (isEntry) {
+      const [key, value] = item as [unknown, unknown];
+      this.value(key);
+      this.push(": ");
+      this.value(value);
+    } else {
+      this.value(item);
+    }
+  }
+
+  private container(obj: object): void {
+    if (Array.isArray(obj)) {
+      this.push("[");
+      this.items(obj, false);
+      this.push("]");
+    } else if (obj instanceof Set) {
+      if (obj.size === 0) {
+        this.push("set()");
+      } else {
+        this.push("{");
+        this.items([...obj], false);
+        this.push("}");
+      }
+    } else if (obj instanceof Map) {
+      this.push("{");
+      this.items([...obj], true);
+      this.push("}");
+    } else {
+      const tag = montyTag(obj);
+      if (tag === "Exception") {
+        this.push(`${pythonTypeName(obj)}(`);
+        this.value((obj as { message?: unknown }).message);
+        this.push(")");
+      } else if (tag === "Type") {
+        const name = (obj as { value?: unknown }).value;
+        this.push(`<class '${typeof name === "string" ? name : "?"}'>`);
+      } else if (tag !== undefined) {
+        this.push(`<${tag}>`);
+      } else {
+        this.push("{");
+        this.items(Object.entries(obj), true);
+        this.push("}");
+      }
+    }
+  }
+
+  private items(items: unknown[], areEntries: boolean): void {
+    for (let i = 0; i < items.length && !this.overflow; i++) {
+      if (i > 0) this.push(", ");
+      this.item(items[i], areEntries);
+    }
+  }
+}
+
+/** The elidable shape of a value: its items, brackets and the noun the marker counts. */
+interface Container {
+  open: string;
+  close: string;
+  noun: "elements" | "entries";
+  items: unknown[];
+  entries: boolean;
+}
+
+function containerOf(value: unknown): Container | undefined {
+  if (Array.isArray(value)) {
+    return { open: "[", close: "]", noun: "elements", items: value, entries: false };
+  }
+  if (value instanceof Set) {
+    return { open: "{", close: "}", noun: "elements", items: [...value], entries: false };
+  }
+  if (value instanceof Map) {
+    return { open: "{", close: "}", noun: "entries", items: [...value], entries: true };
+  }
+  return undefined;
+}
+
+/** One item rendered under `cap` bytes, or `undefined` when it does not fit. */
+function renderItem(container: Container, index: number, cap: number): string | undefined {
+  const r = new Repr(cap);
+  r.item(container.items[index], container.entries);
+  return r.overflow ? undefined : r.text;
+}
+
+/**
+ * Elide the outermost container between its elements: elements taken whole
+ * from the front and from the back into a 50/50 split of the payload, and
+ * one marker where the rest was. `undefined` when even the marker does not
+ * fit, or when the value is not a container.
+ *
+ * When neither end fits a single element the value is dominated by one huge
+ * element: a nested container is elided the same way one level down (to
+ * `ELIDE_DEPTH`), a scalar is rendered whole for the caller's flat cut, so
+ * that the rendered tail is the value's real tail and not a cap's.
+ */
+function elideContainer(
+  value: unknown,
+  maxBytes: number,
+  recovery: string,
+  depth: number,
+): string | undefined {
+  const c = containerOf(value);
+  if (!c) return undefined;
+  const n = c.items.length;
+  const marker = (elided: number) => `[… ${elided} of ${n} ${c.noun} elided. ${recovery} …]`;
+  // Reserve the marker at its widest, the brackets, and a separator each side.
+  const reserve = byteLength(`${c.open}, ${marker(n)}, ${c.close}`);
+  const payload = maxBytes - reserve;
+  if (payload <= 0) return undefined;
+
+  const headBudget = Math.floor(payload / 2);
+  const tailBudget = payload - headBudget;
+  const head: string[] = [];
+  let headBytes = 0;
+  let i = 0;
+  for (; i < n; i++) {
+    const s = renderItem(c, i, headBudget - headBytes);
+    if (s === undefined) break;
+    const cost = byteLength(s) + (head.length > 0 ? 2 : 0);
+    if (headBytes + cost > headBudget) break;
+    head.push(s);
+    headBytes += cost;
+  }
+  const tail: string[] = [];
+  let tailBytes = 0;
+  for (let j = n - 1; j >= i; j--) {
+    const s = renderItem(c, j, tailBudget - tailBytes);
+    if (s === undefined) break;
+    const cost = byteLength(s) + (tail.length > 0 ? 2 : 0);
+    if (tailBytes + cost > tailBudget) break;
+    tail.unshift(s);
+    tailBytes += cost;
+  }
+
+  if (head.length + tail.length === 0) {
+    const first = c.items[0];
+    const rest = n > 1 ? `, ${marker(n - 1)}` : "";
+    const inner =
+      depth < ELIDE_DEPTH && !c.entries
+        ? elideContainer(
+            first,
+            maxBytes - byteLength(`${c.open}${rest}${c.close}`),
+            recovery,
+            depth + 1,
+          )
+        : undefined;
+    if (inner !== undefined) return `${c.open}${inner}${rest}${c.close}`;
+    const whole = new Repr(Number.POSITIVE_INFINITY);
+    whole.item(first, c.entries);
+    return `${c.open}${whole.text}${rest}${c.close}`;
+  }
+  return `${c.open}${[...head, marker(n - head.length - tail.length), ...tail].join(", ")}${c.close}`;
+}
+
+export interface FormatValueOptions {
+  /** Hard byte ceiling on the rendered result, marker included. */
+  maxBytes: number;
+  /** Recovery clause in the marker — how the reader gets at the rest. */
+  recovery: string;
+}
+
+/**
+ * Render a value that crossed the boundary as Python would spell it, within
+ * `maxBytes` — see the section comment for the spelling and the losses.
+ *
+ * A value that fits is returned whole. Over the budget, the outermost
+ * container is elided between its elements (`elideContainer`); a scalar, a
+ * top-level string, or a container whose ends fit nothing takes the flat
+ * 50/50 value cut; a container that cannot even fit the marker is cut
+ * head-only at the byte, with no total claimed. Every path ends in
+ * `truncateText`, so invariant 1 holds by construction, and the renderer
+ * stops at the cap, so the work is the budget's and not the value's.
+ */
+export function formatValue(
+  value: unknown,
+  opts: FormatValueOptions,
+): { text: string; truncated: boolean } {
+  const maxBytes = Math.max(0, opts.maxBytes);
+  const flat = (text: string, headRatio: number, unknownTotal = false) =>
+    truncateText(text, { maxBytes, headRatio, recovery: opts.recovery, unknownTotal });
+  if (typeof value === "string") return flat(value, VALUE_HEAD_RATIO);
+
+  const whole = new Repr(maxBytes);
+  whole.value(value);
+  if (!whole.overflow) return { text: whole.text, truncated: false };
+
+  const elided = elideContainer(value, maxBytes, opts.recovery, 0);
+  if (elided !== undefined) return { text: flat(elided, VALUE_HEAD_RATIO).text, truncated: true };
+  if (containerOf(value)) {
+    // Too small for the marker: the partial render, head-only, claiming no
+    // total — the renderer stopped, so the total is not known.
+    return { text: flat(whole.text, HEAD_ONLY_RATIO, true).text, truncated: true };
+  }
+  // A scalar or a tagged record: bounded by its own size, so render it whole
+  // and let the flat cut keep both of its real ends.
+  const complete = new Repr(Number.POSITIVE_INFINITY);
+  complete.value(value);
+  return { text: flat(complete.text, VALUE_HEAD_RATIO).text, truncated: true };
+}

@@ -492,7 +492,7 @@ describe("formatValue — strings inside a container use Python's quoting", () =
   });
 
   it("other controls as \\xNN; printable non-ASCII kept; a lone surrogate as \\uXXXX", () => {
-    assert.equal(repr(["\x00\x1f\x7f"]), "['\\x00\\x1f\\x7f']");
+    assert.equal(repr(["\x00\x1f\x7f\x85"]), "['\\x00\\x1f\\x7f\\x85']");
     assert.equal(repr(["日本 😀"]), "['日本 😀']");
     assert.equal(repr(["\ud800"]), "['\\ud800']");
   });
@@ -540,6 +540,9 @@ describe("formatValue — bytes, containers, tagged records, the rest", () => {
     );
     assert.equal(repr(tagged("Type", { value: "int" })), "<class 'int'>");
     assert.equal(repr(tagged("FileHandle", {})), "<FileHandle>");
+    // A record missing its field is rendered without inventing one.
+    assert.equal(repr(tagged("Exception", { message: "m" })), "Exception('m')");
+    assert.equal(repr(tagged("Type", {})), "<class '?'>");
     assert.equal(
       repr([
         tagged("Exception", { excType: "Exception", message: "x" }),
@@ -601,6 +604,7 @@ describe("pythonTypeName — the name a TypeError names", () => {
       [tagged("Type", { value: "int" }), "type"],
       [tagged("FileHandle", {}), "FileHandle"],
       [() => 1, "function"],
+      [Symbol("s"), "symbol"],
       [{ k: 1 }, "object"],
     ];
     for (const [value, name] of table) {
@@ -679,9 +683,67 @@ describe("formatValue — elides between the elements of the outermost value", (
   it("the marker names the recovery route it was given", () => {
     const { text } = formatValue(
       Array.from({ length: 10_000 }, (_, i) => i),
-      { maxBytes: 512, headRatio: VALUE_HEAD_RATIO, recovery: "Assign it." },
+      {
+        maxBytes: 512,
+        recovery: "Assign it.",
+      },
     );
     assert.ok(text.includes("elided. Assign it. …]"), text);
+  });
+
+  it("a container whose only element is a huge container is elided one level down", () => {
+    const inner = Array.from({ length: 100_000 }, (_, i) => i);
+    const { text, truncated } = formatValue([inner], valueOpts(1024));
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= 1024);
+    assert.match(
+      text,
+      /^\[\[0, 1, 2, .*\[… \d+ of 100000 elements elided\. Slice it\. …\], .*, 99999\]\]$/,
+    );
+    // With siblings after it, they are counted in a marker of their own.
+    const withSiblings = formatValue([inner, 1, 2], valueOpts(1024)).text;
+    assert.ok(withSiblings.endsWith(", 1, 2]"), withSiblings.slice(-40));
+    assert.match(withSiblings, /^\[\[… 1 of 3 elements elided/);
+  });
+
+  it("the descent stops at a depth, then the remaining value is rendered whole and flat-cut", () => {
+    let value: unknown = "x".repeat(20_000);
+    for (let i = 0; i < 8; i++) value = [value];
+    const { text, truncated } = formatValue(value, valueOpts(1024));
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= 1024);
+    // Eight levels in, eight levels out: the descent adds brackets as it goes
+    // and the whole render of what is left supplies the rest — both real ends.
+    assert.ok(text.startsWith("[[[[[[[['xxx"), text.slice(0, 20));
+    assert.ok(text.endsWith("xxx']]]]]]]]"), text.slice(-20));
+  });
+
+  it("a dict whose only entry is huge renders it whole for the flat cut; a small sibling is kept instead", () => {
+    const only = new Map<string, unknown>([["big", "x".repeat(20_000)]]);
+    const alone = formatValue(only, valueOpts(1024)).text;
+    assert.ok(bytes(alone) <= 1024);
+    assert.ok(alone.startsWith("{'big': 'xxx"), alone.slice(0, 20));
+    assert.ok(alone.endsWith("xxx'}"), alone.slice(-20));
+
+    const withSmall = new Map<string, unknown>([
+      ["big", "x".repeat(20_000)],
+      ["small", 1],
+    ]);
+    assert.equal(
+      formatValue(withSmall, valueOpts(1024)).text,
+      "{[… 1 of 2 entries elided. Slice it. …], 'small': 1}",
+    );
+  });
+
+  it("a budget too small for the marker cuts the partial render head-only, claiming no total", () => {
+    const { text, truncated } = formatValue(
+      Array.from({ length: 300 }, (_, i) => i),
+      valueOpts(48),
+    );
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= 48);
+    assert.ok(text.startsWith("[0, 1, "), text);
+    assert.match(text, /\[… truncated at 48B\. Slice it\. …\]$/);
   });
 });
 

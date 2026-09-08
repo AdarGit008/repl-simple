@@ -2126,6 +2126,8 @@ type CallView = {
   args: string;
   error?: string;
   details?: unknown;
+  seq?: number;
+  stdoutOffset?: number;
 };
 
 type DetailsView = {
@@ -2784,8 +2786,8 @@ describe("repl extension — the trace interleaves with stdout (#69 finding 4, D
     // Printed text that looks like the separator does not fool the last-separator rule.
     assert.deepEqual(ext.stdoutSpan("x\n[result]\ny\n\n[result]\n1", "ok"), { start: 0, end: 13 });
     assert.deepEqual(ext.stdoutSpan("[error: runtime]\nboom\n\n[stdout]\nP1\nP2\n", "error"), {
-      start: 31,
-      end: 37,
+      start: 32,
+      end: 38,
     });
     assert.equal(ext.stdoutSpan("[error: runtime]\nboom", "error"), null);
     assert.equal(ext.stdoutSpan("Tool 'write' requires approval.\nwrite(...)", "suspended"), null);

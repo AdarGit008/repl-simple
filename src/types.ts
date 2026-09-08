@@ -172,7 +172,25 @@ export interface RunOptions {
   limits?: RunLimits | "unbounded";
 }
 
-/** Trace of a single host-tool call during execution */
+/**
+ * Trace of a single host-tool call during execution.
+ *
+ * `seq` and `stdoutOffset` say where in the run the call happened (#69
+ * finding 4, D143). `seq` is a per-run counter, strictly increasing across
+ * every outcome the sandbox traces — a call that ran, threw, was denied, or
+ * could not resolve its arguments — and continuing after the carried entries
+ * when a suspended run resumes. `stdoutOffset` is the byte of the run's own
+ * `stdout` (after the replay mark, before truncation) at which the call was
+ * dispatched: everything printed before the call lies below it, the partial
+ * line Monty flushes at a host boundary included. A consumer that filters
+ * entries out — replay filtering does — leaves gaps; the order is the point.
+ *
+ * Both are optional in the type because a `Session` dump restores entries
+ * through a validator that predates them, and they are deliberately *not*
+ * serialised by `JSON.stringify` (the entry carries a `toJSON` that yields
+ * the validator's shape) — in-process copies keep them. Always present on an
+ * entry the sandbox produced.
+ */
 export interface ToolCallTrace {
   tool: string;
   args: unknown[];
@@ -181,6 +199,10 @@ export interface ToolCallTrace {
   ok: boolean;
   error?: string;
   approved?: boolean;
+  /** Position of the call in its run; strictly increasing, gaps allowed. */
+  seq?: number;
+  /** Byte offset into the run's own `stdout` at which the call was dispatched. */
+  stdoutOffset?: number;
 }
 
 /**
@@ -213,7 +235,19 @@ export type RunErrorKind =
   | "crashed"
   | "unavailable";
 
-/** Successful run result */
+/**
+ * Successful run result.
+ *
+ * `output` is **always a string** (decision 15, Option A; #65, D139): the
+ * `SUBMIT` answer verbatim when the run ended in `SUBMIT` — a non-`str`
+ * answer never gets here, it is a Python `TypeError` in the run — else the
+ * value of the last expression rendered by `formatValue` (`src/truncate.ts`):
+ * Python's spelling (`{'a': 1}`, `[1, 2]`, `True`, `None`, `b'..'`,
+ * `ValueError('bad')`), a bare `str` verbatim, elided between the elements of
+ * the outermost value when it exceeds `maxOutputBytes`. The boundary's losses
+ * are documented there and in docs/truncation-policy.md: a tuple renders as a
+ * list, `1.0` as `1`, a frozenset as a set, `1e400` as `inf`.
+ */
 export interface RunOk {
   status: "ok";
   output: string;

@@ -2011,8 +2011,10 @@ describe("output truncation — the [result] field is bounded", () => {
       { maxOutputBytes: 1024 },
     );
     ok(result);
-    assert.ok(result.output.startsWith("0,1,2,3"), "head lost");
-    assert.ok(result.output.endsWith("4999"), "tail lost");
+    // W3-1: the list renders as Python spells it and is elided between its
+    // elements (D140); before, `String(list)` gave `0,1,2,3` and a flat cut.
+    assert.ok(result.output.startsWith("[0, 1, 2, 3"), "head lost");
+    assert.ok(result.output.endsWith("4999]"), "tail lost");
     const marker = result.output.indexOf("[…");
     assert.ok(marker > 0, "marker missing");
     assert.ok(result.output.indexOf("4999") > marker, "the marker must sit between head and tail");

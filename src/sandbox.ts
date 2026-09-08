@@ -32,13 +32,13 @@ import { SandboxUnavailableError, withSandboxSession } from "./pool.js";
 import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import {
   Truncator,
-  truncateText,
+  formatValue,
+  pythonTypeName,
   STDOUT_MAX_BYTES,
   STDOUT_MAX_LINES,
   STDOUT_HEAD_RATIO,
   STDOUT_RECOVERY,
   OUTPUT_MAX_BYTES,
-  VALUE_HEAD_RATIO,
   VALUE_RECOVERY,
 } from "./truncate.js";
 import { HostToolError } from "./types.js";
@@ -83,6 +83,30 @@ function pythonError(pythonType: string, message: string): Error {
 // ── Dispatch loop accumulators ───────────────────────────────────
 
 /**
+ * The shape of a trace entry that `JSON.stringify` sees — `toJSON` on every
+ * entry the sandbox records.
+ *
+ * `seq` and `stdoutOffset` are left out on purpose. `Session.dump()` writes
+ * `result.calls` verbatim and `Session.load()` validates each entry against
+ * a closed key list (`src/session.ts` `traces()`), so a suspended session
+ * with a call before its gate could not be reloaded if the two fields were
+ * serialised. In-process copies (`{ ...call }`, `structuredClone`) keep them;
+ * a dump has no ordering until that validator learns the fields (D143).
+ */
+function persistedTrace(this: ToolCallTrace): Omit<ToolCallTrace, "seq" | "stdoutOffset"> {
+  const { tool, args, kwargs, durationMs, ok, error, approved } = this;
+  return {
+    tool,
+    args,
+    kwargs,
+    durationMs,
+    ok,
+    ...(error === undefined ? {} : { error }),
+    ...(approved === undefined ? {} : { approved }),
+  };
+}
+
+/**
  * Mutable state carried across iterations of the dispatch loop.
  *
  * Owned by the entry point that builds it and mutated in place — by the loop,
@@ -92,11 +116,17 @@ function pythonError(pythonType: string, message: string): Error {
  * `stdout` is a projection of the `Truncator`, not a field: the accumulator
  * keeps a bounded head and tail plus true counters, and renders the elided form
  * only when a result is built.
+ *
+ * `record` is the one way an entry enters `calls` (D143): it stamps the
+ * entry's place in the run and the stdout position at that moment, so every
+ * push site — nine of them, across the dispatch loop and the resume prologue —
+ * says the same two things the same way.
  */
 class DispatchAccumulators {
   readonly calls: ToolCallTrace[];
   aborted = false;
   private readonly out: Truncator;
+  private nextSeq: number;
 
   constructor(maxStdout: number, prior?: RunSuspended) {
     this.out = new Truncator({
@@ -107,6 +137,10 @@ class DispatchAccumulators {
       truncatedBefore: prior?.stdoutTruncated,
     });
     this.calls = prior ? [...prior.calls] : [];
+    // Numbering continues after the carried entries. An entry restored from a
+    // dump has no `seq` (see `persistedTrace`) and counts by its index, so the
+    // whole run stays strictly increasing either way.
+    this.nextSeq = this.calls.reduce((next, call, i) => Math.max(next, (call.seq ?? i) + 1), 0);
     // Stdout carried across a suspend/resume boundary is re-accumulated from
     // its rendered form: `RunSuspended` transports the string, not the head,
     // tail and counters behind it. This is within one call; across calls,
@@ -117,6 +151,21 @@ class DispatchAccumulators {
 
   print(text: string): void {
     this.out.push(text);
+  }
+
+  /**
+   * Trace a call. `stdoutOffset` is the accumulator's byte total right now:
+   * Monty flushes a partial line at a host boundary before the call reaches
+   * the loop (measured), so what was printed before the call is all in.
+   */
+  record(entry: Omit<ToolCallTrace, "seq" | "stdoutOffset">): void {
+    const call: ToolCallTrace = {
+      ...entry,
+      seq: this.nextSeq++,
+      stdoutOffset: this.out.totalBytes,
+    };
+    Object.defineProperty(call, "toJSON", { value: persistedTrace, enumerable: false });
+    this.calls.push(call);
   }
 
   get stdout(): string {
@@ -398,6 +447,11 @@ function crashMessage(err: MontyCrashedError): string {
  * arrives merged with this call's first print (measured), and skipping the
  * callback would take this call's line with it. The mark is a byte count for
  * the same reason — it is indifferent to how the stream is chunked.
+ *
+ * The callback's return value is ignored by Monty 0.0.21 (measured; pinned
+ * in test/sandbox.test.ts). 0.0.18 threw `TypeError: Value is not undefined`
+ * at a callback that returned anything, which made the block body below
+ * load-bearing (#69 finding 5) — it no longer is, and stays for clarity.
  */
 function makePrintCallback(
   acc: DispatchAccumulators,
@@ -629,34 +683,65 @@ async function buildTypeCheckStubs(registry: ToolRegistry, inputNames: string[])
   return parts.join("\n");
 }
 
-/** Format a Monty value for output. Python `None` → `"None"`. */
-function formatOutput(value: unknown): string {
-  if (value === null || value === undefined) return "None";
-  return String(value);
-}
-
 /**
- * Cap `output` at its byte budget.
+ * Render `output` within its byte budget — the one place a `RunOk.output` is
+ * made, whichever return site makes it (decision 15, D139).
+ *
+ * The value is the last expression's, as Monty handed it over, or the SUBMIT
+ * answer — a string, by then. `formatValue` spells it as Python would and
+ * elides between the elements of the outermost value when it exceeds the
+ * budget (`src/truncate.ts`, #69 finding 1); a string is the flat 50/50 cut
+ * it always was, so the SUBMIT path is capped on the same terms as the
+ * expression path.
  *
  * Applied wherever a `RunOk` is built, not at the point the tool result is
  * rendered, so that every consumer is covered by one cap: the `repl` tool
  * result, and the RLM loop, whose prompts otherwise grow by a full copy of any
- * snippet ending in a bare expression (A23).
- *
- * Uniform across the SUBMIT paths too. A field with two truncation policies
+ * snippet ending in a bare expression (A23). A field with two policies
  * depending on which return site produced it is exactly the drift
  * docs/truncation-policy.md exists to prevent.
  */
-function capOutput(
-  text: string,
+function renderOutput(
+  value: unknown,
   runOpts: RunOptions | undefined,
 ): { output: string; outputTruncated: boolean } {
-  const { text: output, truncated } = truncateText(text, {
+  const { text, truncated } = formatValue(value, {
     maxBytes: runOpts?.maxOutputBytes ?? DEFAULT_MAX_OUTPUT,
-    headRatio: VALUE_HEAD_RATIO,
     recovery: VALUE_RECOVERY,
   });
-  return { output, outputTruncated: truncated };
+  return { output: text, outputTruncated: truncated };
+}
+
+/**
+ * The answer a `SubmitSignal` submits, or `undefined` when it is not a `str`
+ * and the signal is a failure instead (`toolFailure` names the type).
+ *
+ * The check lives here, where the signal is caught, rather than in the tool:
+ * `SUBMIT`'s `execute` receives whatever `**kwargs` held — the type checker
+ * cannot see through `SUBMIT(**json.loads(...))` — and it is the sandbox that
+ * owes `RunOk.output` a string (#65, D141). Before this, a non-string answer
+ * reached `truncateText` and threw `ERR_INVALID_ARG_TYPE` out of
+ * `runInSandbox`, past every caller's `try`.
+ */
+function submittedAnswer(err: SubmitSignal): string | undefined {
+  return typeof err.answer === "string" ? err.answer : undefined;
+}
+
+/**
+ * How a tool's throw reaches Python: the exception type to raise and its
+ * message. A `HostToolError` names its own type; a `SubmitSignal` whose
+ * answer is not a `str` is the `TypeError` a real `SUBMIT(answer: str)` would
+ * raise; anything else is a `RuntimeError`.
+ */
+function toolFailure(err: unknown): { pythonType: string; message: string } {
+  if (err instanceof SubmitSignal) {
+    return {
+      pythonType: "TypeError",
+      message: `SUBMIT() answer must be str, not ${pythonTypeName(err.answer)}`,
+    };
+  }
+  if (err instanceof HostToolError) return { pythonType: err.pythonType, message: err.message };
+  return { pythonType: "RuntimeError", message: err instanceof Error ? err.message : String(err) };
 }
 
 /**
@@ -686,18 +771,35 @@ export function buildApprovalRequest(
   };
 }
 
-/** Resolve tool args from Monty positional+keyword into a flat Record. */
+/**
+ * Resolve tool args from Monty positional+keyword into a flat Record, the way
+ * Python binds a call: positionals in parameter order, keywords by name, a
+ * parameter given both ways is a `TypeError`, and so is a required parameter
+ * given neither way (#65, D142) — `add() missing 1 required positional
+ * argument: 'a'`, in CPython's words. An `optional` parameter is simply left
+ * out, and the tool's `execute` supplies its default.
+ *
+ * The type checker already refuses the direct forms; this is what refuses
+ * `echo(**{})` and `SUBMIT(**{})`, which it cannot see through. Every caller
+ * is in a `try`: the dispatch loop and the resume prologue raise the error
+ * into Python, `Session` treats an unresolvable call as unmatchable.
+ *
+ * Surplus positionals and undeclared keywords are dropped silently
+ * (test/resolve_tool_args.test.ts pins that).
+ */
 export function resolveToolArgs(
   tool: HostTool,
   args: unknown[],
   kwargs: Record<string, unknown>,
 ): Record<string, unknown> {
   const resolved: Record<string, unknown> = {};
+  const missing: string[] = [];
   for (let i = 0; i < tool.params.length; i++) {
     const param = tool.params[i];
-    // Python-style: positional takes priority, keyword duplicate is an error
     const hasPositional = i < args.length;
-    const hasKeyword = param.name in kwargs;
+    // Own property, not `in`: a parameter named `constructor` must not find
+    // `Object.prototype`'s.
+    const hasKeyword = Object.hasOwn(kwargs, param.name);
     if (hasPositional && hasKeyword) {
       throw new HostToolError(
         "TypeError",
@@ -708,8 +810,22 @@ export function resolveToolArgs(
       resolved[param.name] = args[i];
     } else if (hasKeyword) {
       resolved[param.name] = kwargs[param.name];
+    } else if (!param.optional) {
+      missing.push(`'${param.name}'`);
     }
-    // If neither, param is left undefined (caller handles optional/defaults)
+  }
+  if (missing.length > 0) {
+    const names =
+      missing.length === 1
+        ? missing[0]
+        : missing.length === 2
+          ? `${missing[0]} and ${missing[1]}`
+          : `${missing.slice(0, -1).join(", ")}, and ${missing[missing.length - 1]}`;
+    throw new HostToolError(
+      "TypeError",
+      `${tool.name}() missing ${missing.length} required positional argument` +
+        `${missing.length === 1 ? "" : "s"}: ${names}`,
+    );
   }
   return resolved;
 }
@@ -969,7 +1085,7 @@ async function runDispatchLoop(
     if (current instanceof MontyComplete) {
       return {
         status: "ok",
-        ...capOutput(formatOutput(current.output), runOpts),
+        ...renderOutput(current.output, runOpts),
         stdout: acc.stdout,
         stdoutTruncated: acc.stdoutTruncated,
         calls: acc.calls,
@@ -1048,7 +1164,7 @@ async function runDispatchLoop(
         snapshot.kwargs as Record<string, unknown>,
       );
     } catch (err) {
-      acc.calls.push({
+      acc.record({
         tool: tool.name,
         args: snapshot.args as unknown[],
         kwargs: snapshot.kwargs as Record<string, unknown>,
@@ -1092,7 +1208,7 @@ async function runDispatchLoop(
 
       if (!decision) {
         // Denied (or no callback) → PermissionError in Python
-        acc.calls.push({
+        acc.record({
           tool: tool.name,
           args: snapshot.args as unknown[],
           kwargs: snapshot.kwargs as Record<string, unknown>,
@@ -1128,9 +1244,10 @@ async function runDispatchLoop(
       returnValue = await tool.execute(resolvedArgs);
     } catch (err) {
       const durationMs = performance.now() - t0;
-      // SubmitSignal — clean termination
-      if (err instanceof SubmitSignal) {
-        acc.calls.push({
+      // SubmitSignal with a str answer — clean termination.
+      const answer = err instanceof SubmitSignal ? submittedAnswer(err) : undefined;
+      if (answer !== undefined) {
+        acc.record({
           tool: tool.name,
           args: snapshot.args as unknown[],
           kwargs: snapshot.kwargs as Record<string, unknown>,
@@ -1140,17 +1257,16 @@ async function runDispatchLoop(
         });
         return {
           status: "ok",
-          ...capOutput(err.answer, runOpts),
+          ...renderOutput(answer, runOpts),
           stdout: acc.stdout,
           stdoutTruncated: acc.stdoutTruncated,
           calls: acc.calls,
         };
       }
-      // A `HostToolError` carries the Python type to re-raise; anything else
-      // reaches Python as a RuntimeError.
-      const message = err instanceof Error ? err.message : String(err);
-      const pythonType = err instanceof HostToolError ? err.pythonType : "RuntimeError";
-      acc.calls.push({
+      // Everything else reaches Python as an exception — a `SubmitSignal`
+      // with a non-str answer included, as the `TypeError` it is (D141).
+      const { pythonType, message } = toolFailure(err);
+      acc.record({
         tool: tool.name,
         args: snapshot.args as unknown[],
         kwargs: snapshot.kwargs as Record<string, unknown>,
@@ -1170,7 +1286,7 @@ async function runDispatchLoop(
     // The tool returned. Trace it once, here — the resume below is outside the
     // `try` above precisely so it cannot reach a handler that would record this
     // same call a second time.
-    acc.calls.push({
+    acc.record({
       tool: tool.name,
       args: snapshot.args as unknown[],
       kwargs: snapshot.kwargs as Record<string, unknown>,
@@ -1426,7 +1542,7 @@ async function resumeInSession(
         suspended.suspendedCall.kwargs,
       );
       const returnValue = await tool.execute(resolvedArgs);
-      acc.calls.push({
+      acc.record({
         tool: tool.name,
         args: suspended.suspendedCall.args,
         kwargs: suspended.suspendedCall.kwargs,
@@ -1437,8 +1553,9 @@ async function resumeInSession(
       resumeWith = { returnValue };
     } catch (err) {
       const durationMs = performance.now() - t0;
-      if (err instanceof SubmitSignal) {
-        acc.calls.push({
+      const answer = err instanceof SubmitSignal ? submittedAnswer(err) : undefined;
+      if (answer !== undefined) {
+        acc.record({
           tool: tool.name,
           args: suspended.suspendedCall.args,
           kwargs: suspended.suspendedCall.kwargs,
@@ -1448,15 +1565,16 @@ async function resumeInSession(
         });
         return {
           status: "ok",
-          ...capOutput(err.answer, runOpts),
+          ...renderOutput(answer, runOpts),
           stdout: acc.stdout,
           stdoutTruncated: acc.stdoutTruncated,
           calls: acc.calls,
         };
       }
-      const message = err instanceof Error ? err.message : String(err);
-      const pythonType = err instanceof HostToolError ? err.pythonType : "RuntimeError";
-      acc.calls.push({
+      // The same failure shapes as the dispatch loop's — the second SUBMIT
+      // site is guarded on the same terms (D141).
+      const { pythonType, message } = toolFailure(err);
+      acc.record({
         tool: tool.name,
         args: suspended.suspendedCall.args,
         kwargs: suspended.suspendedCall.kwargs,
@@ -1472,7 +1590,7 @@ async function resumeInSession(
     const excMsg = !tool
       ? `name '${suspended.suspendedCall.tool}' is not defined`
       : `tool '${tool.name}' requires approval`;
-    acc.calls.push({
+    acc.record({
       tool: suspended.suspendedCall.tool,
       args: suspended.suspendedCall.args,
       kwargs: suspended.suspendedCall.kwargs,
