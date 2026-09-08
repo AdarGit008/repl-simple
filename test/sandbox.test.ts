@@ -2669,3 +2669,199 @@ describe("a pool with no worker to give", () => {
     }
   });
 });
+
+// ── The print callback's shape, and the byte mark that rides on it (#61) ──
+//
+// `Session` de-duplicates stdout across replays with a byte mark: the
+// number of bytes the replayed prefix printed, handed to the sandbox as
+// `RunOptions.stdoutSkipBytes` and dropped before `onPrint` and the
+// accumulator see anything (D121). The arithmetic assumes Monty's callback
+// shape stays what was measured on 0.0.21, so the shape is pinned here as a
+// tripwire (D122): if an upstream bump changes it, this is the test that
+// says so, rather than a session quietly swallowing or re-emitting a line.
+
+describe("print callback shape — the tripwire under the stdout mark (#61 D122)", () => {
+  const registry = new ToolRegistry([echoTool()]);
+
+  it("fires once per print, newline included", async () => {
+    const prints: string[] = [];
+    const result = await runInSandbox(
+      'print("a")\nprint("b", "c")\nprint("x\\ny")\nfor i in range(3):\n    print(i)',
+      { registry },
+      { onPrint: (text) => prints.push(text) },
+    );
+    ok(result);
+    assert.deepEqual(prints, ["a\n", "b c\n", "x\ny\n", "0\n", "1\n", "2\n"]);
+  });
+
+  it("holds a partial line until the next newline, a host boundary, or the end", async () => {
+    const merged: string[] = [];
+    ok(
+      await runInSandbox(
+        'print("a", end="")\nprint("b", end="")\nprint("c")',
+        { registry },
+        { onPrint: (text) => merged.push(text) },
+      ),
+    );
+    assert.deepEqual(merged, ["abc\n"], "partials are held until a newline");
+
+    const flushed: string[] = [];
+    ok(
+      await runInSandbox(
+        'print("x", end="")\necho("t")\nprint("y")',
+        { registry },
+        {
+          onPrint: (text) => flushed.push(text),
+        },
+      ),
+    );
+    assert.deepEqual(flushed, ["x", "y\n"], "a host call flushes the partial");
+
+    const trailing: string[] = [];
+    const result = await runInSandbox(
+      'print("d", end="")',
+      { registry },
+      {
+        onPrint: (text) => trailing.push(text),
+      },
+    );
+    ok(result);
+    assert.deepEqual(trailing, ["d"], "the end of the run flushes the partial");
+    assert.equal(result.stdout, "d");
+  });
+
+  it("delivers one large print in 8 KiB chunks", async () => {
+    const prints: string[] = [];
+    const result = await runInSandbox(
+      'print("Z" * 20000)',
+      { registry },
+      {
+        onPrint: (text) => prints.push(text),
+      },
+    );
+    ok(result);
+    // 20 001 bytes (the newline) → 8192 + 8192 + 3617.
+    assert.deepEqual(
+      prints.map((p) => Buffer.byteLength(p)),
+      [8192, 8192, 3617],
+      "the chunk size the mark arithmetic is indifferent to, but the skip slicing is not",
+    );
+  });
+
+  it("flushes a partial at a gate in the original call and in a replay alike", async () => {
+    // A partial straddling a suspension must produce the same byte stream in
+    // the segments of the original call as it does when the same code is
+    // replayed without a suspension — otherwise the mark taken from the
+    // original call would not describe the replay.
+    const gate: HostTool = {
+      name: "gate",
+      description: "Gated",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => "g",
+    };
+    const gatedRegistry = new ToolRegistry([gate]);
+    const code = 'print("x", end="")\ngate()\nprint("y")';
+
+    const before: string[] = [];
+    const paused = await runInSandbox(
+      code,
+      { registry: gatedRegistry },
+      {
+        onApproval: () => "suspend",
+        onPrint: (text) => before.push(text),
+      },
+    );
+    suspended(paused);
+    const after: string[] = [];
+    const finished = await resumeSuspended(
+      paused,
+      true,
+      { registry: gatedRegistry },
+      {
+        onPrint: (text) => after.push(text),
+      },
+    );
+    ok(finished);
+    assert.deepEqual(before, ["x"]);
+    assert.deepEqual(after, ["y\n"]);
+    assert.equal(finished.stdout, "xy\n");
+
+    const replayed: string[] = [];
+    ok(
+      await runInSandbox(
+        code,
+        { registry: gatedRegistry },
+        {
+          onApproval: () => true,
+          onPrint: (text) => replayed.push(text),
+        },
+      ),
+    );
+    assert.deepEqual(replayed, ["x", "y\n"], "the replay flushes at the same boundary");
+    assert.equal(
+      Buffer.byteLength(before.join("") + after.join("")),
+      Buffer.byteLength(replayed.join("")),
+      "the mark taken across the suspension must equal the replay's byte count",
+    );
+  });
+});
+
+describe("runInSandbox — stdoutSkipBytes drops the replayed prefix's output (#61 D121)", () => {
+  const registry = new ToolRegistry();
+
+  it("drops exactly that many leading bytes before onPrint and the accumulator", async () => {
+    const prints: string[] = [];
+    const result = await runInSandbox(
+      'print("abc")\nprint("de")',
+      { registry },
+      {
+        stdoutSkipBytes: 4,
+        onPrint: (text) => prints.push(text),
+      },
+    );
+    ok(result);
+    assert.equal(result.stdout, "de\n", "the accumulator saw the prefix's output");
+    assert.deepEqual(prints, ["de\n"], "the live stream saw the prefix's output");
+    assert.equal(result.stdoutTruncated, false);
+  });
+
+  it("slices a callback that straddles the mark", async () => {
+    // The prefix printed a partial line in its own run; on replay that partial
+    // merges with this call's first print into one callback, so the mark lands
+    // inside a callback and the tail beyond it is this call's.
+    const prints: string[] = [];
+    const result = await runInSandbox(
+      'print("ab", end="")\nprint("cd")',
+      { registry },
+      {
+        stdoutSkipBytes: 2,
+        onPrint: (text) => prints.push(text),
+      },
+    );
+    ok(result);
+    assert.equal(result.stdout, "cd\n");
+    assert.deepEqual(prints, ["cd\n"]);
+  });
+
+  it("applies the truncation budget to what is left, not to what was skipped", async () => {
+    const result = await runInSandbox(
+      'print("A" * 5000)\nprint("kept")',
+      { registry },
+      { stdoutSkipBytes: 5001, maxStdoutBytes: 100 },
+    );
+    ok(result);
+    assert.equal(result.stdout, "kept\n");
+    assert.equal(result.stdoutTruncated, false, "the skipped bytes counted against the budget");
+  });
+
+  it("a mark beyond everything printed yields empty stdout, and zero is a no-op", async () => {
+    const beyond = await runInSandbox('print("only")', { registry }, { stdoutSkipBytes: 10_000 });
+    ok(beyond);
+    assert.equal(beyond.stdout, "");
+    const zero = await runInSandbox('print("only")', { registry }, { stdoutSkipBytes: 0 });
+    ok(zero);
+    assert.equal(zero.stdout, "only\n");
+  });
+});

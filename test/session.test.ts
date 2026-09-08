@@ -7,9 +7,19 @@ import { Session } from "../src/session.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
+import { REDACTED } from "../src/redact.js";
+import { withPatchedPrototype } from "./support/prototype-patch.js";
 import type { ApprovalRequest, HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
+
+// The replay caps and the dump bound, as docs/session-replay.md states them
+// (#62 A17, #63). Spelled here rather than imported so this file still loads
+// against a `src/` that predates them and every test below fails on its own
+// — the numbers are part of the contract, and a drift is a failing test.
+const MAX_SNIPPETS = 256;
+const MAX_CACHE_ENTRIES = 1024;
+const MAX_DUMP_BYTES = 1_048_576;
 
 function ok(result: unknown): asserts result is RunOk {
   assert.equal((result as RunOk).status, "ok");
@@ -90,19 +100,19 @@ describe("Session — basic execution", () => {
     assert.ok(typeof result.output === "string");
   });
 
-  it("print output accumulates in stdout", async () => {
+  it("print output is this call's, not the transcript's (#61)", async () => {
     const registry = new ToolRegistry();
     const session = new Session({ registry });
 
     const r1 = await session.run('print("hello")');
     ok(r1);
-    assert.ok(r1.stdout.includes("hello"));
+    assert.equal(r1.stdout, "hello\n");
 
     const r2 = await session.run('print("world")');
     ok(r2);
-    // Replay: both prints fire, so stdout has both
-    assert.ok(r2.stdout.includes("hello"));
-    assert.ok(r2.stdout.includes("world"));
+    // Replay re-executes the first print, but its output belongs to the
+    // first call and is dropped at the byte mark (D121).
+    assert.equal(r2.stdout, "world\n");
   });
 });
 
@@ -409,18 +419,19 @@ describe("Session — prefixLineCount is incrementally maintained (#145 D28)", (
 
     const originalSplit = String.prototype.split as unknown as (...args: unknown[]) => string[];
     let splitCount = 0;
-    String.prototype.split = function (this: string, ...args: unknown[]): string[] {
+    const countingSplit = function (this: string, ...args: unknown[]): string[] {
       if (watched.has(this)) splitCount += 1;
       return originalSplit.apply(this, args);
-    };
+    } as unknown as typeof String.prototype.split;
 
-    try {
+    // The shared helper (#178) restores the prototype in `finally`, and its
+    // sequential assumption holds: `node:test` runs this file's tests one at
+    // a time, so nothing else observes the patched method while we await.
+    await withPatchedPrototype(String.prototype, "split", countingSplit, async () => {
       for (const code of codes) {
         ok(await session.run(code));
       }
-    } finally {
-      String.prototype.split = originalSplit;
-    }
+    });
 
     // Linear: at most a small constant multiple of N. The O(n²) version
     // performs N(N+1)/2 splits on these strings (1830 for N=60).
@@ -1058,9 +1069,11 @@ describe("Session — dump / load", () => {
     const json = session.dump();
 
     const parsed = JSON.parse(json);
-    assert.equal(parsed.version, 1);
+    assert.equal(parsed.version, 2);
     assert.ok(Array.isArray(parsed.snippets));
     assert.equal(parsed.snippets[0], "x = [1, 2, 3]");
+    // The stdout mark rides beside the snippets, one figure each (D121).
+    assert.deepEqual(parsed.stdoutBytes, [0]);
   });
 
   it("load preserves empty session", async () => {
@@ -1736,14 +1749,20 @@ describe("Session — resume carries what it was suspended with (#84, #38)", () 
     }
   });
 
-  it("dump()/load() carries what the resume needs, and nothing JSON cannot (#84 test 5)", async () => {
+  it("dump()/load() carries the suspension, and none of the run's options (#84 test 5, D129)", async () => {
+    // A dump carries the run's *state*, not the host's *policy*. Mounts are
+    // host paths and a capability, `limits` can say "unbounded", the byte
+    // caps are the host's: none of them is written, and a dump that names
+    // them is refused rather than narrowed — the "narrowed on load" branch
+    // is gone. The resume caller supplies them, as `resumeSuspended`'s own
+    // callers always had to (D129; W1-2 flagged the host paths for this).
     const { dir, cleanup } = mountFixture();
     try {
       const registry = new ToolRegistry([gated]);
       const controller = new AbortController();
       const s1 = new Session({ registry });
       suspended(
-        await s1.run('gated_carry("x")\nprint("A" * 5000)\nopen("/data/note.txt").read()', {
+        await s1.run('gated_carry("x")\nopen("/data/note.txt").read()', {
           onApproval: () => "suspend",
           mount: { "/data": dir },
           maxStdoutBytes: 10,
@@ -1753,23 +1772,32 @@ describe("Session — resume carries what it was suspended with (#84, #38)", () 
 
       const json = s1.dump();
       const parsed = JSON.parse(json);
-      // An `AbortSignal` serialises as `{}`. Persisting it would hand a plain
-      // object back as a signal after a restore; the dump must carry only
-      // what a resume reads.
-      assert.ok(
-        !("signal" in parsed.suspendedRunOpts),
-        "the dump persisted the suspended run's AbortSignal as {}",
-      );
+      assert.ok(!("suspendedRunOpts" in parsed), "the dump persisted the run's options");
+      assert.ok(!json.includes(dir), "the dump persisted a host path");
 
-      // A dump written before this change has the raw shape, `{}` included.
-      // Loading one must not hand that `{}` to the sandbox either.
-      parsed.suspendedRunOpts.signal = {};
-      const s2 = Session.load(JSON.stringify(parsed), { registry });
+      // Whatever an older or hand-edited dump carries in that slot — a
+      // signal serialised as `{}`, a mount pointing at the root — is rejected
+      // by name, never narrowed into something the sandbox could act on.
+      for (const suspendedRunOpts of [{ signal: {} }, { mount: { "/": "/" } }, {}]) {
+        assert.throws(
+          () => Session.load(JSON.stringify({ ...parsed, suspendedRunOpts }), { registry }),
+          /Invalid session dump: .*suspendedRunOpts/,
+        );
+      }
 
-      const result = await s2.resume({ onApproval: () => true });
-      ok(result);
-      assert.equal(result.output, "MOUNTED\n", "the mount did not survive the round trip");
-      assert.equal(result.stdoutTruncated, true, "the cap did not survive the round trip");
+      // Restored without a mount: the read is refused inside the sandbox
+      // (the documented outcome of a restore without its mounts).
+      const unmounted = await Session.load(json, { registry }).resume({ onApproval: () => true });
+      err(unmounted);
+      assert.match(unmounted.error, /PermissionError/, "a mount came from the file");
+
+      // Restored with a fresh caller mount: the caller's is what mounts.
+      const mounted = await Session.load(json, { registry }).resume({
+        onApproval: () => true,
+        mount: { "/data": dir },
+      });
+      ok(mounted);
+      assert.equal(mounted.output, "MOUNTED\n");
     } finally {
       cleanup();
     }
@@ -2005,20 +2033,28 @@ describe("Session — the two clocks across a suspension (#38)", () => {
   }
 
   it("the host wall clock restarts on every resume (decision 1: per-segment)", async () => {
-    // 1.2 s of host time before the gate and 1.2 s after, under a 2 s budget.
-    // Per-segment, each side has 0.8 s to spare; a budget that spanned the
-    // suspension would reach the second nap with ~0.8 s left and time out.
-    const session = new Session({ registry: new ToolRegistry([gate, napTool(1200)]) });
+    // Deterministic on the side that matters (D132). The run spends 2.5 s of
+    // host time before the gate, under a 5 s budget it cannot breach. The
+    // resume asks for a 2 s budget (caller-wins) and has nothing left to do
+    // but return the gated call's value: per-segment, that trivial
+    // continuation has the whole 2 s; a budget that spanned the suspension
+    // would already be 0.5 s in the past and time out before anything ran.
+    // The earlier shape — 1.2 s + 1.2 s under 2 s — left 0.8 s of slack on
+    // each side and depended on the host being quiet.
+    const session = new Session({ registry: new ToolRegistry([gate, napTool(2500)]) });
     suspended(
-      await session.run("nap()\ngate_38()\nnap()", {
+      await session.run("nap()\ngate_38()", {
         onApproval: () => "suspend",
-        limits: { maxWallClockSecs: 2 },
+        limits: { maxWallClockSecs: 5 },
       }),
     );
 
-    const result = await session.resume({ onApproval: () => true });
+    const result = await session.resume({
+      onApproval: () => true,
+      limits: { maxWallClockSecs: 2 },
+    });
     ok(result);
-    assert.equal(result.output, "napped");
+    assert.equal(result.output, "ok");
   });
 
   it("the snapshot pins the compute budget: a resume cannot lift it, so a gated-tool loop is bounded by the run that started it (#38 test 3)", async () => {
@@ -2087,5 +2123,895 @@ describe("Session — the two clocks across a suspension (#38)", () => {
     err(result);
     assert.equal(result.errorKind, "timeout");
     assert.match(result.error, /time limit exceeded/);
+  });
+});
+
+// ── stdout is this call's, not the transcript's (#61) ─────────────
+//
+// Replay re-executes every prior snippet, so every prior print fires again
+// and `stdout` used to carry the whole transcript: `alpha`, `alpha\nbeta`,
+// `alpha\nbeta\ngamma` (measured). Past the cap the stale output filled the
+// budget. The session now keeps a byte mark — how much the retained prefix
+// printed — and the sandbox drops that many leading bytes before `onPrint`
+// and the accumulator see anything, so the truncation budget applies to the
+// delta by construction (D121). Bytes, not callbacks: a prefix ending in a
+// partial line merges with the next call's first print into one callback on
+// replay, and a callback count would swallow it.
+
+describe("Session — stdout is this call's, not the transcript's (#61)", () => {
+  const gate: HostTool = {
+    name: "gate_61",
+    description: "Needs approval",
+    params: [],
+    returns: "str",
+    requiresApproval: true,
+    execute: () => "g",
+  };
+
+  it("1 — three runs each return only their own output", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+    const outs: string[] = [];
+    for (const word of ["alpha", "beta", "gamma"]) {
+      const result = await session.run(`print("${word}")`);
+      ok(result);
+      outs.push(result.stdout);
+    }
+    assert.deepEqual(outs, ["alpha\n", "beta\n", "gamma\n"]);
+  });
+
+  it("2 — a 300 KB print followed by a small one returns only the small line, untruncated", async () => {
+    // The destructive case: the replayed 300 KB used to fill the budget and
+    // the only line the caller asked for arrived, if at all, in the tail.
+    const session = new Session({ registry: new ToolRegistry() });
+    ok(await session.run('print("Z" * 300000)'));
+    const result = await session.run('print("IMPORTANT-NEW-OUTPUT")');
+    ok(result);
+    assert.equal(result.stdout, "IMPORTANT-NEW-OUTPUT\n");
+    assert.equal(result.stdoutTruncated, false, "the replayed 300 KB counted against the budget");
+  });
+
+  it("3 — a run that prints nothing returns empty stdout, not the previous run's", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+    ok(await session.run('print("alpha")'));
+    const result = await session.run("x = 1");
+    ok(result);
+    assert.equal(result.stdout, "");
+  });
+
+  it("4 — the delta is what gets truncated, not the accumulated transcript", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+    const first = await session.run('print("A" * 40000)');
+    ok(first);
+    assert.equal(first.stdoutTruncated, true, "precondition: the prefix alone exceeds 32 KiB");
+
+    const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`);
+    const second = await session.run('for i in range(10):\n    print("line", i)');
+    ok(second);
+    assert.equal(second.stdoutTruncated, false, "the prefix's 40 KB was charged to this call");
+    assert.equal(second.stdout, `${lines.join("\n")}\n`);
+  });
+
+  it("5 — reset() resets the mark", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+    ok(await session.run('print("alpha")'));
+    session.reset();
+    // A stale mark would swallow `beta`; no mark at all would re-emit it on
+    // the run after.
+    const beta = await session.run('print("beta")');
+    ok(beta);
+    assert.equal(beta.stdout, "beta\n");
+    const gamma = await session.run('print("gamma")');
+    ok(gamma);
+    assert.equal(gamma.stdout, "gamma\n");
+  });
+
+  it("a suspend/resume call reports its whole output once, and the next call none of it", async () => {
+    // The resume re-accumulates the pre-gate stdout so the *call* reports
+    // everything it printed; the segment counts must add up to the call's
+    // total once, not twice — a double count would swallow the next call's
+    // first bytes.
+    const session = new Session({ registry: new ToolRegistry([gate]) });
+    const paused = await session.run('print("a")\ngate_61()\nprint("b")', {
+      onApproval: () => "suspend",
+    });
+    suspended(paused);
+    assert.equal(paused.stdout, "a\n");
+
+    const finished = await session.resume({ onApproval: () => true });
+    ok(finished);
+    assert.equal(finished.stdout, "a\nb\n", "the resumed call must report the whole call's output");
+
+    const next = await session.run('print("c")');
+    ok(next);
+    assert.equal(next.stdout, "c\n");
+  });
+
+  it("a prefix ending in a partial line is cut at the mark, not at a callback (bytes, not entries)", async () => {
+    // Run 1 prints `x` with no newline: one callback, flushed at the end of
+    // the run. On replay that `x` merges with run 2's `y\n` into a single
+    // callback `xy\n`. Skipping a callback would lose `y`; skipping one byte
+    // keeps it.
+    const session = new Session({ registry: new ToolRegistry() });
+    const first = await session.run('print("x", end="")');
+    ok(first);
+    assert.equal(first.stdout, "x");
+    const second = await session.run('print("y")');
+    ok(second);
+    assert.equal(second.stdout, "y\n");
+  });
+
+  it("the live onPrint stream sees only this call's output", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+    ok(await session.run('print("alpha")'));
+    const streamed: string[] = [];
+    ok(await session.run('print("beta")', { onPrint: (text) => streamed.push(text) }));
+    assert.deepEqual(streamed, ["beta\n"], "the terminal was shown the replayed output again");
+  });
+
+  it("the mark survives dump()/load()", async () => {
+    const registry = new ToolRegistry();
+    const s1 = new Session({ registry });
+    ok(await s1.run('print("alpha")'));
+    const s2 = Session.load(s1.dump(), { registry });
+    const result = await s2.run('print("beta")');
+    ok(result);
+    assert.equal(result.stdout, "beta\n");
+  });
+});
+
+// ── Cache and replay semantics, recovered (#62 A14–A17) ───────────
+//
+// The four defects' original text is lost; each is recovered from the code
+// and written down in docs/session-replay.md. One RED→GREEN test per
+// defect (A15's fix is documentation plus one note; its test pins the
+// documented semantics and the note), and pins for what was already right.
+
+describe("Session — cache and replay semantics recovered (#62 A14–A17)", () => {
+  /** A non-gated tool that counts real executions. */
+  function makeCounter(name = "counter"): { tool: HostTool; count: () => number } {
+    let count = 0;
+    return {
+      tool: {
+        name,
+        description: "Counts real executions",
+        params: [],
+        returns: "str",
+        execute: () => String(++count),
+      },
+      count: () => count,
+    };
+  }
+
+  /** A gated tool that counts real executions. */
+  function makeGated(name = "gated"): { tool: HostTool; executions: () => number } {
+    let executions = 0;
+    return {
+      tool: {
+        name,
+        description: "Gated; counts real executions",
+        params: [{ name: "v", type: "str", description: "Value" }],
+        returns: "str",
+        requiresApproval: true,
+        execute: (args) => `${name}:${args.v}:${++executions}`,
+      },
+      executions: () => executions,
+    };
+  }
+
+  it("A14 — a call made before the gate is cached across the suspension: it neither re-executes nor drifts", async () => {
+    // Measured before the fix: the counter ran 3 times and `n` read 2, then
+    // 3 — the pre-gate entries were dropped at the suspension, so every
+    // later replay re-executed the call and the variable followed it.
+    const counter = makeCounter();
+    const gated = makeGated();
+    const session = new Session({ registry: new ToolRegistry([counter.tool, gated.tool]) });
+
+    suspended(await session.run('n = int(counter())\ngated("x")', { onApproval: () => "suspend" }));
+    ok(await session.resume({ onApproval: () => true }));
+
+    for (let i = 0; i < 2; i++) {
+      const read = await session.run("n");
+      ok(read);
+      assert.equal(read.output, "1", `n drifted on read ${i + 1}`);
+      assert.equal(counter.count(), 1, "the pre-gate call re-executed on replay");
+    }
+    assert.equal(gated.executions(), 1);
+  });
+
+  it("A14 — a nested re-suspension accumulates the pre-gate entries", async () => {
+    const counter = makeCounter();
+    const gated = makeGated();
+    const session = new Session({ registry: new ToolRegistry([counter.tool, gated.tool]) });
+
+    suspended(
+      await session.run('n = int(counter())\ngated("a")\nm = int(counter())\ngated("b")', {
+        onApproval: () => "suspend",
+      }),
+    );
+    suspended(
+      await session.resume({ onApproval: (req) => (req.args[0] === "b" ? "suspend" : true) }),
+    );
+    ok(await session.resume({ onApproval: () => true }));
+    assert.equal(counter.count(), 2, "precondition: each counter ran once");
+
+    const sum = await session.run("n + m");
+    ok(sum);
+    assert.equal(sum.output, "3");
+    assert.equal(counter.count(), 2, "a pre-gate call re-executed on replay");
+    assert.equal(gated.executions(), 2);
+  });
+
+  it("A14 — the pre-gate entries survive a dump()/load() between the suspension and its resume", async () => {
+    const counter = makeCounter();
+    const gated = makeGated();
+    const registry = new ToolRegistry([counter.tool, gated.tool]);
+    const s1 = new Session({ registry });
+    suspended(await s1.run('n = int(counter())\ngated("x")', { onApproval: () => "suspend" }));
+
+    const json = s1.dump();
+    assert.equal(JSON.parse(json).suspended.preGateCache.length, 1, "the dump dropped them");
+
+    const s2 = Session.load(json, { registry });
+    ok(await s2.resume({ onApproval: () => true }));
+    const read = await s2.run("n");
+    ok(read);
+    assert.equal(read.output, "1");
+    assert.equal(counter.count(), 1, "the restored pre-gate call re-executed on replay");
+  });
+
+  it("A15 — a later run that omits an input a retained snippet was given fails with a note naming it", async () => {
+    // Inputs are per-call (decision 12). Without them the replayed snippet
+    // fails at the type check on a prefix line the caller cannot see; the
+    // session knows which names its snippets ran with and says so.
+    const session = new Session({ registry: new ToolRegistry() });
+    ok(await session.run("y = name", { inputs: { name: "Alice" } }));
+
+    const result = await session.run("y");
+    err(result);
+    assert.match(result.error, /inputs are per-call/);
+    assert.match(result.error, /\bname\b/);
+  });
+
+  it("A15 — inputs are per-call: a replayed snippet reads the current call's value, and a dump holds none", async () => {
+    // The documented semantics, pinned: changing an input changes what the
+    // earlier snippet computed, and no value ever reaches a dump.
+    const session = new Session({ registry: new ToolRegistry() });
+    ok(await session.run("y = name", { inputs: { name: "Alice" } }));
+    const read = await session.run("y", { inputs: { name: "Bob" } });
+    ok(read);
+    assert.equal(read.output, "Bob");
+    assert.ok(!session.dump().includes("Alice"), "an input value reached the dump");
+    assert.ok(!session.dump().includes("Bob"), "an input value reached the dump");
+  });
+
+  it("A16 — a failed snippet leaves no replayed state, and its trace is its own", async () => {
+    // Its calls are not cached, its bindings are gone, its side effects
+    // happened and the trace says so — and the trace carries *only* this
+    // call's calls, not the replayed prior ones (measured: `[["a"],["b"]]`).
+    const counter = makeCounter();
+    const session = new Session({ registry: new ToolRegistry([counter.tool, makeEchoTool()]) });
+    ok(await session.run('echo("a")'));
+
+    const failed = await session.run('z = int(counter())\necho("b")\nraise ValueError("boom")');
+    err(failed);
+    assert.deepEqual(
+      failed.calls.map((c) => c.args),
+      [[], ["b"]],
+      "the error trace reported the replayed prior call",
+    );
+    assert.equal(counter.count(), 1, "the call really ran");
+
+    const gone = await session.run("z");
+    err(gone);
+    const fresh = await session.run("counter()");
+    ok(fresh);
+    assert.equal(fresh.output, "2", "the failed snippet's call was cached and replayed");
+    assert.equal(JSON.parse(session.dump()).snippets.length, 2, "the failed snippet was retained");
+  });
+
+  it("A16 — a suspended call's trace, and so the resumed call's, is its own", async () => {
+    const gated = makeGated();
+    const session = new Session({ registry: new ToolRegistry([gated.tool, makeEchoTool()]) });
+    ok(await session.run('echo("a")'));
+
+    const paused = await session.run('echo("b")\ngated("x")', { onApproval: () => "suspend" });
+    suspended(paused);
+    assert.deepEqual(
+      paused.calls.map((c) => c.args),
+      [["b"]],
+    );
+
+    const finished = await session.resume({ onApproval: () => true });
+    ok(finished);
+    assert.deepEqual(
+      finished.calls.map((c) => c.args),
+      [["b"], ["x"]],
+    );
+  });
+
+  /** A v2 dump with `n` one-line snippets and no cache. */
+  function snippetsDump(n: number): string {
+    const snippets = Array.from({ length: n }, (_, i) => `a${i} = ${i}`);
+    return JSON.stringify({
+      version: 2,
+      snippets,
+      stdoutBytes: snippets.map(() => 0),
+      callCache: [],
+    });
+  }
+
+  /** A v2 dump whose one snippet made `n` cached `echo` calls. */
+  function cacheDump(n: number): string {
+    return JSON.stringify({
+      version: 2,
+      snippets: [`for i in range(${n}):\n    echo(str(i))`],
+      stdoutBytes: [0],
+      callCache: Array.from({ length: n }, (_, i) => ({
+        key: `echo::{"text":"${i}"}`,
+        result: String(i),
+      })),
+    });
+  }
+
+  it("A17 — the snippet after the cap is refused before anything runs, naming the cap and the way out", async () => {
+    const counter = makeCounter();
+    const registry = new ToolRegistry([counter.tool]);
+
+    const full = Session.load(snippetsDump(MAX_SNIPPETS), { registry });
+    const refused = await full.run("counter()");
+    err(refused);
+    assert.equal(refused.errorKind, "unavailable");
+    assert.match(refused.error, new RegExp(`\\b${MAX_SNIPPETS}\\b`));
+    assert.match(refused.error, /reset/i);
+    assert.equal(counter.count(), 0, "the refused call ran");
+    assert.equal(JSON.parse(full.dump()).snippets.length, MAX_SNIPPETS, "a snippet was appended");
+
+    // One below the cap: the run that reaches it is kept; the next is not.
+    const nearly = Session.load(snippetsDump(MAX_SNIPPETS - 1), { registry });
+    ok(await nearly.run("z = 1"));
+    err(await nearly.run("z"));
+
+    // The way out works.
+    full.reset();
+    ok(await full.run("counter()"));
+  });
+
+  it("A17 — the cache entry after the cap is refused inside the run, before the tool executes", async () => {
+    let executions = 0;
+    const echo: HostTool = {
+      ...makeEchoTool(),
+      execute: (args) => {
+        executions++;
+        return String(args.text);
+      },
+    };
+    const registry = new ToolRegistry([echo]);
+
+    const session = Session.load(cacheDump(MAX_CACHE_ENTRIES - 1), { registry });
+    ok(await session.run('echo("new")'), "the entry that reaches the cap is refused");
+    assert.equal(executions, 1, "replayed entries executed");
+
+    const refused = await session.run('echo("again")');
+    err(refused);
+    assert.equal(refused.errorKind, "runtime");
+    assert.match(refused.error, new RegExp(`\\b${MAX_CACHE_ENTRIES}\\b`));
+    assert.match(refused.error, /reset/i);
+    assert.equal(executions, 1, "the refused call executed — its side effect happened");
+    const dump = JSON.parse(session.dump());
+    assert.equal(dump.snippets.length, 2, "the refused snippet was appended");
+    assert.equal(dump.callCache.length, MAX_CACHE_ENTRIES);
+  });
+
+  it("A17 — load() refuses a dump beyond either cap", () => {
+    const registry = new ToolRegistry([makeEchoTool()]);
+    assert.throws(
+      () => Session.load(snippetsDump(MAX_SNIPPETS + 1), { registry }),
+      new RegExp(`Invalid session dump: .*snippets.*${MAX_SNIPPETS}`),
+    );
+    assert.throws(
+      () => Session.load(cacheDump(MAX_CACHE_ENTRIES + 1), { registry }),
+      new RegExp(`Invalid session dump: .*callCache.*${MAX_CACHE_ENTRIES}`),
+    );
+  });
+});
+
+// ── Persistence hardening (#63) ───────────────────────────────────
+//
+// `Session.dump()` / `load()` are a public export. Measured before this
+// change: `load()` checked only `version`; `snippets: 5` threw a TypeError
+// from inside the constructor, `callCache: "zzz"` was accepted and blew up
+// on the next run, an extra key was accepted; and a dump whose `callCache`
+// named a `bash` call ran `print(out)` to `ok` with the file's `FAKE-OUTPUT`
+// and no dialog. The invariant this block protects: a persisted session must
+// never be able to grant an approval a human did not grant.
+
+describe("Session — persistence hardening (#63)", () => {
+  const gated: HostTool = {
+    name: "gate_63",
+    description: "Needs approval",
+    params: [{ name: "x", type: "str", description: "Value" }],
+    returns: "str",
+    requiresApproval: true,
+    execute: (args) => `g:${args.x}`,
+  };
+
+  const base = { version: 2, snippets: [] as string[], stdoutBytes: [] as number[], callCache: [] };
+  const validSuspended = {
+    snapshot: "QUJD",
+    suspendedCall: { tool: "gate_63", args: ["x"], kwargs: {}, description: 'gate_63(x="x")' },
+    stdout: "",
+    stdoutTruncated: false,
+    calls: [],
+    stdoutBytes: 0,
+    preGateCache: [],
+  };
+  const withSuspension = (suspended: unknown) => ({
+    ...base,
+    suspended,
+    suspendedCode: 'gate_63("x")',
+  });
+
+  it("1 — a malformed dump is rejected with an error naming the field, never coerced or thrown through", () => {
+    const registry = new ToolRegistry([gated]);
+    const cases: Array<[string, string, RegExp]> = [
+      ["null", "null", /object/],
+      ["array", "[]", /object/],
+      ["not JSON", "{", /Invalid session JSON/],
+      [
+        "version 1 (pre-bump)",
+        JSON.stringify({ version: 1, snippets: [], callCache: [] }),
+        /Unsupported session version: 1 \(expected 2\)/,
+      ],
+      ["version as a string", JSON.stringify({ ...base, version: "2" }), /version/],
+      [
+        "missing snippets",
+        JSON.stringify({ version: 2, stdoutBytes: [], callCache: [] }),
+        /snippets/,
+      ],
+      ["snippets: 5", JSON.stringify({ ...base, snippets: 5 }), /snippets/],
+      [
+        "snippets[1] not a string",
+        JSON.stringify({ ...base, snippets: ["a", 1], stdoutBytes: [0, 0] }),
+        /snippets\[1\]/,
+      ],
+      [
+        "stdoutBytes length mismatch",
+        JSON.stringify({ ...base, snippets: ["a"], stdoutBytes: [] }),
+        /stdoutBytes/,
+      ],
+      [
+        "stdoutBytes negative",
+        JSON.stringify({ ...base, snippets: ["a"], stdoutBytes: [-1] }),
+        /stdoutBytes\[0\]/,
+      ],
+      [
+        "stdoutBytes fractional",
+        JSON.stringify({ ...base, snippets: ["a"], stdoutBytes: [1.5] }),
+        /stdoutBytes\[0\]/,
+      ],
+      ["callCache: 'zzz'", JSON.stringify({ ...base, callCache: "zzz" }), /callCache/],
+      [
+        "callCache entry missing result",
+        JSON.stringify({ ...base, callCache: [{ key: "k" }] }),
+        /callCache\[0\]/,
+      ],
+      [
+        "callCache entry with an extra key",
+        JSON.stringify({ ...base, callCache: [{ key: "k", result: "r", restored: true }] }),
+        /callCache\[0\].*restored/,
+      ],
+      ["extra top-level key", JSON.stringify({ ...base, evil: 1 }), /evil/],
+      [
+        "__proto__ key",
+        '{"version":2,"snippets":[],"stdoutBytes":[],"callCache":[],"__proto__":{"x":1}}',
+        /__proto__/,
+      ],
+      [
+        "suspended without suspendedCode",
+        JSON.stringify({ ...base, suspended: validSuspended }),
+        /suspendedCode/,
+      ],
+      [
+        "suspendedCode without suspended",
+        JSON.stringify({ ...base, suspendedCode: "x" }),
+        /suspendedCode/,
+      ],
+      [
+        "snapshot not base64",
+        JSON.stringify(withSuspension({ ...validSuspended, snapshot: "!!!!" })),
+        /snapshot.*base64/,
+      ],
+      [
+        "snapshot with a bad length",
+        JSON.stringify(withSuspension({ ...validSuspended, snapshot: "QUJDR" })),
+        /snapshot/,
+      ],
+      [
+        "suspendedCall.args not an array",
+        JSON.stringify(
+          withSuspension({
+            ...validSuspended,
+            suspendedCall: { ...validSuspended.suspendedCall, args: "x" },
+          }),
+        ),
+        /suspendedCall\.args/,
+      ],
+      [
+        "suspendedCall missing description",
+        JSON.stringify(
+          withSuspension({
+            ...validSuspended,
+            suspendedCall: { tool: "gate_63", args: [], kwargs: {} },
+          }),
+        ),
+        /suspendedCall\.description/,
+      ],
+      [
+        "calls[0].durationMs a string",
+        JSON.stringify(
+          withSuspension({
+            ...validSuspended,
+            calls: [{ tool: "t", args: [], kwargs: {}, durationMs: "1", ok: true }],
+          }),
+        ),
+        /calls\[0\]\.durationMs/,
+      ],
+      [
+        "suspended.stdoutBytes missing",
+        JSON.stringify(withSuspension({ ...validSuspended, stdoutBytes: undefined })),
+        /suspended\.stdoutBytes/,
+      ],
+      [
+        "suspended.preGateCache missing",
+        JSON.stringify(withSuspension({ ...validSuspended, preGateCache: undefined })),
+        /preGateCache/,
+      ],
+      [
+        "suspendedRunOpts present",
+        JSON.stringify({ ...base, suspendedRunOpts: {} }),
+        /suspendedRunOpts/,
+      ],
+      [
+        "suspended not an object",
+        JSON.stringify({ ...base, suspended: 5, suspendedCode: "x" }),
+        /suspended must be an object/,
+      ],
+      [
+        "suspendedCode not a string",
+        JSON.stringify({ ...base, suspended: validSuspended, suspendedCode: 5 }),
+        /suspendedCode must be a string/,
+      ],
+      [
+        "snapshot empty",
+        JSON.stringify(withSuspension({ ...validSuspended, snapshot: "" })),
+        /snapshot/,
+      ],
+      [
+        "stdoutTruncated not a boolean",
+        JSON.stringify(withSuspension({ ...validSuspended, stdoutTruncated: "no" })),
+        /suspended\.stdoutTruncated/,
+      ],
+      [
+        "suspendedCall.kwargs not an object",
+        JSON.stringify(
+          withSuspension({
+            ...validSuspended,
+            suspendedCall: { ...validSuspended.suspendedCall, kwargs: [] },
+          }),
+        ),
+        /suspendedCall\.kwargs/,
+      ],
+      [
+        "calls[0] with an extra key",
+        JSON.stringify(
+          withSuspension({
+            ...validSuspended,
+            calls: [{ tool: "t", args: [], kwargs: {}, durationMs: 1, ok: true, extra: 1 }],
+          }),
+        ),
+        /calls\[0\].*extra/,
+      ],
+      ["a redacted export", JSON.stringify({ ...base, redacted: true }), /redacted export/],
+    ];
+
+    for (const [label, json, expected] of cases) {
+      assert.throws(
+        () => Session.load(json, { registry }),
+        (e: unknown) =>
+          e instanceof Error &&
+          !(e instanceof TypeError) &&
+          expected.test(e.message) &&
+          (label === "not JSON" ||
+            label.startsWith("version 1") ||
+            /^Invalid session dump/.test(e.message)),
+        `${label}: expected a clear rejection matching ${expected}`,
+      );
+    }
+  });
+
+  it("1b — a well-formed dump with a suspension loads, so the table above is rejecting shape, not suspensions", () => {
+    const registry = new ToolRegistry([gated]);
+    const session = Session.load(JSON.stringify(withSuspension(validSuspended)), { registry });
+    assert.equal(session.isSuspended(), true);
+  });
+
+  it("2 — an oversize dump is refused before it is parsed, fast", () => {
+    const registry = new ToolRegistry([gated]);
+    // 100 MB of base64 alphabet: well-formed as far as any parser could tell,
+    // and refused on its byte length alone.
+    const big = "A".repeat(100 * 1024 * 1024);
+    const json = `{"version":2,"snippets":[],"stdoutBytes":[],"callCache":[],"suspendedCode":"x","suspended":{"snapshot":"${big}","suspendedCall":{"tool":"gate_63","args":[],"kwargs":{},"description":"d"},"stdout":"","stdoutTruncated":false,"calls":[],"stdoutBytes":0,"preGateCache":[]}}`;
+    const started = performance.now();
+    assert.throws(
+      () => Session.load(json, { registry }),
+      new RegExp(`Invalid session dump: .*${MAX_DUMP_BYTES}`),
+    );
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 2000, `refusing 100 MB took ${elapsed.toFixed(0)} ms`);
+  });
+
+  it("3 — a poisoned callCache neither executes a gated tool nor suppresses its prompt", async () => {
+    let executions = 0;
+    const bash: HostTool = {
+      name: "bash",
+      description: "Gated",
+      params: [{ name: "cmd", type: "str", description: "Command" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => {
+        executions++;
+        return "REAL";
+      },
+    };
+    const registry = new ToolRegistry([bash]);
+    const poisoned = JSON.stringify({
+      ...base,
+      snippets: ['out = bash("rm -rf /")'],
+      stdoutBytes: [0],
+      callCache: [{ key: 'bash::{"cmd":"rm -rf /"}', result: "FAKE-OUTPUT" }],
+    });
+
+    let asked = 0;
+    const session = Session.load(poisoned, { registry });
+    const result = await session.run("print(out)", {
+      onApproval: () => {
+        asked++;
+        return false;
+      },
+    });
+    err(result);
+    assert.match(result.error, /PermissionError/);
+    assert.equal(asked, 1, "the file's entry suppressed the prompt");
+    assert.equal(executions, 0, "the file's entry ran the tool");
+    assert.ok(!result.stdout.includes("FAKE-OUTPUT"), "the file's result was served as output");
+  });
+
+  it("3b — a restored gated entry the user approves runs for real, its real result replaces the file's, and only then does it replay silently", async () => {
+    let executions = 0;
+    const counting: HostTool = {
+      ...gated,
+      execute: (args) => `g:${args.x}:${++executions}`,
+    };
+    const registry = new ToolRegistry([counting]);
+    const s1 = new Session({ registry });
+    ok(await s1.run('v = gate_63("x")', { onApproval: () => true }));
+    assert.equal(executions, 1);
+
+    const s2 = Session.load(s1.dump(), { registry });
+    let asked = 0;
+    const first = await s2.run("v", {
+      onApproval: () => {
+        asked++;
+        return true;
+      },
+    });
+    ok(first);
+    assert.equal(asked, 1, "a restored gated entry replayed without asking");
+    assert.equal(executions, 2, "the approved call did not run for real");
+    assert.equal(first.output, "g:x:2", "the file's result was served instead of the real one");
+
+    // Now the session's own: no callback, no prompt, no execution.
+    const second = await s2.run("v");
+    ok(second);
+    assert.equal(second.output, "g:x:2");
+    assert.equal(executions, 2);
+    assert.equal(JSON.parse(s2.dump()).callCache[0].result, "g:x:2");
+  });
+
+  it("3c — a restored suspension is described by its arguments, not by what the file says", async () => {
+    // Measured: a dump whose description said `gate(x='harmless')` while its
+    // args said `x` showed `harmless` in the dialog and ran `x`.
+    const registry = new ToolRegistry([gated]);
+    const s1 = new Session({ registry });
+    const truth = await s1.run('gate_63("x")', { onApproval: () => "suspend" });
+    suspended(truth);
+
+    const parsed = JSON.parse(s1.dump());
+    parsed.suspended.suspendedCall.description = "gate_63(x='harmless')";
+    const s2 = Session.load(JSON.stringify(parsed), { registry });
+
+    let shown = "";
+    const result = await s2.resume({
+      onApproval: (req) => {
+        shown = req.description;
+        return true;
+      },
+    });
+    ok(result);
+    assert.equal(shown, truth.suspendedCall.description);
+    assert.doesNotMatch(shown, /harmless/);
+  });
+
+  it("4 — a round trip keeps snippets, results, the suspension and the mark, and drops the grants", async () => {
+    let executions = 0;
+    const counting: HostTool = {
+      ...gated,
+      execute: (args) => `g:${args.x}:${++executions}`,
+    };
+    const second: HostTool = { ...gated, name: "gate_63b" };
+    const boom: HostTool = {
+      name: "boom",
+      description: "Fails",
+      params: [],
+      returns: "str",
+      execute: () => {
+        throw new HostToolError("RuntimeError", "boom");
+      },
+    };
+    const registry = new ToolRegistry([counting, second, boom]);
+    const s1 = new Session({ registry }, undefined, { grantUses: 3 });
+
+    ok(await s1.run('print("kept")\nk = 1', { onApproval: () => true }));
+    // A failed call and an approved call before the pending gate, so the
+    // suspension's trace carries `error` and `approved` through the round trip.
+    suspended(
+      await s1.run(
+        'try:\n    boom()\nexcept RuntimeError:\n    pass\ngate_63("a")\ngate_63b("b")',
+        { onApproval: () => "suspend" },
+      ),
+    );
+    suspended(
+      await s1.resume({ onApproval: (req) => (req.tool === "gate_63" ? true : "suspend") }),
+    );
+    assert.deepEqual(s1.outstandingGrants(), [{ tool: "gate_63", remaining: 2 }], "precondition");
+
+    const s2 = Session.load(s1.dump(), { registry });
+    assert.deepEqual(s2.outstandingGrants(), [], "a grant survived into the restored session");
+    assert.equal(s2.isSuspended(), true, "the suspension did not survive");
+
+    const resumed = await s2.resume({ onApproval: () => true });
+    ok(resumed);
+    assert.equal(resumed.output, "g:b");
+    assert.deepEqual(
+      resumed.calls.map((c) => [c.tool, c.ok, c.approved]),
+      [
+        ["boom", false, undefined],
+        ["gate_63", true, true],
+        ["gate_63b", true, true],
+      ],
+      "the trace did not survive the round trip",
+    );
+
+    const read = await s2.run("k", { onApproval: () => true });
+    ok(read);
+    assert.equal(read.output, "1", "the snippets did not survive");
+    assert.equal(read.stdout, "", "the mark did not survive");
+  });
+
+  it("5 — dumpRedacted() masks secrets and cuts values, omits the snapshot, and is not loadable; dump() stays verbatim", async () => {
+    const token = "sk-abcdefghijklmnopqrstuvwxyz0123";
+    const leak: HostTool = {
+      name: "leak",
+      description: "Returns a secret and a lot of bytes",
+      params: [],
+      returns: "str",
+      execute: () => `token=${token} then ${"B".repeat(10000)}`,
+    };
+    const boom: HostTool = {
+      name: "boom",
+      description: "Fails with a secret in the message",
+      params: [],
+      returns: "str",
+      execute: () => {
+        throw new HostToolError("RuntimeError", `PASSWORD=hunter2 rejected`);
+      },
+    };
+    const registry = new ToolRegistry([leak, gated, boom]);
+    const session = new Session({ registry });
+    ok(await session.run("x = leak()"));
+    ok(await session.run('secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456"'));
+    suspended(
+      await session.run('try:\n    boom()\nexcept RuntimeError:\n    pass\ngate_63("x")', {
+        onApproval: () => "suspend",
+      }),
+    );
+
+    const verbatim = session.dump();
+    assert.ok(verbatim.includes(token), "the replay cache must hold what the tool returned");
+    assert.ok(verbatim.includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456"));
+    assert.equal(typeof JSON.parse(verbatim).suspended.snapshot, "string");
+
+    const exported = session.dumpRedacted();
+    assert.ok(!exported.includes(token), "the export leaked the token");
+    assert.ok(!exported.includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456"));
+    assert.ok(!exported.includes("hunter2"), "the export leaked a trace error's secret");
+    const red = JSON.parse(exported);
+    assert.equal(red.redacted, true);
+    assert.equal(red.suspended.calls[0].tool, "boom");
+    assert.ok(red.suspended.calls[0].error.includes(REDACTED));
+    assert.ok(!("args" in red.suspended.calls[0]), "the export carried call arguments");
+    assert.equal(red.version, 2);
+    assert.ok(red.callCache[0].result.includes(REDACTED));
+    assert.ok(
+      Buffer.byteLength(red.callCache[0].result) <= 4096,
+      `${Buffer.byteLength(red.callCache[0].result)} bytes against a 4 KiB export budget`,
+    );
+    assert.match(
+      red.callCache[0].result,
+      /truncated at/,
+      "a redaction cut states where, not how much",
+    );
+    assert.ok(red.snippets[1].includes(REDACTED));
+    assert.ok(!("snapshot" in red.suspended), "the export carried the opaque snapshot");
+    assert.equal(red.suspended.tool, "gate_63");
+    assert.throws(() => Session.load(exported, { registry }), /redacted export/);
+  });
+
+  it("6 — dump() refuses to write a dump over the bound", async () => {
+    const big: HostTool = {
+      name: "big",
+      description: "Returns just over the bound",
+      params: [],
+      returns: "str",
+      execute: () => "A".repeat(MAX_DUMP_BYTES + 1000),
+    };
+    const session = new Session({ registry: new ToolRegistry([big]) });
+    ok(await session.run("b = big()"));
+    assert.throws(() => session.dump(), new RegExp(`${MAX_DUMP_BYTES}`));
+  });
+});
+
+// ── Calls are serialised per session (D131) ───────────────────────
+//
+// Measured: two concurrent `resume()` calls on one suspension both returned
+// `ok` and the gated tool executed twice from one approval; two concurrent
+// `run()` calls assembled prefixes that did not include each other. A queue
+// makes concurrent calls behave exactly as sequential ones.
+
+describe("Session — calls are serialised per session (D131)", () => {
+  it("two concurrent resumes execute the approved call once; the loser learns nothing was pending", async () => {
+    let executions = 0;
+    const gated: HostTool = {
+      name: "gate_131",
+      description: "Needs approval",
+      params: [],
+      returns: "str",
+      requiresApproval: true,
+      execute: () => `g:${++executions}`,
+    };
+    const session = new Session({ registry: new ToolRegistry([gated]) });
+    suspended(await session.run("gate_131()", { onApproval: () => "suspend" }));
+
+    const settled = await Promise.allSettled([
+      session.resume({ onApproval: () => true }),
+      session.resume({ onApproval: () => true }),
+    ]);
+    assert.equal(executions, 1, "one approval executed the call more than once");
+    const fulfilled = settled.filter((s) => s.status === "fulfilled");
+    const rejected = settled.filter((s) => s.status === "rejected");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    ok((fulfilled[0] as PromiseFulfilledResult<unknown>).value);
+    assert.match(String((rejected[0] as PromiseRejectedResult).reason), /no suspended execution/i);
+  });
+
+  it("two concurrent runs stack in order, so the second sees the first's bindings", async () => {
+    const session = new Session({ registry: new ToolRegistry() });
+    const [first, second] = await Promise.all([session.run("x = 1"), session.run("y = x + 1")]);
+    ok(first);
+    ok(second);
+    const read = await session.run("y");
+    ok(read);
+    assert.equal(read.output, "2");
   });
 });
