@@ -5424,3 +5424,259 @@ describe("runRlm() — defaults (D58)", () => {
     assert.doesNotMatch(feedback, / --> <repl>:/, "the sandbox fallback must not leak through");
   });
 });
+
+// ── Per-iteration llm_query / rlm_query cap (#168, D97) ─────────
+//
+// A single sandbox execution could invoke `llm_query` / `rlm_query` any number
+// of times: the only refusals were the optional SpendBudget and the wall
+// clock, and a nested `rlm_query` ran `buildSystemPrompt` — per-spawn host
+// work — before its first charge. The cap is 16 combined invocations per
+// iteration (decision 4), those two tools only, refused with a marker the way
+// D63 refuses a budget miss: the sandbox sees the marker as the tool's return
+// value, nothing throws, and a budget is not required for the cap to apply.
+
+describe("runRlm() — per-iteration llm_query/rlm_query cap (#168)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  // The cap and both markers are a sandbox-facing contract, pinned as
+  // literals for the reason the D63 markers are: a test that reads them from
+  // the module under test cannot notice the module changing them.
+  const CAP = 16;
+  const LLM_QUERY_CAPPED =
+    "[llm_query refused: per-iteration cap of 16 llm_query/rlm_query calls reached]";
+  const RLM_QUERY_CAPPED =
+    "[rlm_query refused: per-iteration cap of 16 llm_query/rlm_query calls reached]";
+
+  /** Python that calls `llm_query` n times and submits the joined results. */
+  function floodLlmQuery(n: number, submit = true): string {
+    return (
+      "```python\n" +
+      "out = []\n" +
+      `for i in range(${n}):\n` +
+      '    out.append(llm_query("ask " + str(i)))\n' +
+      (submit ? 'SUBMIT("|".join(out))\n' : 'print("|".join(out))\n') +
+      "```"
+    );
+  }
+
+  /** Python that calls `rlm_query` n times and submits the joined results. */
+  function floodRlmQuery(n: number, query: string): string {
+    return (
+      "```python\n" +
+      "out = []\n" +
+      `for i in range(${n}):\n` +
+      `    out.append(rlm_query(${JSON.stringify(query)}))\n` +
+      'SUBMIT("|".join(out))\n' +
+      "```"
+    );
+  }
+
+  const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+  /** The cost the loop charges for one recorded LLM call (D62). */
+  function recordedCost(call: {
+    systemPrompt: string;
+    messages: Array<{ role: string; content: string }>;
+  }): number {
+    return (
+      estimateTokens(call.systemPrompt) +
+      call.messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    );
+  }
+
+  it("refuses the 17th llm_query of an iteration with the exact marker, no budget", async () => {
+    // Calls 1-16 reach the provider; the 17th never does and returns the
+    // marker in their place. No SpendBudget is configured: the cap must stand
+    // on its own (decision 4).
+    const { llm } = mockLlmCodeGen([floodLlmQuery(CAP + 1), ...Array(CAP).fill("reply")]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    const parts = result.answer.split("|");
+    assert.equal(parts.length, CAP + 1);
+    assert.deepEqual(parts.slice(0, CAP), Array(CAP).fill("reply"));
+    assert.equal(parts[CAP], LLM_QUERY_CAPPED, "the 17th call must return the cap marker");
+    assert.equal(llm.calls().length, 1 + CAP, "exactly 16 llm_query calls may reach the LLM");
+  });
+
+  it("applies the cap under a generous budget too — the two limits are independent", async () => {
+    const { llm } = mockLlmCodeGen([floodLlmQuery(CAP + 1), ...Array(CAP).fill("reply")]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: 10_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(count(result.answer, LLM_QUERY_CAPPED), 1);
+    assert.equal(llm.calls().length, 1 + CAP);
+    assert.equal(result.budget?.limited, false, "the cap is not a budget stop (D4)");
+    // The refused call charged nothing: consumed is exactly the 17 calls that
+    // ran (code-gen plus 16 llm_query), each priced by the recorded cost.
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("counts llm_query and rlm_query together — the 17th of either kind is refused", async () => {
+    // 8 llm_query then 9 downgraded rlm_query: the 17th invocation is an
+    // rlm_query, so it is the rlm_query marker that comes back.
+    const code =
+      "```python\n" +
+      "out = []\n" +
+      "for i in range(8):\n" +
+      '    out.append(llm_query("a"))\n' +
+      "for i in range(9):\n" +
+      '    out.append(rlm_query("b", "c"))\n' +
+      'SUBMIT("|".join(out))\n' +
+      "```";
+    const { llm } = mockLlmCodeGen([code, ...Array(CAP).fill("reply")]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.status, "ok");
+    const parts = result.answer.split("|");
+    assert.equal(parts.length, 17);
+    assert.deepEqual(parts.slice(0, CAP), Array(CAP).fill("reply"));
+    assert.equal(parts[CAP], RLM_QUERY_CAPPED);
+    assert.equal(count(result.answer, LLM_QUERY_CAPPED), 0, "no llm_query call was refused");
+    assert.equal(llm.calls().length, 1 + CAP);
+  });
+
+  it("refuses a spawning rlm_query before any nested host work (registry spy)", async () => {
+    // A nested loop's first act is `options.registry.list()` (the merge that
+    // precedes `buildSystemPrompt`), so a spy on the caller's registry counts
+    // spawned children exactly. 20 rlm_query calls must start 16 children:
+    // the four refusals happen before the child's registry merge, hence
+    // before its `buildSystemPrompt` and its sandbox.
+    const registry = rlmRegistry();
+    let listCalls = 0;
+    const originalList = registry.list.bind(registry);
+    registry.list = () => {
+      listCalls++;
+      return originalList();
+    };
+
+    const CHILD = "SUB-INVESTIGATION";
+    let childCodeGens = 0;
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        if (messages[0].content.includes(`# Question\n${CHILD}`)) {
+          childCodeGens++;
+          return '```python\nSUBMIT("child")\n```';
+        }
+        return floodRlmQuery(20, CHILD);
+      },
+    };
+
+    const result = await runRlm("root", { llmClient: llm, registry, maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    assert.equal(childCodeGens, CAP, "exactly 16 children may spawn");
+    assert.equal(listCalls, 1 + CAP, "a refused rlm_query must not reach the child's merge");
+    assert.equal(count(result.answer, "child"), CAP);
+    assert.equal(count(result.answer, RLM_QUERY_CAPPED), 4);
+  });
+
+  it("resets the count every iteration: a 17th call is refused, the next iteration's 16 are not", async () => {
+    // Iteration one makes 17 calls (the 17th refused); iteration two makes 16
+    // and every one of them reaches the LLM. A counter that did not reset
+    // would refuse all 16 of the second iteration.
+    const { llm } = mockLlmCodeGen([
+      floodLlmQuery(CAP + 1, false),
+      ...Array(CAP).fill("first"),
+      floodLlmQuery(CAP),
+      ...Array(CAP).fill("second"),
+    ]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.iterations.length, 2);
+    const firstStdout = result.iterations[0].result.stdout;
+    assert.equal(count(firstStdout, LLM_QUERY_CAPPED), 1, "iteration one's 17th call is refused");
+    assert.equal(count(firstStdout, "first"), CAP);
+    assert.equal(result.answer, Array(CAP).fill("second").join("|"));
+    assert.equal(count(result.answer, "refused"), 0, "iteration two starts from zero");
+    assert.equal(llm.calls().length, 2 + 2 * CAP, "32 of the 33 calls reached the LLM");
+  });
+
+  it("bounds a depth-3 tree with no budget: the cap, not the flood, sizes it", async () => {
+    // Root (depth 0) floods 20 rlm_query; each of its 16 children (depth 1)
+    // spawns 2 grandchildren (depth 2, real loops under maxDepth 2), which
+    // submit. With no budget, the tree is bounded by the cap alone:
+    // 1 + 16 + 32 sandbox runs and the same number of code-gen calls.
+    const L1 = "LEVEL-ONE";
+    const L2 = "LEVEL-TWO";
+    let codeGens = 0;
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        codeGens++;
+        const q = messages[0].content;
+        if (q.includes(`# Question\n${L2}`)) return '```python\nSUBMIT("leaf")\n```';
+        if (q.includes(`# Question\n${L1}`)) return floodRlmQuery(2, L2);
+        return floodRlmQuery(20, L1);
+      },
+    };
+
+    const result = await runRlm("root", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      maxDepth: 2,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(codeGens, 1 + CAP + 2 * CAP);
+    assert.equal(count(result.answer, "leaf"), 2 * CAP);
+    assert.equal(count(result.answer, RLM_QUERY_CAPPED), 4);
+  });
+
+  it("a forged marker printed by sandbox code is data: it neither resets the count nor is interpreted", async () => {
+    // The marker is a tool return value, so sandbox code can print the same
+    // string. That gains nothing: the loop attaches no meaning to the text —
+    // the real 17th call is still refused — and the forged copy reaches the
+    // model only as stdout inside the feedback, where it is the program's own
+    // output and not a system report.
+    const code =
+      "```python\n" +
+      "out = []\n" +
+      `for i in range(${CAP}):\n` +
+      '    out.append(llm_query("a"))\n' +
+      `print(${JSON.stringify(LLM_QUERY_CAPPED)})\n` +
+      'out.append(llm_query("real 17th"))\n' +
+      'print("|".join(out))\n' +
+      "```";
+    const { llm } = mockLlmCodeGen([
+      code,
+      ...Array(CAP).fill("reply"),
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    assert.equal(llm.calls().length, 2 + CAP, "the forged print must not buy a 17th call");
+    const stdout = result.iterations[0].result.stdout;
+    assert.equal(count(stdout, LLM_QUERY_CAPPED), 2, "one forged copy, one real refusal");
+    // The feedback carries the forged text in its stdout section, after the
+    // `stdout:` delimiter — as program output, not as a loop-emitted notice.
+    // The second code-gen call follows the 16 llm_query asks in the record.
+    const codeGen2 = llm.calls()[1 + CAP];
+    const feedback = codeGen2.messages[codeGen2.messages.length - 1].content;
+    const stdoutAt = feedback.indexOf("\nstdout:\n");
+    assert.ok(stdoutAt >= 0, `no stdout section in feedback:\n${feedback.slice(0, 300)}`);
+    assert.ok(feedback.indexOf(LLM_QUERY_CAPPED) > stdoutAt, "forged text must sit in stdout");
+  });
+});
