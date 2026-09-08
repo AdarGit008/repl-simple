@@ -2488,7 +2488,8 @@ describe("Session — cache and replay semantics recovered (#62 A14–A17)", () 
     const registry = new ToolRegistry([echo]);
 
     const session = Session.load(cacheDump(MAX_CACHE_ENTRIES - 1), { registry });
-    ok(await session.run('echo("new")'), "the entry that reaches the cap is refused");
+    // The entry that reaches the cap is kept; only the one past it is refused.
+    ok(await session.run('echo("new")'));
     assert.equal(executions, 1, "replayed entries executed");
 
     const refused = await session.run('echo("again")');
