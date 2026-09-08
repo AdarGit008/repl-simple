@@ -1,7 +1,8 @@
 # Ship Report — W3-1: Sandbox contract and output fidelity (#65, #69; epics #64, #40, #39)
 
 Branch: `chunk/w3-1-sandbox-output-contract` · Base: `main` (`acadb19`) · Commits: `fb3577e` (spec) ·
-`833dbac` (RED) · `cf97518` (GREEN) · this report · Spec: `tasks/spec-w3-1.md` (D139–D150) ·
+`833dbac` (RED) · `cf97518` (GREEN) · `bbd2e85` (report) · fix round 1: `7964278` (RED) · `88aa7bc`
+(GREEN) · this report · Spec: `tasks/spec-w3-1.md` (D139–D150, fix-round notes under D140 and D144) ·
 Maintainer decisions: 15, 11, 9 · Decision: **GO**
 
 ## What was built
@@ -12,16 +13,26 @@ built, a Python value renders as a Python value, a missing required argument is 
 trace where it happened.
 
 1. **`src/truncate.ts` — `formatValue`, a budget-aware Python-style repr (D140).** `formatValue`
-   (`:748`) spells what crossed the boundary as Python would — `{'a': 1}`, `[1, 2]`, `{1, 2}`,
+   (`:831`) spells what crossed the boundary as Python would — `{'a': 1}`, `[1, 2]`, `{1, 2}`,
    `set()`, `True`, `None`, `b'..'`, `inf`/`nan`, `ValueError('bad')`, `<class 'int'>`, Python's
-   string quoting and escapes inside a container (`reprString` `:471`, `reprBytes` `:491`), a bare
+   string quoting and escapes inside a container (`reprString` `:513`, `reprBytes` `:532`), a bare
    `str` verbatim — and, over the budget, elides *between the elements of the outermost value*
-   (`elideContainer` `:670`): `[0, 1, 2, [… 299994 of 300000 elements elided. Assign the value to a
+   (`elideContainer` `:742`): `[0, 1, 2, [… 299994 of 300000 elements elided. Assign the value to a
    name and slice it to see more. …], 299998, 299999]`. Every path ends in `truncateText`, so
-   invariant 1 holds by construction; the renderer (`Repr` `:513`) stops appending past the cap, so
+   invariant 1 holds by construction; the renderer (`Repr` `:554`) stops appending past the cap, so
    the work is the budget's, not the value's. `pythonTypeName` (`:426`) names types for the
    `TypeError` messages. The boundary's losses are documented, not hidden (tuple → list, `1.0` → `1`,
    frozenset → set, a bare `str` verbatim).
+   **Fix round 1.** The bound was false for a container dominated by one huge scalar: the scalar
+   was spelled in full (a per-character loop) up to four times before the flat cut — `['x' * 10**7]`
+   3.5 s, `['x' * 10**8]` 42 s, synchronous on the host thread after Monty had finished. Now a
+   `str`/`bytes` is spelled one code unit past the cap and no further, by a regex scan
+   (`STRING_ESCAPES` `:473`, `bounded` `:497`); `Repr` walks a value from its tail when asked
+   (`fromEnd`), and both fallbacks render head and tail under the budget (`reprEnds` `:681`) — the
+   whole is never spelled, so that flat cut claims no total (`[… truncated at 16.0KB. … …]`); a
+   dict's huge entry descends through its value behind its key. Measured through `runInSandbox`:
+   `['x' * 10**7]` 3495 → 136 ms, `{'k': 'x' * 10**7}` 3139 → 58 ms, `['x' * 10**8]` 41.7 s →
+   936 ms (main: 1057 ms — the crossing).
 2. **`src/sandbox.ts` — the contract at the three `RunOk` sites (D139, D141, D142, D143).**
    `renderOutput` (`:704`) replaces `formatOutput` + `capOutput` at the expression site and both
    SUBMIT sites. `submittedAnswer` / `toolFailure` (`:726`, `:736`) guard both SUBMIT catch sites: a
@@ -48,7 +59,9 @@ trace where it happened.
    could not be placed under `[trace] N host-tool call(s), K shown in place`. Collapsed output and
    every `formatTrace` line are unchanged; the model-facing text is untouched.
    `TraceView.render` renders at `DEFAULT_COLUMNS` for a width that is not finite or below 1
-   (`NaN` used to grow the output until `Invalid array length`). `CwdRunner` remembers the waiting
+   (`NaN` used to grow the output until `Invalid array length`). Fix round 1: the byte→index map
+   (`:621`) walks per code point — an emoji counted as six bytes, not four, so every offset past
+   one went unplaced. `CwdRunner` remembers the waiting
    tool per session off `RunTrace.suspendedCall` (`noteOutcome` `:822`, `forget` `:829`,
    `dispose` `:842`) and the shutdown report reads `still had a 'write' call waiting for approval`
    (`:1167`) — the name only, never the arguments.
@@ -73,6 +86,9 @@ extension file):
 | `test/sandbox.test.ts` | 203 | 159 | **43** | 1 |
 | `test/extension.test.ts` | 101 | 88 | **13** | 0 |
 
+(At `HEAD` the sandbox figure is **44**: the GREEN commit moved the pre-existing #34 pin "keeps
+both ends of the value, 50/50" to the repr's shape, and it fails on `main` too.)
+
 Every fail is a new or flipped test. Controls green on `main` by design and marked so in place: the
 type-checker refusals (`SUBMIT()` / `SUBMIT(42)` / `**{'answer': None}`, #65 test 5), the finding-3
 and finding-5 measured facts, collapsed rendering, the stale-span fallback, "an abandoned or reset
@@ -88,12 +104,24 @@ tightened to the 0.0.21 shape (`:783`), one span offset off by one and two shape
 RED set corrected.
 
 **Gates at `cf97518`:** `npm run check` clean · `npm run lint` (biome + knip) clean ·
-`npm run coverage`: all per-file floors met — `src/truncate.ts` 100.00, `src/types.ts` 100.00,
-`src/submit_signal.ts` 100.00, `src/sandbox.ts` 97.90 (floor 97.66), `extensions/repl-extension.ts`
-99.85 (floor 99.73), `src/rlm_tools.ts` 100.00 (99.22), `src/session.ts` 99.46 (98.73); no
-`coverage-baseline.json` change · `npm run test:contained` (`REQUIRE_BRIDGE_TOOLS=1`): **1637
-tests, 1625 pass, 0 fail, 12 todo** · CI: `gh pr checks --watch`, all legs including both macOS
-legs — recorded in the PR.
+`npm run coverage`: all per-file floors met — `src/truncate.ts` 99.87 against a 100.00 floor
+(within the instrument's one-line tolerance, `scripts/coverage.mjs` #113; the first edition of this
+report said 100.00 — corrected), `src/types.ts` 100.00, `src/submit_signal.ts` 100.00,
+`src/sandbox.ts` 97.90 (floor 97.66), `extensions/repl-extension.ts` 99.85 (floor 99.73),
+`src/rlm_tools.ts` 100.00 (99.22), `src/session.ts` 99.46 (98.73); no `coverage-baseline.json`
+change · `npm run test:contained` (`REQUIRE_BRIDGE_TOOLS=1`): **1637 tests, 1625 pass, 0 fail, 12
+todo** · CI: `gh pr checks --watch`, all legs including both macOS legs — recorded in the PR.
+
+**Fix round 1** (verifier: the repr spelled a huge scalar whole, up to four times). **RED**
+(`7964278`, against the branch's own `src/` + `extensions/` at `bbd2e85`): `test/truncate.test.ts`
+84 tests / **10** fail (four work-bound tests at 1.4–3.5 s against a 500 ms bound; six shape tests on
+the no-total marker, the real tail, the dict-entry descent, the huge key, the top-level exception) ·
+`test/extension.test.ts` 102 / **1** fail (an offset past an emoji went unplaced). Two shapes added
+to the boundary table (`one huge element`, `one huge entry`) extend an existing test. **GREEN**
+(`88aa7bc`): truncate 84/84 · extension 102/102 · sandbox and resolve unchanged. Gates: `check` ·
+`lint` · `coverage` — `src/truncate.ts` **100.00**, `extensions/repl-extension.ts` 99.85, every
+floor met, no baseline change · `REQUIRE_BRIDGE_TOOLS=1 npm run test:contained`: **1648 tests,
+1636 pass, 0 fail, 12 todo**.
 
 **Measured on 0.0.21** (probes in the session scratchpad, recorded in the spec): a dict arrives as a
 `Map`, a set/frozenset as a `Set`, a list/tuple as an `Array`, `1.0` as `1`, `-0.0` as `0`, `1e400`
@@ -116,6 +144,15 @@ returning `"not undefined"` is tolerated.
   `test/truncate.test.ts:565` (a JS cycle, `[[...]]` / `{'s': {...}}` / `{{...}}`).
 - **A 10⁶-element set**: `test/truncate.test.ts:807` (formats within budget, < 2 s asserted,
   measured ≈ 40 ms). Through the sandbox the cost is the boundary crossing (0.9 s).
+- **A 10 MB scalar inside a container** (fix round 1): `test/truncate.test.ts` "the work is bounded
+  by the budget" — a string in a list, in a dict, as bytes, as an exception's message, each under
+  500 ms (measured 8–20 ms; 1.4–3.7 s before). Reproduce through the sandbox with
+  `runInSandbox("['x' * 10**7]", { registry })` timed: 136 ms on this branch, 3.5 s at `cf97518`,
+  159 ms on `main`; `['x' * 10**8]` 936 ms / 41.7 s / 1057 ms. The marker for that cut is the
+  path-5 no-total form (`[… truncated at 16.0KB. … …]`) — pinned in "a value spelled from both
+  ends claims no total", with the real tail (`\n\t'end"]`, `\x00\xff\n']`, `', [...]]}` for a
+  cyclic value) and the dict-entry descent
+  (`{'k': [0, 1, 2, [… N of 100000 elements elided. … …], …, 99999]}`).
 - **Boundary mutants on the repr's byte limits** (`test/truncate.test.ts:750-805`): six shapes fit
   whole at exactly their own byte size and are cut at one byte less; the ceiling, UTF-8 wholeness
   and marker completeness hold at budgets `0, 1, 7, 8, 16, 33, 64, 100, 257, 1024, 4096, 16384`.
@@ -182,12 +219,16 @@ measured false and pinned as such).
 
 | Commit | Reverts |
 |---|---|
-| this report | `tasks/ship-report-w3-1.md` |
+| this report | `tasks/ship-report-w3-1.md`, `tasks/spec-w3-1.md` (fix-round notes) |
+| `88aa7bc` | fix round 1 GREEN — the bounded repr, `reprEnds`, the dict-entry descent, the policy's rules 3–4, the per-code-point byte map (revert together with `7964278`) |
+| `7964278` | fix round 1 RED tests |
+| `bbd2e85` | the first report |
 | `cf97518` | GREEN — the repr, the SUBMIT guard, required parameters, `seq` / `stdoutOffset`, the interleave, the width guard, the shutdown name, the policy doc (revert together with `833dbac` or the suite goes red) |
 | `833dbac` | the RED tests |
 | `fb3577e` | the spec |
 
-`git revert <report> cf97518 833dbac fb3577e` (newest first) returns to `acadb19`.
+`git revert <report> 88aa7bc 7964278 bbd2e85 cf97518 833dbac fb3577e` (newest first) returns to
+`acadb19`.
 
 ## Closing-comment drafts (for the orchestrator, after merge)
 
@@ -244,7 +285,16 @@ callbacks; the return value ignored). Nothing here remains to be filed.
 
 ## Go / No-Go
 
-**GO.** Check / lint / coverage green at `cf97518` with every owned floor met and no floor changed;
-RED → GREEN in separate commits with the counts above; the full suite through `test:contained` and
-CI on all legs are recorded in the PR body. Nothing outside the owned files touched; two follow-ups
-named for their owners; one residual as a todo test.
+**GO.** Check / lint / coverage green at `cf97518` and again at `88aa7bc` with every owned floor
+met and no floor changed; RED → GREEN in separate commits with the counts above, fix round 1
+included; the full suite through `test:contained` and CI on all legs are recorded in the PR body.
+Nothing outside the owned files touched; two follow-ups named for their owners; one residual as a
+todo test.
+
+Verifier notes not taken up in fix round 1, for the record: `dispose()` drops the shutdown warning
+when the waiting tool is unknown (a session whose suspension predates the trace API — the name is
+what the report exists to say; the warning without it was the W1-3 shape, judged not worth a
+second form); `toolFailure()` labels every `SubmitSignal` as the SUBMIT answer guard (only `SUBMIT`
+raises one; a second tool raising it would be a bug the label makes visible); `pythonTypeName`
+answers `object` for an untagged plain object (Monty tags every record it builds, so none reaches
+it); `docs/tool-trace.md` is not owned.

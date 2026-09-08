@@ -83,6 +83,23 @@ construction. Rendering work is bounded by the cap (the walker stops appending p
 10⁶-element set costs the boundary crossing, not the repr. `pythonTypeName(value)` (`NoneType`,
 `bool`, `int`, `float`, `str`, `bytes`, `list`, `dict`, `set`, `type`, an exception's class, …) is
 exported beside it for the `TypeError` messages.
+**Fix round 1 (verifier finding).** The bound above was false for one shape: a container dominated
+by a single huge scalar. `Repr.scalar` spelled a `str`/`bytes` in full (a per-code-point `+=`
+loop) before `push` checked the cap, and the two fallbacks — `elideContainer`'s zero-fit branch and
+`formatValue`'s scalar branch — rendered the same value whole for the flat cut, so `['x' * 10**7]`
+cost four full passes: 3.5 s (main: 159 ms), 42 s for `10**8`, synchronous on the host thread
+after Monty had finished. Now: (1) a `str`/`bytes` is spelled at most `cap - used + 1` code units
+from the chosen end — enough to overflow, never more — by one regex scan (`\p{Cc}`, `\p{Cs}`,
+the quotes, the backslash) instead of the loop; (2) `Repr` walks a value from its tail when asked
+(`fromEnd`: the same pieces in reverse, last elements first, a string from its end), and
+`reprEnds` renders head and tail under the cap for the flat cut — the whole is never spelled, so
+that cut claims no total (`[… truncated at 16.0KB. … …]`, the path-5 marker) rather than an
+`X of Y` it could only know by doing the forbidden work; (3) a dict's huge entry descends through
+its value behind its key (`{'k': [0, 1, 2, [… N of 10⁶ elements elided …], …]}`) instead of the
+flat fallback. Measured through `runInSandbox`: `['x' * 10**7]` 3495 → 136 ms, `{'k': 'x' * 10**7}`
+3139 → 58 ms, `{'k': list(range(10**6))}` 624 → 392 ms (the crossing), `['x' * 10**8]` under a
+second; isolated `formatValue` 3692 → 11 ms and 38 711 → 94 ms. The policy's "Elision" rules 3–4
+and its bounded-work sentence are rewritten to what is now true.
 
 **D141 — The SUBMIT guard lives where the signal is caught.** `SubmitSignal.answer` is typed
 `unknown` (the `as string` in `rlm_tools.ts` was the lie; that file is not owned, and the type now
@@ -129,6 +146,11 @@ truncated stdout takes calls — offsets at or past the first marker line (`[…
 placed. The trailing `[trace] N host-tool call(s), K shown in place` block lists what was not
 placed, the omitted count and the waiting call. Collapsed output is unchanged, and so is every
 existing `formatTrace` line. The model-facing text is untouched.
+
+**D144, fix round 1.** `interleave`'s byte→index map walked `head` per UTF-16 code unit, so an
+astral character (an emoji: two units, four bytes) counted as six and every offset past one missed
+its boundary — the call fell to the unplaced list. The walk is per code point now; pinned by "an
+offset past an astral character still lands".
 
 **D145 — `TraceView.render` width guard.** A width that is not finite or is below 1 renders at 80
 columns (`DEFAULT_COLUMNS`), never loops.
