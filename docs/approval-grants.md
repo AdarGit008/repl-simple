@@ -1,7 +1,7 @@
 # Approval grants
 
-**Status:** Decided · **Issue:** #44 (Bucket 4, step 3) · **Implemented in:** `src/session.ts`,
-`extensions/repl-extension.ts`
+**Status:** Decided · **Issues:** #44 (Bucket 4, step 3), #35 (dialog cap) · **Implemented in:**
+`src/session.ts`, `extensions/repl-extension.ts`
 
 One approval used to buy unlimited silent re-execution. Measured through the shipped tool:
 
@@ -62,9 +62,11 @@ make branch 2 honest — a grant that authorises more than one execution is defe
 prompt granting it said so, and not before.
 
 #51 replaced `ctx.ui.confirm` with a `ctx.ui.select`, which is where such an answer would go, and did
-not add one: its three options are approve, deny, and decide later. "Decide later" spends nothing —
-it records no grant, because deferring a question is not answering it. Until an option says
-otherwise, `DEFAULT_GRANT_USES` stays at 1 and branch 2 stays dead.
+not add one. Its options are approve, deny, decide later and — since #35 — deny remaining. "Decide
+later" spends nothing: it records no grant, because deferring a question is not answering it. "Deny
+remaining" records nothing either: it is a denial that also latches the rest of the call shut, so it
+can only reduce what runs. Until an option says otherwise, `DEFAULT_GRANT_USES` stays at 1 and
+branch 2 stays dead.
 
 `grantUses` is per-`Session`, and values below 1 are refused rather than clamped: 0 and 0.5 are both
 someone believing something false about the model, and a security ceiling should not be silently
@@ -104,7 +106,7 @@ change removed.
 
 Strict — one approval, one execution — is a real cost. Roughly 93% of permission prompts get
 approved, and a gate that fires on every iteration of a loop is a gate that gets clicked through;
-#35 tracks the dialog-spam half of that problem.
+the dialog cap below (#35) bounds the dialog-spam half of that problem.
 
 The honest alternative to a strict gate is not a lenient gate. It is admitting that some users, in
 some sessions, do not want to be asked — and making that a decision they state, rather than one
@@ -133,10 +135,41 @@ not questions a prompt can meaningfully put to a user, so no mode can answer the
 
 ---
 
+## Dialog cap and "deny remaining" (#35)
+
+The grant model above decides what one approval *buys*. It says nothing about how many times a
+single call may *ask*, and one call once asked twenty times: the sandbox consults the callback once
+per gated call with no memory of having done so, and a Python `try/except PermissionError` loop
+reaches the gate again after every denial. That is a fatigue primitive — vary the command until the
+user clicks yes once.
+
+Both bounds live in `extensions/repl-extension.ts`, in the gate `makeOnApproval` mints for one
+`repl` / `repl_resume` call, so both are per call by construction and `src/` is untouched:
+
+- **A cap.** `MAX_DIALOGS_PER_CALL` is **8**. Only dialogs actually opened count: a headless run,
+  yolo mode and an already-aborted turn answer before the counter, and a replayed call (branch 1
+  above) never reaches the callback. Past the cap every further gated call in that tool call is
+  denied without a dialog — the sandbox sees a plain denial, Python a `PermissionError` — and the
+  result ends with an `[approval cap]` paragraph naming the count, so the model asks the user rather
+  than reading unexplained errors and retrying. `repl_resume` mints a new gate and starts a fresh
+  count; the dialog title says where it sits (`dialog 3 of 8`).
+- **A fourth answer.** *Deny remaining* denies the call on screen exactly as *deny* does, and
+  latches the gate so nothing after it asks; the result ends with an `[approvals denied]` paragraph.
+  It is per call for the same reason the cap is, and it records no grant: it is the way out of a
+  queue, not a preference.
+- **The cancel path** is #33's signal, which #49 already hands to the dialog: an abort settles the
+  open dialog as a denial, and the sandbox returns `aborted` before the next gated call reaches the
+  gate.
+
+Neither bound can manufacture consent — each only ever reduces what gets approved — which is why
+they were safe to land as defence in depth while the grant model was being fixed. What must not be
+added on top of them is what #35's ordering note warns about: an "approve all", an "always allow
+this tool", a remembered preference. `DEFAULT_GRANT_USES` is still 1.
+
+---
+
 ## What this does not fix
 
-- **#35** — the dialog can still fire many times in one run, with no cap and no "deny the rest".
-  Strict mode makes that *more* likely, not less; the two issues are complements.
 - **#44's grant model is per-args.** `bash("date +%s%N")` and `bash("date  +%s%N")` are different
   keys. That is the intended behaviour of a normalised key, not a hole — the second one asks.
 - **#110** — `Repl.resume()` still has no test proving `onApproval` reaches the session, which is

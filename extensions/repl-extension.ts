@@ -26,18 +26,48 @@ const MODE_HELP = "Usage: /repl-approvals [strict|yolo]";
 // ── Approval dialog ──────────────────────────────────────────────
 
 /**
- * The three answers to an approval dialog, in the order they are offered.
+ * The four answers to an approval dialog, in the order they are offered.
  *
  * Approve first because it is the common answer, deny second because it is
- * the safe one, and "decide later" last because it is the one that needs
- * reading. They are constants rather than inline strings because the choice
- * comes back from `ui.select` as the string itself: a typo in one of the two
- * places would silently become a denial. Exported for the same reason — a
- * test that retyped them would be pinning its own copy, not the dialog.
+ * the safe one, "decide later" third because it is the one that needs
+ * reading, and "deny remaining" last because it is the one that needs the
+ * most: it refuses this call *and every gated call after it* in the same
+ * `repl` / `repl_resume` call, without asking again (#35). They are constants
+ * rather than inline strings because the choice comes back from `ui.select`
+ * as the string itself: a typo in one of the two places would silently become
+ * a denial. Exported for the same reason — a test that retyped them would be
+ * pinning its own copy, not the dialog.
  */
 export const APPROVE_CHOICE = "Approve — run this call";
 export const DENY_CHOICE = "Deny — refuse this call";
 export const LATER_CHOICE = "Decide later — keep it waiting";
+export const DENY_REMAINING_CHOICE =
+  "Deny remaining — refuse this and every later call in this run";
+
+// ── Dialog cap (#35) ─────────────────────────────────────────────
+
+/**
+ * The most approval dialogs one `repl` or `repl_resume` call may open.
+ *
+ * One call once produced twenty dialogs back to back: the sandbox asks once
+ * per gated call with no memory of having asked, and a `try/except
+ * PermissionError` loop reaches the gate again after every denial. That is a
+ * fatigue primitive — vary the command until the user clicks yes once — and
+ * the answer is a bound, not a nicer dialog.
+ *
+ * Only dialogs actually opened count. A headless run, yolo mode and an
+ * already-aborted turn answer before the counter, and a call served from the
+ * replay cache never reaches the callback at all. Past the cap, every further
+ * gated call in the same tool call is denied without a dialog and the result
+ * tells the model why. The counter lives in the closure `makeOnApproval`
+ * mints per tool call, so `repl_resume` starts a fresh count.
+ *
+ * Eight is small enough that one run cannot wear anyone down and large enough
+ * for a snippet that legitimately touches several files; a user who wants more
+ * is one `repl_resume` — or `/repl-approvals yolo` — away. Exported so a test
+ * pins the number, not a copy of it.
+ */
+export const MAX_DIALOGS_PER_CALL = 8;
 
 // ── Dialog lifetime ──────────────────────────────────────────────
 
@@ -136,6 +166,24 @@ export function clampModelLimits(maxDurationSecs?: unknown, maxMemoryMiB?: unkno
   return limits;
 }
 
+/**
+ * The slice of pi's `ExtensionContext` a lifecycle handler here reads
+ * (`types.d.ts:209-249`): the directory the runner is keyed by, the trust
+ * decision, and a way to tell the user what a shutdown dropped.
+ */
+interface SessionLifecycleCtx {
+  cwd: string;
+  hasUI: boolean;
+  isProjectTrusted(): boolean;
+  ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
+}
+
+/** A `session_start` / `session_shutdown` handler, as pi's `on` accepts it. */
+type SessionLifecycleHandler = (
+  event: { reason: string },
+  ctx: SessionLifecycleCtx,
+) => void | Promise<void>;
+
 /** Extension registration surface — the subset of pi's API this file uses. */
 interface ReplExtensionApi {
   registerTool: (tool: ReturnType<typeof defineTool>) => void;
@@ -149,6 +197,76 @@ interface ReplExtensionApi {
       ) => Promise<void>;
     },
   ) => void;
+  /**
+   * Lifecycle events (`ExtensionAPI.on`, `types.d.ts:869` / `:875`).
+   * `session_start` fires when a conversation begins — startup, reload,
+   * `/new`, `/resume`, `/fork` — and `session_shutdown` before its runtime is
+   * torn down — quit, reload, `/new`, `/resume`, `/fork`.
+   */
+  on(event: "session_start", handler: SessionLifecycleHandler): void;
+  on(event: "session_shutdown", handler: SessionLifecycleHandler): void;
+}
+
+// ── Runner per working directory (#60) ───────────────────────────
+
+/**
+ * A `ReplRunner` for one working directory, with the state the extension
+ * keeps beside it.
+ *
+ * `trusted` is Pi's project-trust decision as of the most recent event for
+ * this directory. The runner reads it through a closure rather than
+ * receiving a boolean, because the runner outlives the `ctx` that built it
+ * and the decision can change while pi runs — trusting a project
+ * mid-session, or withdrawing it, has to reach the next `repl` call (#53).
+ * `false` until a real `ctx` has been seen, which is the same fail-closed
+ * default `ReplRunner` applies for callers that pass nothing.
+ *
+ * `sessionIds` is every id a `repl` call has handed the runner. `ReplRunner`
+ * offers no way to list its sessions, and a shutdown has to abandon and
+ * release each one to say what it dropped.
+ */
+class CwdRunner {
+  trusted = false;
+  readonly runner: ReplRunner;
+  readonly sessionIds = new Set<string>();
+
+  constructor(cwd: string) {
+    this.runner = new ReplRunner(cwd, { isProjectTrusted: () => this.trusted });
+  }
+
+  /**
+   * Abandon and release every session this runner was handed.
+   *
+   * @returns the ids that were holding a call for approval — each is a call
+   *          that never executed and that somebody was asked about.
+   */
+  dispose(): string[] {
+    const dropped: string[] = [];
+    for (const sessionId of this.sessionIds) {
+      if (this.runner.abandon(sessionId) === "abandoned") dropped.push(sessionId);
+      this.runner.reset(sessionId);
+    }
+    this.sessionIds.clear();
+    return dropped;
+  }
+}
+
+// ── Approval gate ────────────────────────────────────────────────
+
+/**
+ * The approval callback minted for one `repl` / `repl_resume` call, and the
+ * explanation for the model when it denied calls without opening a dialog.
+ */
+interface ApprovalGate {
+  onApproval: (req: ApprovalRequest) => Promise<ApprovalDecision>;
+  /** `undefined` while every denial this call made was one the user gave. */
+  notice(): string | undefined;
+}
+
+/** Append the gate's explanation, when it has one, to what the runner returned. */
+function withApprovalNotice(text: string, gate: ApprovalGate): string {
+  const notice = gate.notice();
+  return notice === undefined ? text : `${text}\n\n${notice}`;
 }
 
 /**
@@ -160,47 +278,57 @@ interface ReplExtensionApi {
  * - `repl_reset` — clear session state
  * - `repl_abandon` — discard a pending suspension
  *
- * And one command:
+ * One command:
  * - `/repl-approvals [strict|yolo]` — read or set the approval mode
+ *
+ * And two lifecycle handlers, `session_start` and `session_shutdown`, that
+ * bind every REPL session to the Pi conversation that created it (#60).
  */
 export default function (pi: ReplExtensionApi) {
   let approvalMode: ApprovalMode = "strict";
-  // Defer ReplRunner construction until first execute() —
-  // ctx.cwd is only available inside execute(), not at module load.
-  let runner: ReplRunner | null = null;
 
   /**
-   * Pi's project-trust decision, as of the most recent tool call.
+   * One runner per working directory, for the current Pi conversation.
    *
-   * The runner reads it through a closure rather than receiving a boolean,
-   * because the runner outlives the `ctx` that built it and the decision can
-   * change while pi runs — trusting a project mid-session, or withdrawing it,
-   * has to reach the next `repl` call (#53). Refreshed on the way in below;
-   * `false` until a real `ctx` has been seen, which is the same fail-closed
-   * default `ReplRunner` applies for callers that pass nothing.
+   * Keyed by `ctx.cwd` (#60): a conversation that spans directories gets a
+   * runner rooted at each — the path jail, the preamble root and the bridge
+   * tools all point where the call was made — instead of one runner rooted
+   * wherever the first call happened to be. Construction waits for the first
+   * event that carries a `ctx` (`session_start`, or a tool call); `ctx.cwd` is
+   * not available at module load. Emptied by `session_shutdown`.
    */
-  let projectTrusted = false;
+  const runners = new Map<string, CwdRunner>();
 
-  function getRunner(ctx: { cwd: string; isProjectTrusted(): boolean }): ReplRunner {
-    projectTrusted = ctx.isProjectTrusted();
-    if (!runner) runner = new ReplRunner(ctx.cwd, { isProjectTrusted: () => projectTrusted });
-    return runner;
+  function getRunner(ctx: { cwd: string; isProjectTrusted(): boolean }): CwdRunner {
+    let entry = runners.get(ctx.cwd);
+    if (!entry) {
+      entry = new CwdRunner(ctx.cwd);
+      runners.set(ctx.cwd, entry);
+    }
+    // Refreshed on the way in, every time — see `CwdRunner.trusted`.
+    entry.trusted = ctx.isProjectTrusted();
+    return entry;
   }
 
   /**
-   * Build an onApproval callback that uses Pi's native select dialog.
+   * Build the approval gate for one tool call, on Pi's native select dialog.
    *
-   * Three answers, because there are three (#51). `confirm` offers two and
-   * cannot distinguish Escape from "No" — `showExtensionConfirm` returns
-   * `result === "Yes"`, so cancel, timeout and abort all arrive as a denial —
-   * and the third answer the sandbox already understands, `"suspend"`, had
-   * nowhere to come from. A `select` can say all three and can tell a
-   * dismissal from an answer.
+   * Four answers. `confirm` offers two and cannot distinguish Escape from
+   * "No" — `showExtensionConfirm` returns `result === "Yes"`, so cancel,
+   * timeout and abort all arrive as a denial — and the third answer the
+   * sandbox already understands, `"suspend"`, had nowhere to come from (#51).
+   * A `select` can say all of them and can tell a dismissal from an answer.
+   * The fourth, "deny remaining", is the way out of a queue of dialogs (#35).
    *
    * `signal` is the abort signal for the tool call the approval belongs to. It
    * is handed to the dialog so that Escape dismisses it and the promise
    * settles, rather than leaving a dialog nobody can answer and a tool nobody
    * can stop (#49).
+   *
+   * The gate is per call: the counter behind `MAX_DIALOGS_PER_CALL` and the
+   * "deny remaining" latch live in this closure and die with it, so
+   * `repl_resume` starts clean and neither can become a remembered
+   * preference. Both only ever reduce what gets approved.
    */
   function makeOnApproval(
     ctx: {
@@ -214,8 +342,19 @@ export default function (pi: ReplExtensionApi) {
       };
     },
     signal?: AbortSignal,
-  ): (req: ApprovalRequest) => Promise<ApprovalDecision> {
-    return async (req: ApprovalRequest): Promise<ApprovalDecision> => {
+  ): ApprovalGate {
+    /** Dialogs this call has opened. Only a `ctx.ui.select` call counts. */
+    let opened = 0;
+    /**
+     * Why gated calls are being denied without a dialog, once they are: the
+     * cap was reached, or the user answered "deny remaining". Set once, never
+     * cleared — the closure is one call's, so the latch is too.
+     */
+    let closed: "cap" | "deny-remaining" | null = null;
+    /** Gated calls denied without a dialog since `closed` was set. */
+    let deniedUnasked = 0;
+
+    const onApproval = async (req: ApprovalRequest): Promise<ApprovalDecision> => {
       // Fail closed first, and before the mode is consulted. `yolo` is set by
       // a human at a terminal; a headless run has nobody who could have set
       // it and nobody watching what it approves, so it stays denied either
@@ -226,14 +365,29 @@ export default function (pi: ReplExtensionApi) {
       // would put one on screen after the user has said stop.
       if (signal?.aborted) return false;
 
+      // The bound (#35): reached when a dialog *past* the cap would open — a
+      // run that opens exactly the cap is not capped — or latched below by the
+      // user's fourth answer. Either way the sandbox sees a plain denial and
+      // Python a PermissionError; `notice()` is how the reason reaches the
+      // model, so it does not read the errors as bad luck and retry.
+      if (closed === null && opened >= MAX_DIALOGS_PER_CALL) closed = "cap";
+      if (closed !== null) {
+        deniedUnasked++;
+        return false;
+      }
+
+      opened++;
       const choice = await ctx.ui.select(
-        `Allow ${req.description}?`,
-        [APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE],
+        `Allow ${req.description}? (dialog ${opened} of ${MAX_DIALOGS_PER_CALL})`,
+        [APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE, DENY_REMAINING_CHOICE],
         { signal, timeout: approvalTimeoutMs() },
       );
 
       if (choice === APPROVE_CHOICE) return true;
       if (choice === LATER_CHOICE) return "suspend";
+      // The fourth answer denies this call exactly as the second does, and
+      // latches the closure so nothing after it asks (#35).
+      if (choice === DENY_REMAINING_CHOICE) closed = "deny-remaining";
       // `undefined` is Escape, the timeout, or the abort — no answer at all.
       // It denies, deliberately: the one property that must not regress is
       // that a call nobody approved does not run. "Decide later" is the
@@ -242,6 +396,28 @@ export default function (pi: ReplExtensionApi) {
       // meaning as well.
       return false;
     };
+
+    const notice = (): string | undefined => {
+      if (closed === "cap") {
+        return (
+          `[approval cap] This call opened ${MAX_DIALOGS_PER_CALL} approval dialogs, the most ` +
+          `one repl or repl_resume call may open, and ${deniedUnasked} later gated call(s) were ` +
+          "denied without asking (each raised PermissionError). The count restarts on the next " +
+          "repl or repl_resume call. Do not simply retry: ask the user how to proceed, or make " +
+          "fewer gated calls."
+        );
+      }
+      if (closed === "deny-remaining") {
+        return (
+          `[approvals denied] The user chose "Deny remaining" at an approval dialog, so ` +
+          `${deniedUnasked} later gated call(s) in this call were denied without asking (each ` +
+          "raised PermissionError). Do not retry them — ask the user how to proceed."
+        );
+      }
+      return undefined;
+    };
+
+    return { onApproval, notice };
   }
 
   // ── /repl-approvals ────────────────────────────────────────
@@ -277,6 +453,44 @@ export default function (pi: ReplExtensionApi) {
     },
   });
 
+  // ── Session lifecycle (#60) ────────────────────────────────
+  //
+  // Sessions belong to one Pi conversation. Pi emits `session_shutdown`
+  // before it tears a conversation's runtime down (`/new`, `/resume`,
+  // `/fork`, reload, quit) and `session_start` when the next one begins.
+  // Without these, REPL state lived in the extension closure for the life of
+  // the process — the next conversation could inherit variables, imports and
+  // a pending approval from the last one, with nothing saying so.
+  //
+  // Pi 0.84.1 also re-runs this factory for every conversation
+  // (`loader.js:407-409`), so `runners` is fresh either way. The shutdown
+  // handler is the contract regardless of that detail: the disposal is
+  // explicit, and a pending approval is reported rather than garbage-collected.
+
+  pi.on("session_start", (_event, ctx) => {
+    // The conversation's runner exists from its first event. Constructing a
+    // `ReplRunner` reads no file and runs no code: sessions — and the
+    // saved-tool preamble, which runs at session creation — are created only
+    // by `repl`, after `isProjectTrusted()` has been consulted for that call.
+    getRunner(ctx);
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    // Idempotent by construction: a second shutdown finds nothing to dispose.
+    for (const entry of runners.values()) {
+      for (const sessionId of entry.dispose()) {
+        // The session id and nothing else. The approval description can hold
+        // a pasted credential, which is why `GrantSummary` omits it too.
+        ctx.ui.notify(
+          `repl: session '${sessionId}' still had a call waiting for approval when this ` +
+            "conversation ended. It was dropped and never executed; nothing was approved.",
+          "warning",
+        );
+      }
+    }
+    runners.clear();
+  });
+
   // ── repl ──────────────────────────────────────────────────
   //
   // Every tool below declares `executionMode: "sequential"`. `ToolDefinition`
@@ -309,7 +523,12 @@ export default function (pi: ReplExtensionApi) {
         "functions. If the session has a tool call waiting for approval, running new " +
         "code discards it — call repl_resume first if you still want that call. " +
         "Cancelling a repl call stops it between tool calls, but a pure-Python loop " +
-        "with no pause points runs until the duration limit (maxDurationSecs).",
+        "with no pause points runs until the duration limit (maxDurationSecs). " +
+        `One repl or repl_resume call opens at most ${MAX_DIALOGS_PER_CALL} approval ` +
+        "dialogs; gated calls past that are denied and the result says why. " +
+        "The sessionId is scoped to this Pi session: when the conversation ends " +
+        "(/new, /resume, /fork, quit) every REPL session is disposed, a pending approval " +
+        "is dropped, and the same sessionId in the next conversation is a new, empty REPL.",
       parameters: Type.Object({
         code: Type.String({ description: "Python code to execute." }),
         sessionId: Type.Optional(
@@ -336,15 +555,23 @@ export default function (pi: ReplExtensionApi) {
         ),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const r = getRunner(ctx);
-        const text = await r.run(
+        const entry = getRunner(ctx);
+        const sessionId = params.sessionId ?? "default";
+        // The only tool that creates sessions, so the only place the runner
+        // learns an id it will have to dispose (#60).
+        entry.sessionIds.add(sessionId);
+        const gate = makeOnApproval(ctx, signal);
+        const text = await entry.runner.run(
           params.code,
-          params.sessionId ?? "default",
-          makeOnApproval(ctx, signal),
+          sessionId,
+          gate.onApproval,
           signal,
           clampModelLimits(params.maxDurationSecs, params.maxMemory),
         );
-        return { content: [{ type: "text" as const, text }], details: {} };
+        return {
+          content: [{ type: "text" as const, text: withApprovalNotice(text, gate) }],
+          details: {},
+        };
       },
     }),
   );
@@ -367,13 +594,17 @@ export default function (pi: ReplExtensionApi) {
         ),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const r = getRunner(ctx);
-        const text = await r.resume(
+        // A fresh gate, so the dialog count restarts here (#35).
+        const gate = makeOnApproval(ctx, signal);
+        const text = await getRunner(ctx).runner.resume(
           params.sessionId ?? "default",
-          makeOnApproval(ctx, signal),
+          gate.onApproval,
           signal,
         );
-        return { content: [{ type: "text" as const, text }], details: {} };
+        return {
+          content: [{ type: "text" as const, text: withApprovalNotice(text, gate) }],
+          details: {},
+        };
       },
     }),
   );
@@ -396,7 +627,10 @@ export default function (pi: ReplExtensionApi) {
       // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const sessionId = params.sessionId ?? "default";
-        const { existed, revoked } = getRunner(ctx).reset(sessionId);
+        const entry = getRunner(ctx);
+        const { existed, revoked } = entry.runner.reset(sessionId);
+        // Reset evicts the session, so there is nothing left to dispose.
+        entry.sessionIds.delete(sessionId);
 
         // State the approval posture on the way out. A reset is the moment
         // someone is asking what this session is still holding, and "which
@@ -448,7 +682,7 @@ export default function (pi: ReplExtensionApi) {
       // is meaningless here, and noUnusedParameters makes the _-prefix the correct idiom
       // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const r = getRunner(ctx);
+        const r = getRunner(ctx).runner;
         const sessionId = params.sessionId ?? "default";
 
         // Three states, three sentences. "No pending suspension" for a

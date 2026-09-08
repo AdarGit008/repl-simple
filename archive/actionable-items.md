@@ -244,17 +244,21 @@ script's *content*.
 
 **Labels:** `security` · **Effort:** M · `[B5]` `[H8]` `[H9]` `[H32]` `[H34]`
 
-A34 covers the timeout. The rest is still open:
+A34 covers the timeout and #35 (wave 1, W1-3) the dialog spam. The rest is still open:
 
 - **`[H32]`** `repl.ts:112` pushes `[result]` with **no cap** — `'A'*2000000` returns a 2,000,009-byte
   tool result into the model's context. Apply `maxStdoutBytes`-style truncation to `output` too.
 - **`[H9]`** `runRlm` messages grow unbounded: measured **1.57 MB across 4 iterations** (~390 K
   tokens). See A23.
 - **`[H8]`** no global token/spend budget across nested RLM fan-out.
-- **`[H34]`** one `repl` call produced **20 modal approval dialogs** with no rate limit, no "deny
-  all", and no cancel path (`_signal` discarded). This is a fatigue primitive: vary the command until
-  the user clicks yes once, which then becomes a permanent grant (A4). Add a per-run approval cap and
-  a "deny remaining" action.
+- **`[H34]`** — **resolved (#35).** One `repl` call produced **20 modal approval dialogs** with no
+  rate limit, no "deny all", and no cancel path (`_signal` discarded): a fatigue primitive — vary the
+  command until the user clicks yes once, which then became a permanent grant (A4). Now one `repl` /
+  `repl_resume` call opens at most **8** dialogs (`MAX_DIALOGS_PER_CALL`, counting only dialogs
+  actually opened; yolo, headless and replayed calls are free), a fourth dialog answer *deny
+  remaining* latches the call shut, the abort signal (#33, #49) settles an open dialog, and the tool
+  result names the cap or the deny-all as the cause. Extension-only; `src/` unchanged. See
+  `docs/approval-grants.md` § "Dialog cap".
 
 ---
 
