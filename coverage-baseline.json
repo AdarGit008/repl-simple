@@ -1,5 +1,5 @@
 {
-  "global": 98.32,
+  "global": 98.74,
   "files": {
     "extensions/repl-extension.ts": 99.73,
     "src/bashenv.ts": 83.8,
@@ -10,7 +10,7 @@
     "src/pool.ts": 100,
     "src/preamble.ts": 100,
     "src/redact.ts": 100,
-    "src/registry.ts": 98.3,
+    "src/registry.ts": 98.27,
     "src/repl.ts": 100,
     "src/rlm_tools.ts": 99.22,
     "src/rlm.ts": 99.64,
