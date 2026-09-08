@@ -4,6 +4,7 @@ import { createRLMTools, RLM_TOOL_CALL_CAP } from "./rlm_tools.js";
 import { estimateTokens, SpendBudget } from "./budget.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
+import { redact } from "./redact.js";
 import {
   truncateText,
   formatSize,
@@ -13,7 +14,6 @@ import {
   OUTPUT_MAX_BYTES,
   VALUE_HEAD_RATIO,
   VALUE_RECOVERY,
-  HEAD_ONLY_RATIO,
 } from "./truncate.js";
 
 // ── RLM types ────────────────────────────────────────────────────
@@ -222,18 +222,19 @@ const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
  * `iterations[].result.error` and the model-visible `buildFeedback` output —
  * and every one of them reads a message whose request-context tail is gone.
  *
- * `unknownTotal` (#191, D98): the marker states where it cut, never how much
- * it dropped. On a model-facing value cut the true total is an affordance;
- * on a redaction cut it is a fact about the withheld text, and a 64 KiB
- * rejection must not be distinguishable from a 1.2 KiB one through the
- * marker when neither body is shown.
+ * The cut is the shared `redact()` (D100): secret-pattern masking, then a
+ * head-only `truncateText` with `unknownTotal` — the marker states where it
+ * cut, never how much it dropped (#191, D98). On a model-facing value cut the
+ * true total is an affordance; on a redaction cut it is a fact about the
+ * withheld text, and a 64 KiB rejection must not be distinguishable from a
+ * 1.2 KiB one through the marker when neither body is shown. The masking is
+ * defence in depth on top of the accepted head-only bound (#192, D99), not a
+ * tightening the bound relies on — see `docs/redaction.md`.
  */
 function redactProviderError(err: unknown): string {
-  return truncateText(err instanceof Error ? err.message : String(err), {
+  return redact(err instanceof Error ? err.message : String(err), {
     maxBytes: RLM_ERROR_MAX_BYTES,
-    headRatio: HEAD_ONLY_RATIO,
     recovery: RLM_ERROR_RECOVERY,
-    unknownTotal: true,
   }).text;
 }
 
