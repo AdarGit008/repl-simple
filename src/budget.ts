@@ -1,9 +1,10 @@
 // ── Spend budget ────────────────────────────────────────────────
 //
-// The shared, observable spend budget for the RLM loop (and, once #78 ports
-// nesting, the tree of nested investigations). Every charge is a *before-the-
-// call* cost so a run never overspends; a call that fits is charged in full
-// and a call that cannot fit degrades instead of throwing (D4).
+// The shared, observable spend budget for the RLM loop and the tree of nested
+// `rlm_query` investigations under it — one pool, handed down to every child
+// (#78). Every charge is a *before-the-call* cost so a run never overspends; a
+// call that fits is charged in full and a call that cannot fit degrades
+// instead of throwing (D4).
 
 /**
  * Estimated tokens per UTF-8 byte: ≈4 bytes/token for typical English code and

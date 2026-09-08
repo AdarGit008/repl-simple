@@ -12,7 +12,7 @@
  *
  * That is not hypothetical. It is what #109 turned out to be: mutants in
  * `rlm.ts`/`rlm_loop.ts` change loop iteration counts, hence sandbox call
- * counts, hence memory — and against the ~41 MB/call leak that #116 later
+ * counts, hence memory — and against the per-call worker leak that #116 later
  * fixed, that was enough to push a worker into an OOM kill. Every such kill
  * scored as a mutant caught, so the *more* memory a run consumed the *better*
  * the tree appeared to be tested. Two runs of one tree disagreed by 18 mutants

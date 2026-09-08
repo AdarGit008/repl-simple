@@ -6,10 +6,11 @@
  * user manager runs `DefaultOOMPolicy=stop`. So a single OOM kill *anywhere* in
  * a pane makes systemd tear down the whole scope — every process in it, editor
  * and agent session included, with SIGTERM (exit 143) and no message printed.
- * The suite is heavy enough to trigger that: one full run peaks near 9 GB, and
- * a long-lived worker climbs far past it because `probeTypeCheckerGaps()` leaks
- * ~41 MB per `runInSandbox` call (#68). On 2026-08-13 a single worker reached
- * 13.4 GB and took the pane down with it.
+ * The suite is heavy enough to trigger that: one full run peaks near 9 GB,
+ * and until #116 a long-lived worker climbed far past it, because on Monty
+ * 0.0.18 `probeTypeCheckerGaps()` leaked tens of megabytes per
+ * `runInSandbox` call (#68). On 2026-08-13 a single worker reached 13.4 GB
+ * and took the pane down with it.
  *
  * `systemd-run --user --scope` moves the job into a scope of its *own*, a
  * sibling of the pane's rather than a child. That is the whole trick: the cap
@@ -18,11 +19,11 @@
  * pane — and whatever is running in it — never sees it.
  *
  * Deliberately NOT set here:
- *   - `CPUQuota`, because #68's definition of done wants before/after timings
- *     and a throttled scope would make those numbers a fiction.
+ *   - `CPUQuota`, because #68's definition of done wanted before/after
+ *     timings and a throttled scope would make those numbers a fiction.
  *   - swap. `MemorySwapMax=0` makes a breach fail fast instead of thrashing;
- *     swap thrash shows up as test *timeouts*, which is precisely the flapping
- *     signal #109 is trying to measure.
+ *     swap thrash shows up as test *timeouts*, which is precisely the
+ *     flapping signal #109 set out to measure.
  *
  * A breach must not be silent. It was, once: on 2026-08-14 a full mutation run
  * hit the 12G ceiling at 24%, systemd tore the scope down under the default

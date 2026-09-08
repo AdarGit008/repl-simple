@@ -156,12 +156,13 @@ export interface RlmResult {
   budget?: RlmBudgetReport;
   /**
    * Error message for a failed result. Populated on `status: "error"` (D53);
-   * the nested `rlm_query` error branch reads it (D52). Truncated head-only
-   * with plain `truncateText` (no sentinel wrap — this is a caller-facing
-   * API return, not a prompt-bound view) at `RLM_ERROR_MAX_BYTES` (1 KiB)
-   * at the assignment site (#167). Head-only keeps only the leading
-   * error-type prefix and drops the tail, where provider request-context /
-   * retry-hints / request-IDs live.
+   * the nested `rlm_query` error branch reads it (D52). Every provider
+   * message passes through `redactProviderError` — secret masking, then a
+   * head-only cut at `RLM_ERROR_MAX_BYTES` (1 KiB) with a magnitude-free
+   * marker (#167, #191, D100) — so the leading error-type prefix survives
+   * and the tail, where provider request-context / retry-hints / request-IDs
+   * live, does not. A caller-facing API return, not a prompt-bound view: no
+   * sentinel wrap.
    */
   error?: string;
 }
@@ -196,10 +197,10 @@ const ERROR_RECOVERY = "Catch the exception and print the full traceback to see 
 // ── RLM provider-error budget ───────────────────────────────────
 //
 // `RlmResult.error` is the caller-facing error from a failed LLM query (D53),
-// not a model-facing view, so it is truncated head-only with plain
-// `truncateText` (no sentinel wrap) at 1 KiB (#167). Head-only keeps only the
-// leading error-type prefix and drops the tail, where provider request-context
-// / retry-hints / request-IDs live.
+// not a model-facing view, so it is redacted head-only at 1 KiB (#167) by the
+// shared `redact()` — masking first, then the cut, no sentinel wrap. Head-only
+// keeps only the leading error-type prefix and drops the tail, where provider
+// request-context / retry-hints / request-IDs live.
 
 /** Byte ceiling for the RLM-level `RlmResult.error` (LLM provider error, 1 KiB). */
 const RLM_ERROR_MAX_BYTES = 1024;
@@ -211,8 +212,8 @@ const RLM_ERROR_MAX_BYTES = 1024;
 const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
 
 /**
- * The one provider-error redaction: head-only truncation of an LLM rejection
- * before it leaves `runRlm` in any form (#167, #184, #189).
+ * The one provider-error redaction: secret masking and a head-only cut of an
+ * LLM rejection before it leaves `runRlm` in any form (#167, #184, #189).
  *
  * All three sites that surface a provider message call this and nothing else,
  * so the rule cannot split across them (#189 — the D53 catch spelled the same
