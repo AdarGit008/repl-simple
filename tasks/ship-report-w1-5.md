@@ -96,9 +96,9 @@ No new dependency. No change outside the owned files.
   that configuration is the policy-doc pin (`docs/` is not swapped); its RED is the commit ordering
   — the pin (`29c6ce0`) precedes the docs (`e0226db`).
 - **Per-item RED→GREEN pairs** (commit → commit): #168 `14b19ce`→`acf9cc9` · #191
-  `916eb79`→`b867735` · #192 `29c6ce0`→`e0226db` · `redact.ts` `ad46328`→`d5ff586` · synthesis cap
-  `03e79d4`→`d4e6338` · #67+#169 `2cce486`→`847d53b` (one pair: the memo and the accessor share
-  `validateStubs`) · #170 `92efbcb`→`66897d2` · #173 `4dc050a`→`d3e8f0b`.
+  `916eb79`→`b867735` · #192 `29c6ce0`→`e0226db` · `redact.ts` `478c85b`→`966e582` · synthesis cap
+  `f9f010f`→`3949c60` · #67+#169 `6442d59`→`7b7144d` (one pair: the memo and the accessor share
+  `validateStubs`) · #170 `50fa224`→`76c768c` · #173 `f0f911e`→`5f88bda`.
 - **Adversarial probes** (all in `test/rlm.test.ts`, block at :5445):
   - *Refusal markers cannot be forged into real output*: sandbox code prints the exact marker; the
     real 17th call is still refused and the forged copy reaches the model only inside the
@@ -140,16 +140,16 @@ and `RLM_TOOL_CALL_CAP` are reachable from their modules, not the barrel, until 
 
 | Commit | Reverts |
 |---|---|
-| `d3e8f0b` / `4dc050a` | #173 question input (+ its tests and the re-pinned tests 9/19/21) |
-| `66897d2` / `92efbcb` | #170 child input inheritance |
-| `847d53b` / `2cce486` | #67 + #169 (registry accessor, memo, prompt section) |
-| `d4e6338` / `03e79d4` | synthesised-answer cap |
-| `d5ff586` / `ad46328` | `src/redact.ts`, `docs/redaction.md`, the `redactProviderError` switch |
+| `5f88bda` / `f0f911e` | #173 question input (+ its tests and the re-pinned tests 9/19/21) |
+| `76c768c` / `50fa224` | #170 child input inheritance |
+| `7b7144d` / `6442d59` | #67 + #169 (registry accessor, memo, prompt section) |
+| `3949c60` / `f9f010f` | synthesised-answer cap |
+| `966e582` / `478c85b` | `src/redact.ts`, `docs/redaction.md`, the `redactProviderError` switch |
 | `e0226db` / `29c6ce0` | #192 doc block + policy narratives |
 | `b867735` / `916eb79` | #191 `unknownTotal` |
 | `acf9cc9` / `14b19ce` | #168 cap |
 
-Each pair reverts cleanly in newest-first order; reverting `d5ff586` alone re-opens the
+Each pair reverts cleanly in newest-first order; reverting `966e582` alone re-opens the
 `HEAD_ONLY_RATIO` import in `src/rlm.ts` (the pre-#191 shape) and keeps #191's marker.
 
 ## Closing-comment drafts (for the orchestrator, after merge)
