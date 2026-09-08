@@ -110,7 +110,9 @@ export interface RlmOptions {
    * prompt and from sandbox code.
    * `context` is always declared and defaults to `""` when absent. A nested
    * `rlm_query` child inherits every input here (#170), with the parent's
-   * context merged into its own.
+   * context merged into its own. `question` is reserved (#173): the loop
+   * declares it from the question argument (a child's is its own query) and
+   * a caller-supplied one throws before any query.
    */
   inputs?: Record<string, string>;
   /** Sandbox RunOptions propagated to each sandbox run. */
@@ -330,12 +332,23 @@ const INPUT_PREVIEW_RECOVERY =
 const QUESTION_MAX_BYTES = 64 * 1024;
 
 /**
- * Route to an elided question: the question is not a sandbox variable, so the
- * model cannot slice it — the marker must not advertise a route it cannot
- * honour (policy Q3). It directs the model to answer from the part shown and
- * flag ambiguity instead (#144, D8).
+ * Route to an elided question (#173, D108): the full question is declared as
+ * the reserved `question` sandbox input, so the model can slice it — the
+ * route exists now, and the marker names it (policy Q3). Before #173 the
+ * question was not a sandbox variable and this clause had to stay weak
+ * (#144, D8); that wording survives as `TOOL_PROMPT_RECOVERY` for the two
+ * paths that still have no sandbox on the reading side.
  */
 const QUESTION_RECOVERY =
+  "The question was truncated. The full question is available as the `question` Python variable — slice it in Python to see more.";
+
+/**
+ * Route to an elided tool-path ask — `llm_query`'s prompt and the downgrade
+ * query — deliberately weak (policy Q3): the sub-LLM that reads it has no
+ * sandbox and no `question` variable, so the marker must not advertise one.
+ * It directs the model to answer from the part shown and flag ambiguity.
+ */
+const TOOL_PROMPT_RECOVERY =
   "The question was truncated. Answer from the part shown and state the assumption if ambiguous.";
 
 // ── Tool-path prompt budgets (#171) ─────────────────────────────
@@ -374,6 +387,15 @@ const DOWNGRADE_CONTEXT_RECOVERY =
 
 /** Valid input names: a letter or underscore, then letters, digits or underscores. */
 const INPUT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * The loop's own input (#173, D108): the full question, declared from the
+ * `runRlm` argument so the model can slice it in Python. Reserved — a caller
+ * supplying one would be silently shadowed, so the merge site refuses it
+ * (the D51 precedent for the tool names). Not rendered as an input block:
+ * the `# Question` section already carries it.
+ */
+const QUESTION_INPUT = "question";
 
 /**
  * Python keywords the identifier pattern cannot reject: `class`, `def`,
@@ -862,6 +884,9 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
   // bounded and marker-complete — fences always close within a preview.
   const inputBlocks: string[] = [];
   for (const [name, value] of Object.entries(inputs)) {
+    // #173: the question is declared for the sandbox's sake; the `# Question`
+    // section already carries it, so it is never an input block too.
+    if (name === QUESTION_INPUT) continue;
     const header = name === "context" ? "# Context" : "# Input";
     const headerLine = `${header} (available as \`${name}\` variable)`;
     if (value) {
@@ -892,7 +917,13 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
 
   const parts = [`# Question\n${questionText}`];
   if (inputSection) parts.push(`\n${inputSection}`);
-  parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
+  // The trailer announces the `question` variable the way the input headers
+  // announce theirs (#72): data the sandbox holds but the prompt never names
+  // is invisible. The leading sentence is a pinned literal — extend, do not
+  // reword.
+  parts.push(
+    `\nWrite Python code to answer the question. The full question is available as the \`${QUESTION_INPUT}\` variable. Call SUBMIT(answer) when done.`,
+  );
   return parts.join("\n");
 }
 
@@ -1216,7 +1247,16 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       throw new TypeError(`invalid input name: ${name} — reserved Python keyword`);
     }
   }
+  // #173 (D108): the question is the loop's own input. A caller's would be
+  // silently shadowed by the assignment below, so refuse it — from either
+  // source, before any query.
+  if (QUESTION_INPUT in runInputs) {
+    throw new Error(
+      `runRlm: input '${QUESTION_INPUT}' is reserved — the loop declares it from the question argument`,
+    );
+  }
   runInputs.context = runInputs.context ?? "";
+  runInputs[QUESTION_INPUT] = question;
   sandboxRunOpts.inputs = runInputs;
   sandboxRunOpts.scriptName = sandboxRunOpts.scriptName ?? "rlm.py";
   if (options.signal) {
@@ -1247,7 +1287,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         const boundedPrompt = truncateWithSentinels(prompt, {
           maxBytes: QUESTION_MAX_BYTES,
           headRatio: VALUE_HEAD_RATIO,
-          recovery: QUESTION_RECOVERY,
+          recovery: TOOL_PROMPT_RECOVERY,
         });
         // D62/D63: a tool-mediated call charges the shared pool before it runs,
         // at the same per-call cost as the top-level loop. If it cannot charge,
@@ -1308,7 +1348,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
             `Query: ${truncateWithSentinels(query, {
               maxBytes: QUESTION_MAX_BYTES,
               headRatio: VALUE_HEAD_RATIO,
-              recovery: QUESTION_RECOVERY,
+              recovery: TOOL_PROMPT_RECOVERY,
             })}\n` +
             `Context: ${contextText}`;
           // D62/D63: the downgrade charges the shared pool before it runs, at
