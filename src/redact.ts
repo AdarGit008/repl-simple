@@ -135,9 +135,9 @@ const DIGEST_PARAMETER = new RegExp(
 const BEARER_TOKEN = "[A-Za-z0-9._~+/=-]";
 const BEARER_VALUE = new RegExp(
   String.raw`\b([Bb][Ee][Aa][Rr][Ee][Rr])[ \t]+` +
-    String.raw`(?![a-z]+(?!${BEARER_TOKEN}))` +
-    String.raw`(?=${BEARER_TOKEN}{16}|${BEARER_TOKEN}*[0-9_-])` +
-    String.raw`${BEARER_TOKEN}{8,}`,
+    `(?![a-z]+(?!${BEARER_TOKEN}))` +
+    `(?=${BEARER_TOKEN}{16}|${BEARER_TOKEN}*[0-9_-])` +
+    `${BEARER_TOKEN}{8,}`,
   "g",
 );
 
