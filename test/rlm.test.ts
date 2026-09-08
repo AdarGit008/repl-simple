@@ -5803,17 +5803,18 @@ describe("runRlm() — redaction marker hides the redacted size (#191)", () => {
 describe("LlmClient threat model is recorded where it is read (#192)", () => {
   const here = fileURLToPath(import.meta.url);
   const rlmSource = readFileSync(join(here, "..", "..", "src", "rlm.ts"), "utf-8");
-  const policy = readFileSync(
-    join(here, "..", "..", "docs", "truncation-policy.md"),
-    "utf-8",
-  );
+  const policy = readFileSync(join(here, "..", "..", "docs", "truncation-policy.md"), "utf-8");
 
   it("the LlmClient doc block in src/rlm.ts declares implementations trusted host code", () => {
     const at = rlmSource.indexOf("export interface LlmClient");
     assert.ok(at > 0, "LlmClient is declared in src/rlm.ts (not src/types.ts)");
     const docStart = rlmSource.lastIndexOf("/**", at);
     const docBlock = rlmSource.slice(docStart, at);
-    assert.match(docBlock, /trusted host code/, `LlmClient doc lacks the trust sentence:\n${docBlock}`);
+    assert.match(
+      docBlock,
+      /trusted host code/,
+      `LlmClient doc lacks the trust sentence:\n${docBlock}`,
+    );
     assert.match(docBlock, /1 KiB/, "the doc must name the accepted head-only bound");
     assert.match(docBlock, /#192/, "the doc must cite the issue that recorded the decision");
   });
@@ -5829,5 +5830,95 @@ describe("LlmClient threat model is recorded where it is read (#192)", () => {
     assert.match(n191, /truncated at 1\.0KB/, "the #191 narrative must show the marker shape");
     assert.match(n192, /trusted host code/, "the #192 narrative must state the trust decision");
     assert.match(n192, /1 KiB/, "the #192 narrative must name the accepted bound");
+  });
+});
+
+// ── Synthesised answer cap (D101) ───────────────────────────────
+//
+// Every other `RlmResult.answer` source is bounded upstream: a submitted
+// answer is the sandbox's `output` (16 KiB cap), a salvaged one is `output`
+// or `stdout` (32 KiB cap). The synthesis reply was returned verbatim — the
+// only uncapped answer path — and the monitor report's claim that it "flows
+// through the D18 cap" was wrong: D18 caps the conversation copy of
+// iteration replies, and the synthesis reply is not an iteration.
+
+describe("runRlm() — synthesised answer cap (D101)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  const SYNTHESIS_RECOVERY = "The synthesised answer was truncated; the rest is not surfaced.";
+
+  const explore = "```python\nprint('still working')\n```";
+
+  it("caps a 1.4 MB synthesised reply at 256 KiB, both ends kept, marker in the middle", async () => {
+    const huge = `${"H".repeat(700 * 1024)}MIDDLE-SENTINEL${"T".repeat(700 * 1024)}`;
+    const { llm } = mockLlmCodeGen([explore, explore, huge]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 2 });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(llm.calls().length, 3, "two iterations plus the synthesis call");
+    const size = Buffer.byteLength(result.answer, "utf8");
+    assert.ok(size <= 256 * 1024, `synthesised answer is ${size} bytes, over the 256 KiB ceiling`);
+    assert.ok(
+      size > 200 * 1024,
+      `synthesised answer is only ${size} bytes — the budget is unspent`,
+    );
+    // A value cut: identified by both ends, the middle elided.
+    assert.ok(result.answer.startsWith("H".repeat(64)), "head lost");
+    assert.ok(
+      result.answer.endsWith("T".repeat(64)),
+      "tail lost — this is a value cut, not head-only",
+    );
+    assert.ok(!result.answer.includes("MIDDLE-SENTINEL"));
+    assert.match(result.answer, /\[… [0-9.]+[KM]B of [0-9.]+MB elided\. /);
+    assert.ok(result.answer.includes(SYNTHESIS_RECOVERY), "recovery clause missing");
+    // An API return, not a prompt-bound view: no sentinel wrap (as RlmResult.error).
+    assert.ok(!result.answer.includes("[TRUNCATED VIEW"), "sentinels must not leak into the API");
+  });
+
+  it("holds the 256 KiB ceiling on a reply just over 1 MiB (truncator marker reserve)", {
+    todo:
+      "src/truncate.ts (not owned by W1-5) reserves the marker at `elided = totalBytes`, assuming " +
+      "the elided figure never renders wider than the total — but formatSize prints a sub-MB " +
+      "elided count as e.g. `944.0KB` (7 chars) against a `1.2MB` total (5 chars), so a cut of a " +
+      "1–1.35 MB value overshoots invariant 1 by 2–3 bytes on every truncateText surface. " +
+      "Intended fix: reserve with the widest rendering of any elided value ≤ total " +
+      "(max over formatSize widths at the 1 MB boundary), then flip this todo off.",
+  }, async () => {
+    const justOverOneMiB = `${"H".repeat(600 * 1024)}MIDDLE${"T".repeat(600 * 1024)}`;
+    const { llm } = mockLlmCodeGen([explore, explore, justOverOneMiB]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 2,
+    });
+
+    assert.equal(result.answerSource, "synthesised");
+    const size = Buffer.byteLength(result.answer, "utf8");
+    assert.ok(size <= 256 * 1024, `synthesised answer is ${size} bytes, over the 256 KiB ceiling`);
+  });
+
+  it("passes a synthesised reply at the budget byte-identical", async () => {
+    const atBudget = "S".repeat(256 * 1024);
+    const { llm } = mockLlmCodeGen([explore, explore, atBudget]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 2 });
+
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, atBudget, "an at-budget reply must render whole");
+    // One byte over is cut.
+    const { llm: over } = mockLlmCodeGen([explore, explore, `${atBudget}!`]);
+    const overResult = await runRlm("q", {
+      llmClient: over,
+      registry: rlmRegistry(),
+      maxIterations: 2,
+    });
+    assert.notEqual(overResult.answer, `${atBudget}!`);
+    assert.ok(overResult.answer.includes(SYNTHESIS_RECOVERY));
   });
 });
