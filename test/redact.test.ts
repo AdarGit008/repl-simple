@@ -446,24 +446,110 @@ describe("maskSecrets — KEY / TOKEN / SECRET / PASSWORD assignments (family 4)
       gone: ["/etc/ssl/private/server.key"],
       kept: ["server.key="],
     },
+    {
+      // Decision 6 lists `KEY=value` literally: the bare word masks.
+      name: "bare KEY= (decision 6, literal)",
+      input: "KEY=abcdef1234567890 done",
+      gone: ["abcdef1234567890"],
+      kept: ["KEY=", " done"],
+      exact: `KEY=${REDACTED} done`,
+    },
   ];
 
   for (const c of CASES) {
     it(`masks ${c.name}`, () => assertMasked(c));
+  }
+
+  it("masks decision 6's literal list in every spelling — bare and compound names, any case, quotes, `export`", () => {
+    const NAMES = [
+      "KEY",
+      "key",
+      "Key",
+      "TOKEN",
+      "token",
+      "SECRET",
+      "secret",
+      "PASSWORD",
+      "password",
+      "PASSWD",
+      "API_KEY",
+      "api_key",
+      "x-api-key",
+      "ACCESS_TOKEN",
+      "CLIENT_SECRET",
+      "DB_PASSWORD",
+    ];
+    const FORMS: Array<(name: string) => [input: string, expected: string]> = [
+      (n) => [`${n}=hunter2hunter2`, `${n}=${REDACTED}`],
+      (n) => [`export ${n}=hunter2hunter2`, `export ${n}=${REDACTED}`],
+      (n) => [`export ${n}="hunter2hunter2"`, `export ${n}="${REDACTED}"`],
+      (n) => [`${n}='hunter2hunter2'`, `${n}='${REDACTED}'`],
+      (n) => [`${n} = hunter2hunter2`, `${n} = ${REDACTED}`],
+      (n) => [`${n}=hunter2hunter2; next`, `${n}=${REDACTED}; next`],
+    ];
+    for (const name of NAMES) {
+      for (const form of FORMS) {
+        const [input, expected] = form(name);
+        const out = maskSecrets(input);
+        assert.equal(out.text, expected, input);
+        assert.equal(out.masked, 1, input);
+      }
+    }
+  });
+
+  it("bare `key:` is a field name, not a credential — compound names take both separators", () => {
+    for (const text of ["key: id", '{"key": "id", "keys": ["a"]}', "sort by key: name"]) {
+      const out = maskSecrets(text);
+      assert.equal(out.masked, 0, text);
+      assert.equal(out.text, text);
+    }
+    assert.equal(maskSecrets("api_key: hunter2hunter2").text, `api_key: ${REDACTED}`);
+    assert.equal(maskSecrets("x-api-key: hunter2hunter2").text, `x-api-key: ${REDACTED}`);
+  });
+});
+
+// ── Documented costs ────────────────────────────────────────────
+//
+// Shapes decision 6 masks on purpose and docs/redaction.md records as the
+// price: the exact output is pinned so a change here is a decision, not a
+// drift.
+
+describe("maskSecrets — documented costs (decision 6, literally)", () => {
+  const COSTS: MaskCase[] = [
+    {
+      // Python's sort kwarg is a bare `key=`; the decision lists `KEY=value`.
+      name: "Python sort kwarg",
+      input: "rows = sorted(items, key=lambda r: r[1])",
+      gone: ["key=lambda"],
+      kept: ["rows = sorted(items, key=", " r: r[1])"],
+      exact: `rows = sorted(items, key=${REDACTED} r: r[1])`,
+    },
+    {
+      name: "dict kwarg",
+      input: "d = dict(key=value, other=1)",
+      gone: ["key=value"],
+      kept: ["d = dict(key=", ", other=1)"],
+      exact: `d = dict(key=${REDACTED}, other=1)`,
+    },
+  ];
+
+  for (const c of COSTS) {
+    it(`masks ${c.name} — the recorded cost`, () => assertMasked(c));
   }
 });
 
 // ── No-false-positive corpus ────────────────────────────────────
 //
 // Text that must pass through byte-identical. Each entry is a realistic
-// non-secret that sits next to the patterns: Python's `key=` sort kwarg,
-// `max_tokens=`, JSON with a "key" field, tracebacks, URLs, SHAs, timestamps,
+// non-secret that sits next to the patterns: `max_tokens=`, `monkey=`,
+// `keyboard=`, JSON with a "key" field, tracebacks, URLs, SHAs, timestamps,
 // SQL, a public certificate. A masking rule that touches any of these is too
-// wide — a dump of RLM code (#63) would be corrupted by it.
+// wide — a dump of RLM code (#63) would be corrupted by it. (Python's bare
+// `key=` kwarg is *not* here: decision 6 lists `KEY=value` literally, so it
+// masks — see the documented-costs table.)
 
 const CORPUS: Array<{ name: string; text: string }> = [
-  { name: "Python sort kwarg", text: "rows = sorted(items, key=lambda r: r[1])" },
-  { name: "dict kwarg", text: "d = dict(key=value, other=1)" },
+  { name: "kwargs that are not key=", text: "d = dict(name=value, other=1); sorted(rows, cmp=f)" },
   { name: "max_tokens", text: "request(model='x', max_tokens=4096, temperature=0)" },
   { name: "tokens plural", text: "tokens=['a', 'b']; passwords=[]" },
   { name: "tokenizer", text: "tokenizer=AutoTokenizer.from_pretrained('gpt2')" },
@@ -471,7 +557,10 @@ const CORPUS: Array<{ name: string; text: string }> = [
   { name: "SQL primary key", text: "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)" },
   { name: "prose about keys", text: "The primary key is the id column; a monkey=1 mapping." },
   { name: "words ending in key", text: "turkey=hot, hockey=cold, donkey=grey" },
+  { name: "monkey", text: "monkey=banana" },
+  { name: "keyboard", text: "keyboard=on" },
   { name: "keyword arguments", text: "keyword=value pairs are passed as **kwargs" },
+  { name: "key_id / secret_id", text: "key_id=7 secret_id=8 token_count=9 password_hash=x" },
   {
     name: "traceback",
     text: 'Traceback (most recent call last):\n  File "rlm.py", line 3, in <module>\n    x = 1 / 0\nZeroDivisionError: division by zero',
@@ -518,6 +607,7 @@ describe("maskSecrets / redact — idempotence", () => {
     "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
     "-----BEGIN PRIVATE KEY-----\nMIIB",
     "API_KEY=abc123 TOKEN=def456 password: ghi789",
+    "export KEY=abc123 key='def456'",
     'GITHUB_TOKEN="ghp_abcdefghijklmnopqrstuvwxyz0123"',
   ];
 
