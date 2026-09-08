@@ -2683,6 +2683,37 @@ describe("ReplRunner — the store fails closed (#198)", () => {
     }
   });
 
+  it("a first load whose manifest cannot be written withholds everything — the store dir is read-only", async (t) => {
+    // The test above used to reach this path too, until a store path through
+    // a file became `unavailable` at read time (#198 carry-over 4). A
+    // read-only store directory is the shape that still reads `absent` — no
+    // manifest yet — and fails on the write: the first-ever load must not
+    // report success for an acceptance it could not record (D91). A control
+    // for coverage: green on main by construction.
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      chmodSync(store, 0o500);
+      const out = await trustedRunner(cwd, store).run("add_two(1, 2)", "s1");
+      assert.match(out, /^\[preamble unverified\]/, out);
+      assert.match(out, /cannot write the manifest/, out);
+      assert.match(out, /adder/, "the notice must name what was withheld");
+      assert.match(out, /used when not defined/, "an unrecorded acceptance ran the preamble");
+      assert.deepEqual(readdirSync(store), [], "something was written to a read-only store");
+    } finally {
+      try {
+        chmodSync(store, 0o700);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a store inside the project — option, env and symlink — and writes nothing there", async () => {
     const cwd = makeTempDir();
     const outside = makeStore();
@@ -3282,6 +3313,28 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
     assert.equal(traced.status, "ok");
     assert.deepEqual(outline(traced), [["read", false, undefined]]);
     assert.match(traced.calls[0].error ?? "", /outside the project root/);
+  });
+
+  // Residual, recorded as a todo rather than an issue (decision 9).
+  it("two concurrent runs on one session each get exactly their own calls", {
+    todo:
+      "the recorder is per session, not per run (D112): two runWithTrace calls in flight on " +
+      "one sessionId share it, the first to finish clears it, and the alignment of the other " +
+      "drops or misplaces calls. The extension never does this (executionMode: sequential) and " +
+      "#59 documents the library's stance. Intended approach: a per-run recorder handed to " +
+      "Session.run / resume as a run-scoped registry wrapper (src/session.ts, another chunk's " +
+      "file this wave), so each run aligns against its own executions only.",
+  }, async () => {
+    await runner.run("1", "concurrent");
+    const [a, b] = await Promise.all([
+      runner.runWithTrace("read('hello.txt')\nread('hello.txt')\nread('hello.txt')", "concurrent"),
+      runner.runWithTrace(
+        "read('big.txt', 1, 1)\nread('big.txt', 2, 1)\nread('big.txt', 3, 1)",
+        "concurrent",
+      ),
+    ]);
+    assert.equal(a.calls.length, 3, `run A listed ${a.calls.length} of its 3 calls`);
+    assert.equal(b.calls.length, 3, `run B listed ${b.calls.length} of its 3 calls`);
   });
 });
 
