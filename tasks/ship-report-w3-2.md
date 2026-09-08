@@ -184,7 +184,7 @@ passing test.
 ## Closing-comment drafts (for the orchestrator, after merge)
 
 **#86**
-> Closed by W3-2 (PR #NNN, merge `<sha>`), the second half of the sweep (W2-3 did the cold files in
+> Closed by W3-2 (PR #215, merge `<sha>`), the second half of the sweep (W2-3 did the cold files in
 > #212). Ledger in `tasks/ship-report-w3-2.md`: every comment block in `src/session.ts` (144),
 > `src/repl.ts` (108), `src/bridge.ts` (36), `src/redact.ts` (28), `src/index.ts` (15) and the
 > prompt text of `src/registry.ts` read against the code and the tracker; 16 blocks corrected, 1
@@ -196,7 +196,7 @@ passing test.
 > `resolveToolArgs` comment is W3-1's (`src/sandbox.ts`) this wave.
 
 **#174**
-> Closed by W3-2 (PR #NNN) as document-only, per session decision 16. README now carries a "Module
+> Closed by W3-2 (PR #215) as document-only, per session decision 16. README now carries a "Module
 > map": `src/repl.ts` is the runner behind the `repl*` tools, `src/rlm.ts` the RLM loop,
 > `src/rlm_tools.ts` the loop's sandbox-side tools, `repl/repl_server.py` the bundled preamble
 > (hard-coded in `src/preamble.ts`, shipped via `package.json` `files`). No rename: it would orphan
@@ -204,7 +204,7 @@ passing test.
 > default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) the diagnostic regex reads.
 
 **#83**
-> Closed by W3-2 (PR #NNN). The three exit criteria, evidenced:
+> Closed by W3-2 (PR #215). The three exit criteria, evidenced:
 > 1. *No exported symbol is unreachable* — `knip` runs in `npm run lint` since W2-3 (#212,
 >    decision 14); `arg()` deleted, the barrel pinned (`test/registry.test.ts:198`).
 > 2. *No comment in `src/` contradicts the code beneath it* — W2-3's ledger (266 blocks, cold
@@ -217,7 +217,7 @@ passing test.
 
 **#175** (posted by this chunk on re-label — the only issue action taken)
 > Re-homed as standalone infrastructure (session decision 17, 2026-09-08): `bucket-11` removed,
-> `infra` added. The procedure is `docs/mutation-rebaseline-runbook.md` (PR #NNN): a fresh
+> `infra` added. The procedure is `docs/mutation-rebaseline-runbook.md` (PR #215): a fresh
 > `.stryker-incremental.json` and why, `--dryRunOnly` to size the run, `--mutate` shards into one
 > incremental file under `scripts/contained.mjs --limit`, a big-memory host with nothing else
 > running the suite, freshness and provenance checks, and which numbers to write where. The #165
