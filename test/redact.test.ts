@@ -749,7 +749,7 @@ describe("maskSecrets — bounded work on long inputs", () => {
     { name: "one word", text: "A".repeat(1024 * 1024) },
     { name: "many words", text: "A ".repeat(512 * 1024) },
     { name: "many separators", text: "a_b-c.".repeat(200 * 1024) },
-    { name: "many BEGIN lines without END", text: "-----BEGIN PRIVATE KEY-----\n".repeat(2000) },
+    { name: "many BEGIN lines without END", text: "-----BEGIN PRIVATE KEY-----\n".repeat(37449) },
     { name: "many colons", text: "key: value: key: value:\n".repeat(50 * 1024) },
   ];
 
@@ -761,4 +761,45 @@ describe("maskSecrets — bounded work on long inputs", () => {
       assert.ok(ms < 2000, `took ${ms.toFixed(0)} ms`);
     });
   }
+
+  it("the PEM scan is linear: 1024 BEGIN lines with no END in 1 MiB cost no more than 3× one BEGIN line (best of 5 runs)", () => {
+    // A budget alone cannot tell linear from quadratic — it only says "fast
+    // enough today". The lazy body scan used to rescan to the end of the text
+    // for every BEGIN that had no END, so the cost grew with the number of
+    // BEGIN lines (16000 lines = 854 ms; 1 MiB through redact() = 4.4 s).
+    // Both texts here are exactly 1 MiB — the same memory footprint and cache
+    // behaviour — so the only thing that differs is the number of BEGIN
+    // lines: a linear scan costs the same for one as for 1024 (measured
+    // ~1×), the quadratic one ~50× more (V8 runs the lazy rescan at literal-
+    // search speed, ~0.1 ms per MiB per BEGIN, so a thousand lines are
+    // needed for a margin no CI runner can close). A size-doubling form of
+    // this test measured 3.10× per doubling under the parallel full-suite
+    // load — cache effects at 1 MiB, not the algorithm — which is why the
+    // size is held fixed. Runs are interleaved and the best of five is kept,
+    // four passes per timing, so a transient stall cannot land on one text
+    // alone and the figures are milliseconds rather than timer ticks.
+    const LINE = "-----BEGIN PRIVATE KEY-----\n";
+    const SIZE = 1024 * 1024;
+    const RUNS = 5;
+    const PASSES = 4;
+    const COUNTS = [1, 1024];
+    const texts = COUNTS.map((k) => LINE.repeat(k) + "A".repeat(SIZE - k * LINE.length));
+    const best = texts.map(() => Number.POSITIVE_INFINITY);
+    for (let run = 0; run < RUNS; run++) {
+      for (let i = 0; i < texts.length; i++) {
+        const started = process.hrtime.bigint();
+        for (let pass = 0; pass < PASSES; pass++) maskSecrets(texts[i] as string);
+        best[i] = Math.min(best[i] as number, Number(process.hrtime.bigint() - started) / 1e6);
+      }
+    }
+    // A floor on the divisor: a sub-millisecond figure must not make a
+    // healthy 1× read as 30×.
+    const ratio = (best[1] as number) / Math.max(best[0] as number, 1);
+    assert.ok(
+      ratio < 3,
+      `${COUNTS[1]} BEGIN lines cost ${ratio.toFixed(2)}× one (best of ${RUNS}, ${PASSES} passes each: ${best
+        .map((t) => t.toFixed(1))
+        .join(" / ")} ms)`,
+    );
+  });
 });
