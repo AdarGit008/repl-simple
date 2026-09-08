@@ -616,11 +616,15 @@ function interleave(
 
   // Byte offset → code-unit index, for offsets that land on a character
   // boundary of the head (the sandbox counts whole callbacks, so they do).
-  const indexAtByte = new Map<number, number>();
+  // Walked per code point: an astral character is two code units but four
+  // bytes, not the six that measuring each unit alone would count.
+  const indexAtByte = new Map<number, number>([[0, 0]]);
   let byte = 0;
-  for (let i = 0; i <= head.length; i++) {
-    indexAtByte.set(byte, i);
-    if (i < head.length) byte += Buffer.byteLength(head[i], "utf8");
+  let index = 0;
+  for (const ch of head) {
+    byte += Buffer.byteLength(ch, "utf8");
+    index += ch.length;
+    indexAtByte.set(byte, index);
   }
 
   const insertions: Array<{ at: number; text: string; seq: number }> = [];

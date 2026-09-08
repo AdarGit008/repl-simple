@@ -463,52 +463,93 @@ function reprNumber(value: number): string {
 }
 
 /**
+ * What a `str` repr escapes: the quotes and the backslash, the C0/C1 controls
+ * and DEL (`\p{Cc}`), and a lone surrogate (`\p{Cs}` — under the `u` flag a
+ * paired one is a single astral code point and does not match). Everything
+ * else, printable non-ASCII included, is kept as Python 3 keeps it. One
+ * native scan replaces the per-character loop: a 10 MB string with nothing
+ * to escape costs the scan, not a million appends.
+ */
+const STRING_ESCAPES = /["'\\\p{Cc}\p{Cs}]/gu;
+
+/** One escaped character of a `str` repr, `quote` being the delimiter in use. */
+function escapeChar(ch: string, quote: string): string {
+  if (ch === "\\") return "\\\\";
+  if (ch === "'" || ch === '"') return ch === quote ? `\\${quote}` : ch;
+  if (ch === "\n") return "\\n";
+  if (ch === "\r") return "\\r";
+  if (ch === "\t") return "\\t";
+  const code = ch.charCodeAt(0);
+  return code >= 0xd800 && code <= 0xdfff
+    ? `\\u${code.toString(16).padStart(4, "0")}`
+    : `\\x${code.toString(16).padStart(2, "0")}`;
+}
+
+/**
+ * The part of a string a bounded render spells: the whole when it has at
+ * most `limit` code units, else its first `limit` (or, `fromEnd`, its last).
+ * Every code unit costs at least one byte rendered, so a cut part of
+ * `limit = remaining + 1` units is guaranteed past the cap — the render is
+ * known not to fit without spelling the rest. A surrogate pair split at the
+ * edge renders as a `\uXXXX` there, which is harmless: the edge lies beyond
+ * the cap, past what any caller keeps.
+ */
+function bounded<T extends { length: number; slice(from: number, to?: number): T }>(
+  whole: T,
+  limit: number,
+  fromEnd: boolean,
+): { part: T; cut: boolean } {
+  if (whole.length <= limit) return { part: whole, cut: false };
+  return { part: fromEnd ? whole.slice(whole.length - limit) : whole.slice(0, limit), cut: true };
+}
+
+/**
  * `repr()` of a string: single quotes unless the text holds a `'` and no
  * `"`; the backslash, the quote, `\n`, `\r` and `\t` escaped by name; other
  * C0/C1 controls and DEL as `\xNN`; a lone surrogate as `\uXXXX`; printable
- * non-ASCII kept, as Python 3 keeps it.
+ * non-ASCII kept. Bounded by `limit` code units from the chosen end; a cut
+ * render has its quote only on the end it is true to.
  */
-function reprString(text: string): string {
+function reprString(text: string, limit: number, fromEnd: boolean): string {
   const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
-  let out = quote;
-  for (const ch of text) {
-    const code = ch.codePointAt(0) as number;
-    if (ch === "\\") out += "\\\\";
-    else if (ch === quote) out += `\\${quote}`;
-    else if (ch === "\n") out += "\\n";
-    else if (ch === "\r") out += "\\r";
-    else if (ch === "\t") out += "\\t";
-    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
-      out += `\\x${code.toString(16).padStart(2, "0")}`;
-    } else if (code >= 0xd800 && code <= 0xdfff) {
-      out += `\\u${code.toString(16).padStart(4, "0")}`;
-    } else out += ch;
-  }
-  return out + quote;
+  const { part, cut } = bounded(text, limit, fromEnd);
+  const body = part.replace(STRING_ESCAPES, (ch) => escapeChar(ch, quote));
+  return `${cut && fromEnd ? "" : quote}${body}${cut && !fromEnd ? "" : quote}`;
 }
 
-/** `repr()` of bytes: `b'…'` with printable ASCII kept and everything else as `\xNN`. */
-function reprBytes(bytes: Uint8Array): string {
+/**
+ * What a `bytes` repr escapes, the bytes read as latin1 characters:
+ * everything outside printable ASCII — the controls and DEL (`\p{Cc}`), the
+ * high half — plus the quotes and the backslash.
+ */
+const BYTES_ESCAPES = /["'\\\p{Cc}\u{a0}-\u{ff}]/gu;
+
+/**
+ * `repr()` of bytes: `b'…'` with printable ASCII kept and everything else
+ * as `\xNN`, bounded like `reprString`. The bytes are read as latin1 so each
+ * byte is one character and the same escaping scan applies.
+ */
+function reprBytes(bytes: Uint8Array, limit: number, fromEnd: boolean): string {
   const quote = bytes.includes(0x27) && !bytes.includes(0x22) ? '"' : "'";
-  let out = `b${quote}`;
-  for (const byte of bytes) {
-    if (byte === 0x5c) out += "\\\\";
-    else if (byte === quote.charCodeAt(0)) out += `\\${quote}`;
-    else if (byte === 0x0a) out += "\\n";
-    else if (byte === 0x0d) out += "\\r";
-    else if (byte === 0x09) out += "\\t";
-    else if (byte >= 0x20 && byte < 0x7f) out += String.fromCharCode(byte);
-    else out += `\\x${byte.toString(16).padStart(2, "0")}`;
-  }
-  return out + quote;
+  const { part, cut } = bounded(bytes, limit, fromEnd);
+  const body = Buffer.from(part)
+    .toString("latin1")
+    .replace(BYTES_ESCAPES, (ch) => escapeChar(ch, quote));
+  return `${cut && fromEnd ? "" : `b${quote}`}${body}${cut && !fromEnd ? "" : quote}`;
 }
 
 /**
  * The Python-style renderer, with a byte cap that bounds its work: past the
  * cap nothing more is appended and `overflow` says so, which is how a caller
- * learns "this does not fit" without rendering the rest. A container seen
- * again while it is still open is a cycle, spelled `[...]` / `{...}` as
+ * learns "this does not fit" without rendering the rest — a string or bytes
+ * is spelled only as far as the cap can be exceeded, never whole. A container
+ * seen again while it is still open is a cycle, spelled `[...]` / `{...}` as
  * Python spells it.
+ *
+ * `fromEnd` mirrors the walk: the same pieces in the reverse order, the last
+ * elements first, a string from its tail, so `text` is a true suffix of the
+ * full repr under the same cap. The two directions together give a caller
+ * both real ends of a value that fits neither way, for the price of two caps.
  */
 class Repr {
   private readonly parts: string[] = [];
@@ -516,12 +557,16 @@ class Repr {
   private used = 0;
   overflow = false;
 
-  constructor(private readonly cap: number) {}
+  constructor(
+    private readonly cap: number,
+    private readonly fromEnd = false,
+  ) {}
 
   get text(): string {
-    return this.parts.join("");
+    return (this.fromEnd ? [...this.parts].reverse() : this.parts).join("");
   }
 
+  /** Append in walk order: the next piece towards the middle of the value. */
   push(text: string): void {
     if (this.overflow) return;
     this.parts.push(text);
@@ -531,7 +576,7 @@ class Repr {
 
   value(value: unknown): void {
     if (this.overflow) return;
-    const scalar = Repr.scalar(value);
+    const scalar = this.scalar(value);
     if (scalar !== undefined) {
       this.push(scalar);
       return;
@@ -550,8 +595,10 @@ class Repr {
   }
 
   /** The repr of a non-container, or `undefined` for a container. */
-  private static scalar(value: unknown): string | undefined {
+  private scalar(value: unknown): string | undefined {
     if (value === null || value === undefined) return "None";
+    // One more code unit than the cap has room for is enough to overflow it.
+    const limit = this.cap - this.used + 1;
     switch (typeof value) {
       case "boolean":
         return value ? "True" : "False";
@@ -560,7 +607,7 @@ class Repr {
       case "bigint":
         return value.toString();
       case "string":
-        return reprString(value);
+        return reprString(value, limit, this.fromEnd);
       case "function":
         return "<function>";
       case "symbol":
@@ -568,63 +615,76 @@ class Repr {
       default:
         break;
     }
-    return value instanceof Uint8Array ? reprBytes(value) : undefined;
+    return value instanceof Uint8Array ? reprBytes(value, limit, this.fromEnd) : undefined;
   }
 
   /** One element of a list or set, or one `key: value` of a dict. */
   item(item: unknown, isEntry: boolean): void {
     if (isEntry) {
       const [key, value] = item as [unknown, unknown];
-      this.value(key);
+      const [first, second] = this.fromEnd ? [value, key] : [key, value];
+      this.value(first);
       this.push(": ");
-      this.value(value);
+      this.value(second);
     } else {
       this.value(item);
     }
   }
 
+  /** `open`, then the inside, then `close` — from whichever end is being built. */
+  private wrap(open: string, close: string, inside: () => void): void {
+    this.push(this.fromEnd ? close : open);
+    inside();
+    this.push(this.fromEnd ? open : close);
+  }
+
   private container(obj: object): void {
-    if (Array.isArray(obj)) {
-      this.push("[");
-      this.items(obj, false);
-      this.push("]");
-    } else if (obj instanceof Set) {
-      if (obj.size === 0) {
-        this.push("set()");
-      } else {
-        this.push("{");
-        this.items([...obj], false);
-        this.push("}");
-      }
-    } else if (obj instanceof Map) {
-      this.push("{");
-      this.items([...obj], true);
-      this.push("}");
+    const tag = montyTag(obj);
+    if (tag === "Exception") {
+      this.wrap(`${pythonTypeName(obj)}(`, ")", () =>
+        this.value((obj as { message?: unknown }).message),
+      );
+    } else if (tag === "Type") {
+      const name = (obj as { value?: unknown }).value;
+      this.push(`<class '${typeof name === "string" ? name : "?"}'>`);
+    } else if (tag !== undefined) {
+      this.push(`<${tag}>`);
+    } else if (obj instanceof Set && obj.size === 0) {
+      this.push("set()");
     } else {
-      const tag = montyTag(obj);
-      if (tag === "Exception") {
-        this.push(`${pythonTypeName(obj)}(`);
-        this.value((obj as { message?: unknown }).message);
-        this.push(")");
-      } else if (tag === "Type") {
-        const name = (obj as { value?: unknown }).value;
-        this.push(`<class '${typeof name === "string" ? name : "?"}'>`);
-      } else if (tag !== undefined) {
-        this.push(`<${tag}>`);
-      } else {
-        this.push("{");
-        this.items(Object.entries(obj), true);
-        this.push("}");
-      }
+      const c = containerOf(obj) ?? {
+        open: "{",
+        close: "}",
+        items: Object.entries(obj),
+        entries: true,
+      };
+      this.wrap(c.open, c.close, () => this.items(c.items, c.entries));
     }
   }
 
   private items(items: unknown[], areEntries: boolean): void {
-    for (let i = 0; i < items.length && !this.overflow; i++) {
-      if (i > 0) this.push(", ");
-      this.item(items[i], areEntries);
+    const n = items.length;
+    for (let k = 0; k < n && !this.overflow; k++) {
+      if (k > 0) this.push(", ");
+      this.item(items[this.fromEnd ? n - 1 - k : k], areEntries);
     }
   }
+}
+
+/**
+ * Both real ends of one rendering, for the flat cut: the head under `cap`
+ * and, only when that did not reach the end, the tail under the same cap.
+ * `whole` says the head was the whole thing. The cut keeps a real head and a
+ * real tail without the value ever being spelled in full, so the work stays
+ * the budget's — twice over — and not the value's.
+ */
+function reprEnds(render: (r: Repr) => void, cap: number): { text: string; whole: boolean } {
+  const head = new Repr(cap);
+  render(head);
+  if (!head.overflow) return { text: head.text, whole: true };
+  const tail = new Repr(cap, true);
+  render(tail);
+  return { text: head.text + tail.text, whole: false };
 }
 
 /** The elidable shape of a value: its items, brackets and the noun the marker counts. */
@@ -657,6 +717,16 @@ function renderItem(container: Container, index: number, cap: number): string | 
 }
 
 /**
+ * A structural render for the flat cut. `partial` says the text holds a real
+ * head and a real tail with nothing between — one element was spelled from
+ * both ends only, never whole — so the cut can claim no total for it.
+ */
+interface Elided {
+  text: string;
+  partial: boolean;
+}
+
+/**
  * Elide the outermost container between its elements: elements taken whole
  * from the front and from the back into a 50/50 split of the payload, and
  * one marker where the rest was. `undefined` when even the marker does not
@@ -664,15 +734,17 @@ function renderItem(container: Container, index: number, cap: number): string | 
  *
  * When neither end fits a single element the value is dominated by one huge
  * element: a nested container is elided the same way one level down (to
- * `ELIDE_DEPTH`), a scalar is rendered whole for the caller's flat cut, so
- * that the rendered tail is the value's real tail and not a cap's.
+ * `ELIDE_DEPTH`) — a dict's entry through its value, behind its key — and
+ * anything else is rendered from both ends under the budget (`reprEnds`) for
+ * the caller's flat cut, so that the cut's tail is the value's real tail and
+ * not a cap's, and the work is still the budget's.
  */
 function elideContainer(
   value: unknown,
   maxBytes: number,
   recovery: string,
   depth: number,
-): string | undefined {
+): Elided | undefined {
   const c = containerOf(value);
   if (!c) return undefined;
   const n = c.items.length;
@@ -709,21 +781,30 @@ function elideContainer(
   if (head.length + tail.length === 0) {
     const first = c.items[0];
     const rest = n > 1 ? `, ${marker(n - 1)}` : "";
+    const frame = byteLength(`${c.open}${rest}${c.close}`);
+    // The value to descend into, and what stands before it: a dict entry
+    // descends through its value behind `key: `, when the key itself fits.
+    let prefix = "";
+    let target = first;
+    if (c.entries) {
+      const [key, value] = first as [unknown, unknown];
+      const k = new Repr(maxBytes - frame);
+      k.value(key);
+      prefix = `${k.text}: `;
+      target = k.overflow ? undefined : value;
+    }
     const inner =
-      depth < ELIDE_DEPTH && !c.entries
-        ? elideContainer(
-            first,
-            maxBytes - byteLength(`${c.open}${rest}${c.close}`),
-            recovery,
-            depth + 1,
-          )
+      depth < ELIDE_DEPTH
+        ? elideContainer(target, maxBytes - frame - byteLength(prefix), recovery, depth + 1)
         : undefined;
-    if (inner !== undefined) return `${c.open}${inner}${rest}${c.close}`;
-    const whole = new Repr(Number.POSITIVE_INFINITY);
-    whole.item(first, c.entries);
-    return `${c.open}${whole.text}${rest}${c.close}`;
+    if (inner !== undefined) {
+      return { text: `${c.open}${prefix}${inner.text}${rest}${c.close}`, partial: inner.partial };
+    }
+    const ends = reprEnds((r) => r.item(first, c.entries), maxBytes - frame);
+    return { text: `${c.open}${ends.text}${rest}${c.close}`, partial: !ends.whole };
   }
-  return `${c.open}${[...head, marker(n - head.length - tail.length), ...tail].join(", ")}${c.close}`;
+  const body = [...head, marker(n - head.length - tail.length), ...tail].join(", ");
+  return { text: `${c.open}${body}${c.close}`, partial: false };
 }
 
 export interface FormatValueOptions {
@@ -743,7 +824,9 @@ export interface FormatValueOptions {
  * 50/50 value cut; a container that cannot even fit the marker is cut
  * head-only at the byte, with no total claimed. Every path ends in
  * `truncateText`, so invariant 1 holds by construction, and the renderer
- * stops at the cap, so the work is the budget's and not the value's.
+ * stops at the cap — from either end — so the work is the budget's and not
+ * the value's: nothing is ever spelled whole to be cut afterwards, and a
+ * flat cut through a value spelled from its two ends claims no total.
  */
 export function formatValue(
   value: unknown,
@@ -759,15 +842,17 @@ export function formatValue(
   if (!whole.overflow) return { text: whole.text, truncated: false };
 
   const elided = elideContainer(value, maxBytes, opts.recovery, 0);
-  if (elided !== undefined) return { text: flat(elided, VALUE_HEAD_RATIO).text, truncated: true };
+  if (elided !== undefined) {
+    return { text: flat(elided.text, VALUE_HEAD_RATIO, elided.partial).text, truncated: true };
+  }
   if (containerOf(value)) {
     // Too small for the marker: the partial render, head-only, claiming no
     // total — the renderer stopped, so the total is not known.
     return { text: flat(whole.text, HEAD_ONLY_RATIO, true).text, truncated: true };
   }
-  // A scalar or a tagged record: bounded by its own size, so render it whole
-  // and let the flat cut keep both of its real ends.
-  const complete = new Repr(Number.POSITIVE_INFINITY);
-  complete.value(value);
-  return { text: flat(complete.text, VALUE_HEAD_RATIO).text, truncated: true };
+  // A scalar or a tagged record: no elements to elide between, so the flat
+  // cut keeps both of its real ends — spelled from each end under the
+  // budget, never whole, and so claiming no total.
+  const ends = reprEnds((r) => r.value(value), maxBytes);
+  return { text: flat(ends.text, VALUE_HEAD_RATIO, true).text, truncated: true };
 }

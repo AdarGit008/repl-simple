@@ -612,14 +612,23 @@ What the boundary does not carry, and so what `output` cannot show. Recorded rat
    it to see more. …], 299998, 299999]` (`entries` for a dict). The counts are the true counts
    (invariant 5). A nested value is shown whole or skipped.
 3. A value whose ends fit nothing is dominated by one huge element: a nested container is elided the
-   same way one level down (to a depth of 4); a scalar is rendered whole and the flat 50/50 cut keeps
-   both of its real ends.
-4. A bare string, and any non-container, takes the flat 50/50 value cut it always did.
+   same way one level down (to a depth of 4) — a dict's entry through its value, behind its key
+   (`{'k': [0, 1, 2, [… 999994 of 1000000 elements elided. … …], 999998, 999999]}`); anything
+   else is spelled from its head and from its tail, each under the budget, and the flat 50/50 cut
+   joins the two real ends: `['xxx…[… truncated at 16.0KB. … …]…xxx']`. The whole was never
+   spelled, so that marker claims no total (the path-5 form), never an `X of Y` the renderer could
+   only know by doing the work the budget forbids.
+4. A bare string takes the flat 50/50 value cut it always did, with its true total. Any other
+   non-container (an exception with a huge message) is spelled from both ends as in 3.
 5. A container under a budget too small for its marker (< ~80 bytes) is cut head-only at the byte,
    claiming no total (`[… truncated at 48B. … …]`), because the renderer stopped before the end.
 
-The renderer stops appending past the budget, so the work is the budget's and not the value's: a
-10⁶-element set costs the boundary crossing (≈0.9 s, measured), not the repr.
+The renderer stops appending past the budget — from either end — so the work is the budget's and
+not the value's: a 10⁶-element set costs the boundary crossing (≈0.9 s, measured), not the repr,
+and a 10 MB string inside a list costs the same as one that fits (≈10 ms for the repr, measured;
+before fix round 1 it was spelled in full up to four times, 3.5 s, and 42 s for 100 MB). A `str` or
+`bytes` is spelled only as far as the budget can be exceeded — one code unit past the cap is
+enough to know it does not fit.
 
 The extension's argument renderer (`viewArgs` in `extensions/repl-extension.ts`) is a second,
 smaller Python-ish spelling with masking and a display cap. It is not a truncator and does not
