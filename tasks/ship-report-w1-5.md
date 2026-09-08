@@ -1,7 +1,7 @@
 # Ship Report — W1-5: RLM boundary hygiene, stub honesty, and the shared redaction helper
 
 Branch: `chunk/w1-5-rlm-hygiene-redaction` · Base: `main` (`3770e46`) · Spec: `tasks/spec-w1-5.md`
-(D97–D110) · Decision: **GO**
+(D97–D115; fix round 1 = D111–D115) · Decision: **GO**
 
 Issues closed by the PR: #168, #191, #192, #67, #169, #170, #173 (plus the filed synthesised-reply
 residual, which had no number). Epics #70 and #31 are **not** closed here — their closing-comment
@@ -29,15 +29,19 @@ Security first, then hygiene — one commit pair (RED test, GREEN fix) per item:
    and that the 1 KiB head-only bound is accepted, not tightened; `docs/truncation-policy.md` gains
    the #191 and #192 narratives and the general redaction rule now records "no magnitude" and
    names `src/redact.ts` as the one call site.
-4. **`src/redact.ts` — the shared redaction helper (D100).** `redact(text, { maxBytes, recovery })`
-   = `maskSecrets(text)` then a head-only `truncateText` with `unknownTotal`. Masking runs before
-   the cut so a token straddling the boundary leaves no fragment. Four rule families (known token
-   prefixes with the prefix kept; `Authorization` header values with the scheme kept and bare
-   `Bearer` tokens; PEM private-key blocks, terminated or cut off; `NAME=value` where NAME ends in
-   `_KEY`/`-KEY`/`.KEY`, is `APIKEY`, or ends in `TOKEN`/`SECRET`/`PASSWORD`/`PASSWD` — bare `key=`
-   excluded because it is Python's sort kwarg). Every regex is linear on 1 MiB adversarial shapes;
-   masking is idempotent. `redactProviderError` now calls it, so the shared object has a live
-   consumer; `docs/redaction.md` is the normative description.
+4. **`src/redact.ts` — the shared redaction helper (D100; round 1: D111, D112, D114).**
+   `redact(text, { maxBytes, recovery })` = `maskSecrets(text)` then a head-only `truncateText` with
+   `unknownTotal`. Masking runs before the cut so a token straddling the boundary leaves no
+   fragment. Four rule families, each read on one line (`[ \t]`, never `\s`): known token prefixes
+   with the prefix kept; `Authorization` header values — a known scheme (`Basic`, `Bearer`,
+   `Digest`, `Token`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `AWS4-HMAC-SHA256`) kept and its
+   credential masked, an unknown first token masked together with the same-line token after it, a
+   lone value masked whole — and bare `Bearer` tokens; PEM private-key blocks, terminated or cut
+   off, with a tempered body scan; `NAME=value` / `NAME: value` for decision 6's list literally —
+   bare `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`PASSWD` and any name ending in them, word-bounded, bare
+   `key` on `=` only. Every regex is linear on 1 MiB adversarial shapes (the PEM scan proven by a
+   same-size density test); masking is idempotent in text and count. `redactProviderError` calls
+   it, so the shared object has a live consumer; `docs/redaction.md` is the normative description.
 5. **Synthesised-answer cap (D101).** The cap-time synthesis reply was the one uncapped
    `RlmResult.answer` path (the monitor report's "flows through the D18 cap" claim was wrong: D18
    caps the conversation copy of *iteration* replies). It is now cut at 256 KiB, value-shaped, plain
@@ -63,12 +67,15 @@ No new dependency. No change outside the owned files.
 
 ## Verification evidence
 
-- **Gates at HEAD:** `npm run check` clean · `npm run lint` clean · `REQUIRE_BRIDGE_TOOLS=1 npm run
-  test:contained` → **1249 tests, 1247 pass, 0 fail, 2 todo** (36.1 s, exit 0, no OOM) ·
-  `npm run coverage` (contained) → **"All per-file floors met"**, exit 0; owned files measured
-  `src/rlm.ts` 99.64 · `src/rlm_tools.ts` 100.00 · `src/registry.ts` 98.30 · `src/redact.ts` 99.37
-  in the merged run (100.00 measured alone — one line, the #113 merge defect, inside the gate's
-  tolerance; the same exposure `src/truncate.ts` documents at 99.74/100) · global 98.60 (reported).
+- **Gates at HEAD (fix round 1):** `npm run check` clean · `npm run lint` clean ·
+  `REQUIRE_BRIDGE_TOOLS=1 npm run test:contained` → **1275 tests, 1273 pass, 0 fail, 2 todo**
+  (36.8 s, exit 0, no OOM) · `npm run coverage` (contained) → **"All per-file floors met"**, exit 0;
+  owned files measured `src/rlm.ts` 99.64 · `src/rlm_tools.ts` 100.00 · `src/registry.ts` 98.30 ·
+  `src/redact.ts` **100.00 in the merged run** — 207/207 lines in both merged measurements at HEAD
+  (the gate and a kept-lcov run of the same command line), so the floor of 100 is met without the
+  tolerance (D115). The 99.37 the first round saw was one lost line of the 159-line file under the
+  #113 merge defect; the rewrite of families 2–4 replaced that region. (Round-0 figures: 1249 tests,
+  1247 pass.)
 - **Coverage baseline (D110).** `npm run coverage:update` ran exactly once, contained, after every
   test was in (3 measurements, per-file minima, no refusal). Floors that changed, each justified:
   - `src/rlm.ts` 99.14 → **99.64** — the cap, redaction, synthesis, prompt-section and question
@@ -113,12 +120,47 @@ No new dependency. No change outside the owned files.
   `test/sandbox.test.ts`, `test/repl_server.test.ts`, `test/types.test.ts`, `test/builtins.test.ts`)
   pass unchanged with the `-> None` rendering: 334/334.
 
+## Fix round 1 — the verifier's findings (2026-09-08)
+
+Verdict on round 0 was *fail* on one blocking finding plus six non-blocking ones. Every finding
+is accepted and fixed; none is refuted. One RED→GREEN pair per finding family, each new test
+measured RED against the branch's pre-fix code (the fix's parent commit), the guards named.
+
+| # | Finding | Fix | Evidence |
+|---|---|---|---|
+| 1 (blocking) | Family 2a kept a schemeless `Authorization` credential and masked the *next* token when whitespace and text followed (`Authorization: abcdef1234567890XYZ\nX-Request-Id: 42` → credential survived; the "schemeless header" fixture was green only because `==` is outside the scheme class) | D111: one-line rule (`[ \t]`), a known-scheme list kept, an unknown first token masked with its same-line successor, a lone value masked whole; values end at end of line, whitespace, quote, `;`, `,`; `BEARER_VALUE` no longer crosses a newline | `8ec1ea4` → `bef3137`. `test/redact.test.ts:110` family 2: the exact probe (`:155`), header dumps with several headers, compact and schemeless JSON, two `curl -H` lines, `;`- and `,`-joined pairs, every known scheme by spelling, four unknown schemes, a scheme word with no credential, `the Bearer\nauthentication scheme` untouched. RED: 12 fail (4 rows, 5 named tests, the idempotent count, both fuzzes) |
+| 2 | Family 3a quadratic on BEGIN lines with no END (×4 per doubling; 16000 lines = 854 ms; 1 MiB through `redact()` 4.4 s); the doc's linearity claim and the 56 KB fixture did not match | D112: tempered body scan `(?:(?!-----BEGIN )[\s\S])*?`; the shape at 1 MiB; a same-size density test; `docs/redaction.md` says what is measured | `e1f59c9` → `9dff198`. `:833` bounded work: 1 MiB of BEGIN lines 3.6 ms (was 4923 ms); `:855` density: 1024 vs 1 BEGIN lines in 1 MiB, best of 5 × 4 passes, **1.11×** fixed (13.4 / 14.9 ms) vs **36.21×** on the old scan (9.4 / 339.2 ms), bound 3×. 16000 lines 4.19 ms; `redact()` of 1 MiB 4.09 ms. RED: both fail |
+| 3 | A caller tool named `question` was silently shadowed by the reserved input (`TypeError: 'str' object is not callable`; the tool never ran) | D113: refused at `runRlm` start after the D51 loop — `runRlm: tool 'question' conflicts with the reserved 'question' input — the sandbox variable would shadow the tool. Rename it.` | `e796bd9` → `d594646`. `test/rlm.test.ts:6151`: exact message, zero LLM calls. RED: "Missing expected rejection" |
+| 4 | Decision 6 lists `KEY|TOKEN|SECRET|PASSWORD=value` literally; bare `KEY=value` passed through | D114: bare words and names ending in them, any case, quotes/`export`/spaces tolerated, word-bounded both sides (`monkey=`, `keyboard=`, `keyword=`, `key_id=` stay data), bare `key` on `=` only; Python's `key=` kwarg masks — the recorded cost, exact output pinned | `0e0df0e` → `f49b9d1`. `:354` family 4: the exact probe, a 16-name × 6-form literal-list walk (96 inputs), the `key:` field-name pin; `:517` documented costs. RED: 4 fail (probe, walk, both cost pins); guards: 4 corpus entries and the `key:` pin |
+| 5 | `src/redact.ts` floor 100 above the merged 99.37, held by the one-line tolerance | D115: two merged measurements at HEAD read 207/207; the floor is the measured value | `npm run coverage`: `src/redact.ts 100.00 100.00`; kept lcov `LH:207 LF:207`, no `DA:*,0` row |
+| 6 | Ship-report citations drifted by 1–2 lines | Regenerated from `grep -n` at HEAD (this document) | `:5890`, `:5983`, `:6000`, `:6041`, `:6099`, `:6151`; registry `:422`, `:532` |
+| 7 | Re-run the no-false-positive corpus plus a fuzz of 200 random lines | Corpus: **29 entries**, 0 masked. Fuzz (`:784`, seeded LCG): **200 random one-to-three-line non-secret documents** from 49 header/env/prose/code lines, **0 false positives**; **200 random header dumps** with a planted credential in five header shapes, **0 survivals**, every other header verbatim | The negative fuzz was RED on the old code — 3 documents masked, all `…Bearer\nauthentication…` (the newline-crossing rule); the positive fuzz was RED on schemeless credentials ahead of a header |
+| 4a–4d (minor) | `\s+` across newlines; `;`/`,` swallowed; `masked` not idempotent (2 on a second pass); a tautological idempotence assertion | All in D111: `[ \t]` only, terminators preserved, the header and assignment rules refuse a value that is already `[REDACTED]`, the assertion is `twice.masked === 0` | `:601` idempotence over every positive fixture and the corpus: second pass masks 0 |
+
+**RED against the pre-fix code, per pair** (`npx tsx --test test/redact.test.ts` at the RED
+commit, `--test-name-pattern="#173"` for `test/rlm.test.ts`): pair 1 — 102 tests, 12 fail; pair 2
+— 103 tests, 2 fail (the 1 MiB shape 4923 ms; the density ratio 36×); pair 3 — the `#173` block, 1
+fail of 6; pair 4 — 110 tests, 4 fail. **Guards, green before and after by design** (disclosed, not
+counted as RED): pair 1's Bearer header dump, compact and schemeless JSON, both `curl -H` lines and
+the `WWW-Authenticate` corpus entry (6); pair 4's four corpus entries and the `key:` pin (5).
+
+**Why the growth test holds the size fixed.** A size-doubling form (256 KiB → 1 MiB, under 3× per
+doubling, four passes each) measured 2.0 / 6.2 / 17.0 ms = **3.10×** on the *fixed* code under the
+parallel full-suite load — cache effects at 1 MiB, not the algorithm (linear separates from
+quadratic by 2× vs 4× there, which contention erases). Two texts of exactly 1 MiB with 1 and 1024
+BEGIN lines share their memory profile, so only the scan count differs: 1.11× linear against 36×
+quadratic under the same 3× bound.
+
+**Documented cost accepted with decision 6, literally.** `sorted(rows, key=lambda r: r[1])` →
+`sorted(rows, key=[REDACTED] r: r[1])`. The two kwarg corpus entries became the documented-costs
+table; `docs/redaction.md` records the price. Bare `key:` stays a field name.
+
 ## Residuals — as todo tests, not issues (decision 9)
 
 | Todo test | Where | Why deferred | Intended approach |
 |---|---|---|---|
-| `holds the 256 KiB ceiling on a reply just over 1 MiB (truncator marker reserve)` | `test/rlm.test.ts:5891` | `src/truncate.ts` (not owned) reserves the marker at `elided = totalBytes`, assuming the elided figure never renders wider than the total; `formatSize` prints `944.0KB` (7 chars) against `1.2MB` (5), so a cut of a 1–1.35 MB value overshoots invariant 1 by 2–3 bytes on every `truncateText` surface | reserve with the widest rendering of any elided value ≤ total (the 1 MB boundary), then flip the todo |
-| `the repl tool reports degraded stubs to the user (deferred, decision 10)` | `test/rlm.test.ts:5984` | decision 10: the `repl`-side notice is wave 2; `src/repl.ts` is not owned | `ReplRunner` surfaces `degradedStubs().tools` once per session in the tool result, the slot the preamble status uses |
+| `holds the 256 KiB ceiling on a reply just over 1 MiB (truncator marker reserve)` | `test/rlm.test.ts:5890` | `src/truncate.ts` (not owned) reserves the marker at `elided = totalBytes`, assuming the elided figure never renders wider than the total; `formatSize` prints `944.0KB` (7 chars) against `1.2MB` (5), so a cut of a 1–1.35 MB value overshoots invariant 1 by 2–3 bytes on every `truncateText` surface | reserve with the widest rendering of any elided value ≤ total (the 1 MB boundary), then flip the todo |
+| `the repl tool reports degraded stubs to the user (deferred, decision 10)` | `test/rlm.test.ts:5983` | decision 10: the `repl`-side notice is wave 2; `src/repl.ts` is not owned | `ReplRunner` surfaces `degradedStubs().tools` once per session in the tool result, the slot the preamble status uses |
 
 Also recorded, not hidden: `src/index.ts` is not owned, so `redact`, `maskSecrets`, `DegradedStub`,
 `StubDegradationReport`, `TY_GAP_REASONS`, `stubValidationInvocations`, `resetStubValidationMemo`
@@ -140,6 +182,10 @@ and `RLM_TOOL_CALL_CAP` are reachable from their modules, not the barrel, until 
 
 | Commit | Reverts |
 |---|---|
+| `f49b9d1` / `0e0df0e` | round 1: family 4 literal (bare `KEY=`, word boundaries, costs table) |
+| `d594646` / `e796bd9` | round 1: `question` tool collision |
+| `9dff198` / `e1f59c9` | round 1: tempered PEM scan, 1 MiB shape, density test |
+| `bef3137` / `8ec1ea4` | round 1: family 2 shapes, one-line rules, idempotent count, fuzz |
 | `5f88bda` / `f0f911e` | #173 question input (+ its tests and the re-pinned tests 9/19/21) |
 | `76c768c` / `50fa224` | #170 child input inheritance |
 | `7b7144d` / `6442d59` | #67 + #169 (registry accessor, memo, prompt section) |
@@ -150,7 +196,9 @@ and `RLM_TOOL_CALL_CAP` are reachable from their modules, not the barrel, until 
 | `acf9cc9` / `14b19ce` | #168 cap |
 
 Each pair reverts cleanly in newest-first order; reverting `966e582` alone re-opens the
-`HEAD_ONLY_RATIO` import in `src/rlm.ts` (the pre-#191 shape) and keeps #191's marker.
+`HEAD_ONLY_RATIO` import in `src/rlm.ts` (the pre-#191 shape) and keeps #191's marker. Reverting
+`bef3137` alone re-opens the blocking leak; the round-1 pairs are otherwise independent of each
+other.
 
 ## Closing-comment drafts (for the orchestrator, after merge)
 
@@ -184,15 +232,17 @@ renders. Deferred as a todo test: the `repl`-side notice (decision 10).
 **#169.** Landed in W1-5 (merge SHA). Stub validation is memoised per process by stub content, across
 `runRlm` calls and nesting levels; the probe memo was already per process. Counter-backed tests:
 `test/registry.test.ts:532` (identical sets validate once, a rejected validation is never cached,
-reset hook) and `test/rlm.test.ts:5998` (two runs plus a nested child validate once).
+reset hook) and `test/rlm.test.ts:6000` (two runs plus a nested child validate once).
 
 **#170.** Landed in W1-5 (merge SHA). Decision 7: the child inherits the parent's full `options.inputs`
-with the D52 merged context on top; documented on `RlmOptions.inputs`. Tests: `test/rlm.test.ts:6039`.
+with the D52 merged context on top; documented on `RlmOptions.inputs`. Tests: `test/rlm.test.ts:6041`.
 
 **#173.** Landed in W1-5 (merge SHA). `question` is a reserved sandbox input: sliceable, announced in the
 trailer, never double-rendered, refused from either input source before any query;
-`QUESTION_RECOVERY` names the slice route and the tool paths keep the sandbox-free wording. Tests:
-`test/rlm.test.ts:6097`; template pins 9/19/21 updated in the same commit.
+`QUESTION_RECOVERY` names the slice route and the tool paths keep the sandbox-free wording; a
+caller *tool* named `question` is refused at `runRlm` start like the D51 names (fix round 1, D113).
+Tests: `test/rlm.test.ts:6099`, the tool collision at `:6151`; template pins 9/19/21 updated in the
+same commit.
 
 ### #70 — Bucket 9 epic (draft; do not close from this PR)
 
@@ -243,7 +293,8 @@ after W1-3 and W1-5 merge.
 
 ## Go / No-Go
 
-**GO.** Security items first and test-backed; every new test measured RED against main's source;
-full contained suite green; no unowned file touched; the two residuals are todo tests with named
-approaches; the one brief deviation (`void` fixed in the renderer) is forced by unowned files and
-recorded above.
+**GO.** Security items first and test-backed; every new test measured RED against main's source
+(round 0) or the pre-fix parent (round 1, guards disclosed); full contained suite green; no unowned
+file touched; the two residuals are todo tests with named approaches; the one brief deviation
+(`void` fixed in the renderer) is forced by unowned files and recorded above; the verifier's
+blocking finding and all six non-blocking ones are fixed with evidence in the round-1 section.
