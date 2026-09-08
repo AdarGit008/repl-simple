@@ -122,9 +122,10 @@ Both defects are worth reporting upstream. For bucket 10 it means carrying an ex
 repair someone else's manifest, and documenting that Alpine is not merely unsupported but *silently
 degraded* if a user reaches for the wasm entry.
 
-**Not answered:** #40 also asks what `npm pack` looks like and what must appear in `files`, and its
-acceptance comment adds the `engines` floor. 0.0.21 declares `engines.node >= 20` against our
-`>=22.19.0`, so that one is "no change" — the other two remain open.
+**Not answered here:** #40 also asks what `npm pack` looks like and what must appear in `files`, and
+its acceptance comment adds the `engines` floor. 0.0.21 declares `engines.node >= 20` against our
+`>=22.19.0`, so that one is "no change" — the other two remained open until bucket 10 answered them
+(see §Undetermined; corrected 2026-09-08).
 
 ### 3. Cost — memory and startup per session, against `A41`'s unbounded session map
 
@@ -287,8 +288,14 @@ item 3 buildable; it does not make it unnecessary.**
 
 Ordered so each step is verifiable against the bucket 1 gate before the next begins.
 
-1. **Pin and declare.** `@pydantic/monty@0.0.21` plus an explicit `@bjorn3/browser_wasi_shim`. Report
-   the missing dependency upstream. Re-document the musl position in `docs/`, per #19's DoD.
+1. **Pin — and do not declare the shim.** `@pydantic/monty@0.0.21` is the only runtime dependency.
+   *Corrected 2026-09-08:* this step first prescribed an explicit `@bjorn3/browser_wasi_shim`, and
+   `package.json` deliberately omits it. Declaring the shim makes the in-process wasm entry
+   *loadable*, which is the trap §2 describes — it runs with no worker, no crash isolation and no
+   host backstop, so it must fail at import rather than appear to work. `src/` imports
+   `@pydantic/monty/node` explicitly so the wasm path cannot be selected by accident; the musl
+   position is recorded in `docs/platform-support.md`, per #19's DoD. Report the missing
+   dependency upstream as a defect in *their* manifest, not something to repair in ours.
 2. **Pool lifecycle.** One pool per process. Set `checkoutTimeout` and `maxProcesses` explicitly —
    never the defaults. Decide the session-to-worker policy against `A41` before any of it is load-bearing.
 3. **Rewrite `runInSandbox`/`resumeSuspended`** onto `checkout()` → **`feedStart` + host-awaits +
@@ -336,7 +343,11 @@ or incomplete, and five affected issues had been missed entirely.
   §Corrections: armed at 2 s against an 8 s host stall, it did not fire. It does not.
 - Whether actual **musl/Alpine** behaves as the glibc wasm measurement in §2 suggests. No container
   runtime was used; every platform result here is glibc x64, Node 24.
-- `npm pack` / what must appear in `files` (#40 asks; unanswered).
+- ~~`npm pack` / what must appear in `files` (#40 asks; unanswered).~~ **Answered** by bucket 10
+  (`tasks/ship-report-bucket-10.md`, PR #205; corrected here 2026-09-08): `files: ["dist", "src",
+  "repl", "extensions", "NOTICE"]` — a 60-entry tarball with no tests, docs or plans. The native
+  `monty` binary is not ours to ship: it arrives through `@pydantic/monty`'s own platform
+  `optionalDependencies`, so nothing binary-related appears in our `files`.
 - Which release between 0.0.19 and 0.0.21 introduced the clock change.
 - Whether the embedded-CPython worker implied by `installDependencies` shares these semantics; every
   result here is against the default sandbox worker.
