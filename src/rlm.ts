@@ -1,6 +1,6 @@
 import type { RunOptions, RunResult } from "./types.js";
 import { ToolRegistry, probeImportableModules, renderPythonToolRules } from "./registry.js";
-import { createRLMTools } from "./rlm_tools.js";
+import { createRLMTools, RLM_TOOL_CALL_CAP } from "./rlm_tools.js";
 import { estimateTokens, SpendBudget } from "./budget.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
@@ -611,6 +611,24 @@ const LLM_QUERY_REFUSED = "[llm_query refused: spend budget exhausted]";
 /** `rlm_query` downgrade refusal — same shape, distinct tool. */
 const RLM_QUERY_REFUSED = "[rlm_query refused: spend budget exhausted]";
 
+// ── Per-iteration invocation cap (#168, D97) ────────────────────
+//
+// The budget bounds spend; nothing bounded *breadth*. One sandbox execution
+// could call `llm_query` / `rlm_query` any number of times — and a nested
+// `rlm_query` builds a registry and a system prompt (per-spawn host work)
+// before its first charge attempt, so a tight budget refused the LLM call and
+// still paid for the spawn. The cap is 16 combined invocations of those two
+// tools per iteration (decision 4), counted in the closures below and reset
+// before every sandbox run. It is checked first — before the #171 bound, the
+// charge, the depth check and any nested `runRlm` — and it refuses the D63
+// way: a marker as the tool's return value, never a throw, budget or not.
+
+/** `llm_query` refusal over the per-iteration cap. */
+const LLM_QUERY_CAPPED = `[llm_query refused: per-iteration cap of ${RLM_TOOL_CALL_CAP} llm_query/rlm_query calls reached]`;
+
+/** `rlm_query` refusal over the per-iteration cap — spawn and downgrade alike. */
+const RLM_QUERY_CAPPED = `[rlm_query refused: per-iteration cap of ${RLM_TOOL_CALL_CAP} llm_query/rlm_query calls reached]`;
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /** What a reply yields for the loop: code (fenced or raw), or a direct answer. */
@@ -1151,6 +1169,12 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     sandboxRunOpts.signal = options.signal;
   }
 
+  // Combined `llm_query` + `rlm_query` invocations in the current iteration
+  // (#168, D97). Reset to 0 right before each sandbox run; each nested loop
+  // has its own (its own closures), so the parent counts the spawn and the
+  // child counts its own tools.
+  let toolCallsThisIteration = 0;
+
   // The sandbox registry is the caller's tools merged with the loop's own
   // RLM tools (llm_query, rlm_query, SUBMIT). `llm_query` is a single-turn
   // ask against the same system prompt; `rlm_query` spawns a nested runRlm
@@ -1159,6 +1183,9 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     ...options.registry.list(),
     ...createRLMTools({
       onLLMQuery: async (prompt) => {
+        // #168: the cap is the first check — before the bound, the charge
+        // and the provider — so a refused call costs nothing at all.
+        if (++toolCallsThisIteration > RLM_TOOL_CALL_CAP) return LLM_QUERY_CAPPED;
         // #171: the prompt is the whole ask, written by the model — bound it
         // exactly as the main loop bounds its question, and before anything
         // else, so the charge below prices what actually goes out and a forged
@@ -1198,6 +1225,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         }
       },
       onRLMQuery: async (query, context) => {
+        // #168: checked before the depth branch, so a refused spawn never
+        // builds a child registry or system prompt (the per-spawn host work
+        // the budget could not bound) and a refused downgrade never charges.
+        if (++toolCallsThisIteration > RLM_TOOL_CALL_CAP) return RLM_QUERY_CAPPED;
         const depth = options.depth ?? 0;
         const maxDepth = options.maxDepth ?? 1;
 
@@ -1402,7 +1433,9 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       sandboxRunOpts.lineOffset = options.preamble.split("\n").length;
     }
 
-    // 4. Run in sandbox
+    // 4. Run in sandbox. The invocation cap is per iteration (#168): the
+    // count starts from zero for every run.
+    toolCallsThisIteration = 0;
     const result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);
 
     // 5. Record iteration

@@ -1,6 +1,21 @@
 import type { HostTool } from "./types.js";
 import { SubmitSignal } from "./submit_signal.js";
 
+// ── Per-iteration invocation cap (#168, D97) ────────────────────
+
+/**
+ * How many `llm_query` + `rlm_query` invocations one sandbox execution may
+ * make, combined (decision 4). Declared here rather than in `rlm.ts` so the
+ * tool descriptions below and the loop's refusal markers cite one number and
+ * cannot drift apart. The loop enforces it — a call over the cap returns a
+ * refusal marker string, never throws (D4) — with or without a spend budget.
+ */
+export const RLM_TOOL_CALL_CAP = 16;
+
+const CAP_NOTE =
+  `At most ${RLM_TOOL_CALL_CAP} llm_query + rlm_query calls (combined) may run per iteration; ` +
+  "any further call returns a refusal marker string instead of an answer.";
+
 // ── Options ──────────────────────────────────────────────────────
 
 export interface RLMToolOptions {
@@ -18,7 +33,8 @@ function createLLMQueryTool(onLLMQuery: RLMToolOptions["onLLMQuery"]): HostTool 
     description:
       "Ask the sub-LLM a question. Blocks until the LLM responds. " +
       "Use for: semantic reasoning, summarization, open-ended analysis. " +
-      "Avoid for: counting, filtering, regex — do those in Python directly.",
+      "Avoid for: counting, filtering, regex — do those in Python directly. " +
+      CAP_NOTE,
     params: [
       {
         name: "prompt",
@@ -42,7 +58,8 @@ function createRLMQueryTool(onRLMQuery: RLMToolOptions["onRLMQuery"]): HostTool 
     description:
       "Spawn a nested RLM loop to investigate a sub-question. " +
       "The nested loop gets its own sandbox and fresh LLM sessions. " +
-      "Use for: deep multi-step sub-investigations that need code execution.",
+      "Use for: deep multi-step sub-investigations that need code execution. " +
+      CAP_NOTE,
     params: [
       {
         name: "query",
