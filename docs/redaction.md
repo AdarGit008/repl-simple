@@ -47,8 +47,8 @@ holds the PEM scan linear — two texts of exactly 1 MiB, one holding a single `
 holding 1024 `BEGIN` lines with no `END`, the many-line text costing under 3× the one-line text
 (best of 5 interleaved runs, 4 passes each) — the shape that was ×4 per doubling before the body
 scan was tempered to stop at the next `BEGIN`. The slowest measured constant is the assignment rule
-on an alternating word/non-word run (`a-a-a-…`): ~0.4 s per MiB, linear; every other shape is under
-30 ms per MiB. No rule reads across a line: whitespace inside a rule is a space or a tab, never a
+on a separator-dense run (`a-a-a-…`, `a_b-c.…`): ~0.4 s per MiB, linear; every other shape is under
+60 ms per MiB. No rule reads across a line: whitespace inside a rule is a space or a tab, never a
 newline, so a header dump is masked one header at a time and prose on the next line is prose.
 
 | # | Shape | Example → result | Notes |

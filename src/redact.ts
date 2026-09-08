@@ -178,9 +178,9 @@ const PEM_PRIVATE_KEY_OPEN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/g;
  * `[REDACTED]` is not a value.
  *
  * The rule's constant is the largest here: a word boundary at every
- * character of an alternating word/non-word run and up to ~130 lazy name
- * expansions per position cost ~0.4 s per MiB of `a-a-a-…` (measured;
- * linear, and every other shape is under 30 ms per MiB).
+ * character of a separator-dense run and up to ~130 lazy name expansions
+ * per position cost ~0.4 s per MiB of `a-a-a-…` or `a_b-c.…` (measured;
+ * linear, and every other shape is under 60 ms per MiB).
  */
 const SECRET_NAME = "[A-Za-z0-9_.-]";
 const SECRET_ASSIGNMENT = new RegExp(
