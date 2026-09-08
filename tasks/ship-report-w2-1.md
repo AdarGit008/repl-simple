@@ -2,8 +2,8 @@
 
 Branch: `chunk/w2-1-trace-visibility` · Base: `main` (`e3c68da`) · Commits: `08f70ec` (spec) ·
 `eca7dd4` (RED) · `1361cfe` (GREEN) · `021eaa6` (wrap fix) · `0a4c80b` (docs) · `7c30b07` (coverage
-control + todo) · Spec: `tasks/spec-w2-1.md` (D111–D120) · Maintainer decisions: 11, 5, 6, 9 ·
-Decision: **GO**
+control + todo) · `b70e1b1` (this report) · `e7b5c68` (macOS fix) · Spec: `tasks/spec-w2-1.md`
+(D111–D120) · Maintainer decisions: 11, 5, 6, 9 · PR: #214 · Decision: **GO**
 
 ## What was built
 
@@ -149,8 +149,12 @@ No new `src/` module; `coverage-baseline.json` untouched (W2-3's). No new depend
     ✗ bash("echo Authorization: Bearer [REDACTED]") denied 0ms — tool 'bash' requires approval
   ```
 
-- **CI**: verified only when `gh pr checks <n> --watch` reports every leg — Linux and macOS, node
-  22 and 24, lint, coverage — SUCCESS (conventions "CI on all legs"); the PR body carries the line.
+- **CI on all legs** (PR #214): the first push (`b70e1b1`) failed **both macOS legs** on the
+  `/var` vs `/private/var` shape — the new bridge pin compared pi's jailed, canonical path with the
+  raw temp spelling; Linux, coverage and lint were green. `e7b5c68` realpaths both sides
+  (conventions "CI on all legs"); `gh pr checks 214 --watch` at `e7b5c68`: lint + format, coverage
+  floors (node 24, ubuntu), check + test on ubuntu-latest and macos-latest × node 22 and 24 —
+  **every leg SUCCESS**.
 
 ## Residuals as todo tests
 
@@ -181,6 +185,8 @@ plain rendering.
 
 | Commit | Reverts |
 |---|---|
+| `e7b5c68` | realpath both sides in the bridge details pin (test-only; reverting it re-breaks the macOS legs) |
+| `b70e1b1` | this report |
 | `7c30b07` | the read-only-store control and the concurrency todo (test-only; reverting the control re-opens the `src/repl.ts` floor breach — revert only together with `1361cfe`) |
 | `0a4c80b` | `docs/tool-trace.md`, the README lines |
 | `021eaa6` | word-wrapping in `TraceView` (cosmetic) |
@@ -188,7 +194,8 @@ plain rendering.
 | `eca7dd4` | the RED tests |
 | `08f70ec` | the spec |
 
-`git revert 7c30b07 0a4c80b 021eaa6 1361cfe eca7dd4 08f70ec` (newest first) returns to `e3c68da`.
+`git revert e7b5c68 b70e1b1 7c30b07 0a4c80b 021eaa6 1361cfe eca7dd4 08f70ec` (newest first, this
+docs commit included) returns to `e3c68da`.
 
 ## Closing-comment drafts (for the orchestrator, after merge)
 
@@ -228,5 +235,5 @@ and an unlistable directory no longer hiding an unavailable store (`:3543`).
 **1446-1436-0-10** / coverage, floors met with `src/repl.ts` at 100.00). RED → GREEN in separate
 commits: 42 new tests red on main for the reasons recorded, two controls named as such, one
 coverage control, one residual as a todo test. `run()` / `resume()` byte-identical by construction
-and pinned; nothing outside the owned files touched; three follow-ups named for their owners. CI on
-all legs is the last gate; the PR body carries its result.
+and pinned; nothing outside the owned files touched; three follow-ups named for their owners. CI
+green on all legs at `e7b5c68` (PR #214), after one macOS-only path fix in a test.
