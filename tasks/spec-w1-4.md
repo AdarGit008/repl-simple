@@ -120,3 +120,69 @@ manifest store read/write/update/malformed/inside-cwd; `resolvePreambleStoreDir`
   `coverage-baseline.json` change; `README.md` (W2-1) and `src/index.ts` re-exports are reported, not
   edited.
 - Residuals become `todo` tests (decisions.md #9), never issues.
+
+## Fix round 1 (2026-09-08, after the independent verification of `c545263`)
+
+CI was red on both macOS legs and the verifier's probes P1 and P10 broke. Four decisions are
+amended in place — no new D-ids, the range is D89–D96.
+
+**D89 amended — canonical paths, on every operation.** The store already canonicalised through the
+path jail; the two macOS failures were tests comparing the raw `/var/…` temp spelling against the
+canonical `/private/var/…` path the store hands out. `PreambleManifestStore.storeDir()` now exposes
+the canonical store directory — the one every manifest path is under — and both tests compare
+`realpathSync` of both sides (conventions.md "CI on all legs"). Two things the round's instruction
+("realpath at `ReplRunner` construction") could not be taken literally on: `test/bridge.test.ts:323`
+pins that only `src/pathjail.ts` may say `realpath`, so canonicalisation stays behind the async jail
+and cannot run in a synchronous constructor; and it is deliberately **not memoised** — a canonical
+path cached at construction would let `mkdir -p` follow a store directory swapped for a symlink into
+the project between two sessions of one process, which the per-operation walk refuses. Every
+operation therefore resolves afresh; every path returned is canonical.
+
+**D91 amended — an unlistable directory is not a first load.** `savedToolNames` swallowed every
+`readdir` error as "no tools", so a `.pi/code-tools` at mode `000` made the loader return an empty
+load: `acceptPreamble` wrote `{}` over the acceptance record and reported success; a first-ever
+session build wrote an empty manifest; a later build called every accepted file removed. The loader
+now reports a directory that exists but cannot be listed (`EACCES`, `EIO`) as
+`SavedToolsPreamble.unlistable` (the errno message; every other field empty; `ENOENT` / `ENOTDIR`
+stay "no tools"). `ReplRunner.loadVerifiedPreamble` short-circuits on it before any manifest write
+or reconciliation with a `[preamble unreadable] .pi/code-tools could not be listed (…)` notice;
+`savedToolNames` keeps its names-or-nothing contract for the untrusted path.
+
+**D93 amended — agent churn is silent in a trusted project only.** `save_tool` and `delete_tool`
+update the manifest only while `isTrusted()` says the project is trusted. Acceptance authority is
+the trust decision plus explicit accepts; an untrusted session's approval-gated write still happens
+but is not an accept, and the reply says so ("… once this project is trusted and its saved tools
+are accepted — a save made while untrusted is not an accept"). With that, "an untrusted project
+never touches the store at all" (docs) is true for the session build, both tools and
+`acceptPreamble`, and a test pins it (no store write at all while untrusted, a fresh store included).
+
+**D94 amended — a fifth outcome.** `AcceptPreambleOutcome` gains `{ status: "unreadable"; reason }`:
+the directory could not be listed, nothing was accepted, the manifest is untouched.
+
+**Docs.** Two first-ever-load windows and one UX consequence named under "What this does not
+cover": a deleted manifest or an upgrade over a project trusted before this build is a first load
+and accepts what is on disk then; a project that contains the default store (`cwd = $HOME`) has the
+store refused and every saved tool withheld until `REPL_PREAMBLE_STORE_DIR` names a directory
+outside.
+
+**Tests — RED → GREEN, measured against the branch's pre-fix `src/` (`c545263`).** Seven new tests,
+all red before the fix (repl 123 tests / 119 pass / **4 fail**; toolstore 154 / 149 / **3 fail** /
+2 todo), all green after:
+
+| Test | Where | Red because |
+|---|---|---|
+| a symlinked store dir is its target: canonical paths, one manifest | `test/toolstore.test.ts:2671` | `storeDir` is not a function |
+| a directory it cannot list is unlistable — nothing loaded, nothing known | `:2422` | `unlistable` undefined |
+| an untrusted session leaves the manifest alone — save_tool and delete_tool alike | `:2832` | manifest rewritten with `planted` |
+| hands out canonical paths, and both spellings share the manifest | `test/repl.test.ts:2880` | `storeDir` is not a function |
+| a tool saved while untrusted is withheld once the project is trusted | `:2925` | manifest rewritten; `planted` loaded silently after trust |
+| acceptPreamble refuses, and a session build withholds with a notice, over EACCES | `:2994` | `accepted: []`, manifest overwritten with `{}` |
+| a first-ever load over an unlistable directory records nothing | `:3040` | empty manifest written, no notice |
+
+The `chmod 000` tests skip under root (`process.getuid?.() === 0`) and on Windows, mirroring
+`test/toolstore.test.ts:2279`. The existing ordering guard "the live trust decision outranks the
+annotation" (`test/toolstore.test.ts:3014`) was green on main by construction (main already answers
+"project not trusted"); it now flips trust mid-test and asserts the `not accepted — added` annotation
+and the `read_tool` NOTE, which main cannot produce — it discriminates, and the comment says which
+half is the guard. Two existing tests changed assertion only (realpath both sides):
+`test/repl.test.ts:2466` and `test/toolstore.test.ts:2511`.

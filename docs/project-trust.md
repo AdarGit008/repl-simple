@@ -112,6 +112,12 @@ the same directory — each is a new `loadSavedTools`, and each is checked again
 | A file the manifest does not know | **Withheld** — not concatenated, never executed | `[preamble changed] … name (added)` |
 | A file whose hash differs | **Withheld** | `[preamble changed] … name (changed)` |
 | An accepted file that is gone | Nothing to withhold | `[preamble changed] … no longer in .pi/code-tools` |
+| `.pi/code-tools` exists but cannot be listed (`EACCES`) | Nothing loads, and the manifest is **untouched** — not written on a first load, not reconciled on a later one | `[preamble unreadable] … could not be listed` |
+
+The last row is the difference between "empty" and "unknown". A directory the loader cannot list is
+not an empty set: recording one would erase the acceptance record over a transient permission error,
+and comparing against one would call every accepted file removed. `ReplRunner.acceptPreamble()`
+answers `unreadable` for the same reason, and accepts nothing.
 
 The check is a hash, not a stat: a same-size rewrite with a restored mtime is still a rewrite. The
 withheld files keep their place in the 32-file / 64 KiB budget, so accepting one never unloads a
@@ -124,9 +130,14 @@ what it cannot read. It is the *execution* that waits.
 - `ReplRunner.acceptPreamble()` re-hashes everything that loads and rewrites the manifest — the
   host's explicit accept. The pi command that calls it, `/repl-accept-preamble`, lands in the next
   wave; until then embedders call it directly.
-- `save_tool` records the hash of what it wrote, and `delete_tool` drops the entry. The agent writes
-  these files, so its own writes never withhold — and `save_tool`'s approval dialog is the consent.
-  Re-saving a withheld file from inside `repl` is therefore a valid way to accept it.
+- `save_tool` records the hash of what it wrote, and `delete_tool` drops the entry — **in a trusted
+  project**. The agent writes these files, so its own writes never withhold — and `save_tool`'s
+  approval dialog is the consent. Re-saving a withheld file from inside `repl` is therefore a valid
+  way to accept it. In an untrusted project both tools leave the manifest alone: the write is still
+  approval-gated and still happens, but acceptance authority is the trust decision plus explicit
+  accepts, and a session that never held trust must not decide what a trusted one runs. A file
+  saved while untrusted is withheld — with the notice — once the project is trusted, until the set
+  is accepted; the tool's reply says so.
 - A removed file is a notice, not a withhold, and the manifest keeps its entry: if the file comes
   back with the bytes that were accepted, it loads without ceremony. The notice repeats on each new
   session until the set is accepted again.
@@ -143,12 +154,16 @@ there would be a manifest the attacker rewrites. So the store is, in order of pr
 4. `~/.local/state/repl-simple`
 
 with one file per project, `preambles/<sha256 of the project's real path>.json`, mode `0600` in a
-`0700` directory, written whole through a rename. A store that resolves inside the project —
-literally, or through a symlink — is refused. A store that cannot be read, cannot be written, or
-holds something that is not a manifest is **unavailable**, and an unavailable store withholds
-everything that would have loaded and says so in a `[preamble unverified]` line. Never open: an
-acceptance that cannot be recorded would make the next load a "first load", and first loads accept.
-An untrusted project never touches the store at all.
+`0700` directory, written whole through a rename. Every path the store hands out is canonical —
+symlinks followed, so a store named `/var/…` on macOS lives at `/private/var/…` and says so — and the
+inside-the-project verdict is made on the canonical paths of both sides, afresh on every operation.
+A store that resolves inside the project — literally, or through a symlink — is refused. A store
+that cannot be read, cannot be written, or holds something that is not a manifest is
+**unavailable**, and an unavailable store withholds everything that would have loaded and says so
+in a `[preamble unverified]` line. Never open: an acceptance that cannot be recorded would make the
+next load a "first load", and first loads accept. An untrusted project never touches the store at
+all — not the session build, which does not read it, not `save_tool` / `delete_tool`, which do not
+update it, not `acceptPreamble()`, which answers `untrusted` before looking.
 
 ## For embedders
 
@@ -168,8 +183,11 @@ of guessing wrong in the other direction is arbitrary code execution.
 `loadSavedTools` returns code that will run with full host-tool access; call it only for a project
 whose code the user has agreed to run. `savedToolNames` is the half that is safe either way. Hand
 `loadSavedTools` an `accepted` map and it withholds what the map does not cover, reporting it in
-`unaccepted`; `createPreambleManifestStore` and `resolvePreambleStoreDir` are the pieces `ReplRunner`
-builds that map from, for a host that keeps its own.
+`unaccepted`; a directory it cannot list comes back with `unlistable` set and every other field
+empty — treat that as "unknown", never as "nothing". `createPreambleManifestStore` and
+`resolvePreambleStoreDir` are the pieces `ReplRunner` builds that map from, for a host that keeps
+its own. The store's `storeDir()` and `manifestPath()` are canonical paths; compare against those,
+never against the spelling the store was given.
 
 ## What this does not cover
 
@@ -193,6 +211,18 @@ builds that map from, for a host that keeps its own.
 - **An unavailable store is a window, not a wall.** While the store cannot be used everything is
   withheld — but a project trusted *during* that window has no manifest, so the first load after
   the store recovers accepts whatever is on disk then.
+- **A missing manifest is a first load, and first loads accept.** Two ways to arrive there without
+  the store ever failing: the manifest is deleted (a user cleaning `~/.local/state`), or this build
+  is the first one with a manifest at all and the project was trusted before it existed. Either way
+  the next trusted load accepts whatever is on disk *then* — a file pulled in the meantime included.
+  The trust decision, not the manifest, is what covered those files; if that is not the state you
+  want, review `.pi/code-tools` before the first `repl` call, or revoke trust and re-grant it.
+- **A project that contains the store is refused — and so is every saved tool in it.** The default
+  store is under `~/.local/state`, so running pi with `cwd = $HOME` (or any ancestor of the state
+  dir) puts the store inside the project. That is refused, and every tool in `~/.pi/code-tools` is
+  withheld with `[preamble unverified] … inside the project` until `REPL_PREAMBLE_STORE_DIR` (or the
+  embedder's `preambleStoreDir`) names a directory outside the project. Fail-closed by design; the
+  notice names the variable.
 - **`list_saved_tools` still compares size and mtime** for its in-session "changed since" note; only
   `read_tool` — which has the bytes anyway — compares the hash. The accepted-set check at session
   build always hashes.
