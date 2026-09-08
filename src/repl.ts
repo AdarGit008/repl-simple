@@ -57,12 +57,18 @@ export interface ResetOutcome {
  *   in part; the manifest is untouched.
  * - `store-unavailable`: the manifest could not be written — the store is
  *   inside the project, or unwritable — and nothing changed.
+ * - `unreadable`: `.pi/code-tools` exists but could not be listed (`EACCES`,
+ *   `EIO`), so nothing is known about what is there. Nothing was accepted
+ *   and the manifest is untouched: an empty set written here would erase the
+ *   acceptance record over a transient permission error, and report success
+ *   for a directory that was never seen.
  */
 export type AcceptPreambleOutcome =
   | { status: "accepted"; accepted: string[]; manifestPath: string }
   | { status: "untrusted" }
   | { status: "refused"; refused: RefusedTool[] }
-  | { status: "store-unavailable"; reason: string };
+  | { status: "store-unavailable"; reason: string }
+  | { status: "unreadable"; reason: string };
 
 // ── Project trust ──────────────────────────────────────────────────
 
@@ -371,6 +377,9 @@ export class ReplRunner {
       root: this.cwd,
       hostToolNames: this.buildRegistry().hostToolNames,
     });
+    // A directory that cannot be listed is not an empty one. Accepting
+    // "nothing" here would be accepting a set the loader never saw (#198).
+    if (load.unlistable !== undefined) return { status: "unreadable", reason: load.unlistable };
     if (load.refused.length > 0) return { status: "refused", refused: load.refused };
     try {
       const manifestPath = await this.manifest.write(hashesOf(load.loadedIdentity));
@@ -555,7 +564,7 @@ export class ReplRunner {
   /**
    * Load a trusted project's preamble against its accepted set (#198).
    *
-   * Three manifest states, three loads:
+   * Three manifest states, one load:
    * - **absent** — the first load since trust. The trust dialog covered the
    *   files present now, so everything loads and the manifest is written,
    *   empty set included: a project trusted before it had any saved tools
@@ -565,10 +574,18 @@ export class ReplRunner {
    *   is redone with an empty accepted set, and everything is withheld.
    * - **ok** — files the set does not cover are withheld and named; accepted
    *   names that are in no bucket at all are reported as removed, notice
-   *   only. A refused preamble (#54) short-circuits both: nothing loads, and
-   *   the refusal notice is the whole story.
+   *   only.
    * - **unavailable** — unreadable, malformed, inside the project: fail
    *   closed, withhold everything that would have loaded, say why.
+   *
+   * Two things come before any of that. A refused preamble (#54) is the
+   * whole story: nothing loads, nothing is accepted, and the refusal notice
+   * says why. And a tools directory that cannot be listed loads nothing and
+   * **records nothing**: it is not an empty set — an implicit accept of a set
+   * the loader never saw would write `{}` over a real acceptance record on a
+   * transient EACCES, and a comparison against it would call every accepted
+   * file removed — so the manifest is left exactly as it was, and the model
+   * is told the directory could not be read.
    *
    * The unverified notice is delivered only when something was actually
    * withheld: a project with nothing to load has nothing to be told.
@@ -579,14 +596,24 @@ export class ReplRunner {
     const root = this.cwd;
     const read = await this.manifest.read();
 
+    // What the loader compares against: the accepted set; nothing at all
+    // when the manifest cannot be trusted (everything is withheld); no
+    // comparison on a first-ever load (everything is accepted).
+    let accepted: ReadonlyMap<string, string> | undefined;
+    if (read.status === "ok") accepted = read.files;
+    else if (read.status === "unavailable") accepted = new Map();
+    const load = await loadSavedTools({ root, hostToolNames, accepted });
+
+    if (load.unlistable !== undefined) {
+      return { load, notices: [unlistableNotice(load.unlistable)] };
+    }
+    if (load.refused.length > 0) return { load, notices: [] };
+
     if (read.status === "unavailable") {
-      const load = await loadSavedTools({ root, hostToolNames, accepted: new Map() });
       return { load, notices: unverifiedNotices(read.reason, load.unaccepted) };
     }
 
     if (read.status === "absent") {
-      const load = await loadSavedTools({ root, hostToolNames });
-      if (load.refused.length > 0) return { load, notices: [] };
       try {
         await this.manifest.write(hashesOf(load.loadedIdentity));
         return { load, notices: [] };
@@ -599,8 +626,6 @@ export class ReplRunner {
       }
     }
 
-    const load = await loadSavedTools({ root, hostToolNames, accepted: read.files });
-    if (load.refused.length > 0) return { load, notices: [] };
     const removed = removedSince(read.files, load);
     const changed = load.unaccepted.length > 0 || removed.length > 0;
     return { load, notices: changed ? [changedNotice(load.unaccepted, removed)] : [] };
@@ -760,6 +785,21 @@ function unreadableNotice(unreadable: UnreadableTool[]): string {
     `not loaded: ${files}. They are not defined in this session — calling one raises ` +
     `NameError. Fix or remove the file(s) under .pi/code-tools, ` +
     "then run `repl` with a new `sessionId` to load the preamble."
+  );
+}
+
+/**
+ * What the model is told when `.pi/code-tools` exists but could not be
+ * listed (#198): nothing loaded, and — the part that matters for the accepted
+ * set — nothing was recorded. The reason is an errno string, attacker-
+ * influenced through the path; it is escaped like every notice.
+ */
+function unlistableNotice(reason: string): string {
+  return (
+    `[preamble unreadable] .pi/code-tools could not be listed (${escapeNoticeName(reason)}), ` +
+    "so no saved tools were loaded — none is defined in this session, and calling one raises " +
+    "NameError. The accepted set was left as it was. Fix the directory's permissions, then run " +
+    "`repl` with a new `sessionId` to load the preamble."
   );
 }
 

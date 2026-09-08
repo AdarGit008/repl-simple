@@ -155,8 +155,11 @@ export interface ToolStoreOptions {
    *
    * The agent writes these files, so its own gated write records the hash of
    * what it wrote and its delete drops the entry — legitimate churn never
-   * withholds (#198). Both touch the manifest only when one exists; a failed
-   * update is appended to the reply, never thrown.
+   * withholds (#198). Both touch the manifest only when one exists and only
+   * while `isTrusted()` says the project is trusted: acceptance authority is
+   * the trust decision plus explicit accepts, and a session that never held
+   * trust must not decide what a trusted one runs. A failed update is
+   * appended to the reply, never thrown.
    */
   manifest?: PreambleManifestStore;
 }
@@ -597,13 +600,18 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
         await target.close();
       }
 
-      // The agent's own write is accepted on the spot: the approval dialog
-      // that gated this call is the consent the manifest records (#198). The
-      // hash is over the exact bytes written, which is what the loader will
-      // read back. A manifest that cannot be updated costs a notice on the
-      // next session, never the save itself.
+      // The agent's own write is accepted on the spot — in a trusted project.
+      // The approval dialog that gated this call is the consent the manifest
+      // records (#198), and the hash is over the exact bytes written, which
+      // is what the loader will read back. In an untrusted project the write
+      // still happens (it was approved) but it is not an accept: the file is
+      // withheld, with the notice, once the project is trusted, until the
+      // set is accepted. A manifest that cannot be updated costs a notice on
+      // the next session, never the save itself. One trust read for the
+      // update and the reply, so a flip between them cannot split the story.
+      const trusted = isTrustedNow();
       let manifestNote = "";
-      if (options.manifest) {
+      if (options.manifest && trusted) {
         const sha256 = sha256Hex(Buffer.from(content, "utf-8"));
         try {
           const outcome = await options.manifest.update((files) => {
@@ -621,13 +629,15 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       }
 
       // Trust-aware: in an untrusted project a new session withholds the file
-      // until the project is trusted — claiming it "loads in new sessions"
-      // unconditionally would be the lie this issue exists to remove.
+      // until the project is trusted and the set is accepted — claiming it
+      // "loads in new sessions" unconditionally would be the lie this issue
+      // exists to remove.
       return (
         `Tool '${name}' saved.` +
-        (isTrustedNow()
+        (trusted
           ? " It loads in sessions created after this one — the current session's preamble is unchanged."
-          : " It will load in new sessions once this project is trusted.") +
+          : " It will load in new sessions once this project is trusted and its saved tools are " +
+            "accepted — a save made while untrusted is not an accept.") +
         manifestNote
       );
     },
@@ -667,10 +677,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       }
 
       // Drop the accepted entry with the file, so the next session does not
-      // report the agent's own deletion as a removed tool (#198). A stale
-      // entry costs a notice, so a failed update is reported, not thrown.
+      // report the agent's own deletion as a removed tool (#198) — in a
+      // trusted project; an untrusted one leaves the manifest alone and the
+      // entry costs a removed notice once trusted. A stale entry costs a
+      // notice either way, so a failed update is reported, not thrown.
       let manifestNote = "";
-      if (options.manifest) {
+      if (options.manifest && isTrustedNow()) {
         try {
           const outcome = await options.manifest.update((files) => {
             files.delete(name);
@@ -1026,6 +1038,18 @@ export interface SavedToolsPreamble {
    * loads either way, and the refusal is the story).
    */
   unaccepted: UnacceptedTool[];
+  /**
+   * Set when the tools directory exists but could not be listed (`EACCES`,
+   * `EIO`): the readdir error's message. Absent otherwise — never `undefined`
+   * as a key, so a load compares equal to a plain empty one.
+   *
+   * Nothing loaded and **nothing is known** about what is there. This is not
+   * an empty set: a caller that records acceptance must not write one from
+   * it, and one that compares against the accepted set has nothing to call
+   * removed (#198). Every other field is empty. Raw errno text — escape
+   * before rendering into model-facing text.
+   */
+  unlistable?: string;
 }
 
 /**
@@ -1073,7 +1097,9 @@ export interface UnreadableTool {
  * model what was withheld, and reading a directory listing is not reading —
  * still less executing — the hostile file the listing names.
  *
- * Returns `[]` when the directory does not exist.
+ * Returns `[]` when the directory does not exist — and when it cannot be
+ * listed: names or nothing, never a throw. The loader is the caller that
+ * must not mistake "cannot see" for "empty"; it uses {@link listToolNames}.
  */
 export async function savedToolNames(options: ToolStoreOptions): Promise<string[]> {
   const root = resolve(options.root);
@@ -1090,17 +1116,47 @@ export async function savedToolNames(options: ToolStoreOptions): Promise<string[
     throw err;
   }
 
+  try {
+    return await listToolNames(dir);
+  } catch {
+    return []; // Cannot be listed — nothing to name, and no error to raise here
+  }
+}
+
+/**
+ * The tool names in `dir`, sorted: the `.py` entries, extension dropped.
+ *
+ * A directory that is not there lists nothing. One that is there but cannot
+ * be listed — `EACCES`, `EIO` — throws the readdir error: "cannot see" is
+ * not "empty", and the one caller that records acceptance from a listing
+ * must be able to tell them apart (#198).
+ */
+async function listToolNames(dir: string): Promise<string[]> {
   let entries: string[];
   try {
     entries = await readdir(dir);
-  } catch {
-    return []; // Directory doesn't exist — no tools to name
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return [];
+    throw err;
   }
-
   return entries
     .filter((e) => extname(e) === ".py")
     .map((e) => e.slice(0, -3))
     .sort();
+}
+
+/** The loader's answer when nothing loaded and nothing is wrong with the directory. */
+function nothingLoaded(): SavedToolsPreamble {
+  return {
+    preamble: "",
+    loaded: [],
+    loadedIdentity: new Map(),
+    skipped: [],
+    unreadable: [],
+    refused: [],
+    unaccepted: [],
+  };
 }
 
 // ── loadSavedTools ────────────────────────────────────────────────
@@ -1153,30 +1209,23 @@ export async function loadSavedTools(
     dir = await containedToolsDir(toolsDir, root);
   } catch (err) {
     if (err instanceof HostToolError && err.pythonType === "PermissionError") {
-      return {
-        preamble: "",
-        loaded: [],
-        loadedIdentity: new Map(),
-        skipped: [],
-        unreadable: [],
-        refused: [],
-        unaccepted: [],
-      };
+      return nothingLoaded();
     }
     throw err;
   }
 
-  const names = await savedToolNames({ root, toolsDir: dir });
-  if (names.length === 0)
-    return {
-      preamble: "",
-      loaded: [],
-      loadedIdentity: new Map(),
-      skipped: [],
-      unreadable: [],
-      refused: [],
-      unaccepted: [],
-    };
+  // A directory that is there and cannot be listed is not an empty one:
+  // nothing is known about what it holds, and a caller that recorded
+  // acceptance from this load would record an empty set over a real one
+  // (#198). Say so, and load nothing — the accepted-set comparison never
+  // runs, so nothing is called added, changed or removed either.
+  let names: string[];
+  try {
+    names = await listToolNames(dir);
+  } catch (err) {
+    return { ...nothingLoaded(), unlistable: (err as Error).message };
+  }
+  if (names.length === 0) return nothingLoaded();
 
   const reservedNames = new Set(options.hostToolNames ?? []);
   const accepted = options.accepted;
@@ -1402,6 +1451,14 @@ export type PreambleManifestRead =
  * `unavailable`; `write` and `update` throw, and the message says so.
  */
 export interface PreambleManifestStore {
+  /**
+   * The store directory, canonical — symlinks followed through whatever part
+   * of it exists — and the one every path this store hands out is under. A
+   * temp dir on macOS is `/var/…` by name and `/private/var/…` in fact;
+   * compare against this, never against the spelling the store was given.
+   * Throws when the store is unavailable.
+   */
+  storeDir(): Promise<string>;
   /** Where this project's manifest lives, or would. Throws when the store is unavailable. */
   manifestPath(): Promise<string>;
   /** The accepted set, `absent` before the first accept, `unavailable` when it cannot be trusted. */
@@ -1530,8 +1587,22 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
     }
   }
 
-  /** Both spellings of both paths, as the jail does; then the key. */
-  async function locate(): Promise<{ path: string; dir: string; project: string }> {
+  /**
+   * Both spellings of both paths, as the jail does; then the key.
+   *
+   * Resolved afresh on every operation, not once: a store directory swapped
+   * for a symlink into the project between two sessions of one process must
+   * be refused by the next write, and a cached answer would let `mkdir -p`
+   * follow it. Everything returned is canonical — the store, the manifest
+   * directory and the manifest path — so no caller ever compares a real
+   * path with a spelled one.
+   */
+  async function locate(): Promise<{
+    path: string;
+    dir: string;
+    project: string;
+    store: string;
+  }> {
     const project = await canonicalRoot();
     const real = await canonicalStore();
     if (contains(store, root) || contains(real, project)) {
@@ -1542,7 +1613,7 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
     }
     const key = createHash("sha256").update(project).digest("hex");
     const dir = join(real, "preambles");
-    return { path: join(dir, `${key}.json`), dir, project };
+    return { path: join(dir, `${key}.json`), dir, project, store: real };
   }
 
   async function readAt(path: string): Promise<PreambleManifestRead> {
@@ -1594,6 +1665,10 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
   }
 
   return {
+    async storeDir() {
+      return (await locate()).store;
+    },
+
     async manifestPath() {
       return (await locate()).path;
     },
