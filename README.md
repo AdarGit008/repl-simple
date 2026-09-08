@@ -79,7 +79,9 @@ shared redaction helper and cut head-only at 256 bytes, so a `write` of a file o
 never lands in the session file; results and `stdout` are not in the trace at all. Only calls that
 executed are listed — a call served from the replay cache is not. For embedders,
 `ReplRunner.runWithTrace()` / `resumeWithTrace()` return the same text as `run()` / `resume()` plus
-the calls, verbatim. Unordered relative to `stdout` for now.
+the calls, verbatim (`RunTrace`, `TracedCall` and `TraceStatus` are exported). The trace is in
+dispatch order; where each call fell in `stdout` is the sandbox's to report per call (`seq`, #46),
+not the runner's to reconstruct.
 See [docs/tool-trace.md](docs/tool-trace.md) and
 [#46](https://github.com/AdarGit008/repl-simple/issues/46).
 
@@ -267,12 +269,33 @@ it runs Python in-process, so a runaway blocks the event loop and there is no cr
 npm test        # tsx --test test/*.test.ts
 npm run check   # tsc --noEmit            (tsconfig.json)
 npm run build   # tsc -p tsconfig.build.json
-npm run lint    # biome check --error-on-warnings
+npm run lint    # biome check --error-on-warnings && knip
 npm run format  # biome format --write
 npm run coverage # per-file line-coverage floors
 npm run mutation # stryker, contained in a memory-capped systemd scope
 npm run test:contained # the suite, likewise contained
 ```
+
+### Module map
+
+The two names that read as a transposition are not one
+([#174](https://github.com/AdarGit008/repl-simple/issues/174), session decision 16: documented,
+not renamed):
+
+| Path | What it is |
+|---|---|
+| `src/repl.ts` | `ReplRunner` — the **runner** behind the `repl` / `repl_resume` / `repl_reset` / `repl_abandon` tools: the session pool, project trust and the accepted set, the trace. Nothing RLM. |
+| `src/rlm.ts` | `runRlm` — the RLM **loop**: code-gen → execute → feedback until `SUBMIT`, with its prompt budgets, spend budget and salvage. |
+| `src/rlm_tools.ts` | The loop's sandbox-side tools — `llm_query`, `rlm_query`, `SUBMIT` — registered by `runRlm` for the sandbox, not by the extension. |
+| `repl/repl_server.py` | The bundled Python **preamble** the loop prepends (`getReplPreamble()`; the path is hard-coded in `src/preamble.ts`, and `repl/` is in `package.json` `files` so it ships). Named after pi-reepl's server, which it descends from. |
+| `src/session.ts` | `Session` — transcript replay, the call cache, dumps ([docs/session-replay.md](docs/session-replay.md)). |
+| `src/sandbox.ts`, `src/pool.ts` | One Monty run — dispatch loop, approval gate, limits — and the worker pool it checks out of. |
+| `src/registry.ts`, `src/builtins.ts`, `src/bridge.ts`, `src/toolstore.ts` | Host tools: the registry and stubs, the builtins, the jailed pi bridge, the saved-tool store. |
+| `extensions/repl-extension.ts` | The pi extension: registers the four tools and the `/repl-*` commands, renders results and the trace. |
+
+A rename would orphan the `coverage-baseline.json` keys, reopen the package `files` list (#81) and
+touch the pinned `scriptName` default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) that the
+diagnostic line-number regex reads; the map is what makes the names harmless.
 
 Nine environment variables tune the sandbox, all read at call time.
 
@@ -353,9 +376,19 @@ the types the compiler checks away from the ones that actually run.
 ### Formatting and lint
 
 [Biome](https://biomejs.dev) is the single formatter and linter — `npm run lint` runs `biome check`,
-covering the formatter, the linter and import sorting in one pass. `.editorconfig` carries the
-settings an editor can apply without Biome installed; `biome.json` reads it (`useEditorconfig`) and
-adds a 100-column line width.
+covering the formatter, the linter and import sorting in one pass, and then
+[knip](https://knip.dev), the unused-export check that keeps the public barrel honest
+([#85](https://github.com/AdarGit008/repl-simple/issues/85)). `.editorconfig` carries the settings
+an editor can apply without Biome installed; `biome.json` reads it (`useEditorconfig`) and adds a
+100-column line width.
+
+`.claude/` is ignored by git, by Biome (`"!!.claude"` in `files.includes` — the double negation
+keeps the scanner out, not only the checker) and by knip. Claude Code keeps per-checkout state
+there, and its orchestrator puts agent worktrees under `.claude/worktrees/`, each a full copy of
+this tree with its own `biome.json`; Biome's scanner then reports *Found a nested root
+configuration* and `npm run lint` fails in the main checkout with nothing wrong in it. (knip prints
+a hint that the entry is unused — its `project` globs never reach `.claude/` — which is the point:
+they must never start to.)
 
 `--error-on-warnings` is what makes it a gate. Biome exits 0 on warning-severity diagnostics by
 default, so a rule like `noExplicitAny` would print and still pass. CI runs lint as its own job,
@@ -375,11 +408,13 @@ Two lint rules are configured away from their defaults, both deliberately:
 - **`useTemplate: "error"`** — promoted from Biome's default `info`, which never fails a build. A rule
   that cannot go red is decoration.
 - **`noNonNullAssertion: "off"`** — `strictNullChecks` already covers the safety case; the rule is a
-  style preference about how an already-established invariant is spelled. Its three `src/` sites sit
-  in code that [#84](https://github.com/AdarGit008/repl-simple/issues/84),
+  style preference about how an already-established invariant is spelled. The three `src/` sites it
+  was switched off for were rewritten away by
+  [#84](https://github.com/AdarGit008/repl-simple/issues/84),
   [#50](https://github.com/AdarGit008/repl-simple/issues/50) and
-  [#78](https://github.com/AdarGit008/repl-simple/issues/78) are actively rewriting; worth revisiting
-  once they land.
+  [#78](https://github.com/AdarGit008/repl-simple/issues/78): `biome lint
+  --only=style/noNonNullAssertion src` reports none today (2026-09-08), so the switch is now a
+  preference rather than an exemption, and turning the rule back on is a one-line change.
 
 The bulk-format commit is listed in `.git-blame-ignore-revs`. To skip it in blame locally:
 
@@ -394,8 +429,8 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs
 baseline; lowering a floor is a decision to explain in the commit message, not a formality.
 
 Floors are per file because a global number does not bite. Deleting `test/sandbox.test.ts` — 1811
-lines, and the only file that kills any `sandbox.ts` mutation — moves the global figure from 96.92%
-to **93.64%**, a drop a round global floor of 90% survives without noticing. The same deletion drops
+lines when this was measured, and the only file that kills any `sandbox.ts` mutation — moved the
+global figure from 96.92% to **93.64%**, a drop a round global floor of 90% survives without noticing. The same deletion drops
 `src/sandbox.ts` from 97.06% to 83.63%, which the per-file floor catches. (Re-measured on 0.0.21;
 the same experiment on 0.0.18 moved the global figure by 0.55 pp.)
 
@@ -471,11 +506,14 @@ reasoning behind every config value: [docs/mutation-testing.md](docs/mutation-te
 `src/sandbox.ts` was rewritten and `src/pool.ts` is new, so both the mutant population and the score
 have moved by an unknown amount, in an unknown direction. The floor is not a CI gate — mutation runs
 on demand, not in `.github/workflows/ci.yml` — so nothing is silently passing on a stale number, but
-treat the 57% as unverified until a full sweep re-baselines it.
+treat the 58% as unverified until a full sweep re-baselines it. That sweep is standalone
+infrastructure work, not a session task ([#175](https://github.com/AdarGit008/repl-simple/issues/175),
+session decision 17): the procedure is
+[docs/mutation-rebaseline-runbook.md](docs/mutation-rebaseline-runbook.md).
 
 This is the quality gate the coverage floors above are explicitly *not*. It is also expensive —
-**~33 CPU-hours** for a full run, because the command runner re-runs all 465 tests per mutant with no
-per-test filtering. Two consequences:
+**~33 CPU-hours** for the 2231-mutant run that set the baseline, because the command runner re-runs
+the whole suite (465 tests then, ~1450 now) per mutant with no per-test filtering. Two consequences:
 
 - **Run it with `npm run mutation`**, which contains it in a systemd scope with a memory ceiling so
   a breach cannot take your terminal session down with it. `npm test` is already parallel, so
@@ -511,7 +549,8 @@ stops `pi-coding-agent` fetching an unpinned "latest" binary from GitHub release
 goes red rather than quietly dropping coverage.
 
 CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
-ubuntu-latest and macos-latest, for every push and pull request.
+ubuntu-latest and macos-latest, plus one `npm run lint` job and one `npm run coverage` job (Node 24,
+ubuntu), for every push and pull request.
 
 ## Attribution
 

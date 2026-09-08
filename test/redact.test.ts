@@ -154,9 +154,12 @@ describe("maskSecrets — known token prefixes (family 1)", () => {
       assert.equal(out.masked, 0, prose);
       assert.equal(out.text, prose);
     }
-    // A separator is a boundary: the realistic shapes all mask.
-    for (const text of [`token=sk-${KEY}`, `"sk-${KEY}"`, `Bearer sk-${KEY}`, `key:sk-${KEY}`]) {
-      assert.equal(maskSecrets(text).masked, 1, text);
+    // A separator is a boundary: the realistic shapes all mask (once each —
+    // a `TOKEN=` or `KEY=` name in front would compose with family 4).
+    for (const text of [`x=sk-${KEY}`, `"sk-${KEY}"`, `Bearer sk-${KEY}`, `id:sk-${KEY}`]) {
+      const out = maskSecrets(text);
+      assert.equal(out.masked, 1, text);
+      assert.ok(out.text.includes(`sk-${REDACTED}`), text);
     }
   });
 });

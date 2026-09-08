@@ -182,5 +182,7 @@ this tool", a remembered preference. `DEFAULT_GRANT_USES` is still 1.
 
 - **#44's grant model is per-args.** `bash("date +%s%N")` and `bash("date  +%s%N")` are different
   keys. That is the intended behaviour of a normalised key, not a hole — the second one asks.
-- **#110** — `Repl.resume()` still has no test proving `onApproval` reaches the session, which is
-  M22's untracked sibling. It fails closed, so it breaks resume rather than opening a bypass.
+- **#110** — M22's untracked sibling, the mutant that drops `onApproval` from `session.resume()`,
+  was closed on 2026-08-17 (PR #147): `test/repl.test.ts` drives `Repl.resume()` with an approval,
+  a pre-aborted signal and a denial ("suspend → resume(approve) runs the pending call" and its
+  two siblings), and `docs/mutation-testing.md` records the kill. Nothing here is still open.

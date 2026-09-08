@@ -398,12 +398,12 @@ const TOOL_SPECS: ToolSpec[] = [
 /**
  * Create HostTool wrappers around Pi's built-in coding tools.
  *
- * Read-only tools (read, grep, find, ls) are jailed to `cwd` and require no
- * approval; a path outside it is refused, `..` and symlinks included.
- * Mutating tools (bash, edit, write) require approval by default;
- * set `{ gateMutating: false }` to skip approval for all. `bash` is
- * therefore the only way to reach outside the root, and it is gated —
- * see docs/path-jail.md.
+ * Read-only tools (read, grep, find, ls) are jailed to `cwd` and, unless
+ * `{ gateReads: true }`, require no approval; a path outside it is refused,
+ * `..` and symlinks included. Mutating tools (bash, edit, write) require
+ * approval by default; set `{ gateMutating: false }` to skip approval for
+ * all. `bash` is therefore the only way to reach outside the root, and it is
+ * gated — see docs/path-jail.md.
  *
  * `bash` also runs with an allowlisted environment rather than the host's, so
  * one approved command cannot disclose the credentials the pi process happens

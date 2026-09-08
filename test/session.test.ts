@@ -3218,16 +3218,21 @@ describe("Session — one combined replay-cache cap at load (D154c)", () => {
   const gate = makeCountingGate("gate_w32c");
   const registry = new ToolRegistry([gate.tool, makeEchoTool()]);
 
-  /** A real suspension with one pre-gate entry, its `callCache` padded to `n` entries. */
-  async function paddedDump(n: number): Promise<string> {
+  /**
+   * A real suspension with one pre-gate entry, its `callCache` padded to
+   * `cached` entries and its `preGateCache` to `preGate`.
+   */
+  async function paddedDump(cached: number, preGate = 1): Promise<string> {
     const live = new Session({ registry });
     suspended(await live.run('echo("pre")\ngate_w32c("x")', { onApproval: () => "suspend" }));
     const dump = JSON.parse(live.dump());
     assert.equal(dump.suspended.preGateCache.length, 1);
-    dump.callCache = Array.from({ length: n }, (_, i) => ({
-      key: `echo::{"text":"${i}"}`,
-      result: String(i),
-    }));
+    const entry = (i: number) => ({ key: `echo::{"text":"${i}"}`, result: String(i) });
+    dump.callCache = Array.from({ length: cached }, (_, i) => entry(i));
+    dump.suspended.preGateCache = [
+      ...dump.suspended.preGateCache,
+      ...Array.from({ length: preGate - 1 }, (_, i) => entry(cached + i)),
+    ];
     return JSON.stringify(dump);
   }
 
@@ -3244,7 +3249,7 @@ describe("Session — one combined replay-cache cap at load (D154c)", () => {
     assertRefused(
       registry,
       "1000 + 25, suspended",
-      await paddedDump(MAX_CACHE_ENTRIES - 24),
+      await paddedDump(MAX_CACHE_ENTRIES - 24, 25),
       new RegExp(`callCache[^]*preGateCache[^]*\\b${MAX_CACHE_ENTRIES}\\b`),
     );
   });

@@ -28,7 +28,8 @@ import { HEAD_ONLY_RATIO, truncateText } from "./truncate.js";
  * `docs/redaction.md`, which is the normative description of the rules below.
  *
  * Consumers: the RLM provider-error path (`redactProviderError` in
- * `src/rlm.ts`) today; the trace and session-dump exports of #46 / #63 next.
+ * `src/rlm.ts`), the trace the extension persists (`buildDetails`, #46) and
+ * the session-dump export (`Session.dumpRedacted`, #63).
  */
 
 // ── Replacement tokens ──────────────────────────────────────────
@@ -57,9 +58,16 @@ const REDACTED_LITERAL = String.raw`\[REDACTED\]`;
  * the reader still learns what kind of credential was there; the body needs
  * at least 16 token characters, which no real credential of these shapes is
  * shorter than and which keeps `sk-1`-style lookalikes as data.
+ *
+ * No word boundary before the prefix: a token glued to a preceding word — a
+ * write body that starts mid-word — is still that token (D155). `sk-` is the
+ * one exception and keeps its boundary, because `sk` ends `task`, `risk`,
+ * `desk` and `disk`, and `task-force-2024-report` is `sk-` plus seventeen
+ * token characters; the cost is an `sk-` key glued to a *letter*, which no
+ * realistic shape produces (`=`, a quote, a space and `:` are all boundaries).
  */
 const TOKEN_PREFIX =
-  /\b(sk-(?:ant-)?|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AKIA|AIza)[A-Za-z0-9_-]{16,}/g;
+  /(\bsk-(?:ant-)?|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AKIA|AIza)[A-Za-z0-9_-]{16,}/g;
 
 /**
  * Family 2a — an `Authorization` header value (also `Proxy-Authorization`),
@@ -106,20 +114,41 @@ const AUTHORIZATION_HEADER = new RegExp(
  * counts once; a header carrying none of the three is left alone (the old
  * rule masked `username=`, the parameter *name*, and kept the hash).
  *
- * The parameter list is read to the end of the line, at most 4 KiB past
- * `Digest` — ten times a real one — so a line of `;`-joined headers costs
- * one bounded scan per header rather than a rescan to the line's end for
- * each. A quoted value may carry a JSON escape (`\"…\"`); the value class
- * excludes backslashes, which no hex or base64 parameter contains.
+ * The parameter list is read **one parameter at a time** (D155): a name, `=`,
+ * and a value that is either quoted — running to its closing quote, spaces
+ * and commas inside it included, or to the end of the line when the quote
+ * was never closed — or bare, running to the next separator. The list ends
+ * at `;`, at a newline, or at the first token that is not a parameter, so a
+ * line of `;`-joined headers costs one scan of each header's own list, and
+ * one header's list costs one scan of itself however long its `uri=` is
+ * (the 4 KiB window this replaces let a hash after a longer one survive).
+ * Only a parameter *named* `response`, `nonce` or `cnonce` is masked: a
+ * `nonce=` inside another parameter's value is that parameter's value. A
+ * quoted value may carry a JSON escape (`\"…\"`); no value class admits a
+ * backslash otherwise, and no hex or base64 parameter contains one.
  */
+const DIGEST_QUOTED = String.raw`(?:"[^"\\\n]*(?:"|(?=\n|$))|'[^'\\\n]*(?:'|(?=\n|$))|\\"[^"\\\n]*(?:\\"|(?=\n|$)))`;
+const DIGEST_BARE = String.raw`[^\s"';,\\]*`;
+const DIGEST_PARAM = String.raw`[^\s"';,=\\]+[ \t]*=[ \t]*(?:${DIGEST_QUOTED}|${DIGEST_BARE})`;
+const DIGEST_SEPARATOR = String.raw`(?:[ \t]*,[ \t]*|[ \t]+)`;
 const DIGEST_HEADER = new RegExp(
-  String.raw`(\bAuthorization["']?[ \t]*:[ \t]*["']?Digest[ \t]+)(?=${AUTH_PARAMETER})([^\n]{0,4096})`,
+  String.raw`(\bAuthorization["']?[ \t]*:[ \t]*["']?Digest[ \t]+)(?=${AUTH_PARAMETER})` +
+    `(${DIGEST_PARAM}(?:${DIGEST_SEPARATOR}${DIGEST_PARAM})*)`,
   "gi",
 );
-const DIGEST_PARAMETER = new RegExp(
-  String.raw`(\b(?:response|nonce|cnonce)[ \t]*=[ \t]*(?:\\?["'])?)(?!${REDACTED_LITERAL})([^\s"';,\\]+)`,
-  "gi",
+/**
+ * One parameter of a captured list, with its separator: the same grammar as
+ * `DIGEST_PARAM`, with the value's quotes and body captured so the mask can
+ * keep the quotes. Applied globally to a list the header rule has already
+ * bounded, so consecutive matches tokenise it exactly.
+ */
+const DIGEST_TOKEN = new RegExp(
+  String.raw`([^\s"';,=\\]+)([ \t]*=[ \t]*)` +
+    String.raw`(?:(")([^"\\\n]*)("|(?=\n|$))|(')([^'\\\n]*)('|(?=\n|$))|(\\")([^"\\\n]*)(\\"|(?=\n|$))|(${DIGEST_BARE}))` +
+    `(${DIGEST_SEPARATOR})?`,
+  "g",
 );
+const DIGEST_SECRET_PARAMETERS = /^(?:response|nonce|cnonce)$/i;
 
 /**
  * Family 2b — a bare `Bearer <token>` outside a header line, on one line.
@@ -131,13 +160,19 @@ const DIGEST_PARAMETER = new RegExp(
  * are base64, hex or JWTs, so the lowercase-word exclusion costs a shape no
  * issued token has (recorded in `docs/redaction.md`). The word is matched in
  * any case without the `i` flag, which would make the lowercase test blind.
+ *
+ * A period is a token character (JWTs), but a *trailing* one is sentence
+ * punctuation: the sixteen are counted up to a character that is not a
+ * period, and the masked run never ends in one — `the Bearer
+ * implementations.` is fifteen letters of prose, and a token before a full
+ * stop keeps the full stop (D155).
  */
 const BEARER_TOKEN = "[A-Za-z0-9._~+/=-]";
 const BEARER_VALUE = new RegExp(
   String.raw`\b([Bb][Ee][Aa][Rr][Ee][Rr])[ \t]+` +
     `(?![a-z]+(?!${BEARER_TOKEN}))` +
-    `(?=${BEARER_TOKEN}{16}|${BEARER_TOKEN}*[0-9_-])` +
-    `${BEARER_TOKEN}{8,}`,
+    String.raw`(?=${BEARER_TOKEN}{16,}(?<!\.)|${BEARER_TOKEN}*[0-9_-])` +
+    String.raw`${BEARER_TOKEN}{8,}(?<!\.)`,
   "g",
 );
 
@@ -222,8 +257,7 @@ export function maskSecrets(text: string): MaskResult {
     .replace(TOKEN_PREFIX, (_m, prefix: string) => count(`${prefix}${REDACTED}`))
     .replace(
       DIGEST_HEADER,
-      (_m, lead: string, parameters: string) =>
-        `${lead}${parameters.replace(DIGEST_PARAMETER, (_p, name: string) => count(`${name}${REDACTED}`))}`,
+      (_m, lead: string, parameters: string) => `${lead}${maskDigestParameters(parameters, count)}`,
     )
     .replace(AUTHORIZATION_HEADER, (_m, lead: string, scheme: string | undefined) =>
       count(`${lead}${scheme ?? ""}${REDACTED}`),
@@ -233,6 +267,42 @@ export function maskSecrets(text: string): MaskResult {
     .replace(PEM_PRIVATE_KEY_OPEN, () => count(REDACTED_PRIVATE_KEY))
     .replace(SECRET_ASSIGNMENT, (_m, lead: string) => count(`${lead}${REDACTED}`));
   return { text: out, masked };
+}
+
+/**
+ * Mask the credential parameters of one Digest parameter list, token by
+ * token. The list is exactly what `DIGEST_HEADER` captured, so every
+ * position is covered by one `DIGEST_TOKEN` match and a name is only ever
+ * read at a parameter's start. An empty value, and a value that is already
+ * `[REDACTED]`, are not values.
+ */
+function maskDigestParameters(list: string, count: (replacement: string) => string): string {
+  return list.replace(
+    DIGEST_TOKEN,
+    (
+      token: string,
+      name: string,
+      equals: string,
+      dqOpen: string | undefined,
+      dqValue: string | undefined,
+      dqClose: string | undefined,
+      sqOpen: string | undefined,
+      sqValue: string | undefined,
+      sqClose: string | undefined,
+      jqOpen: string | undefined,
+      jqValue: string | undefined,
+      jqClose: string | undefined,
+      bare: string | undefined,
+      separator: string | undefined,
+    ) => {
+      if (!DIGEST_SECRET_PARAMETERS.test(name)) return token;
+      const open = dqOpen ?? sqOpen ?? jqOpen ?? "";
+      const value = dqValue ?? sqValue ?? jqValue ?? bare ?? "";
+      const close = dqClose ?? sqClose ?? jqClose ?? "";
+      if (value === "" || value === REDACTED) return token;
+      return `${name}${equals}${open}${count(REDACTED)}${close}${separator ?? ""}`;
+    },
+  );
 }
 
 // ── Redaction ───────────────────────────────────────────────────

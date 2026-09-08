@@ -515,7 +515,8 @@ export function renderPythonToolRules(importableModules: string[]): string {
 - Imports: ONLY these modules exist: ${importableModules.join(", ")}. Anything else
   (e.g. ${blocked.join(", ")}) raises ModuleNotFoundError — there are no third-party
   packages.
-- Class definitions and match statements are not supported.
+- Class inheritance, metaclasses and match statements are not supported (NotImplementedError);
+  a plain class with __init__ and methods works.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,
   FileNotFoundError, OSError).`;
 }
