@@ -27,6 +27,16 @@ import {
  * `signal` is the caller's abort: implementations that support cancellation
  * should honour it so an aborted run stops being billed; the loop also races
  * against it as a safety net for clients that ignore it (#75).
+ *
+ * Threat model (#192, D99): implementations are **trusted host code** — the
+ * same trust as the process that constructs `runRlm`'s options — so the
+ * provider-error redaction guards against what a provider *response* carries
+ * (request-context tails, retry hints, request IDs), not against a hostile
+ * client. That is why the redaction is a 1 KiB head-only cut (#167, #184)
+ * and the bound it leaves — a rejection under 1 KiB, or one that leads with
+ * request context, passes its head verbatim to the caller and the model — is
+ * accepted rather than tightened. A client that wants less than that to reach
+ * either surface must strip it before rejecting.
  */
 export interface LlmClient {
   query(
