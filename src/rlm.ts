@@ -211,12 +211,19 @@ const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
  * Sites 2 and 3 reach two consumers each — the caller-visible
  * `iterations[].result.error` and the model-visible `buildFeedback` output —
  * and every one of them reads a message whose request-context tail is gone.
+ *
+ * `unknownTotal` (#191, D98): the marker states where it cut, never how much
+ * it dropped. On a model-facing value cut the true total is an affordance;
+ * on a redaction cut it is a fact about the withheld text, and a 64 KiB
+ * rejection must not be distinguishable from a 1.2 KiB one through the
+ * marker when neither body is shown.
  */
 function redactProviderError(err: unknown): string {
   return truncateText(err instanceof Error ? err.message : String(err), {
     maxBytes: RLM_ERROR_MAX_BYTES,
     headRatio: HEAD_ONLY_RATIO,
     recovery: RLM_ERROR_RECOVERY,
+    unknownTotal: true,
   }).text;
 }
 
