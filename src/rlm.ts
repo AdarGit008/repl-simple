@@ -390,10 +390,13 @@ const INPUT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
  * The loop's own input (#173, D108): the full question, declared from the
- * `runRlm` argument so the model can slice it in Python. Reserved — a caller
- * supplying one would be silently shadowed, so the merge site refuses it
- * (the D51 precedent for the tool names). Not rendered as an input block:
- * the `# Question` section already carries it.
+ * `runRlm` argument so the model can slice it in Python. Reserved on both
+ * sides: a caller *input* of this name would be silently shadowed by the
+ * assignment, a caller *tool* of this name by the sandbox global (a str —
+ * `question(...)` a TypeError, the tool never called). The merge site
+ * refuses the first, `runRlm`'s start the second, the D51 precedent for the
+ * loop's tool names (D113). Not rendered as an input block: the `# Question`
+ * section already carries it.
  */
 const QUESTION_INPUT = "question";
 
@@ -1208,6 +1211,16 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           `Remove it — the loop provides its own RLM tools.`,
       );
     }
+  }
+  // #173 (D108, D113): the reserved `question` input is a sandbox global. A
+  // caller tool of that name would be merged and then shadowed by the str —
+  // `question(...)` a TypeError, the tool never called, nothing saying why —
+  // so refuse it here, the D51 rule applied to the loop's own input.
+  if (options.registry.has(QUESTION_INPUT)) {
+    throw new Error(
+      `runRlm: tool '${QUESTION_INPUT}' conflicts with the reserved '${QUESTION_INPUT}' input — ` +
+        "the sandbox variable would shadow the tool. Rename it.",
+    );
   }
   if (!Number.isInteger(maxIterations) || maxIterations < 1) {
     throw new Error("runRlm: maxIterations must be a positive integer");
