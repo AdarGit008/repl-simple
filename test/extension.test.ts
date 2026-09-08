@@ -9,6 +9,13 @@ import {
   LATER_CHOICE,
   clampModelLimits,
 } from "../extensions/repl-extension.js";
+// The #35 constants are read off the namespace rather than named-imported so
+// that this file still *loads* against an extension that predates them: the
+// RED check runs these tests against main's `extensions/`, and a missing
+// named export is a link error that fails every test here, not the ones
+// about the cap. On such an extension they are `undefined`, and only the
+// assertions that use them fail.
+import * as extension from "../extensions/repl-extension.js";
 import { ReplRunner } from "../src/repl.js";
 import { withPatchedPrototype } from "./support/prototype-patch.js";
 
@@ -55,23 +62,66 @@ type RegisteredCommand = {
 };
 
 /**
+ * A lifecycle handler as the extension hands it to `pi.on` — the shape of
+ * pi's `ExtensionHandler<SessionStartEvent | SessionShutdownEvent>`
+ * (`types.d.ts:862`), with the context left loose because each test builds
+ * only the part of `ExtensionContext` the handler under test reads.
+ */
+type LifecycleHandler = (
+  event: { type: string; reason: string },
+  ctx: unknown,
+) => void | Promise<void>;
+
+/**
  * Invoke the extension factory and collect what it registers.
  *
  * The module is import-cached, but each `default()` call builds a fresh
- * closure — and therefore a fresh `ReplRunner` *and* a fresh approval mode —
- * so callers get an independent runner and are not exposed to the cwd caching
- * in `getRunner` (#60). Tests that switch the mode rely on that isolation.
+ * closure — and therefore fresh runners *and* a fresh approval mode — so
+ * callers get independent state. Tests that switch the mode rely on that
+ * isolation. This is also what pi does: the factory is re-run for every
+ * conversation (`loader.js:407-409`), so one `load()` is one Pi session.
+ *
+ * `on` collects lifecycle handlers by event name so `fire` can drive them the
+ * way pi's runner does (#60).
  */
-async function load(): Promise<{ tools: RegisteredTool[]; commands: RegisteredCommand[] }> {
+async function load(): Promise<{
+  tools: RegisteredTool[];
+  commands: RegisteredCommand[];
+  handlers: Map<string, LifecycleHandler[]>;
+}> {
   const tools: RegisteredTool[] = [];
   const commands: RegisteredCommand[] = [];
+  const handlers = new Map<string, LifecycleHandler[]>();
   const mod = await import("../extensions/repl-extension.js");
   mod.default({
     registerTool: (t: unknown) => tools.push(t as RegisteredTool),
     registerCommand: (name: string, options: unknown) =>
       commands.push({ name, ...(options as Omit<RegisteredCommand, "name">) }),
+    on: (event: string, handler: LifecycleHandler) => {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
   } as never);
-  return { tools, commands };
+  return { tools, commands, handlers };
+}
+
+/**
+ * Fire a lifecycle event the way pi's extension runner does: every handler
+ * registered for it, in registration order, each awaited.
+ *
+ * Fails when nothing is registered. A test that fires an event the extension
+ * never subscribed to would otherwise pass by doing nothing.
+ */
+async function fire(
+  handlers: Map<string, LifecycleHandler[]>,
+  type: "session_start" | "session_shutdown",
+  reason: string,
+  ctx: unknown,
+): Promise<void> {
+  const list = handlers.get(type) ?? [];
+  assert.ok(list.length > 0, `the extension registered no ${type} handler`);
+  for (const handler of list) await handler({ type, reason }, ctx);
 }
 
 async function loadTools(): Promise<RegisteredTool[]> {
@@ -992,7 +1042,7 @@ describe("repl extension — suspension is reachable (#51)", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("offers approve, deny and decide-later, and names the call in the title", async () => {
+  it("offers approve, deny, decide-later and deny-remaining, and names the call and the count in the title", async () => {
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
 
@@ -1006,15 +1056,24 @@ describe("repl extension — suspension is reachable (#51)", () => {
     );
 
     assert.equal(ui.opened.length, 1);
+    // The order is pinned too: the three original positions do not move, and
+    // the most consequential answer is the last one (#35 D82).
     assert.deepEqual(
       ui.opened[0].options,
-      [APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE],
-      "a dialog that does not offer the third answer makes suspension unreachable again",
+      [APPROVE_CHOICE, DENY_CHOICE, LATER_CHOICE, extension.DENY_REMAINING_CHOICE],
+      "a dialog that does not offer the third answer makes suspension unreachable again; " +
+        "one that does not offer the fourth leaves the user no way out of a queue (#35)",
     );
     // The user has to be told what they are approving; `select` has no message
     // parameter, so the description has to be in the title.
     assert.match(ui.opened[0].title, /write/);
     assert.match(ui.opened[0].title, /offered\.txt/);
+    // And how many more times they can be asked in this call (#35 D84).
+    assert.match(
+      ui.opened[0].title,
+      new RegExp(`\\(dialog 1 of ${extension.MAX_DIALOGS_PER_CALL}\\)`),
+      "the dialog does not say where in the per-call budget it sits",
+    );
   });
 
   it("decide later → repl_resume → approve completes the call", async () => {
@@ -1394,5 +1453,544 @@ describe("repl extension — abort between gated host calls (D7 test 1)", () => 
     );
     // Context, not the assertion itself: the run reports the abort.
     assert.match(out, /\[error: aborted\]/);
+  });
+});
+
+// ── Approval cap and deny remaining (#35) ────────────────────────
+//
+// One `repl` call produced twenty modal dialogs back to back. The sandbox
+// asks once per gated call with no memory of how many times it has asked
+// (`sandbox.ts` dispatch loop), and a Python `try/except PermissionError`
+// loop reaches the gate again after every denial — so a script can ask until
+// the user clicks yes once out of exhaustion. That is a fatigue primitive.
+//
+// The bound lives in the extension: `makeOnApproval` is minted per
+// `execute()`, so a counter in its closure is per call by construction,
+// restarts on `repl_resume`, and touches nothing in `src/`. A cap and a
+// "deny remaining" only ever reduce what gets approved; nothing here makes
+// approving easier (the ordering note in #35).
+//
+// Everything below is measured on side effects — which files exist — and on
+// dialogs actually opened, never on the returned text alone.
+
+/**
+ * `n` gated calls in one snippet, each denial caught so the loop reaches the
+ * gate again — the shape of the fatigue attack. Call `i` writes
+ * `<prefix><i>.txt`, so what executed is readable off the disk.
+ */
+function gatedLoop(n: number, prefix: string): string {
+  return [
+    `for i in range(${n}):`,
+    "    try:",
+    `        write('${prefix}' + str(i) + '.txt', 'x')`,
+    "    except PermissionError:",
+    "        pass",
+  ].join("\n");
+}
+
+describe("repl extension — approval cap and deny remaining (#35)", () => {
+  let cwd: string;
+  const CAP = extension.MAX_DIALOGS_PER_CALL;
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-cap-"));
+  });
+
+  after(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  const ctxWith = (select: unknown) => ({
+    cwd,
+    isProjectTrusted: () => true,
+    hasUI: true,
+    ui: { select },
+  });
+
+  /** The first `expected` of `n` loop calls executed, and none after them. */
+  function assertWritten(prefix: string, n: number, expected: number): void {
+    for (let i = 0; i < n; i++) {
+      assert.equal(
+        existsSync(join(cwd, `${prefix}${i}.txt`)),
+        i < expected,
+        i < expected
+          ? `${prefix}${i}.txt: an approved call did not execute`
+          : `${prefix}${i}.txt: a call past the cap executed`,
+      );
+    }
+  }
+
+  it("50 gated calls open at most the cap, and the model is told why the rest were denied", async () => {
+    const { tools, commands } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    // Every dialog approves — the user who is being worn down. Fifty answers
+    // are scripted so an over-cap dialog fails on the count, not on the script.
+    const ui = scriptedSelect(Array.from({ length: 50 }, () => APPROVE_CHOICE));
+    const result = await repl.execute(
+      "cap-1",
+      { code: gatedLoop(50, "spam"), sessionId: "cap-50" },
+      undefined,
+      undefined,
+      ctxWith(ui.select),
+    );
+
+    assert.equal(ui.opened.length, CAP, "more dialogs opened than the cap allows");
+    assertWritten("spam", 50, CAP);
+
+    // Issue #35 test 3: the result names the cap as the cause, so the model
+    // does not read forty-two bare PermissionErrors and retry.
+    const text = result.content[0].text;
+    assert.match(text, /\[approval cap\]/);
+    assert.match(text, new RegExp(`opened ${CAP} approval dialogs`));
+    assert.match(
+      text,
+      new RegExp(`${50 - CAP} later gated call\\(s\\) were denied without asking`),
+    );
+
+    // Control: yolo-approved calls do not count. The same fifty calls in yolo
+    // open nothing, write everything, and carry no cap notice — the cap bounds
+    // dialogs, not executions.
+    await commands[0].handler("yolo", notifyCtx().ctx);
+    const unasked = scriptedSelect([]);
+    const yolo = await repl.execute(
+      "cap-2",
+      { code: gatedLoop(50, "yolo"), sessionId: "cap-yolo" },
+      undefined,
+      undefined,
+      ctxWith(unasked.select),
+    );
+    assert.equal(unasked.opened.length, 0, "yolo opened a dialog");
+    assertWritten("yolo", 50, 50);
+    assert.doesNotMatch(yolo.content[0].text, /\[approval cap\]/);
+  });
+
+  it("'Deny remaining' opens no further dialog and denies everything after it", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const ui = scriptedSelect([extension.DENY_REMAINING_CHOICE]);
+    const result = await repl.execute(
+      "dr-1",
+      { code: gatedLoop(50, "rest"), sessionId: "deny-rest" },
+      undefined,
+      undefined,
+      ctxWith(ui.select),
+    );
+
+    // Issue #35 test 2: exactly the dialog being answered, and none after it.
+    assert.equal(ui.opened.length, 1, "a dialog opened after 'Deny remaining'");
+    assertWritten("rest", 50, 0);
+
+    const text = result.content[0].text;
+    assert.match(text, /\[approvals denied\]/);
+    assert.match(text, /Deny remaining/);
+    assert.match(text, /49 later gated call\(s\)/);
+    assert.doesNotMatch(text, /\[approval cap\]/, "a user's choice was reported as the cap");
+  });
+
+  it("exactly the cap is not capped, one more is — and replayed calls are free", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const ui = scriptedSelect(Array.from({ length: 2 * CAP + 2 }, () => APPROVE_CHOICE));
+    const ctx = ctxWith(ui.select);
+
+    // Seed the session with one approved call. Every later `repl` call on the
+    // session replays it from the cache — the sandbox never asks about a
+    // replay (`Session.makeApprovalGate` branch 1), so it must not spend a
+    // dialog from the budget either.
+    await repl.execute(
+      "ex-0",
+      { code: "write('seed.txt', 'x')", sessionId: "exact" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(ui.opened.length, 1);
+
+    // Exactly the cap: every call asks, every call runs, no notice — the
+    // boundary is `>`, not `>=` (stryker mutates `extensions/**`).
+    const atCap = await repl.execute(
+      "ex-1",
+      { code: gatedLoop(CAP, "at"), sessionId: "exact" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      ui.opened.length,
+      1 + CAP,
+      "the replayed seed call spent a dialog, or a call at the cap was refused",
+    );
+    assertWritten("at", CAP, CAP);
+    assert.doesNotMatch(atCap.content[0].text, /\[approval cap\]/);
+
+    // One more than the cap, in a fresh session: the last call is denied
+    // without a dialog and the notice counts it.
+    const over = await repl.execute(
+      "ex-2",
+      { code: gatedLoop(CAP + 1, "over"), sessionId: "exact-over" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(ui.opened.length, 1 + 2 * CAP, "the call past the cap opened a dialog");
+    assertWritten("over", CAP + 1, CAP);
+    assert.match(over.content[0].text, /\[approval cap\]/);
+    assert.match(over.content[0].text, /1 later gated call\(s\)/);
+  });
+
+  it("an abort at the first dialog ends the sequence — the cap is not what stopped it", async () => {
+    // Issue #35 test 4. The abort pin itself already held (#49, D7); what is
+    // new is that the sequence ends on the abort, not on the cap, and that
+    // the dialog the user escaped from was the four-answer one.
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const controller = new AbortController();
+    const opened: string[][] = [];
+    const select = async (_title: string, options: string[]): Promise<string | undefined> => {
+      opened.push(options);
+      controller.abort();
+      return DENY_CHOICE;
+    };
+
+    const result = await repl.execute(
+      "ab-1",
+      { code: gatedLoop(50, "abort"), sessionId: "cap-abort" },
+      controller.signal,
+      undefined,
+      ctxWith(select),
+    );
+
+    assert.equal(opened.length, 1, "a dialog opened after the user cancelled");
+    assert.deepEqual(opened[0], [
+      APPROVE_CHOICE,
+      DENY_CHOICE,
+      LATER_CHOICE,
+      extension.DENY_REMAINING_CHOICE,
+    ]);
+    assertWritten("abort", 50, 0);
+
+    const text = result.content[0].text;
+    assert.match(text, /aborted/);
+    assert.doesNotMatch(text, /\[approval cap\]/, "the abort was reported as the cap");
+    assert.doesNotMatch(text, /\[approvals denied\]/, "the abort was reported as deny-remaining");
+  });
+
+  it("the count restarts on repl_resume", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl);
+    assert.ok(resume);
+
+    // Approve up to the last dialog of the budget, then "decide later" at it:
+    // the run suspends having spent its whole count.
+    const ui = scriptedSelect([
+      ...Array.from({ length: CAP - 1 }, () => APPROVE_CHOICE),
+      LATER_CHOICE,
+      APPROVE_CHOICE,
+      APPROVE_CHOICE,
+      APPROVE_CHOICE,
+    ]);
+    const ctx = ctxWith(ui.select);
+
+    const suspended = await repl.execute(
+      "rs-1",
+      { code: gatedLoop(CAP + 2, "rs"), sessionId: "restart" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(suspended.content[0].text, /requires approval/);
+    assert.equal(ui.opened.length, CAP);
+    assertWritten("rs", CAP + 2, CAP - 1);
+    assert.doesNotMatch(suspended.content[0].text, /\[approval cap\]/);
+
+    // Resume: the pending call asks — dialog 1 of a new count — and so do the
+    // two calls after it. Three dialogs past the run's budget, no cap.
+    const done = await resume.execute("rs-2", { sessionId: "restart" }, undefined, undefined, ctx);
+    assert.equal(ui.opened.length, CAP + 3, "the resume inherited the run's count");
+    assert.match(ui.opened[CAP].title, new RegExp(`\\(dialog 1 of ${CAP}\\)`));
+    assertWritten("rs", CAP + 2, CAP + 2);
+    assert.doesNotMatch(done.content[0].text, /\[approval cap\]/);
+  });
+
+  it("repl_resume is capped on its own count, and says so", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl);
+    assert.ok(resume);
+
+    // "Decide later" at the very first call, then approve everything the
+    // resume asks: the pending call plus CAP - 1 more fill the resume's
+    // budget, and the two after that are denied without a dialog.
+    const ui = scriptedSelect([LATER_CHOICE, ...Array.from({ length: CAP }, () => APPROVE_CHOICE)]);
+    const ctx = ctxWith(ui.select);
+
+    await repl.execute(
+      "rc-1",
+      { code: gatedLoop(CAP + 2, "rc"), sessionId: "resume-cap" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(ui.opened.length, 1);
+
+    const result = await resume.execute(
+      "rc-2",
+      { sessionId: "resume-cap" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(ui.opened.length, 1 + CAP, "the resume opened more dialogs than its cap");
+    assertWritten("rc", CAP + 2, CAP);
+
+    const text = result.content[0].text;
+    assert.match(text, /\[approval cap\]/, "the resume path does not report the cap");
+    assert.match(text, /2 later gated call\(s\)/);
+  });
+});
+
+// ── Session lifecycle (#60) ──────────────────────────────────────
+//
+// Sessions belong to one Pi conversation. Pi emits `session_shutdown` when a
+// conversation ends (`/new`, `/resume`, `/fork`, quit) and `session_start`
+// when the next one begins. Before this the extension registered neither, so
+// REPL state outlived the conversation that made it and a pending approval
+// was garbage-collected without a word to anyone. These tests drive the
+// handlers the way pi's runner does — every registered handler, in order,
+// awaited — through the `load()` harness's `on` stub.
+//
+// Issue #60's test 3 (a cwd change mid-session) is dropped: `ctx.cwd` is set
+// once in pi's extension runner constructor (runner.js:154) and exposed by a
+// getter with no setter (runner.js:476-478), so it cannot change inside one
+// session. What keying by cwd still buys — one runner per directory rather
+// than one runner rooted wherever the first call happened to be — is tested.
+
+/**
+ * A ctx that serves both a tool call and a lifecycle handler: dialog answers
+ * scripted, notifications collected, trust as given.
+ */
+function lifecycleCtx(cwd: string, answers: Array<string | undefined> = [], trusted = true) {
+  const notes: Array<{ message: string; type?: string }> = [];
+  const ui = scriptedSelect(answers);
+  return {
+    notes,
+    ui,
+    ctx: {
+      cwd,
+      hasUI: true,
+      isProjectTrusted: () => trusted,
+      ui: {
+        select: ui.select,
+        notify: (message: string, type?: string) => notes.push({ message, type }),
+      },
+    },
+  };
+}
+
+describe("repl extension — session lifecycle (#60)", () => {
+  let cwdA: string;
+  let cwdB: string;
+  let hostile: string;
+
+  before(() => {
+    cwdA = mkdtempSync(join(tmpdir(), "repl-ext-life-a-"));
+    cwdB = mkdtempSync(join(tmpdir(), "repl-ext-life-b-"));
+    hostile = mkdtempSync(join(tmpdir(), "repl-ext-life-hostile-"));
+    mkdirSync(join(hostile, ".pi", "code-tools"), { recursive: true });
+    writeFileSync(
+      join(hostile, ".pi", "code-tools", "hostile.py"),
+      "write('pwned.txt', 'owned')\n",
+    );
+  });
+
+  after(() => {
+    for (const dir of [cwdA, cwdB, hostile]) {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("state does not leak across a session_shutdown / session_start cycle", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+    const { ctx } = lifecycleCtx(cwdA);
+
+    await repl.execute("l-1", { code: "leak = 41" }, undefined, undefined, ctx);
+    const before = await repl.execute("l-2", { code: "leak + 1" }, undefined, undefined, ctx);
+    assert.match(before.content[0].text, /\[result\]\n42/);
+
+    await fire(handlers, "session_shutdown", "new", ctx);
+    await fire(handlers, "session_start", "new", ctx);
+
+    // Monty reports an unbound name at type-check time (`unresolved-reference`)
+    // rather than as a runtime NameError; either spelling is "gone".
+    const after = await repl.execute("l-3", { code: "leak + 1" }, undefined, undefined, ctx);
+    assert.match(
+      after.content[0].text,
+      /unresolved-reference|NameError/,
+      "a variable from the previous conversation was still bound",
+    );
+  });
+
+  it("session_shutdown is idempotent — a second call neither throws nor reports again", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+    const { ctx, notes } = lifecycleCtx(cwdA, [LATER_CHOICE]);
+
+    await repl.execute(
+      "i-1",
+      { code: "write('idem.txt', 'x')", sessionId: "idem" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    await fire(handlers, "session_shutdown", "new", ctx);
+    assert.equal(notes.length, 1, "the pending suspension was not reported");
+
+    await fire(handlers, "session_shutdown", "new", ctx);
+    assert.equal(notes.length, 1, "the second shutdown reported the same suspension again");
+    assert.equal(existsSync(join(cwdA, "idem.txt")), false);
+  });
+
+  it("two working directories get two runners, each rooted at its own cwd", async () => {
+    const { tools } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+    const a = lifecycleCtx(cwdA, [APPROVE_CHOICE]);
+    const b = lifecycleCtx(cwdB, [APPROVE_CHOICE]);
+
+    await repl.execute("k-1", { code: "rooted = 'A'" }, undefined, undefined, a.ctx);
+    const inB = await repl.execute("k-2", { code: "rooted" }, undefined, undefined, b.ctx);
+    assert.match(
+      inB.content[0].text,
+      /unresolved-reference|NameError/,
+      "cwd B saw cwd A's session",
+    );
+
+    // Not by inspecting internals: the jail root is where the write lands.
+    await repl.execute("k-3", { code: "write('marker.txt', 'B')" }, undefined, undefined, b.ctx);
+    assert.equal(
+      existsSync(join(cwdB, "marker.txt")),
+      true,
+      "the write under cwd B did not land in B",
+    );
+    assert.equal(
+      existsSync(join(cwdA, "marker.txt")),
+      false,
+      "the write under cwd B landed in A — one runner rooted at the first cwd seen",
+    );
+  });
+
+  it("a suspension pending in the old conversation is not resumable in the new one", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl);
+    assert.ok(resume);
+    const { ctx, ui } = lifecycleCtx(cwdA, [LATER_CHOICE]);
+
+    const suspended = await repl.execute(
+      "p-1",
+      { code: "write('carry.txt', 'x')", sessionId: "carry" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(suspended.content[0].text, /requires approval/);
+
+    await fire(handlers, "session_shutdown", "resume", ctx);
+    await fire(handlers, "session_start", "resume", ctx);
+
+    // The same sessionId in the next conversation is a new, empty REPL: there
+    // is nothing to resume, and no dialog is opened about the old call.
+    const after = await resume.execute("p-2", { sessionId: "carry" }, undefined, undefined, ctx);
+    assert.match(after.content[0].text, /No session 'carry' exists/);
+    assert.equal(ui.opened.length, 1, "the new conversation asked about the old one's call");
+    assert.equal(existsSync(join(cwdA, "carry.txt")), false);
+  });
+
+  it("shutdown reports a pending suspension as dropped, and only that one", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+    const { ctx, notes } = lifecycleCtx(cwdA, [LATER_CHOICE]);
+
+    await repl.execute("r-1", { code: "quiet = 1", sessionId: "quiet" }, undefined, undefined, ctx);
+    await repl.execute(
+      "r-2",
+      { code: "write('dropped.txt', 'x')", sessionId: "waiting" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    await fire(handlers, "session_shutdown", "quit", ctx);
+
+    assert.equal(notes.length, 1, "expected exactly one report, for the suspended session");
+    assert.equal(notes[0].type, "warning");
+    assert.match(notes[0].message, /'waiting'/);
+    assert.match(notes[0].message, /never executed/);
+    assert.doesNotMatch(notes[0].message, /'quiet'/, "a session with nothing pending was reported");
+    // The arguments stay out of the report, as they do in `GrantSummary`: an
+    // approval description can hold a pasted credential.
+    assert.doesNotMatch(notes[0].message, /dropped\.txt/);
+    assert.equal(existsSync(join(cwdA, "dropped.txt")), false);
+  });
+
+  it("the repl description says sessionId is scoped to the Pi session", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    // The model has to be told what reusing an id buys, because the previous
+    // behaviour was the opposite and the string alone cannot tell it.
+    assert.match(repl.description, /sessionId is scoped to this Pi session/);
+    assert.match(repl.description, /pending approval is dropped/);
+  });
+
+  it("session_start runs nothing — no preamble before repl is called, trusted or not", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+
+    const untrusted = lifecycleCtx(hostile, [], false);
+    await fire(handlers, "session_start", "startup", untrusted.ctx);
+    assert.equal(
+      existsSync(join(hostile, "pwned.txt")),
+      false,
+      "session_start ran an untrusted project's preamble",
+    );
+
+    // Trust makes no difference here: session_start creates no session, so
+    // the preamble — which runs at session creation — cannot run before a
+    // `repl` call has consulted isProjectTrusted for itself. The one scripted
+    // answer is for the positive control below; session_start must not use it.
+    const trusted = lifecycleCtx(hostile, [APPROVE_CHOICE], true);
+    await fire(handlers, "session_start", "new", trusted.ctx);
+    assert.equal(
+      existsSync(join(hostile, "pwned.txt")),
+      false,
+      "session_start created a session — the preamble ran before any repl call",
+    );
+    assert.equal(
+      untrusted.ui.opened.length + trusted.ui.opened.length,
+      0,
+      "session_start opened an approval dialog",
+    );
+
+    // Positive control: the same preamble does run — through the approval
+    // gate, like any gated call — once `repl` asks for a session under trust.
+    await repl.execute("h-1", { code: "1 + 1" }, undefined, undefined, trusted.ctx);
+    assert.equal(trusted.ui.opened.length, 1, "the preamble's gated write did not ask");
+    assert.equal(readFileSync(join(hostile, "pwned.txt"), "utf8"), "owned");
   });
 });
