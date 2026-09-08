@@ -4118,10 +4118,13 @@ describe("runRlm() — question cap", () => {
       `question section is ${Buffer.byteLength(questionSection, "utf8")} bytes`,
     );
     assert.match(questionSection, /elided/, "the truncation marker must state what went");
+    // #173 (D108): the question is a sandbox variable now, so the recovery
+    // clause names the route that exists — slicing `question` in Python —
+    // instead of the old "answer from the part shown" hedge.
     assert.match(
       questionSection,
-      /state the assumption/,
-      "the recovery clause must direct the model to answer from what is shown",
+      /available as the `question` Python variable — slice it in Python to see more/,
+      "the recovery clause must name the `question` variable route",
     );
   });
 
@@ -4207,7 +4210,7 @@ describe("runRlm() — question cap", () => {
       });
       const section = questionSectionOf(llm.calls()[0].messages[0].content);
       assert.match(section, /elided/, "the truncation marker must fire just over the budget");
-      assert.match(section, /state the assumption/);
+      assert.match(section, /slice it in Python to see more/, "the #173 route (D108)");
       assert.ok(
         Buffer.byteLength(section, "utf8") <= 64 * 1024,
         `question section is ${Buffer.byteLength(section, "utf8")} bytes`,
@@ -4286,8 +4289,8 @@ describe("runRlm() — composition and boundary strength", () => {
     assert.match(questionSection, /elided/, "the truncation marker must state what went");
     assert.match(
       questionSection,
-      /state the assumption/,
-      "the recovery clause must direct the model to answer from what is shown",
+      /available as the `question` Python variable — slice it in Python to see more/,
+      "the recovery clause must name the `question` variable route (#173, D108)",
     );
 
     // The input section: test 7's locators — the first input's header and the
@@ -6078,5 +6081,113 @@ describe("runRlm() — child inherits the parent's full options.inputs (#170)", 
       `inherited input not announced:\n${childPrompt}`,
     );
     assert.ok(childPrompt.includes("EXTRA"), "the inherited value must be previewed");
+  });
+});
+
+// ── The question is a sandbox input (#173, D108) ────────────────
+//
+// The full question was not sandbox-accessible, so `QUESTION_RECOVERY` had to
+// stay deliberately weak (policy Q3 — never name a route that does not
+// exist). It is now declared as the reserved `question` input: sliceable in
+// Python, announced in the prompt trailer, never double-rendered as an input
+// block, and refused if a caller tries to supply one. The two tool paths
+// (`llm_query`'s prompt, the downgrade query) have no sandbox on their side
+// and keep the sandbox-free wording.
+
+describe("runRlm() — the question is a sandbox input (#173)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("`question` is sliceable in Python", async () => {
+    const { llm } = mockLlmCodeGen([
+      "```python\nSUBMIT(question[:5] + '|' + str(len(question)))\n```",
+    ]);
+
+    const result = await runRlm("hello world", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "hello|11");
+  });
+
+  it("a nested child's `question` is its own query, not the parent's", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT(question + " -> " + rlm_query("sub-question"))\n```',
+      "```python\nSUBMIT(question)\n```",
+    ]);
+
+    const result = await runRlm("parent-question", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "parent-question -> sub-question");
+  });
+
+  it("a caller-supplied `question` input is refused before any query, from either source", async () => {
+    const attempts: Array<Partial<Parameters<typeof runRlm>[1]>> = [
+      { inputs: { question: "x" } },
+      { runOptions: { inputs: { question: "x" } } },
+    ];
+    for (const extra of attempts) {
+      const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+      await assert.rejects(
+        runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5, ...extra }),
+        /input 'question' is reserved/,
+      );
+      assert.equal(llm.calls().length, 0, "the collision must be rejected before any LLM query");
+    }
+  });
+
+  it("renders the question once, with no `# Input` block, and announces the variable in the trailer", async () => {
+    const question = "UNIQUE-QUESTION-TEXT-9f3a";
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    await runRlm(question, { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.equal(prompt.split(question).length - 1, 1, `question rendered twice:\n${prompt}`);
+    assert.ok(prompt.startsWith(`# Question\n${question}`), `header changed:\n${prompt}`);
+    assert.ok(
+      !prompt.includes("# Input (available as `question` variable)"),
+      `the question must not render as an input block:\n${prompt}`,
+    );
+    assert.ok(
+      prompt.endsWith(
+        "\n\nWrite Python code to answer the question. The full question is available as the `question` variable. Call SUBMIT(answer) when done.",
+      ),
+      `trailer:\n${prompt.slice(-240)}`,
+    );
+  });
+
+  it("the main loop's marker names the variable route; the tool-path prompts do not", async () => {
+    // Two markers for one truncated ask, one route each. The main loop's
+    // question is a sandbox variable, so its marker says so. llm_query's
+    // prompt reaches the sub-LLM with no sandbox on that side, so its marker
+    // must not tell it to slice a variable it does not have.
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT(llm_query("Q" * (70 * 1024)))\n```',
+      "reply",
+    ]);
+
+    const result = await runRlm("q".repeat(128 * 1024), {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.answer, "reply");
+    const mainPrompt = llm.calls()[0].messages[0].content;
+    assert.match(mainPrompt, /`question` Python variable — slice it in Python to see more/);
+    const toolPrompt = llm.calls()[1].messages[0].content;
+    assert.match(toolPrompt, /The question was truncated\. Answer from the part shown/);
+    assert.doesNotMatch(toolPrompt, /`question` Python variable/, "no sandbox, no variable route");
   });
 });
