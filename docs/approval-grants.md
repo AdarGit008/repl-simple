@@ -47,8 +47,16 @@ cursor will serve, not whether it appears anywhere in the cache. That distinctio
 "the same call being replayed" versus "something like this ran once".
 
 The cursor is visible only inside `createCachingRegistry`, which is the replay implementation
-itself. When #40 removes transcript replay, that function and this branch go with it and the grant
-model below is untouched.
+itself. Transcript replay survived the 0.0.21 migration and stays (decision 12, 2026-09-08;
+`docs/session-replay.md` records its semantics), so this branch stays with it; the grant model
+below never depended on it and would be untouched by its removal.
+
+**An entry restored from a dump is not a replay for this branch.** `Session.load()` marks every
+entry it restores (in memory only). The cursor still serves a non-gated one, but `willReplayKey` is
+false for a restored entry, so a gated call reached in replay asks the user; approved, it runs for
+real and its real result replaces the file's, and only then does it replay silently. The rule it
+protects is #63's: *a persisted session must never be able to grant an approval that a human did
+not grant* — measured before the fix, a dump whose cache named a `bash` call ran without a dialog.
 
 ### Branch 2, and why the default makes it dead code
 
@@ -98,7 +106,9 @@ credential someone pasted.
 
 Grants are in-process. `Session.dump()`/`load()` are never called on the shipped path, and even if
 they were, a grant that survives into another process is precisely the unbounded lifetime this
-change removed.
+change removed. The dump's schema is validated on load and carries no approval state of any kind —
+not grants, not the run's mounts or limits, and not the file's word on cached gated calls (see
+above); `docs/session-replay.md` has the full list.
 
 ---
 

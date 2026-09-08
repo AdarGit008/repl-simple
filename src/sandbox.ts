@@ -109,7 +109,9 @@ class DispatchAccumulators {
     this.calls = prior ? [...prior.calls] : [];
     // Stdout carried across a suspend/resume boundary is re-accumulated from
     // its rendered form: `RunSuspended` transports the string, not the head,
-    // tail and counters behind it. Cross-call stdout semantics are #61's.
+    // tail and counters behind it. This is within one call; across calls,
+    // the replayed prefix's output never reaches the accumulator at all — it
+    // is dropped at the byte mark in `makePrintCallback` (#61, D121).
     if (prior?.stdout) this.out.push(prior.stdout);
   }
 
@@ -385,17 +387,46 @@ function crashMessage(err: MontyCrashedError): string {
  * The one print callback. Both entry points hand this to Monty — as
  * `startOpts.printCallback` and as `MontySnapshot.load()`'s — and it is the
  * only thing that writes stdout.
+ *
+ * `stdoutSkipBytes` is the replayed prefix's share of the stream (#61, D121):
+ * a transcript-replaying caller re-executes code whose output belongs to an
+ * earlier call, and this is where that output is dropped — before `onPrint`,
+ * so the terminal is not shown it again, and before the accumulator, so the
+ * budget is spent on this call's bytes alone. A callback that straddles the
+ * mark is sliced at it rather than skipped whole: Monty holds a partial line
+ * until the next newline or host boundary, so a prefix that ended in one
+ * arrives merged with this call's first print (measured), and skipping the
+ * callback would take this call's line with it. The mark is a byte count for
+ * the same reason — it is indifferent to how the stream is chunked.
  */
 function makePrintCallback(
   acc: DispatchAccumulators,
   runOpts: RunOptions | undefined,
 ): (stream: string, text: string) => void {
+  const requested = runOpts?.stdoutSkipBytes;
+  let toSkip =
+    requested !== undefined && Number.isFinite(requested) && requested > 0
+      ? Math.floor(requested)
+      : 0;
   return (_stream: string, text: string) => {
+    let own = text;
+    if (toSkip > 0) {
+      const bytes = Buffer.byteLength(text, "utf8");
+      if (bytes <= toSkip) {
+        toSkip -= bytes;
+        return;
+      }
+      // The mark was counted over whole callbacks of an earlier run, so it
+      // falls on a character boundary of the concatenated stream even when it
+      // falls inside this callback.
+      own = Buffer.from(text, "utf8").subarray(toSkip).toString("utf8");
+      toSkip = 0;
+    }
     // Unconditional, and before the accumulator: the human's live stream is not
     // the model's context window and must not share its budget. Gating this on
     // truncation silenced the terminal mid-run (M9).
-    runOpts?.onPrint?.(text);
-    acc.print(text);
+    runOpts?.onPrint?.(own);
+    acc.print(own);
   };
 }
 
@@ -631,8 +662,12 @@ function capOutput(
 /**
  * Build an ApprovalRequest from a tool and the raw Monty args/kwargs.
  * Constructs a human-readable description from the tool's metadata.
+ *
+ * Exported for `Session.load`: the description is display text derived from
+ * the arguments, and a restored session re-derives it from the live tool so a
+ * dump cannot show one command in the dialog and run another (#63, D128).
  */
-function buildApprovalRequest(
+export function buildApprovalRequest(
   tool: HostTool,
   args: unknown[],
   kwargs: Record<string, unknown>,

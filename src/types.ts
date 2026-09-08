@@ -103,6 +103,14 @@ export interface RunOptions {
   /**
    * Bound as globals before the code runs. Part of the snapshot from then on,
    * so a resume needs nothing re-supplied.
+   *
+   * **Per-call, not session state** (#62 A15, decision 12). A `Session`
+   * binds them fresh on every `run()`; the replayed transcript sees the
+   * *current* call's values, so a snippet that read `x` at call 1 reads
+   * whatever call 2 binds — a changed value changes what earlier code
+   * computed, and an omitted one fails the replay. Re-supply the same inputs
+   * on every call that depends on them. Values are never persisted and never
+   * appear in a dump. See docs/session-replay.md.
    */
   inputs?: Record<string, string>;
   /**
@@ -137,6 +145,18 @@ export interface RunOptions {
    * assembled still shifts typing diagnostics, and they are corrected here.
    */
   lineOffset?: number;
+  /**
+   * Leading bytes of print output that belong to a replayed prefix and are
+   * dropped before `onPrint` and the `stdout` accumulator see anything. A
+   * callback straddling the mark is sliced at it. `Session` owns this figure
+   * exactly as it owns `lineOffset`: it is the number of bytes the retained
+   * transcript printed when it ran, so what remains is this call's own output
+   * and the `stdout` budget applies to that alone (#61, D121). Absent or `0`
+   * means nothing is dropped — the historical behavior, and what a resume
+   * passes, since a restored snapshot continues where it paused and replays
+   * nothing.
+   */
+  stdoutSkipBytes?: number;
   /**
    * Resource limits, or `"unbounded"` to run with none at all.
    *
@@ -177,9 +197,11 @@ export interface ToolCallTrace {
  * and neither is served by being told to check its logic. Both are ceilings
  * this library imposes, so it owes the caller the name of the one it hit.
  *
- * `unavailable` is the sandbox refusing to start: no worker could be checked
- * out of the pool before the checkout timeout. Nothing ran, so unlike every
- * other kind it says nothing about the caller's code.
+ * `unavailable` is a refusal to start: no worker could be checked out of the
+ * pool before the checkout timeout, or a `Session` holds its full complement
+ * of retained snippets and will not add another until it is reset (#62 A17,
+ * docs/session-replay.md). Nothing ran, so unlike every other kind it says
+ * nothing about the caller's code.
  */
 export type RunErrorKind =
   | "syntax"
@@ -223,8 +245,10 @@ export interface RunError {
  * stored in a dump (a restore without them keeps running, having turned every
  * read of a mounted file into `PermissionError`), and the byte caps on
  * `stdout` and `output`, which are the host's. `Session` carries all of those
- * across the suspension (see `Session.resume`); a caller of `resumeSuspended`
- * directly is responsible for them itself.
+ * across a suspension in the same process (see `Session.resume`); a caller of
+ * `resumeSuspended` directly is responsible for them itself, and so is
+ * whoever resumes a suspension restored from a `Session` dump — a dump
+ * carries the run's state, never the host's policy (docs/session-replay.md).
  *
  * The host wall clock (`maxWallClockSecs`) does not span the suspension: it
  * restarts on every resume, so each approved continuation gets a fresh

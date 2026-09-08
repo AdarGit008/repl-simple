@@ -392,6 +392,7 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 | `llm_query` prompt | 64 KiB | 50/50 head+tail | #171 |
 | downgraded-`rlm_query` query | 64 KiB | 50/50 head+tail | #171 |
 | downgraded-`rlm_query` context | 5 KiB | 50/50 head+tail | #171 |
+| `Session.dumpRedacted()` cache results and stdout | 4 KiB | head-only, total unknown (via `redact()`) | #63 |
 
 Every `truncateText` row in this table goes through one implementation, `src/truncate.ts`, per
 invariant 4 — the `#74`/`#144`/`#145` rows too, not only the four `#29`/`#34` rows. The conversation
@@ -488,6 +489,20 @@ Each string now goes through `truncateWithSentinels` at the ceiling of whatever 
 The context's recovery clause is a new constant, `DOWNGRADE_CONTEXT_RECOVERY`, and deliberately not `INPUT_PREVIEW_RECOVERY`. The downgrade has no sandbox, so the context is not a named Python variable and "slice it in Python to see more" is a route that does not exist there (Q3). It mirrors `QUESTION_RECOVERY` instead: answer from the part shown, and say so if it is ambiguous.
 
 The bound is applied *before* the spend charge, not after. The charge is a before-the-call price on what the call will cost (D62), so pricing the raw prompt once a ceiling exists would bill a run for tokens it never sends — and could refuse a call that would have fitted.
+
+**#61 (the `stdout` budget applies to the call's delta).** `Session` replays the whole transcript on
+every call, so every prior `print` fired again and the budget was spent on the replayed output first:
+a 300 KB print followed by `IMPORTANT-NEW-OUTPUT` returned 32 751 bytes of stale `Z`s with the new
+line surviving only because the 25/75 tail keeps it (measured). The session now hands the sandbox a
+byte mark — the bytes the retained transcript printed — as `RunOptions.stdoutSkipBytes`, and
+`makePrintCallback` drops that many leading bytes before `onPrint` and before the `Truncator` sees
+anything. The budget, the line budget, the counters in the marker and the `stdoutTruncated` flag all
+describe **this call's output alone**; the same case now returns `IMPORTANT-NEW-OUTPUT\n`,
+untruncated. Invariant 6 is what the mark's bookkeeping relies on: the session measures the call's
+bytes on the unconditional `onPrint` stream. Bytes rather than callbacks because Monty holds a
+partial line until the next newline or host boundary, so a prefix ending in one merges with the
+next call's first print into a single callback on replay (D121; semantics in
+`docs/session-replay.md`).
 
 **Redaction shape (general rule):** redaction cuts are head-only (`HEAD_ONLY_RATIO`) — 50/50 head+tail is a *value* shape (identified by both ends at once) and keeps the tail, which is exactly where provider request-context / retry-hints / request-IDs live. Use head-only for anything whose goal is *redaction* rather than symmetric display. A redaction marker carries **no magnitude** (`unknownTotal`, #191): it states where it cut, never how much it withheld. Both halves of the rule live in one place, `redact()` in `src/redact.ts`, which composes secret-pattern masking in front of the cut (`docs/redaction.md`); new redaction sites call it rather than `truncateText` directly.
 
