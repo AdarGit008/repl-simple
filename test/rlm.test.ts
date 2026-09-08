@@ -6023,3 +6023,60 @@ describe("runRlm() — stub validation is memoised across calls and nesting (#16
     );
   });
 });
+
+// ── Child inherits the parent's full options.inputs (#170, D107) ──
+//
+// The nested loop forwarded `runOptions` (so `runOptions.inputs` flowed) and
+// merged `context`, but the parent's other `options.inputs` were dropped: a
+// sub-investigation could not see data its parent was handed by name. The
+// child now receives every parent input, with the merged context on top
+// (decision 7). The parent's `question` is the one input it does not inherit —
+// the child declares its own (D108).
+
+describe("runRlm() — child inherits the parent's full options.inputs (#170)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("the child reads a non-context parent input, and the merged context still wins", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("sub", "SUB-CTX")\nSUBMIT("outer: " + result)\n```',
+      '```python\nSUBMIT(extra + "|" + context)\n```',
+    ]);
+
+    const result = await runRlm("parent", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "PARENT-CTX", extra: "EXTRA" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    // `extra` is the parent's value; `context` is the D52 merge, not the raw parent input.
+    assert.equal(result.answer, "outer: EXTRA|PARENT-CTX\n\nSUB-CTX");
+  });
+
+  it("the child's initial prompt announces the inherited input by name (#72 contract)", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT(rlm_query("sub"))\n```',
+      '```python\nSUBMIT("child")\n```',
+    ]);
+
+    const result = await runRlm("parent", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { extra: "EXTRA" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.answer, "child");
+    const childPrompt = llm.calls()[1].messages[0].content;
+    assert.ok(childPrompt.includes("# Question\nsub"), `not the child's prompt:\n${childPrompt}`);
+    assert.ok(
+      childPrompt.includes("# Input (available as `extra` variable)"),
+      `inherited input not announced:\n${childPrompt}`,
+    );
+    assert.ok(childPrompt.includes("EXTRA"), "the inherited value must be previewed");
+  });
+});
