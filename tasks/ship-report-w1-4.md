@@ -155,7 +155,7 @@ that contains the store is refused with all its tools; the accept command is not
   store (`~/.local/state/repl-simple/preambles/`; the verifier measured 14 files over one
   `test:contained` plus one `coverage` run, all keyed to `/tmp/repl-ext-*` temp dirs). Harmless in
   CI (writable `$HOME`), clutter locally; an unwritable `$HOME` fails its "runs the same tools once
-  the project is trusted" test closed. Fix is the same three lines `test/repl.test.ts:41–50` use:
+  the project is trusted" test closed. Fix is the same three lines `test/repl.test.ts:41–52` use:
   set `REPL_PREAMBLE_STORE_DIR` to a `mkdtempSync` dir at module load, restore the variable and
   remove the dir in a root-level `after`. Not done here: the file belongs to another chunk this wave.
 - **`README.md:117–127`** (W2-1): after "revoking trust stops the code running rather than waiting
