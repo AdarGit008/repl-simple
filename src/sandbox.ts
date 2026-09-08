@@ -1302,9 +1302,25 @@ export async function resumeSuspended(
   // be handed back: host paths are not in the dump, and a snapshot restored
   // without them keeps running, having silently turned every read of a mounted
   // file into `PermissionError` (measured). 0.0.18's `MontySnapshot.load()`
-  // could not re-establish them at all, which is #38; the half of that issue
-  // living in `session.ts`, where the run options are saved and never read
-  // back, is #84 and is untouched here.
+  // could not re-establish them at all, which was #38; `Session.resume` now
+  // carries the suspended run's `mount` (with its byte caps and limits) and
+  // hands them back through `runOpts`, which was #84.
+  //
+  // `LoadSnapshotOptions` audit (0.0.21; #38 "Do" item 3), field by field:
+  //   - `printCallback` — re-attached below; stdout after the resume is kept.
+  //   - `mount` — re-established by value from `runOpts.mount`, just above.
+  //   - `externalLookup` — consulted only by `resumeAuto()` for host
+  //     functions; this loop answers every `NameLookupSnapshot` itself with
+  //     `resume(name)`, so there is nothing to carry.
+  //   - `os` — consulted only by `resumeAuto()` for OS calls the mounts do not
+  //     cover; never supplied on `feedStart` either, so deny-by-default holds
+  //     on both sides of the suspension.
+  // Not options of the load at all: `inputs` are globals in the snapshot; the
+  // compute budget travels with it, limit and elapsed both (measured — the
+  // checkout's `limits` below govern nothing the restored feed does except
+  // the host wall clock, which restarts per segment by decision), as does the
+  // memory ceiling (#177); `scriptName` named the feed for diagnostics a
+  // resume cannot raise.
   const deadlineAt = hostDeadlineAt(runOpts?.limits);
 
   try {
