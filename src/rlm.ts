@@ -1,9 +1,10 @@
 import type { RunOptions, RunResult } from "./types.js";
 import { ToolRegistry, probeImportableModules, renderPythonToolRules } from "./registry.js";
-import { createRLMTools } from "./rlm_tools.js";
+import { createRLMTools, RLM_TOOL_CALL_CAP } from "./rlm_tools.js";
 import { estimateTokens, SpendBudget } from "./budget.js";
 import { runInSandbox } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
+import { redact } from "./redact.js";
 import {
   truncateText,
   formatSize,
@@ -13,7 +14,6 @@ import {
   OUTPUT_MAX_BYTES,
   VALUE_HEAD_RATIO,
   VALUE_RECOVERY,
-  HEAD_ONLY_RATIO,
 } from "./truncate.js";
 
 // ── RLM types ────────────────────────────────────────────────────
@@ -27,6 +27,16 @@ import {
  * `signal` is the caller's abort: implementations that support cancellation
  * should honour it so an aborted run stops being billed; the loop also races
  * against it as a safety net for clients that ignore it (#75).
+ *
+ * Threat model (#192, D99): implementations are **trusted host code** — the
+ * same trust as the process that constructs `runRlm`'s options — so the
+ * provider-error redaction guards against what a provider *response* carries
+ * (request-context tails, retry hints, request IDs), not against a hostile
+ * client. That is why the redaction is a 1 KiB head-only cut (#167, #184)
+ * and the bound it leaves — a rejection under 1 KiB, or one that leads with
+ * request context, passes its head verbatim to the caller and the model — is
+ * accepted rather than tightened. A client that wants less than that to reach
+ * either surface must strip it before rejecting.
  */
 export interface LlmClient {
   query(
@@ -98,7 +108,11 @@ export interface RlmOptions {
    * per value with an elision marker beyond that). Never pass secrets or
    * data the model must not see — the model reads these values from the
    * prompt and from sandbox code.
-   * `context` is always declared and defaults to `""` when absent.
+   * `context` is always declared and defaults to `""` when absent. A nested
+   * `rlm_query` child inherits every input here (#170), with the parent's
+   * context merged into its own. `question` is reserved (#173): the loop
+   * declares it from the question argument (a child's is its own query) and
+   * a caller-supplied one throws before any query.
    */
   inputs?: Record<string, string>;
   /** Sandbox RunOptions propagated to each sandbox run. */
@@ -211,11 +225,19 @@ const RLM_ERROR_RECOVERY = "The full provider error is not surfaced.";
  * Sites 2 and 3 reach two consumers each — the caller-visible
  * `iterations[].result.error` and the model-visible `buildFeedback` output —
  * and every one of them reads a message whose request-context tail is gone.
+ *
+ * The cut is the shared `redact()` (D100): secret-pattern masking, then a
+ * head-only `truncateText` with `unknownTotal` — the marker states where it
+ * cut, never how much it dropped (#191, D98). On a model-facing value cut the
+ * true total is an affordance; on a redaction cut it is a fact about the
+ * withheld text, and a 64 KiB rejection must not be distinguishable from a
+ * 1.2 KiB one through the marker when neither body is shown. The masking is
+ * defence in depth on top of the accepted head-only bound (#192, D99), not a
+ * tightening the bound relies on — see `docs/redaction.md`.
  */
 function redactProviderError(err: unknown): string {
-  return truncateText(err instanceof Error ? err.message : String(err), {
+  return redact(err instanceof Error ? err.message : String(err), {
     maxBytes: RLM_ERROR_MAX_BYTES,
-    headRatio: HEAD_ONLY_RATIO,
     recovery: RLM_ERROR_RECOVERY,
   }).text;
 }
@@ -263,6 +285,26 @@ const ASSISTANT_REPLY_MAX_BYTES = MAX_CONVERSATION_BYTES;
 const ASSISTANT_REPLY_RECOVERY =
   "Your previous reply exceeded the conversation budget and was truncated. Keep replies concise and re-state anything important.";
 
+// ── Synthesised answer cap (D101) ───────────────────────────────
+//
+// Every other `RlmResult.answer` source is bounded upstream — a submitted
+// answer is the sandbox's `output` (16 KiB), a salvaged one is `output` or
+// `stdout` (32 KiB) — but the cap-time synthesis reply was returned verbatim,
+// the one uncapped answer path. It is an API return, not a prompt-bound
+// view, so the cut is plain `truncateText` (no sentinel wrap — as
+// `RlmResult.error`), value-shaped because an answer is identified by both
+// ends.
+
+/** Byte ceiling on the synthesised answer (256 KiB, value shape). */
+const SYNTHESIS_ANSWER_MAX_BYTES = ASSISTANT_REPLY_MAX_BYTES;
+
+/**
+ * Route to an elided synthesised answer: there is none (policy Q3). The
+ * synthesis reply is not an iteration, so no `llmResponse` record keeps the
+ * raw text, and the caller cannot ask for the rest.
+ */
+const SYNTHESIS_ANSWER_RECOVERY = "The synthesised answer was truncated; the rest is not surfaced.";
+
 // ── Initial-prompt aggregate cap ───────────────────────────────
 //
 // Each input renders a whole block: a header plus a fenced per-value preview,
@@ -290,12 +332,23 @@ const INPUT_PREVIEW_RECOVERY =
 const QUESTION_MAX_BYTES = 64 * 1024;
 
 /**
- * Route to an elided question: the question is not a sandbox variable, so the
- * model cannot slice it — the marker must not advertise a route it cannot
- * honour (policy Q3). It directs the model to answer from the part shown and
- * flag ambiguity instead (#144, D8).
+ * Route to an elided question (#173, D108): the full question is declared as
+ * the reserved `question` sandbox input, so the model can slice it — the
+ * route exists now, and the marker names it (policy Q3). Before #173 the
+ * question was not a sandbox variable and this clause had to stay weak
+ * (#144, D8); that wording survives as `TOOL_PROMPT_RECOVERY` for the two
+ * paths that still have no sandbox on the reading side.
  */
 const QUESTION_RECOVERY =
+  "The question was truncated. The full question is available as the `question` Python variable — slice it in Python to see more.";
+
+/**
+ * Route to an elided tool-path ask — `llm_query`'s prompt and the downgrade
+ * query — deliberately weak (policy Q3): the sub-LLM that reads it has no
+ * sandbox and no `question` variable, so the marker must not advertise one.
+ * It directs the model to answer from the part shown and flag ambiguity.
+ */
+const TOOL_PROMPT_RECOVERY =
   "The question was truncated. Answer from the part shown and state the assumption if ambiguous.";
 
 // ── Tool-path prompt budgets (#171) ─────────────────────────────
@@ -334,6 +387,18 @@ const DOWNGRADE_CONTEXT_RECOVERY =
 
 /** Valid input names: a letter or underscore, then letters, digits or underscores. */
 const INPUT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * The loop's own input (#173, D108): the full question, declared from the
+ * `runRlm` argument so the model can slice it in Python. Reserved on both
+ * sides: a caller *input* of this name would be silently shadowed by the
+ * assignment, a caller *tool* of this name by the sandbox global (a str —
+ * `question(...)` a TypeError, the tool never called). The merge site
+ * refuses the first, `runRlm`'s start the second, the D51 precedent for the
+ * loop's tool names (D113). Not rendered as an input block: the `# Question`
+ * section already carries it.
+ */
+const QUESTION_INPUT = "question";
 
 /**
  * Python keywords the identifier pattern cannot reject: `class`, `def`,
@@ -572,6 +637,19 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
   const stubs = await registry.renderTypeStubs();
   const importableModules = await probeImportableModules();
   const rules = renderPythonToolRules(importableModules);
+  // #67 (D105): a tool whose stub degraded has no checked signature, so the
+  // model is told which calls it must check itself. Absent on a clean
+  // registry — the shipped prompt is byte-identical.
+  const { tools: unchecked } = await registry.degradedStubs();
+  const uncheckedSection =
+    unchecked.length > 0
+      ? [
+          "",
+          "## Unchecked Tools",
+          "The type checker cannot validate calls to these tools — check their arguments yourself:",
+          ...unchecked.map((tool) => `- ${tool.name} — ${tool.detail}`),
+        ]
+      : [];
 
   return [
     DEFAULT_RLM_SYSTEM_PROMPT,
@@ -582,6 +660,7 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
     "Call these as plain functions (no await, no import):",
     "",
     stubs || "(standard Python only)",
+    ...uncheckedSection,
     "",
     "## Python Rules",
     rules,
@@ -610,6 +689,24 @@ const LLM_QUERY_REFUSED = "[llm_query refused: spend budget exhausted]";
 
 /** `rlm_query` downgrade refusal — same shape, distinct tool. */
 const RLM_QUERY_REFUSED = "[rlm_query refused: spend budget exhausted]";
+
+// ── Per-iteration invocation cap (#168, D97) ────────────────────
+//
+// The budget bounds spend; nothing bounded *breadth*. One sandbox execution
+// could call `llm_query` / `rlm_query` any number of times — and a nested
+// `rlm_query` builds a registry and a system prompt (per-spawn host work)
+// before its first charge attempt, so a tight budget refused the LLM call and
+// still paid for the spawn. The cap is 16 combined invocations of those two
+// tools per iteration (decision 4), counted in the closures below and reset
+// before every sandbox run. It is checked first — before the #171 bound, the
+// charge, the depth check and any nested `runRlm` — and it refuses the D63
+// way: a marker as the tool's return value, never a throw, budget or not.
+
+/** `llm_query` refusal over the per-iteration cap. */
+const LLM_QUERY_CAPPED = `[llm_query refused: per-iteration cap of ${RLM_TOOL_CALL_CAP} llm_query/rlm_query calls reached]`;
+
+/** `rlm_query` refusal over the per-iteration cap — spawn and downgrade alike. */
+const RLM_QUERY_CAPPED = `[rlm_query refused: per-iteration cap of ${RLM_TOOL_CALL_CAP} llm_query/rlm_query calls reached]`;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -790,6 +887,9 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
   // bounded and marker-complete — fences always close within a preview.
   const inputBlocks: string[] = [];
   for (const [name, value] of Object.entries(inputs)) {
+    // #173: the question is declared for the sandbox's sake; the `# Question`
+    // section already carries it, so it is never an input block too.
+    if (name === QUESTION_INPUT) continue;
     const header = name === "context" ? "# Context" : "# Input";
     const headerLine = `${header} (available as \`${name}\` variable)`;
     if (value) {
@@ -820,7 +920,13 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
 
   const parts = [`# Question\n${questionText}`];
   if (inputSection) parts.push(`\n${inputSection}`);
-  parts.push(`\nWrite Python code to answer the question. Call SUBMIT(answer) when done.`);
+  // The trailer announces the `question` variable the way the input headers
+  // announce theirs (#72): data the sandbox holds but the prompt never names
+  // is invisible. The leading sentence is a pinned literal — extend, do not
+  // reword.
+  parts.push(
+    `\nWrite Python code to answer the question. The full question is available as the \`${QUESTION_INPUT}\` variable. Call SUBMIT(answer) when done.`,
+  );
   return parts.join("\n");
 }
 
@@ -1106,6 +1212,16 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       );
     }
   }
+  // #173 (D108, D113): the reserved `question` input is a sandbox global. A
+  // caller tool of that name would be merged and then shadowed by the str —
+  // `question(...)` a TypeError, the tool never called, nothing saying why —
+  // so refuse it here, the D51 rule applied to the loop's own input.
+  if (options.registry.has(QUESTION_INPUT)) {
+    throw new Error(
+      `runRlm: tool '${QUESTION_INPUT}' conflicts with the reserved '${QUESTION_INPUT}' input — ` +
+        "the sandbox variable would shadow the tool. Rename it.",
+    );
+  }
   if (!Number.isInteger(maxIterations) || maxIterations < 1) {
     throw new Error("runRlm: maxIterations must be a positive integer");
   }
@@ -1144,12 +1260,27 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       throw new TypeError(`invalid input name: ${name} — reserved Python keyword`);
     }
   }
+  // #173 (D108): the question is the loop's own input. A caller's would be
+  // silently shadowed by the assignment below, so refuse it — from either
+  // source, before any query.
+  if (QUESTION_INPUT in runInputs) {
+    throw new Error(
+      `runRlm: input '${QUESTION_INPUT}' is reserved — the loop declares it from the question argument`,
+    );
+  }
   runInputs.context = runInputs.context ?? "";
+  runInputs[QUESTION_INPUT] = question;
   sandboxRunOpts.inputs = runInputs;
   sandboxRunOpts.scriptName = sandboxRunOpts.scriptName ?? "rlm.py";
   if (options.signal) {
     sandboxRunOpts.signal = options.signal;
   }
+
+  // Combined `llm_query` + `rlm_query` invocations in the current iteration
+  // (#168, D97). Reset to 0 right before each sandbox run; each nested loop
+  // has its own (its own closures), so the parent counts the spawn and the
+  // child counts its own tools.
+  let toolCallsThisIteration = 0;
 
   // The sandbox registry is the caller's tools merged with the loop's own
   // RLM tools (llm_query, rlm_query, SUBMIT). `llm_query` is a single-turn
@@ -1159,6 +1290,9 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     ...options.registry.list(),
     ...createRLMTools({
       onLLMQuery: async (prompt) => {
+        // #168: the cap is the first check — before the bound, the charge
+        // and the provider — so a refused call costs nothing at all.
+        if (++toolCallsThisIteration > RLM_TOOL_CALL_CAP) return LLM_QUERY_CAPPED;
         // #171: the prompt is the whole ask, written by the model — bound it
         // exactly as the main loop bounds its question, and before anything
         // else, so the charge below prices what actually goes out and a forged
@@ -1166,7 +1300,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         const boundedPrompt = truncateWithSentinels(prompt, {
           maxBytes: QUESTION_MAX_BYTES,
           headRatio: VALUE_HEAD_RATIO,
-          recovery: QUESTION_RECOVERY,
+          recovery: TOOL_PROMPT_RECOVERY,
         });
         // D62/D63: a tool-mediated call charges the shared pool before it runs,
         // at the same per-call cost as the top-level loop. If it cannot charge,
@@ -1198,6 +1332,10 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
         }
       },
       onRLMQuery: async (query, context) => {
+        // #168: checked before the depth branch, so a refused spawn never
+        // builds a child registry or system prompt (the per-spawn host work
+        // the budget could not bound) and a refused downgrade never charges.
+        if (++toolCallsThisIteration > RLM_TOOL_CALL_CAP) return RLM_QUERY_CAPPED;
         const depth = options.depth ?? 0;
         const maxDepth = options.maxDepth ?? 1;
 
@@ -1223,7 +1361,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
             `Query: ${truncateWithSentinels(query, {
               maxBytes: QUESTION_MAX_BYTES,
               headRatio: VALUE_HEAD_RATIO,
-              recovery: QUESTION_RECOVERY,
+              recovery: TOOL_PROMPT_RECOVERY,
             })}\n` +
             `Context: ${contextText}`;
           // D62/D63: the downgrade charges the shared pool before it runs, at
@@ -1265,7 +1403,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           // budget is a hard ceiling on total tree spend. `onIteration` is
           // deliberately not forwarded: child iterations are the child's own.
           budget,
-          inputs: { context: merged },
+          // #170 (D107): the child inherits every parent input — a
+          // sub-investigation must not be blind to data its parent was handed
+          // by name — with the merged context on top. `runOptions.inputs`
+          // already flows through `runOptions` above.
+          inputs: { ...(options.inputs ?? {}), context: merged },
         });
 
         return nested.status === "ok"
@@ -1402,7 +1544,9 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
       sandboxRunOpts.lineOffset = options.preamble.split("\n").length;
     }
 
-    // 4. Run in sandbox
+    // 4. Run in sandbox. The invocation cap is per iteration (#168): the
+    // count starts from zero for every run.
+    toolCallsThisIteration = 0;
     const result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);
 
     // 5. Record iteration
@@ -1532,7 +1676,12 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     if (!options.signal?.aborted) {
       return {
         status: "max_iterations",
-        answer: synthesized,
+        // D101: the one answer path nothing upstream bounds.
+        answer: truncateText(synthesized, {
+          maxBytes: SYNTHESIS_ANSWER_MAX_BYTES,
+          headRatio: VALUE_HEAD_RATIO,
+          recovery: SYNTHESIS_ANSWER_RECOVERY,
+        }).text,
         answerSource: "synthesised",
         iterations,
         ...(report ? { budget: report } : {}),

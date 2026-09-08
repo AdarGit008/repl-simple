@@ -456,6 +456,31 @@ block-level elision over whole per-value previews (D15), so no cut can split a f
 
 **#189 / #190 (one rule site, and the cause behind it).** #167 bounded the D53 catch and #184 bounded the two tool paths, but the D53 catch kept spelling the `truncateText` call out inline instead of calling the helper #184 had introduced — one rule under two spellings, which a later change to the cap, the ratio or the marker would have split silently. All three provider-error surfaces now call `redactProviderError` and nothing else, and it is the only place in `rlm.ts` that names `RLM_ERROR_MAX_BYTES` / `HEAD_ONLY_RATIO` / `RLM_ERROR_RECOVERY` together. Behaviour is unchanged: the row above still reads 1 KiB, head-only, for every one of them. The two tool paths additionally go through `sandboxProviderError`, which builds `new Error(redactProviderError(err), { cause: err })` — the redacted message is still the whole of what crosses into the sandbox (`src/sandbox.ts` reads `err.message` and nothing else when mapping a tool throw to a Python `RuntimeError`), so the cause is an in-process debugging affordance that no truncated surface can reach. The pin is an equality one: the tool-call trace's `error` — the field carrying `err.message` verbatim out of the sandbox — must equal, byte for byte, what the D53 catch produces for the same rejection.
 
+**#191 (marker magnitude on a redaction cut).** Invariant 5 — counters keep counting — makes the
+marker state the true total, and on a model-facing value cut that total is an affordance: the model
+needs to know how much it is not seeing. On a *redaction* cut the calculus is different. The total is
+a fact about the withheld text, and it reached both the model (`buildFeedback`) and the caller
+(`iterations[].result.error`, `RlmResult.error`): a 64 KiB provider rejection and a 1.2 KiB one were
+distinguishable through `[… 63.0KB of 64.0KB elided. …]` even though neither body was shown. The
+truncator already had the switch for a caller that cannot or should not claim a total —
+`TruncatorOptions.unknownTotal`, built for `http_get` — and `redactProviderError` now passes it, so
+every redaction marker reads `[… truncated at 1.0KB. The full provider error is not surfaced. …]`:
+where it cut, nothing about what it dropped. Scoped to the redaction path only; the `stdout` /
+`output` / value surfaces keep their true totals. (Decision 7, D98.)
+
+**#192 (which provider clients are in scope).** The 1 KiB head-only window passes a rejection under
+1 KiB byte-for-byte, and keeps the head of one that *leads* with request context. Whether that is a
+bound or a defect turns on who writes `LlmClient` implementations, and the answer is recorded on the
+interface itself (`src/rlm.ts`, where it is declared): **`LlmClient` implementations are
+trusted host code** — the same trust as the process that constructs `runRlm`'s options. The redaction therefore
+guards against what a provider *response* carries — request-context tails, retry hints, request IDs
+— not against a hostile client, and the 1 KiB head-only bound is **accepted**, not tightened (lowering
+the cap does nothing for a short error; pattern-stripping a moving target misses silently; dropping
+the message entirely kills the debuggability with it). A client that wants less than 1 KiB of a
+rejection to reach either surface strips it before rejecting. The secret masking that
+`src/redact.ts` composes in front of the cut (see `docs/redaction.md`) is defence in depth on top of
+this accepted bound — a known-pattern net, not a tightening the bound relies on. (Decision 7, D99.)
+
 **#171 (the two tool-path prompts).** `llm_query(prompt)` and the `depth >= maxDepth` downgrade of `rlm_query(query, context)` assemble a user message out of strings the *model* wrote and hand it to the provider. The main loop has always bounded its own question and its input previews before they reach a prompt; these two paths bounded nothing, so a runaway generation could ship an arbitrarily large body — and, with no neutralising pass, could plant a `[TRUNCATED VIEW BEGIN]`/`[TRUNCATED VIEW END]` pair that the sub-LLM, reading under the same D17 system-prompt rule, would take as authentic.
 
 Each string now goes through `truncateWithSentinels` at the ceiling of whatever it corresponds to in the main loop, rather than at one shared number: the ask *is* a question, so `llm_query`'s prompt and the downgrade's query take `QUESTION_MAX_BYTES` and `QUESTION_RECOVERY`; the downgrade's context is one value, so it takes `INPUT_PREVIEW_VALUE_MAX_BYTES`. Two budgets, not one — a shared budget would let a huge query starve the context, or let a huge context ride the question's much larger allowance. Both are value cuts (50/50 head+tail), not redactions: the goal is to keep the ask legible at both ends, not to withhold a tail.
@@ -464,7 +489,7 @@ The context's recovery clause is a new constant, `DOWNGRADE_CONTEXT_RECOVERY`, a
 
 The bound is applied *before* the spend charge, not after. The charge is a before-the-call price on what the call will cost (D62), so pricing the raw prompt once a ceiling exists would bill a run for tokens it never sends — and could refuse a call that would have fitted.
 
-**Redaction shape (general rule):** redaction cuts are head-only (`HEAD_ONLY_RATIO`) — 50/50 head+tail is a *value* shape (identified by both ends at once) and keeps the tail, which is exactly where provider request-context / retry-hints / request-IDs live. Use head-only for anything whose goal is *redaction* rather than symmetric display.
+**Redaction shape (general rule):** redaction cuts are head-only (`HEAD_ONLY_RATIO`) — 50/50 head+tail is a *value* shape (identified by both ends at once) and keeps the tail, which is exactly where provider request-context / retry-hints / request-IDs live. Use head-only for anything whose goal is *redaction* rather than symmetric display. A redaction marker carries **no magnitude** (`unknownTotal`, #191): it states where it cut, never how much it withheld. Both halves of the rule live in one place, `redact()` in `src/redact.ts`, which composes secret-pattern masking in front of the cut (`docs/redaction.md`); new redaction sites call it rather than `truncateText` directly.
 
 **Exception 3 — the conversation byte count uses `TextEncoder`, and that *is* byte measurement.**
 D2 writes the budget as `Buffer.byteLength`; `TextEncoder.encode().length` is UTF-8 byte measurement

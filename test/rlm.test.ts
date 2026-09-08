@@ -4,6 +4,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
+// The #169 memo exports are reached through the namespace so that, run
+// against a `src/` without them, only their test fails rather than this
+// whole file failing to link (D109).
+import * as registryModule from "../src/registry.js";
 import { estimateTokens, SpendBudget } from "../src/budget.js";
 import type { HostTool, RunErrorKind } from "../src/types.js";
 
@@ -4114,10 +4118,13 @@ describe("runRlm() — question cap", () => {
       `question section is ${Buffer.byteLength(questionSection, "utf8")} bytes`,
     );
     assert.match(questionSection, /elided/, "the truncation marker must state what went");
+    // #173 (D108): the question is a sandbox variable now, so the recovery
+    // clause names the route that exists — slicing `question` in Python —
+    // instead of the old "answer from the part shown" hedge.
     assert.match(
       questionSection,
-      /state the assumption/,
-      "the recovery clause must direct the model to answer from what is shown",
+      /available as the `question` Python variable — slice it in Python to see more/,
+      "the recovery clause must name the `question` variable route",
     );
   });
 
@@ -4203,7 +4210,7 @@ describe("runRlm() — question cap", () => {
       });
       const section = questionSectionOf(llm.calls()[0].messages[0].content);
       assert.match(section, /elided/, "the truncation marker must fire just over the budget");
-      assert.match(section, /state the assumption/);
+      assert.match(section, /slice it in Python to see more/, "the #173 route (D108)");
       assert.ok(
         Buffer.byteLength(section, "utf8") <= 64 * 1024,
         `question section is ${Buffer.byteLength(section, "utf8")} bytes`,
@@ -4282,8 +4289,8 @@ describe("runRlm() — composition and boundary strength", () => {
     assert.match(questionSection, /elided/, "the truncation marker must state what went");
     assert.match(
       questionSection,
-      /state the assumption/,
-      "the recovery clause must direct the model to answer from what is shown",
+      /available as the `question` Python variable — slice it in Python to see more/,
+      "the recovery clause must name the `question` variable route (#173, D108)",
     );
 
     // The input section: test 7's locators — the first input's header and the
@@ -5422,5 +5429,793 @@ describe("runRlm() — defaults (D58)", () => {
     const feedback = llm.calls()[1].messages[llm.calls()[1].messages.length - 1].content;
     assert.match(feedback, / --> rlm\.py:1:/, 'the default scriptName is "rlm.py"');
     assert.doesNotMatch(feedback, / --> <repl>:/, "the sandbox fallback must not leak through");
+  });
+});
+
+// ── Per-iteration llm_query / rlm_query cap (#168, D97) ─────────
+//
+// A single sandbox execution could invoke `llm_query` / `rlm_query` any number
+// of times: the only refusals were the optional SpendBudget and the wall
+// clock, and a nested `rlm_query` ran `buildSystemPrompt` — per-spawn host
+// work — before its first charge. The cap is 16 combined invocations per
+// iteration (decision 4), those two tools only, refused with a marker the way
+// D63 refuses a budget miss: the sandbox sees the marker as the tool's return
+// value, nothing throws, and a budget is not required for the cap to apply.
+
+describe("runRlm() — per-iteration llm_query/rlm_query cap (#168)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  // The cap and both markers are a sandbox-facing contract, pinned as
+  // literals for the reason the D63 markers are: a test that reads them from
+  // the module under test cannot notice the module changing them.
+  const CAP = 16;
+  const LLM_QUERY_CAPPED =
+    "[llm_query refused: per-iteration cap of 16 llm_query/rlm_query calls reached]";
+  const RLM_QUERY_CAPPED =
+    "[rlm_query refused: per-iteration cap of 16 llm_query/rlm_query calls reached]";
+
+  /** Python that calls `llm_query` n times and submits the joined results. */
+  function floodLlmQuery(n: number, submit = true): string {
+    return (
+      "```python\n" +
+      "out = []\n" +
+      `for i in range(${n}):\n` +
+      '    out.append(llm_query("ask " + str(i)))\n' +
+      (submit ? 'SUBMIT("|".join(out))\n' : 'print("|".join(out))\n') +
+      "```"
+    );
+  }
+
+  /** Python that calls `rlm_query` n times and submits the joined results. */
+  function floodRlmQuery(n: number, query: string): string {
+    return (
+      "```python\n" +
+      "out = []\n" +
+      `for i in range(${n}):\n` +
+      `    out.append(rlm_query(${JSON.stringify(query)}))\n` +
+      'SUBMIT("|".join(out))\n' +
+      "```"
+    );
+  }
+
+  const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
+
+  /** The cost the loop charges for one recorded LLM call (D62). */
+  function recordedCost(call: {
+    systemPrompt: string;
+    messages: Array<{ role: string; content: string }>;
+  }): number {
+    return (
+      estimateTokens(call.systemPrompt) +
+      call.messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    );
+  }
+
+  it("refuses the 17th llm_query of an iteration with the exact marker, no budget", async () => {
+    // Calls 1-16 reach the provider; the 17th never does and returns the
+    // marker in their place. No SpendBudget is configured: the cap must stand
+    // on its own (decision 4).
+    const { llm } = mockLlmCodeGen([floodLlmQuery(CAP + 1), ...Array(CAP).fill("reply")]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    const parts = result.answer.split("|");
+    assert.equal(parts.length, CAP + 1);
+    assert.deepEqual(parts.slice(0, CAP), Array(CAP).fill("reply"));
+    assert.equal(parts[CAP], LLM_QUERY_CAPPED, "the 17th call must return the cap marker");
+    assert.equal(llm.calls().length, 1 + CAP, "exactly 16 llm_query calls may reach the LLM");
+  });
+
+  it("applies the cap under a generous budget too — the two limits are independent", async () => {
+    const { llm } = mockLlmCodeGen([floodLlmQuery(CAP + 1), ...Array(CAP).fill("reply")]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      budget: 10_000_000,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(count(result.answer, LLM_QUERY_CAPPED), 1);
+    assert.equal(llm.calls().length, 1 + CAP);
+    assert.equal(result.budget?.limited, false, "the cap is not a budget stop (D4)");
+    // The refused call charged nothing: consumed is exactly the 17 calls that
+    // ran (code-gen plus 16 llm_query), each priced by the recorded cost.
+    const expected = llm.calls().reduce((sum, call) => sum + recordedCost(call), 0);
+    assert.equal(result.budget?.consumed, expected);
+  });
+
+  it("counts llm_query and rlm_query together — the 17th of either kind is refused", async () => {
+    // 8 llm_query then 9 downgraded rlm_query: the 17th invocation is an
+    // rlm_query, so it is the rlm_query marker that comes back.
+    const code =
+      "```python\n" +
+      "out = []\n" +
+      "for i in range(8):\n" +
+      '    out.append(llm_query("a"))\n' +
+      "for i in range(9):\n" +
+      '    out.append(rlm_query("b", "c"))\n' +
+      'SUBMIT("|".join(out))\n' +
+      "```";
+    const { llm } = mockLlmCodeGen([code, ...Array(CAP).fill("reply")]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.status, "ok");
+    const parts = result.answer.split("|");
+    assert.equal(parts.length, 17);
+    assert.deepEqual(parts.slice(0, CAP), Array(CAP).fill("reply"));
+    assert.equal(parts[CAP], RLM_QUERY_CAPPED);
+    assert.equal(count(result.answer, LLM_QUERY_CAPPED), 0, "no llm_query call was refused");
+    assert.equal(llm.calls().length, 1 + CAP);
+  });
+
+  it("refuses a spawning rlm_query before any nested host work (registry spy)", async () => {
+    // A nested loop's first act is `options.registry.list()` (the merge that
+    // precedes `buildSystemPrompt`), so a spy on the caller's registry counts
+    // spawned children exactly. 20 rlm_query calls must start 16 children:
+    // the four refusals happen before the child's registry merge, hence
+    // before its `buildSystemPrompt` and its sandbox.
+    const registry = rlmRegistry();
+    let listCalls = 0;
+    const originalList = registry.list.bind(registry);
+    registry.list = () => {
+      listCalls++;
+      return originalList();
+    };
+
+    const CHILD = "SUB-INVESTIGATION";
+    let childCodeGens = 0;
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        if (messages[0].content.includes(`# Question\n${CHILD}`)) {
+          childCodeGens++;
+          return '```python\nSUBMIT("child")\n```';
+        }
+        return floodRlmQuery(20, CHILD);
+      },
+    };
+
+    const result = await runRlm("root", { llmClient: llm, registry, maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    assert.equal(childCodeGens, CAP, "exactly 16 children may spawn");
+    assert.equal(listCalls, 1 + CAP, "a refused rlm_query must not reach the child's merge");
+    assert.equal(count(result.answer, "child"), CAP);
+    assert.equal(count(result.answer, RLM_QUERY_CAPPED), 4);
+  });
+
+  it("resets the count every iteration: a 17th call is refused, the next iteration's 16 are not", async () => {
+    // Iteration one makes 17 calls (the 17th refused); iteration two makes 16
+    // and every one of them reaches the LLM. A counter that did not reset
+    // would refuse all 16 of the second iteration.
+    const { llm } = mockLlmCodeGen([
+      floodLlmQuery(CAP + 1, false),
+      ...Array(CAP).fill("first"),
+      floodLlmQuery(CAP),
+      ...Array(CAP).fill("second"),
+    ]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.iterations.length, 2);
+    const firstStdout = result.iterations[0].result.stdout;
+    assert.equal(count(firstStdout, LLM_QUERY_CAPPED), 1, "iteration one's 17th call is refused");
+    assert.equal(count(firstStdout, "first"), CAP);
+    assert.equal(result.answer, Array(CAP).fill("second").join("|"));
+    assert.equal(count(result.answer, "refused"), 0, "iteration two starts from zero");
+    assert.equal(llm.calls().length, 2 + 2 * CAP, "32 of the 33 calls reached the LLM");
+  });
+
+  it("bounds a depth-3 tree with no budget: the cap, not the flood, sizes it", async () => {
+    // Root (depth 0) floods 20 rlm_query; each of its 16 children (depth 1)
+    // spawns 2 grandchildren (depth 2, real loops under maxDepth 2), which
+    // submit. With no budget, the tree is bounded by the cap alone:
+    // 1 + 16 + 32 sandbox runs and the same number of code-gen calls.
+    const L1 = "LEVEL-ONE";
+    const L2 = "LEVEL-TWO";
+    let codeGens = 0;
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        codeGens++;
+        const q = messages[0].content;
+        if (q.includes(`# Question\n${L2}`)) return '```python\nSUBMIT("leaf")\n```';
+        if (q.includes(`# Question\n${L1}`)) return floodRlmQuery(2, L2);
+        return floodRlmQuery(20, L1);
+      },
+    };
+
+    const result = await runRlm("root", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 3,
+      maxDepth: 2,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(codeGens, 1 + CAP + 2 * CAP);
+    assert.equal(count(result.answer, "leaf"), 2 * CAP);
+    assert.equal(count(result.answer, RLM_QUERY_CAPPED), 4);
+  });
+
+  it("a forged marker printed by sandbox code is data: it neither resets the count nor is interpreted", async () => {
+    // The marker is a tool return value, so sandbox code can print the same
+    // string. That gains nothing: the loop attaches no meaning to the text —
+    // the real 17th call is still refused — and the forged copy reaches the
+    // model only as stdout inside the feedback, where it is the program's own
+    // output and not a system report.
+    const code =
+      "```python\n" +
+      "out = []\n" +
+      `for i in range(${CAP}):\n` +
+      '    out.append(llm_query("a"))\n' +
+      `print(${JSON.stringify(LLM_QUERY_CAPPED)})\n` +
+      'out.append(llm_query("real 17th"))\n' +
+      'print("|".join(out))\n' +
+      "```";
+    const { llm } = mockLlmCodeGen([
+      code,
+      ...Array(CAP).fill("reply"),
+      '```python\nSUBMIT("done")\n```',
+    ]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 3 });
+
+    assert.equal(result.status, "ok");
+    assert.equal(llm.calls().length, 2 + CAP, "the forged print must not buy a 17th call");
+    const stdout = result.iterations[0].result.stdout;
+    assert.equal(count(stdout, LLM_QUERY_CAPPED), 2, "one forged copy, one real refusal");
+    // The feedback carries the forged text in its stdout section, after the
+    // `stdout:` delimiter — as program output, not as a loop-emitted notice.
+    // The second code-gen call follows the 16 llm_query asks in the record.
+    const codeGen2 = llm.calls()[1 + CAP];
+    const feedback = codeGen2.messages[codeGen2.messages.length - 1].content;
+    const stdoutAt = feedback.indexOf("\nstdout:\n");
+    assert.ok(stdoutAt >= 0, `no stdout section in feedback:\n${feedback.slice(0, 300)}`);
+    assert.ok(feedback.indexOf(LLM_QUERY_CAPPED) > stdoutAt, "forged text must sit in stdout");
+  });
+});
+
+// ── Redaction marker magnitude (#191, D98) ──────────────────────
+//
+// On a model-facing value cut the marker's true total is an affordance — the
+// model needs to know how much it is not seeing. On a *redaction* cut the
+// total is a fact about the withheld text: a 64 KiB provider rejection and a
+// 1.2 KiB one were distinguishable through the marker even though neither
+// body was shown. The redaction now passes `unknownTotal`, so the marker
+// states where it cut and nothing about what it dropped.
+
+describe("runRlm() — redaction marker hides the redacted size (#191)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  const HUGE = `${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`;
+
+  /** The #191 shape: where it cut, never how much or of what total. */
+  function assertHidesMagnitude(text: string, label: string): void {
+    assert.match(
+      text,
+      /\[… truncated at 1\.0KB\. The full provider error is not surfaced\. …\]/,
+      `${label}: marker must state where it cut:\n${text.slice(-160)}`,
+    );
+    assert.doesNotMatch(text, /elided/, `${label}: marker must not state how much was dropped`);
+    assert.doesNotMatch(text, /64\.0KB|63\.0KB/, `${label}: marker must not disclose the total`);
+    assert.ok(!text.includes("TAIL-SECRET-REQID"), `${label}: tail leaked`);
+  }
+
+  it("the D53 RlmResult.error marker states where it cut, not the total", async () => {
+    const llm: LlmClient = {
+      async query() {
+        throw new Error(HUGE);
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 1 });
+
+    assert.equal(result.status, "error");
+    assertHidesMagnitude(result.error!, "RlmResult.error");
+  });
+
+  it("the llm_query tool path hides the size on both surfaces", async () => {
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw new Error(HUGE);
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 1 });
+
+    assert.equal(result.iterations[0].result.status, "error");
+    assertHidesMagnitude(result.iterations[0].result.error!, "iterations[].result.error");
+    assertHidesMagnitude(buildFeedback(result.iterations[0].result), "buildFeedback");
+  });
+
+  it("the downgraded rlm_query path hides the size on both surfaces", async () => {
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```';
+        throw new Error(HUGE);
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.iterations[0].result.status, "error");
+    assertHidesMagnitude(result.iterations[0].result.error!, "iterations[].result.error");
+    assertHidesMagnitude(buildFeedback(result.iterations[0].result), "buildFeedback");
+  });
+
+  it("the nested [rlm_query error: …] re-interpolation hides the size", async () => {
+    const nestedQuestion = "SUB-INVESTIGATION";
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        if (messages[0].content.includes(`# Question\n${nestedQuestion}`)) {
+          throw new Error(HUGE);
+        }
+        return (
+          "```python\n" +
+          `result = rlm_query(${JSON.stringify(nestedQuestion)})\n` +
+          'SUBMIT("outer: " + result)\n' +
+          "```"
+        );
+      },
+    };
+
+    const result = await runRlm("outer task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.ok(result.answer.startsWith("outer: [rlm_query error: error] A"));
+    assertHidesMagnitude(result.answer, "nested answer");
+  });
+});
+
+// ── Provider-error threat model is written down (#192, D99) ─────
+//
+// #192 asked which provider clients are in scope, because the answer decides
+// whether the 1 KiB head-only window (which passes a short or leading secret
+// verbatim) is an accepted bound or a defect. The decision — `LlmClient`
+// implementations are trusted host code; the bound is accepted — has to live
+// where the interface is declared and in the normative policy, not only in a
+// ship report. Pinned at the source, the way test 6 pins invariant 4.
+
+describe("LlmClient threat model is recorded where it is read (#192)", () => {
+  const here = fileURLToPath(import.meta.url);
+  const rlmSource = readFileSync(join(here, "..", "..", "src", "rlm.ts"), "utf-8");
+  const policy = readFileSync(join(here, "..", "..", "docs", "truncation-policy.md"), "utf-8");
+
+  it("the LlmClient doc block in src/rlm.ts declares implementations trusted host code", () => {
+    const at = rlmSource.indexOf("export interface LlmClient");
+    assert.ok(at > 0, "LlmClient is declared in src/rlm.ts (not src/types.ts)");
+    const docStart = rlmSource.lastIndexOf("/**", at);
+    const docBlock = rlmSource.slice(docStart, at);
+    assert.match(
+      docBlock,
+      /trusted host code/,
+      `LlmClient doc lacks the trust sentence:\n${docBlock}`,
+    );
+    assert.match(docBlock, /1 KiB/, "the doc must name the accepted head-only bound");
+    assert.match(docBlock, /#192/, "the doc must cite the issue that recorded the decision");
+  });
+
+  it("the truncation policy records the #191 and #192 decisions", () => {
+    const p191 = policy.indexOf("**#191");
+    const p192 = policy.indexOf("**#192");
+    assert.ok(p191 > 0, "policy has no #191 narrative");
+    assert.ok(p192 > 0, "policy has no #192 narrative");
+    const n191 = policy.slice(p191, p191 + 1500);
+    const n192 = policy.slice(p192, p192 + 1500);
+    assert.match(n191, /unknownTotal/, "the #191 narrative must name the switch it flips");
+    assert.match(n191, /truncated at 1\.0KB/, "the #191 narrative must show the marker shape");
+    assert.match(n192, /trusted host code/, "the #192 narrative must state the trust decision");
+    assert.match(n192, /1 KiB/, "the #192 narrative must name the accepted bound");
+  });
+});
+
+// ── Synthesised answer cap (D101) ───────────────────────────────
+//
+// Every other `RlmResult.answer` source is bounded upstream: a submitted
+// answer is the sandbox's `output` (16 KiB cap), a salvaged one is `output`
+// or `stdout` (32 KiB cap). The synthesis reply was returned verbatim — the
+// only uncapped answer path — and the monitor report's claim that it "flows
+// through the D18 cap" was wrong: D18 caps the conversation copy of
+// iteration replies, and the synthesis reply is not an iteration.
+
+describe("runRlm() — synthesised answer cap (D101)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  const SYNTHESIS_RECOVERY = "The synthesised answer was truncated; the rest is not surfaced.";
+
+  const explore = "```python\nprint('still working')\n```";
+
+  it("caps a 1.4 MB synthesised reply at 256 KiB, both ends kept, marker in the middle", async () => {
+    const huge = `${"H".repeat(700 * 1024)}MIDDLE-SENTINEL${"T".repeat(700 * 1024)}`;
+    const { llm } = mockLlmCodeGen([explore, explore, huge]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 2 });
+
+    assert.equal(result.status, "max_iterations");
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(llm.calls().length, 3, "two iterations plus the synthesis call");
+    const size = Buffer.byteLength(result.answer, "utf8");
+    assert.ok(size <= 256 * 1024, `synthesised answer is ${size} bytes, over the 256 KiB ceiling`);
+    assert.ok(
+      size > 200 * 1024,
+      `synthesised answer is only ${size} bytes — the budget is unspent`,
+    );
+    // A value cut: identified by both ends, the middle elided.
+    assert.ok(result.answer.startsWith("H".repeat(64)), "head lost");
+    assert.ok(
+      result.answer.endsWith("T".repeat(64)),
+      "tail lost — this is a value cut, not head-only",
+    );
+    assert.ok(!result.answer.includes("MIDDLE-SENTINEL"));
+    assert.match(result.answer, /\[… [0-9.]+[KM]B of [0-9.]+MB elided\. /);
+    assert.ok(result.answer.includes(SYNTHESIS_RECOVERY), "recovery clause missing");
+    // An API return, not a prompt-bound view: no sentinel wrap (as RlmResult.error).
+    assert.ok(!result.answer.includes("[TRUNCATED VIEW"), "sentinels must not leak into the API");
+  });
+
+  it("holds the 256 KiB ceiling on a reply just over 1 MiB (truncator marker reserve)", {
+    todo:
+      "src/truncate.ts (not owned by W1-5) reserves the marker at `elided = totalBytes`, assuming " +
+      "the elided figure never renders wider than the total — but formatSize prints a sub-MB " +
+      "elided count as e.g. `944.0KB` (7 chars) against a `1.2MB` total (5 chars), so a cut of a " +
+      "1–1.35 MB value overshoots invariant 1 by 2–3 bytes on every truncateText surface. " +
+      "Intended fix: reserve with the widest rendering of any elided value ≤ total " +
+      "(max over formatSize widths at the 1 MB boundary), then flip this todo off.",
+  }, async () => {
+    const justOverOneMiB = `${"H".repeat(600 * 1024)}MIDDLE${"T".repeat(600 * 1024)}`;
+    const { llm } = mockLlmCodeGen([explore, explore, justOverOneMiB]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 2,
+    });
+
+    assert.equal(result.answerSource, "synthesised");
+    const size = Buffer.byteLength(result.answer, "utf8");
+    assert.ok(size <= 256 * 1024, `synthesised answer is ${size} bytes, over the 256 KiB ceiling`);
+  });
+
+  it("passes a synthesised reply at the budget byte-identical", async () => {
+    const atBudget = "S".repeat(256 * 1024);
+    const { llm } = mockLlmCodeGen([explore, explore, atBudget]);
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 2 });
+
+    assert.equal(result.answerSource, "synthesised");
+    assert.equal(result.answer, atBudget, "an at-budget reply must render whole");
+    // One byte over is cut.
+    const { llm: over } = mockLlmCodeGen([explore, explore, `${atBudget}!`]);
+    const overResult = await runRlm("q", {
+      llmClient: over,
+      registry: rlmRegistry(),
+      maxIterations: 2,
+    });
+    assert.notEqual(overResult.answer, `${atBudget}!`);
+    assert.ok(overResult.answer.includes(SYNTHESIS_RECOVERY));
+  });
+});
+
+// ── Unchecked tools are named in the system prompt (#67, D105) ──
+//
+// A tool whose stub degraded is one the model should be more careful with:
+// nothing checks its arguments. The registry now reports the list; the loop
+// surfaces it to the model in the prompt it builds (decision 10). The
+// `repl`-side notice is deferred, pinned as a todo below.
+
+describe("runRlm() — unchecked tools are listed in the system prompt (#67)", () => {
+  const broken: HostTool = {
+    name: "broken",
+    description: "a tool whose stub cannot parse",
+    params: [{ name: "class", type: "str", description: "a keyword as a name" }],
+    returns: "str",
+    execute: () => "",
+  };
+
+  it("lists a degraded tool under ## Unchecked Tools with its detail", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: new ToolRegistry([broken]),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].systemPrompt;
+    const at = prompt.indexOf("## Unchecked Tools");
+    assert.ok(at >= 0, `no Unchecked Tools section:\n${prompt}`);
+    const end = prompt.indexOf("## Python Rules", at);
+    assert.ok(end > at, "the section sits before the Python rules");
+    const section = prompt.slice(at, end);
+    assert.match(section, /^- broken — stub did not parse/m, `section:\n${section}`);
+    assert.match(section, /check their arguments yourself/i, `section:\n${section}`);
+    // The degraded stub itself still renders as the Any fallback above it.
+    assert.ok(prompt.includes("broken: Any = None"));
+  });
+
+  it("a clean registry has no such section, and SUBMIT no longer renders -> void", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    await runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: 5 });
+
+    const prompt = llm.calls()[0].systemPrompt;
+    assert.ok(!prompt.includes("## Unchecked Tools"), `unexpected section:\n${prompt}`);
+    assert.ok(!prompt.includes("Unchecked"), "no degradation wording on a clean registry");
+    assert.ok(prompt.includes("def SUBMIT(answer: str) -> None:"), `SUBMIT stub:\n${prompt}`);
+    assert.ok(!prompt.includes("-> void"), "void is not a Python name");
+  });
+
+  it("the repl tool reports degraded stubs to the user (deferred, decision 10)", {
+    todo:
+      "decision 10 defers the repl-side notice: src/repl.ts (not owned by W1-5) does not read " +
+      "registry.degradedStubs() yet. Intended approach: ReplRunner surfaces the `tools` list once " +
+      "per session in the repl tool result (the same slot the preamble status uses), so a user " +
+      "whose custom tool silently degraded is told. Flip this pin when src/repl.ts names it.",
+  }, () => {
+    const here = fileURLToPath(import.meta.url);
+    const replSource = readFileSync(join(here, "..", "..", "src", "repl.ts"), "utf-8");
+    // `ok` rather than `match`: a failing `match` prints the whole source as
+    // `actual`, and this pin is expected to fail until wave 2.
+    assert.ok(replSource.includes("degradedStubs"), "src/repl.ts does not consult the report");
+  });
+});
+
+// ── Stub validation is memoised across runRlm calls (#169, D106) ──
+
+describe("runRlm() — stub validation is memoised across calls and nesting (#169)", () => {
+  it("two runs and a nested child over the same caller registry validate the stubs once", async () => {
+    // Each runRlm builds a fresh merged ToolRegistry (caller tools + the RLM
+    // tools), and so does every nested child. The instance cache never hits
+    // across them; the content-addressed memo must.
+    const tool: HostTool = {
+      name: "my_tool",
+      description: "a caller tool",
+      params: [],
+      returns: "str",
+      execute: () => "hi",
+    };
+    const registry = new ToolRegistry([tool]);
+    registryModule.resetStubValidationMemo();
+
+    const { llm: first } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    await runRlm("q", { llmClient: first, registry, maxIterations: 5 });
+    const { llm: second } = mockLlmCodeGen([
+      '```python\nnested = rlm_query("sub")\nSUBMIT(nested)\n```',
+      '```python\nSUBMIT("from nested")\n```',
+    ]);
+    const result = await runRlm("q", { llmClient: second, registry, maxIterations: 5 });
+
+    assert.equal(result.answer, "from nested");
+    assert.equal(
+      registryModule.stubValidationInvocations(),
+      1,
+      "the parent, its second run and its child must share one validation",
+    );
+  });
+});
+
+// ── Child inherits the parent's full options.inputs (#170, D107) ──
+//
+// The nested loop forwarded `runOptions` (so `runOptions.inputs` flowed) and
+// merged `context`, but the parent's other `options.inputs` were dropped: a
+// sub-investigation could not see data its parent was handed by name. The
+// child now receives every parent input, with the merged context on top
+// (decision 7). The parent's `question` is the one input it does not inherit —
+// the child declares its own (D108).
+
+describe("runRlm() — child inherits the parent's full options.inputs (#170)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("the child reads a non-context parent input, and the merged context still wins", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("sub", "SUB-CTX")\nSUBMIT("outer: " + result)\n```',
+      '```python\nSUBMIT(extra + "|" + context)\n```',
+    ]);
+
+    const result = await runRlm("parent", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { context: "PARENT-CTX", extra: "EXTRA" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    // `extra` is the parent's value; `context` is the D52 merge, not the raw parent input.
+    assert.equal(result.answer, "outer: EXTRA|PARENT-CTX\n\nSUB-CTX");
+  });
+
+  it("the child's initial prompt announces the inherited input by name (#72 contract)", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT(rlm_query("sub"))\n```',
+      '```python\nSUBMIT("child")\n```',
+    ]);
+
+    const result = await runRlm("parent", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      inputs: { extra: "EXTRA" },
+      maxIterations: 5,
+    });
+
+    assert.equal(result.answer, "child");
+    const childPrompt = llm.calls()[1].messages[0].content;
+    assert.ok(childPrompt.includes("# Question\nsub"), `not the child's prompt:\n${childPrompt}`);
+    assert.ok(
+      childPrompt.includes("# Input (available as `extra` variable)"),
+      `inherited input not announced:\n${childPrompt}`,
+    );
+    assert.ok(childPrompt.includes("EXTRA"), "the inherited value must be previewed");
+  });
+});
+
+// ── The question is a sandbox input (#173, D108) ────────────────
+//
+// The full question was not sandbox-accessible, so `QUESTION_RECOVERY` had to
+// stay deliberately weak (policy Q3 — never name a route that does not
+// exist). It is now declared as the reserved `question` input: sliceable in
+// Python, announced in the prompt trailer, never double-rendered as an input
+// block, and refused if a caller tries to supply one. The two tool paths
+// (`llm_query`'s prompt, the downgrade query) have no sandbox on their side
+// and keep the sandbox-free wording.
+
+describe("runRlm() — the question is a sandbox input (#173)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("`question` is sliceable in Python", async () => {
+    const { llm } = mockLlmCodeGen([
+      "```python\nSUBMIT(question[:5] + '|' + str(len(question)))\n```",
+    ]);
+
+    const result = await runRlm("hello world", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "hello|11");
+  });
+
+  it("a nested child's `question` is its own query, not the parent's", async () => {
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT(question + " -> " + rlm_query("sub-question"))\n```',
+      "```python\nSUBMIT(question)\n```",
+    ]);
+
+    const result = await runRlm("parent-question", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.answer, "parent-question -> sub-question");
+  });
+
+  it("a caller-supplied `question` input is refused before any query, from either source", async () => {
+    const attempts: Array<Partial<Parameters<typeof runRlm>[1]>> = [
+      { inputs: { question: "x" } },
+      { runOptions: { inputs: { question: "x" } } },
+    ];
+    for (const extra of attempts) {
+      const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+      await assert.rejects(
+        runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 5, ...extra }),
+        /input 'question' is reserved/,
+      );
+      assert.equal(llm.calls().length, 0, "the collision must be rejected before any LLM query");
+    }
+  });
+
+  it("a caller tool named `question` is refused before any query — the input would shadow it (the D51 rule)", async () => {
+    // Without the check the tool is merged, the sandbox global `question`
+    // (a str) shadows it, and `question("x")` is "TypeError: 'str' object is
+    // not callable" — the tool never runs and nothing says why.
+    const tool: HostTool = {
+      name: "question",
+      description: "caller-owned tool",
+      params: [{ name: "x", type: "str", description: "" }],
+      returns: "str",
+      execute: async () => "TOOL",
+    };
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT(question("x"))\n```']);
+    await assert.rejects(
+      runRlm("hello world", {
+        llmClient: llm,
+        registry: new ToolRegistry([tool]),
+        maxIterations: 1,
+      }),
+      {
+        message:
+          "runRlm: tool 'question' conflicts with the reserved 'question' input — the sandbox variable would shadow the tool. Rename it.",
+      },
+    );
+    assert.equal(llm.calls().length, 0, "the collision must be rejected before any LLM query");
+  });
+
+  it("renders the question once, with no `# Input` block, and announces the variable in the trailer", async () => {
+    const question = "UNIQUE-QUESTION-TEXT-9f3a";
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    await runRlm(question, { llmClient: llm, registry: rlmRegistry(), maxIterations: 5 });
+
+    const prompt = llm.calls()[0].messages[0].content;
+    assert.equal(prompt.split(question).length - 1, 1, `question rendered twice:\n${prompt}`);
+    assert.ok(prompt.startsWith(`# Question\n${question}`), `header changed:\n${prompt}`);
+    assert.ok(
+      !prompt.includes("# Input (available as `question` variable)"),
+      `the question must not render as an input block:\n${prompt}`,
+    );
+    assert.ok(
+      prompt.endsWith(
+        "\n\nWrite Python code to answer the question. The full question is available as the `question` variable. Call SUBMIT(answer) when done.",
+      ),
+      `trailer:\n${prompt.slice(-240)}`,
+    );
+  });
+
+  it("the main loop's marker names the variable route; the tool-path prompts do not", async () => {
+    // Two markers for one truncated ask, one route each. The main loop's
+    // question is a sandbox variable, so its marker says so. llm_query's
+    // prompt reaches the sub-LLM with no sandbox on that side, so its marker
+    // must not tell it to slice a variable it does not have.
+    const { llm } = mockLlmCodeGen([
+      '```python\nSUBMIT(llm_query("Q" * (70 * 1024)))\n```',
+      "reply",
+    ]);
+
+    const result = await runRlm("q".repeat(128 * 1024), {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.answer, "reply");
+    const mainPrompt = llm.calls()[0].messages[0].content;
+    assert.match(mainPrompt, /`question` Python variable — slice it in Python to see more/);
+    const toolPrompt = llm.calls()[1].messages[0].content;
+    assert.match(toolPrompt, /The question was truncated\. Answer from the part shown/);
+    assert.doesNotMatch(toolPrompt, /`question` Python variable/, "no sandbox, no variable route");
   });
 });

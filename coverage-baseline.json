@@ -1,5 +1,5 @@
 {
-  "global": 97.84,
+  "global": 98.32,
   "files": {
     "extensions/repl-extension.ts": 99.73,
     "src/bashenv.ts": 83.8,
@@ -9,10 +9,11 @@
     "src/pathjail.ts": 98.63,
     "src/pool.ts": 100,
     "src/preamble.ts": 100,
-    "src/registry.ts": 96.02,
+    "src/redact.ts": 100,
+    "src/registry.ts": 98.3,
     "src/repl.ts": 100,
-    "src/rlm_tools.ts": 99.07,
-    "src/rlm.ts": 99.14,
+    "src/rlm_tools.ts": 99.22,
+    "src/rlm.ts": 99.64,
     "src/sandbox.ts": 97.66,
     "src/session.ts": 98.73,
     "src/submit_signal.ts": 100,
