@@ -1993,4 +1993,31 @@ describe("repl extension — session lifecycle (#60)", () => {
     assert.equal(trusted.ui.opened.length, 1, "the preamble's gated write did not ask");
     assert.equal(readFileSync(join(hostile, "pwned.txt"), "utf8"), "owned");
   });
+
+  // Residual, recorded as a todo rather than an issue (decision 9).
+  it("the shutdown report names the tool that was waiting, not only the session", {
+    todo:
+      "ReplRunner.abandon answers only 'abandoned' | 'nothing-pending' | 'no-session', so the " +
+      "extension cannot learn which tool the dropped call was for without a src/ change, and " +
+      "src/repl.ts is W1-2's file this wave. Intended approach: have abandon() return the " +
+      "dropped ApprovalRequest's tool name alongside the outcome — the name, never the " +
+      "arguments, which can hold a pasted credential — and interpolate it into the report.",
+  }, async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    assert.ok(repl);
+    const { ctx, notes } = lifecycleCtx(cwdA, [LATER_CHOICE]);
+
+    await repl.execute(
+      "n-1",
+      { code: "write('named.txt', 'x')", sessionId: "named" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await fire(handlers, "session_shutdown", "quit", ctx);
+
+    assert.equal(notes.length, 1);
+    assert.match(notes[0].message, /'write'/, "the report does not say which tool was waiting");
+  });
 });
