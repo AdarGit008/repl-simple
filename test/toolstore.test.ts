@@ -2419,6 +2419,46 @@ describe("loadSavedTools — content hash and the accepted set (#198)", () => {
     }
   });
 
+  it("a directory it cannot list is unlistable — nothing loaded, nothing known", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    const opts: ToolStoreOptions = { root };
+    try {
+      writeSavedTool(opts, "add", "def add():\n    return 1\n");
+      chmodSync(toolsDirOf(opts), 0o000);
+
+      // Not "no tools": the loader cannot see what is there, and a caller
+      // that recorded acceptance from this load would record an empty set
+      // over a real one. It says so, and loads nothing.
+      const load = await loadSavedTools(opts);
+      assert.match(load.unlistable ?? "", /EACCES|permission/i, JSON.stringify(load));
+      assert.equal(load.preamble, "");
+      assert.deepEqual(load.loaded, []);
+      assert.deepEqual(load.unaccepted, []);
+      assert.deepEqual(load.unreadable, []);
+
+      // With an accepted set: still unlistable, and nothing is called added,
+      // changed or removed — the comparison never ran.
+      const checked = await loadSavedTools({
+        ...opts,
+        accepted: new Map([["add", "a".repeat(64)]]),
+      });
+      assert.match(checked.unlistable ?? "", /EACCES|permission/i);
+      assert.deepEqual(checked.unaccepted, []);
+
+      // The safe half stays safe: names or nothing, never a throw.
+      assert.deepEqual(await savedToolNames(opts), []);
+    } finally {
+      try {
+        chmodSync(toolsDirOf(opts), 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+    }
+  });
+
   it("a refused preamble reports nothing as unaccepted — nothing loads either way", async () => {
     const root = makeTempDir();
     try {
@@ -2479,7 +2519,9 @@ describe("preamble manifest store (#198)", () => {
       const files = new Map([["add", "a".repeat(64)]]);
       const path = await store.write(files);
       assert.equal(path, await store.manifestPath());
-      assert.ok(path.startsWith(join(storeDir, "preambles") + sep), path);
+      // Both sides canonical: the store hands out real paths, and a temp dir
+      // is a symlink away from its real path on macOS (/var → /private/var).
+      assert.ok(path.startsWith(join(realpathSync(storeDir), "preambles") + sep), path);
       assert.match(path, /[0-9a-f]{64}\.json$/);
       assert.deepEqual(await store.read(), { status: "ok", files });
 
@@ -2626,6 +2668,42 @@ describe("preamble manifest store (#198)", () => {
     }
   });
 
+  it("a symlinked store dir is its target: canonical paths, one manifest", async () => {
+    // The Linux stand-in for macOS, where every temp dir is reached through
+    // /var → /private/var: the store is named by a link, and every path it
+    // hands out must be the canonical one — compared against a canonical
+    // expectation, never the link's spelling.
+    const root = makeTempDir();
+    const outside = makeStoreDir();
+    try {
+      const target = join(outside, "real");
+      mkdirSync(target);
+      const link = join(outside, "link");
+      symlinkSync(target, link);
+
+      const viaLink = toolstore.createPreambleManifestStore(link, root);
+      assert.equal(await viaLink.storeDir(), realpathSync(target));
+      const path = await viaLink.write(new Map([["add", "a".repeat(64)]]));
+      assert.ok(path.startsWith(join(realpathSync(target), "preambles") + sep), path);
+      assert.equal(path, await viaLink.manifestPath());
+      assert.equal(realpathSync(path), path, "the manifest path is not canonical");
+
+      // The target's spelling is the same store: one manifest, read back.
+      const direct = toolstore.createPreambleManifestStore(target, root);
+      assert.equal(await direct.storeDir(), await viaLink.storeDir());
+      assert.equal(await direct.manifestPath(), path);
+      assert.deepEqual(await direct.read(), {
+        status: "ok",
+        files: new Map([["add", "a".repeat(64)]]),
+      });
+      assert.deepEqual(readdirSync(join(target, "preambles")), [basename(path)]);
+      assert.deepEqual(readdirSync(link), ["preambles"]);
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it("leaves no temp file behind when the write fails", async (t) => {
     if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
     if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
@@ -2745,6 +2823,51 @@ describe("save_tool and delete_tool keep the manifest (#198)", () => {
       assert.match(deleted, /deleted/);
       assert.doesNotMatch(deleted, /accepted set/, deleted);
       assert.deepEqual(await manifest.read(), { status: "absent" });
+    } finally {
+      cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an untrusted session leaves the manifest alone — save_tool and delete_tool alike", async () => {
+    // Acceptance authority is the trust decision plus explicit accepts. The
+    // write is approval-gated, so it may proceed; what it is not, while the
+    // project is untrusted, is an accept — otherwise a session that never
+    // held trust could put a file into the accepted set of one that does.
+    const root = makeTempDir();
+    const storeDir = makeStoreDir();
+    try {
+      writeSavedTool({ root }, "add", "def add():\n    return 1\n");
+      const manifest = toolstore.createPreambleManifestStore(storeDir, root);
+      const accepted = new Map([["add", "a".repeat(64)]]);
+      const path = await manifest.write(accepted);
+      const before = readFileSync(path, "utf8");
+      const tools = createToolStoreTools({ root, manifest, isTrusted: () => false });
+
+      const saved = await findTool(tools, "save_tool").execute({
+        name: "planted",
+        code: "def planted():\n    return 1",
+        description: "saved untrusted",
+      });
+      assert.match(saved, /saved/, saved);
+      assert.match(saved, /once this project is trusted/, saved);
+      assert.doesNotMatch(
+        saved,
+        /recorded as accepted/,
+        `an untrusted save was an accept: ${saved}`,
+      );
+      assert.ok(
+        existsSync(join(root, ".pi", "code-tools", "planted.py")),
+        "the save itself failed",
+      );
+      assert.deepEqual(await manifest.read(), { status: "ok", files: accepted });
+      assert.equal(readFileSync(path, "utf8"), before, "the manifest was rewritten");
+
+      const deleted = await findTool(tools, "delete_tool").execute({ name: "add" });
+      assert.match(deleted, /deleted/, deleted);
+      assert.doesNotMatch(deleted, /accepted set/, deleted);
+      assert.deepEqual(await manifest.read(), { status: "ok", files: accepted });
+      assert.equal(readFileSync(path, "utf8"), before, "the manifest was rewritten");
     } finally {
       cleanup();
       rmSync(storeDir, { recursive: true, force: true });
@@ -2889,12 +3012,19 @@ describe("tools annotate an unaccepted file (#198)", () => {
   });
 
   it("the live trust decision outranks the annotation", async () => {
+    // An ordering guard: a session whose files were all withheld pending
+    // acceptance has no preamble, so an untrust flip keeps it, and the tools
+    // must answer with the live decision before they look at the annotation.
+    // The untrusted half alone holds on main too (main answers "project not
+    // trusted" and ignores the map); the trusted half is what discriminates —
+    // the same view, one flip later, must show the annotation.
     const root = makeTempDir();
     try {
       const opts: ToolStoreOptions = { root };
       writeSavedTool(opts, "add", "def add():\n    return 1\n");
       const view = status({ loaded: [], unaccepted: new Map([["add", "added"]]) });
-      const tools = createToolStoreTools({ root, preambleStatus: view, isTrusted: () => false });
+      let trusted = false;
+      const tools = createToolStoreTools({ root, preambleStatus: view, isTrusted: () => trusted });
 
       assert.equal(
         await findTool(tools, "list_saved_tools").execute({}),
@@ -2904,6 +3034,15 @@ describe("tools annotate an unaccepted file (#198)", () => {
         async () => findTool(tools, "read_tool").execute({ name: "add" }),
         (err: unknown) => err instanceof HostToolError && err.pythonType === "PermissionError",
       );
+
+      trusted = true;
+      assert.equal(
+        await findTool(tools, "list_saved_tools").execute({}),
+        "add [not loaded: not accepted — added since the saved tools were last accepted]",
+      );
+      const read = await findTool(tools, "read_tool").execute({ name: "add" });
+      assert.match(read, /^# NOTE: not loaded in this session — .*added/, read);
+      assert.match(read, /def add/);
     } finally {
       cleanup();
     }

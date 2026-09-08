@@ -1,11 +1,13 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   writeFileSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   existsSync,
   statSync,
@@ -2473,8 +2475,16 @@ describe("ReplRunner — a changed preamble is withheld until accepted (#198)", 
       assert.match(out, /\[result\]\n3/);
 
       const { path, files } = await readManifest(store, cwd);
-      assert.ok(path.startsWith(store + sep), `the manifest is not under the store: ${path}`);
-      assert.ok(!path.startsWith(cwd), `the manifest is inside the project: ${path}`);
+      // Both sides canonical: the store hands out real paths, and a temp dir
+      // is a symlink away from its real path on macOS (/var → /private/var).
+      assert.ok(
+        realpathSync(path).startsWith(realpathSync(store) + sep),
+        `the manifest is not under the store: ${path}`,
+      );
+      assert.ok(
+        !realpathSync(path).startsWith(realpathSync(cwd)),
+        `the manifest is inside the project: ${path}`,
+      );
       assert.match(files.adder, /^[0-9a-f]{64}$/, "the manifest must hold a sha256 per file");
       // Nothing was created in the project — not under `.pi/`, not anywhere.
       assert.deepEqual(readdirSync(cwd), [".pi"]);
@@ -2860,6 +2870,202 @@ describe("ReplRunner — acceptPreamble and the tools' view of withheld files (#
       assert.match(JSON.stringify(inside), /inside the project/);
       assert.deepEqual(readdirSync(cwd), [".pi"]);
     } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ReplRunner — a symlinked store dir is one store with its target (#198)", () => {
+  it("hands out canonical paths, and both spellings share the manifest", async () => {
+    // The Linux stand-in for macOS, where every temp dir is reached through
+    // /var → /private/var and a store named by the one spelling must not be
+    // compared against the other: the store is reached through a link, the
+    // manifest lands under the real directory, and a runner over the real
+    // spelling sees the same accepted set.
+    const cwd = makeTempDir();
+    const outside = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const target = join(outside, "real");
+      mkdirSync(target);
+      const link = join(outside, "link");
+      symlinkSync(target, link);
+
+      const out = await trustedRunner(cwd, link).run("add_two(1, 2)", "s");
+      assert.match(out, /\[result\]\n3/, out);
+      assert.doesNotMatch(out, /preamble/, out);
+
+      const store = toolstore.createPreambleManifestStore(link, cwd);
+      assert.equal(await store.storeDir(), realpathSync(target));
+      const { path, files } = await readManifest(link, cwd);
+      assert.equal(realpathSync(path), path, "the manifest path is not canonical");
+      assert.ok(path.startsWith(realpathSync(target) + sep), path);
+      assert.ok(realpathSync(path).startsWith(realpathSync(link) + sep), path);
+      assert.deepEqual(Object.keys(files), ["adder"]);
+      assert.equal(readdirSync(join(target, "preambles")).length, 1);
+
+      // The git-pull vector through the other spelling: one manifest.
+      saveToolFile(cwd, "evil", HOSTILE);
+      const { prompts, ask } = recorder();
+      const viaTarget = await trustedRunner(cwd, target).run("add_two(1, 2)", "s", ask);
+      assert.equal(existsSync(join(cwd, "pwned.txt")), false, "the pulled file executed");
+      assert.deepEqual(prompts, []);
+      assert.match(viaTarget, /\[preamble changed\]/, viaTarget);
+      assert.match(viaTarget, /evil \(added\)/);
+      assert.match(viaTarget, /\[result\]\n3/);
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ReplRunner — an untrusted session never touches the store (#198)", () => {
+  it("a tool saved while untrusted is withheld once the project is trusted", async () => {
+    // Acceptance authority is the trust decision plus explicit accepts. An
+    // untrusted session's save_tool is approval-gated and may proceed; what
+    // it may not do is put the file into the accepted set — a session that
+    // never held trust would otherwise decide what a trusted one runs.
+    const cwd = makeTempDir();
+    const fresh = makeStore();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    // A Python double-quoted literal: the body's own quotes are single.
+    const planted = `"write('pwned.txt', 'owned')\\ndef planted():\\n    return 1"`;
+    try {
+      // No manifest yet: an untrusted session creates none, whatever it does.
+      const cold = new ReplRunner(cwd, { preambleStoreDir: fresh });
+      await cold.run("1 + 1", "u");
+      await cold.run(`save_tool('planted', ${planted}, 'planted untrusted')`, "u", approve);
+      await cold.run("delete_tool('planted')", "u");
+      assert.match(await cold.run("list_saved_tools()", "u"), /adder/);
+      assert.deepEqual(await cold.acceptPreamble(), { status: "untrusted" });
+      assert.deepEqual(readdirSync(fresh), [], "an untrusted session wrote the store");
+
+      // A manifest from a trusted run: an untrusted session leaves it as it is.
+      await trustedRunner(cwd, store).run("1 + 1", "s");
+      const { path } = await readManifest(store, cwd);
+      const before = readFileSync(path, "utf8");
+      const untrusted = new ReplRunner(cwd, { preambleStoreDir: store });
+      const saved = await untrusted.run(
+        `save_tool('planted', ${planted}, 'planted untrusted')`,
+        "u",
+        approve,
+      );
+      assert.match(saved, /saved/, saved);
+      assert.match(saved, /once this project is trusted/, saved);
+      assert.doesNotMatch(
+        saved,
+        /recorded as accepted/,
+        `an untrusted save was an accept: ${saved}`,
+      );
+      assert.equal(readFileSync(path, "utf8"), before, "the untrusted save rewrote the manifest");
+      const deleted = await untrusted.run("delete_tool('adder')", "u");
+      assert.match(deleted, /deleted/, deleted);
+      assert.doesNotMatch(deleted, /accepted set/, deleted);
+      assert.equal(readFileSync(path, "utf8"), before, "the untrusted delete rewrote the manifest");
+      assert.deepEqual(Object.keys((await readManifest(store, cwd)).files), ["adder"]);
+
+      // Trust granted: the planted file is withheld and named; the deleted
+      // one is reported as gone. Nothing the untrusted session did was an accept.
+      const { prompts, ask } = recorder();
+      const out = await trustedRunner(cwd, store).run("planted()", "s", ask);
+      assert.equal(existsSync(join(cwd, "pwned.txt")), false, "the planted file executed");
+      assert.deepEqual(prompts, []);
+      assert.match(out, /\[preamble changed\]/, out);
+      assert.match(out, /planted \(added\)/, out);
+      assert.match(out, /no longer in \.pi\/code-tools: adder/, out);
+      assert.match(out, /used when not defined/, "the planted tool was defined");
+    } finally {
+      cleanup();
+      rmSync(fresh, { recursive: true, force: true });
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ReplRunner — an unlistable .pi/code-tools never rewrites the accepted set (#198)", () => {
+  /** The saved-tools directory, for the permission flips. */
+  function toolsDir(cwd: string): string {
+    return join(cwd, ".pi", "code-tools");
+  }
+
+  it("acceptPreamble refuses, and a session build withholds with a notice, over EACCES", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const runner = trustedRunner(cwd, store);
+      await runner.run("1 + 1", "s1");
+      const { path } = await readManifest(store, cwd);
+      const before = readFileSync(path, "utf8");
+      chmodSync(toolsDir(cwd), 0o000);
+
+      // A directory that cannot be listed is not an empty one: accepting
+      // "nothing" here would erase the acceptance record over a transient
+      // permission error, and report success for a directory it never saw.
+      const outcome = await runner.acceptPreamble();
+      assert.equal(outcome.status, "unreadable", JSON.stringify(outcome));
+      assert.match(JSON.stringify(outcome), /EACCES|permission/i);
+      assert.equal(readFileSync(path, "utf8"), before, "acceptPreamble rewrote the manifest");
+
+      // A session build: nothing loads, the model is told why, and the
+      // manifest is neither rewritten nor reconciled — nothing is "removed".
+      const s2 = await runner.run("add_two(1, 2)", "s2");
+      assert.match(s2, /^\[preamble unreadable\]/, s2);
+      assert.match(s2, /could not be listed/, s2);
+      assert.doesNotMatch(s2, /no longer in/, "an unlistable directory was reported as removals");
+      assert.match(s2, /used when not defined/, "something loaded from an unlistable directory");
+      assert.equal(readFileSync(path, "utf8"), before, "the session build rewrote the manifest");
+
+      // Readable again: the accepted set survived, so the next session is silent.
+      chmodSync(toolsDir(cwd), 0o755);
+      const s3 = await runner.run("add_two(1, 2)", "s3");
+      assert.doesNotMatch(s3, /preamble/, `the acceptance record was lost: ${s3}`);
+      assert.match(s3, /\[result\]\n3/);
+    } finally {
+      try {
+        chmodSync(toolsDir(cwd), 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("a first-ever load over an unlistable directory records nothing", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      chmodSync(toolsDir(cwd), 0o000);
+      const runner = trustedRunner(cwd, store);
+      const s1 = await runner.run("add_two(1, 2)", "s1");
+      assert.match(s1, /^\[preamble unreadable\]/, s1);
+      assert.match(s1, /used when not defined/);
+      // No empty manifest: an implicit accept of a set it could not see
+      // would withhold every real file as "added" once the directory is
+      // readable — or worse, record nothing as the covered set.
+      assert.deepEqual(readdirSync(store), [], "an unlistable first load wrote a manifest");
+
+      // Readable: this is the first-ever load, and it accepts what is there.
+      chmodSync(toolsDir(cwd), 0o755);
+      const s2 = await runner.run("add_two(1, 2)", "s2");
+      assert.doesNotMatch(s2, /preamble/, s2);
+      assert.match(s2, /\[result\]\n3/);
+      assert.deepEqual(Object.keys((await readManifest(store, cwd)).files), ["adder"]);
+    } finally {
+      try {
+        chmodSync(toolsDir(cwd), 0o755);
+      } catch {
+        /* already gone */
+      }
       cleanup();
       rmSync(store, { recursive: true, force: true });
     }
