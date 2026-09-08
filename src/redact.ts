@@ -42,11 +42,12 @@ export const REDACTED_PRIVATE_KEY = "[REDACTED PRIVATE KEY]";
 // ── Rules ───────────────────────────────────────────────────────
 //
 // Every pattern is linear on long inputs: name prefixes are bounded and lazy,
-// alternations are anchored on a word boundary or a literal, and no rule
-// begins with an unbounded greedy class. Whitespace inside a rule is `[ \t]`,
-// never `\s`: no rule reads across a line, so a header dump is masked one
-// header at a time and prose on the next line is prose. The "bounded work"
-// tests pin the linearity.
+// alternations are anchored on a word boundary or a literal, no rule begins
+// with an unbounded greedy class, and the PEM body scan is tempered so a
+// BEGIN looks no further than the next BEGIN. Whitespace inside a rule is
+// `[ \t]`, never `\s`: no rule reads across a line, so a header dump is
+// masked one header at a time and prose on the next line is prose. The
+// "bounded work" tests pin the budgets; the growth test pins the linearity.
 
 /** The `[REDACTED]` token, escaped for a rule to refuse: an already-masked value is not a value. */
 const REDACTED_LITERAL = String.raw`\[REDACTED\]`;
@@ -90,9 +91,17 @@ const AUTHORIZATION_HEADER = new RegExp(
 /** Family 2b — a bare `Bearer <token>` outside a header line, on one line. The word keeps its spelling. */
 const BEARER_VALUE = /\b(Bearer)[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi;
 
-/** Family 3a — a PEM private-key block, envelope included. Certificates and public keys are not secrets. */
+/**
+ * Family 3a — a PEM private-key block, envelope included. The body scan is
+ * tempered — it stops at the next `-----BEGIN ` — so a BEGIN with no END
+ * costs one look as far as the next BEGIN, not a rescan to the end of the
+ * text for every BEGIN (that was quadratic: ×4 per doubling, 16000 lines in
+ * 854 ms). A BEGIN with no END before the next BEGIN is not a block; family
+ * 3b then masks from the first such BEGIN to the end. Certificates and
+ * public keys are not secrets.
+ */
 const PEM_PRIVATE_KEY_BLOCK =
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN )[\s\S])*?-----END [A-Z ]*PRIVATE KEY-----/g;
 
 /** Family 3b — a block whose END line was cut off (the head-only case): everything from BEGIN on. */
 const PEM_PRIVATE_KEY_OPEN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/g;

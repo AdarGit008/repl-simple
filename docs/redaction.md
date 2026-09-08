@@ -41,7 +41,10 @@ live; and on a redaction cut the true total is a fact about the withheld text, n
 ## The four pattern families
 
 Every rule is case-sensitive unless noted, anchored on a word boundary or a literal, and linear on
-long inputs (the "bounded work" tests run each over 1 MiB of adversarial shapes). No rule reads
+long inputs: the "bounded work" tests run each over 1 MiB of adversarial shapes, and a growth test
+holds the PEM scan under 3× per doubling from 256 KiB to 1 MiB of `BEGIN` lines with no `END` (best
+of five interleaved runs) — the shape that was ×4 per doubling before the body scan was tempered to
+stop at the next `BEGIN`. No rule reads
 across a line: whitespace inside a rule is a space or a tab, never a newline, so a header dump is
 masked one header at a time and prose on the next line is prose.
 
@@ -50,7 +53,7 @@ masked one header at a time and prose on the next line is prose.
 | 1 | Known token prefixes: `sk-` (incl. `sk-ant-`), `ghp_` `gho_` `ghu_` `ghs_` `ghr_` `github_pat_`, `glpat-`, `xox[abprs]-`, `AKIA`, `AIza`, followed by ≥ 16 token characters | `sk-abc…xyz` → `sk-[REDACTED]` | Prefix kept so the reader learns the credential's kind. Shorter than 16 → data (`sk-1`). |
 | 2a | `Authorization:` (or `Proxy-Authorization:`) header value, plain or JSON-quoted | `Authorization: Bearer eyJ…` → `Authorization: Bearer [REDACTED]`; `Authorization: abc123…` → `Authorization: [REDACTED]`; `Authorization: Bot abc…` → `Authorization: [REDACTED]` | A known scheme is kept: `Basic`, `Bearer`, `Digest`, `Token`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `AWS4-HMAC-SHA256` (any case). An unknown first token followed by a second on the same line — a scheme this rule does not know, or a credential followed by a word — is masked *with* that second token: the two are indistinguishable, and keeping the first would leak a `Bot`/`SSWS`/`OAuth` credential. A lone value is masked whole. The value ends at end of line, whitespace, a quote, `;` or `,`, so `Authorization: Bearer a; Authorization: Bearer b` masks both and keeps the `;`. A known scheme with nothing after it is data. |
 | 2b | Bare `Bearer <token>` (≥ 8 token chars) on one line | `curl -H 'bearer abc…'` → `Bearer [REDACTED]` | Case-insensitive. "the bearer of" is data (too short); "the Bearer\nauthentication scheme" is data (next line). |
-| 3 | PEM private-key block, `BEGIN … PRIVATE KEY` to `END …`, or from `BEGIN` to end of text when the `END` line is gone (the head-only case) | whole block → `[REDACTED PRIVATE KEY]` | `CERTIFICATE` and `PUBLIC KEY` blocks are not secrets and are untouched. |
+| 3 | PEM private-key block, `BEGIN … PRIVATE KEY` to `END …`, or from `BEGIN` to end of text when the `END` line is gone (the head-only case) | whole block → `[REDACTED PRIVATE KEY]` | `CERTIFICATE` and `PUBLIC KEY` blocks are not secrets and are untouched. The body scan stops at the next `-----BEGIN `: a `BEGIN` with no `END` before the next `BEGIN` is not a block, and the open-block rule then masks from the first such `BEGIN` to the end. |
 | 4 | `NAME=value` / `NAME: value` (quotes and spaces tolerated) where NAME ends in `_KEY`/`-KEY`/`.KEY`, is `APIKEY`, or ends in `TOKEN`/`SECRET`/`PASSWORD`/`PASSWD` | `API_KEY=abc` → `API_KEY=[REDACTED]`; `"api_key": "x"` → `"api_key": "[REDACTED]"` | Case-insensitive. The value stops at whitespace, a quote, `;`, `,` or `&`. |
 
 Rules compose: `GITHUB_TOKEN=ghp_…` is masked by family 1 and then family 4, ending as
