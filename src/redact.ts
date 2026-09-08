@@ -1,3 +1,9 @@
+import { HEAD_ONLY_RATIO, truncateText } from "./truncate.js";
+
+// The import sits above the module comment on purpose: with a `/** */` block
+// ahead of the first import, V8 reports every line of the block as uncovered
+// (measured — 26 lines, 83 % on a file every test executes whole).
+
 /**
  * The one redaction.
  *
@@ -24,8 +30,6 @@
  * Consumers: the RLM provider-error path (`redactProviderError` in
  * `src/rlm.ts`) today; the trace and session-dump exports of #46 / #63 next.
  */
-
-import { HEAD_ONLY_RATIO, truncateText } from "./truncate.js";
 
 // ── Replacement tokens ──────────────────────────────────────────
 

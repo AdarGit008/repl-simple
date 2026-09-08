@@ -5989,7 +5989,9 @@ describe("runRlm() — unchecked tools are listed in the system prompt (#67)", (
   }, () => {
     const here = fileURLToPath(import.meta.url);
     const replSource = readFileSync(join(here, "..", "..", "src", "repl.ts"), "utf-8");
-    assert.match(replSource, /degradedStubs/, "src/repl.ts does not consult the report");
+    // `ok` rather than `match`: a failing `match` prints the whole source as
+    // `actual`, and this pin is expected to fail until wave 2.
+    assert.ok(replSource.includes("degradedStubs"), "src/repl.ts does not consult the report");
   });
 });
 
