@@ -337,3 +337,69 @@ describe("truncatedBefore — the flag survives a resume", () => {
     assert.equal(t.truncated, false);
   });
 });
+
+// ── The boundary (bucket 2, exit criterion 4) ───────────────────
+//
+// `overBudget` is `totalBytes > maxBytes || totalLines > maxLines`. A `>=`
+// mutant on either comparison survived (#24 M11/M12) because no test sat on
+// the line: every input was far past the budget or comfortably inside it.
+// Each case here lands exactly on the cap, then steps one past it.
+
+describe("the boundary — exactly at the budget is within it (bucket 2, exit criterion 4)", () => {
+  it("a stream of exactly maxBytes is returned whole, at every character width", () => {
+    for (const { label, char, width } of WIDTHS) {
+      const input = char.repeat(8);
+      const budget = 8 * width;
+      assert.equal(bytes(input), budget, `${label}: fixture is not exactly at the cap`);
+
+      const t = new Truncator(stdoutOpts(budget));
+      t.push(input);
+      assert.equal(t.truncated, false, `${label}: exactly at the cap reported as truncated`);
+      assert.equal(t.render(), input, `${label}: exactly at the cap was cut`);
+      assert.equal(t.totalBytes, budget);
+    }
+  });
+
+  it("one byte past maxBytes is truncated", () => {
+    const t = new Truncator(stdoutOpts(64));
+    t.push("A".repeat(65));
+    assert.equal(t.truncated, true);
+  });
+
+  it("many chunks summing to exactly maxBytes are not truncated; the next byte is", () => {
+    const t = new Truncator(stdoutOpts(100));
+    for (let i = 0; i < 10; i++) t.push("0123456789");
+    assert.equal(t.totalBytes, 100);
+    assert.equal(t.truncated, false);
+    assert.equal(t.render(), "0123456789".repeat(10));
+
+    t.push("!");
+    assert.equal(t.truncated, true);
+  });
+
+  it("truncateText agrees: exactly at the cap returns the input verbatim", () => {
+    const input = "A".repeat(1024);
+    const { text, truncated } = truncateText(input, stdoutOpts(1024));
+    assert.equal(text, input);
+    assert.equal(truncated, false);
+  });
+
+  it("exactly maxLines lines is not truncated; one more is", () => {
+    const t = new Truncator({ ...stdoutOpts(1024 * 1024), maxLines: 10 });
+    for (let i = 0; i < 10; i++) t.push(`${i}\n`);
+    assert.equal(t.totalLines, 10);
+    assert.equal(t.truncated, false);
+
+    t.push("10\n");
+    assert.equal(t.totalLines, 11);
+    assert.equal(t.truncated, true);
+  });
+
+  it("an unterminated final line counts, and still sits within the budget at the boundary", () => {
+    const t = new Truncator({ ...stdoutOpts(1024 * 1024), maxLines: 10 });
+    for (let i = 0; i < 9; i++) t.push(`${i}\n`);
+    t.push("last");
+    assert.equal(t.totalLines, 10);
+    assert.equal(t.truncated, false);
+  });
+});
