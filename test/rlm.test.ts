@@ -5680,3 +5680,113 @@ describe("runRlm() — per-iteration llm_query/rlm_query cap (#168)", () => {
     assert.ok(feedback.indexOf(LLM_QUERY_CAPPED) > stdoutAt, "forged text must sit in stdout");
   });
 });
+
+// ── Redaction marker magnitude (#191, D98) ──────────────────────
+//
+// On a model-facing value cut the marker's true total is an affordance — the
+// model needs to know how much it is not seeing. On a *redaction* cut the
+// total is a fact about the withheld text: a 64 KiB provider rejection and a
+// 1.2 KiB one were distinguishable through the marker even though neither
+// body was shown. The redaction now passes `unknownTotal`, so the marker
+// states where it cut and nothing about what it dropped.
+
+describe("runRlm() — redaction marker hides the redacted size (#191)", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  const HUGE = `${"A".repeat(64 * 1024)}TAIL-SECRET-REQID`;
+
+  /** The #191 shape: where it cut, never how much or of what total. */
+  function assertHidesMagnitude(text: string, label: string): void {
+    assert.match(
+      text,
+      /\[… truncated at 1\.0KB\. The full provider error is not surfaced\. …\]/,
+      `${label}: marker must state where it cut:\n${text.slice(-160)}`,
+    );
+    assert.doesNotMatch(text, /elided/, `${label}: marker must not state how much was dropped`);
+    assert.doesNotMatch(text, /64\.0KB|63\.0KB/, `${label}: marker must not disclose the total`);
+    assert.ok(!text.includes("TAIL-SECRET-REQID"), `${label}: tail leaked`);
+  }
+
+  it("the D53 RlmResult.error marker states where it cut, not the total", async () => {
+    const llm: LlmClient = {
+      async query() {
+        throw new Error(HUGE);
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 1 });
+
+    assert.equal(result.status, "error");
+    assertHidesMagnitude(result.error!, "RlmResult.error");
+  });
+
+  it("the llm_query tool path hides the size on both surfaces", async () => {
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nllm_query("hello")\nSUBMIT("done")\n```';
+        throw new Error(HUGE);
+      },
+    };
+
+    const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry(), maxIterations: 1 });
+
+    assert.equal(result.iterations[0].result.status, "error");
+    assertHidesMagnitude(result.iterations[0].result.error!, "iterations[].result.error");
+    assertHidesMagnitude(buildFeedback(result.iterations[0].result), "buildFeedback");
+  });
+
+  it("the downgraded rlm_query path hides the size on both surfaces", async () => {
+    let call = 0;
+    const llm: LlmClient = {
+      async query() {
+        call++;
+        if (call === 1) return '```python\nresult = rlm_query("q", "c")\nSUBMIT(result)\n```';
+        throw new Error(HUGE);
+      },
+    };
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+      maxDepth: 1,
+      depth: 1,
+    });
+
+    assert.equal(result.iterations[0].result.status, "error");
+    assertHidesMagnitude(result.iterations[0].result.error!, "iterations[].result.error");
+    assertHidesMagnitude(buildFeedback(result.iterations[0].result), "buildFeedback");
+  });
+
+  it("the nested [rlm_query error: …] re-interpolation hides the size", async () => {
+    const nestedQuestion = "SUB-INVESTIGATION";
+    const llm: LlmClient = {
+      async query(_systemPrompt, messages) {
+        if (messages[0].content.includes(`# Question\n${nestedQuestion}`)) {
+          throw new Error(HUGE);
+        }
+        return (
+          "```python\n" +
+          `result = rlm_query(${JSON.stringify(nestedQuestion)})\n` +
+          'SUBMIT("outer: " + result)\n' +
+          "```"
+        );
+      },
+    };
+
+    const result = await runRlm("outer task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.ok(result.answer.startsWith("outer: [rlm_query error: error] A"));
+    assertHidesMagnitude(result.answer, "nested answer");
+  });
+});
