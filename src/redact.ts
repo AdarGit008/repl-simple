@@ -33,7 +33,7 @@ import { HEAD_ONLY_RATIO, truncateText } from "./truncate.js";
 
 // ── Replacement tokens ──────────────────────────────────────────
 
-/** What a masked value becomes. Contains no character any rule matches, so masking is idempotent. */
+/** What a masked value becomes. Every value-taking rule refuses it, so masking is idempotent — text and count. */
 export const REDACTED = "[REDACTED]";
 
 /** What a PEM private-key block becomes, envelope included. */
@@ -43,7 +43,13 @@ export const REDACTED_PRIVATE_KEY = "[REDACTED PRIVATE KEY]";
 //
 // Every pattern is linear on long inputs: name prefixes are bounded and lazy,
 // alternations are anchored on a word boundary or a literal, and no rule
-// begins with an unbounded greedy class. The "bounded work" tests pin that.
+// begins with an unbounded greedy class. Whitespace inside a rule is `[ \t]`,
+// never `\s`: no rule reads across a line, so a header dump is masked one
+// header at a time and prose on the next line is prose. The "bounded work"
+// tests pin the linearity.
+
+/** The `[REDACTED]` token, escaped for a rule to refuse: an already-masked value is not a value. */
+const REDACTED_LITERAL = String.raw`\[REDACTED\]`;
 
 /**
  * Family 1 — known token prefixes. The prefix is kept (`sk-[REDACTED]`) so
@@ -55,15 +61,34 @@ const TOKEN_PREFIX =
   /\b(sk-(?:ant-)?|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xox[abprs]-|AKIA|AIza)[A-Za-z0-9_-]{16,}/g;
 
 /**
- * Family 2a — an `Authorization` header value, plain or JSON-quoted. The
- * scheme survives (`Bearer`, `Basic`) because it identifies the failure
- * without identifying the request; the credential after it does not.
+ * Family 2a — an `Authorization` header value (also `Proxy-Authorization`),
+ * plain or JSON-quoted. Three shapes, each read on one line:
+ *
+ * - `<known scheme> <credential>` — the scheme survives (`Bearer`, `Basic`,
+ *   …) because it identifies the failure without identifying the request;
+ *   the credential does not.
+ * - `<token> <token>` with a scheme this rule does not know — `Bot`, `SSWS`,
+ *   `OAuth`, or a credential followed by prose: indistinguishable, so the
+ *   pair is masked whole. The cost is one word of prose in the rare second
+ *   case; the alternative is a scheme word kept and a credential leaked.
+ * - `<credential>` alone — line end, quote, `;` or `,` follows — masked whole.
+ *
+ * A value ends at whitespace, a quote, `;` or `,`, so a `;`-joined list keeps
+ * its separators and the next header keeps its name. A known scheme with no
+ * credential after it on the line is data, and so is `[REDACTED]`.
  */
-const AUTHORIZATION_HEADER =
-  /(\bAuthorization["']?\s*:\s*["']?)(?:([A-Za-z][A-Za-z0-9-]*)\s+)?([^\s"']+)/gi;
+const AUTH_SCHEMES = "Basic|Bearer|Digest|Token|Negotiate|NTLM|HOBA|Mutual|AWS4-HMAC-SHA256";
+const AUTH_VALUE = String.raw`[^\s"';,]+`;
+const AUTHORIZATION_HEADER = new RegExp(
+  String.raw`(\bAuthorization["']?[ \t]*:[ \t]*["']?)` +
+    String.raw`(?!(?:(?:${AUTH_SCHEMES})[ \t]+)?${REDACTED_LITERAL})` +
+    String.raw`(?:((?:${AUTH_SCHEMES})[ \t]+)${AUTH_VALUE}` +
+    String.raw`|(?!(?:${AUTH_SCHEMES})(?!${AUTH_VALUE}))${AUTH_VALUE}(?:[ \t]+${AUTH_VALUE})?)`,
+  "gi",
+);
 
-/** Family 2b — a bare `Bearer <token>` outside a header line. The word keeps its spelling. */
-const BEARER_VALUE = /\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+/** Family 2b — a bare `Bearer <token>` outside a header line, on one line. The word keeps its spelling. */
+const BEARER_VALUE = /\b(Bearer)[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 /** Family 3a — a PEM private-key block, envelope included. Certificates and public keys are not secrets. */
 const PEM_PRIVATE_KEY_BLOCK =
@@ -81,8 +106,11 @@ const PEM_PRIVATE_KEY_OPEN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/g;
  * as data. The value stops at whitespace, a quote, `;`, `,` or `&`, so the
  * terminator and whatever follows survive.
  */
-const SECRET_ASSIGNMENT =
-  /\b((?:[A-Za-z0-9_.-]{0,63}?[_.-]KEY|APIKEY|[A-Za-z0-9_.-]{0,64}?(?:TOKEN|SECRET|PASSWORD|PASSWD))\b["']?\s*[=:]\s*["']?)([^\s"';,&]+)/gi;
+const SECRET_ASSIGNMENT = new RegExp(
+  String.raw`\b((?:[A-Za-z0-9_.-]{0,63}?[_.-]KEY|APIKEY|[A-Za-z0-9_.-]{0,64}?(?:TOKEN|SECRET|PASSWORD|PASSWD))\b["']?\s*[=:]\s*["']?)` +
+    String.raw`(?!${REDACTED_LITERAL})([^\s"';,&]+)`,
+  "gi",
+);
 
 // ── Masking ─────────────────────────────────────────────────────
 
@@ -100,8 +128,9 @@ export interface MaskResult {
  * header rule runs before the bare-`Bearer` rule so a header keeps its scheme,
  * and the token-prefix rule runs before the assignment rule so
  * `GITHUB_TOKEN=ghp_…` collapses to `GITHUB_TOKEN=[REDACTED]` rather than
- * `GITHUB_TOKEN=ghp_[REDACTED]`. Idempotent: no replacement token contains a
- * character any rule can match.
+ * `GITHUB_TOKEN=ghp_[REDACTED]`. Idempotent in text and count: the prefix,
+ * Bearer and PEM rules cannot match inside a replacement token, and the two
+ * value-taking rules (header, assignment) refuse a value that already is one.
  */
 export function maskSecrets(text: string): MaskResult {
   let masked = 0;
@@ -112,7 +141,7 @@ export function maskSecrets(text: string): MaskResult {
   const out = text
     .replace(TOKEN_PREFIX, (_m, prefix: string) => count(`${prefix}${REDACTED}`))
     .replace(AUTHORIZATION_HEADER, (_m, lead: string, scheme: string | undefined) =>
-      count(`${lead}${scheme ? `${scheme} ` : ""}${REDACTED}`),
+      count(`${lead}${scheme ?? ""}${REDACTED}`),
     )
     .replace(BEARER_VALUE, (_m, word: string) => count(`${word} ${REDACTED}`))
     .replace(PEM_PRIVATE_KEY_BLOCK, () => count(REDACTED_PRIVATE_KEY))
