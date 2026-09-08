@@ -108,7 +108,9 @@ export interface RlmOptions {
    * per value with an elision marker beyond that). Never pass secrets or
    * data the model must not see — the model reads these values from the
    * prompt and from sandbox code.
-   * `context` is always declared and defaults to `""` when absent.
+   * `context` is always declared and defaults to `""` when absent. A nested
+   * `rlm_query` child inherits every input here (#170), with the parent's
+   * context merged into its own.
    */
   inputs?: Record<string, string>;
   /** Sandbox RunOptions propagated to each sandbox run. */
@@ -1348,7 +1350,11 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
           // budget is a hard ceiling on total tree spend. `onIteration` is
           // deliberately not forwarded: child iterations are the child's own.
           budget,
-          inputs: { context: merged },
+          // #170 (D107): the child inherits every parent input — a
+          // sub-investigation must not be blind to data its parent was handed
+          // by name — with the merged context on top. `runOptions.inputs`
+          // already flows through `runOptions` above.
+          inputs: { ...(options.inputs ?? {}), context: merged },
         });
 
         return nested.status === "ok"
