@@ -3016,3 +3016,58 @@ describe("Session — calls are serialised per session (D131)", () => {
     assert.equal(read.output, "2");
   });
 });
+
+// ── Residual: a denied restored gated call derails the cursor ─────
+//
+// Recorded in docs/session-replay.md as a known limit, and here as the
+// property that is missing (decision 9). When the user denies a *restored*
+// gated entry during replay, the gate raises `PermissionError` without
+// telling the caching registry, so the cursor stays on the denied entry and
+// every later call in the prefix mismatches: non-gated ones execute for real
+// (their side effect repeats), gated ones ask. A key mismatch always behaved
+// this way; the restored-entry rule (D128) makes it reachable from a
+// single denial rather than from edited code.
+
+describe("Session — a denied restored gated call should not derail the replay (residual)", () => {
+  it("later non-gated entries are still served from the restored cache after a denial", {
+    todo:
+      "the gate and the cursor do not talk: a denial raises PermissionError in Python without " +
+      "advancing the replay cursor past the denied entry, so the next entry mismatches and " +
+      "executes for real. Intended approach: have `willReplayKey` hand the gate a `skip()` for " +
+      "the entry it refused to treat as a replay, so a denial consumes the entry and the cursor " +
+      "stays aligned; the denied call itself must still not execute.",
+  }, async () => {
+    let echoExecutions = 0;
+    const echo: HostTool = {
+      ...makeEchoTool(),
+      execute: (args) => {
+        echoExecutions++;
+        return String(args.text);
+      },
+    };
+    const gated: HostTool = {
+      name: "gate_res",
+      description: "Needs approval",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `g:${args.x}`,
+    };
+    const registry = new ToolRegistry([echo, gated]);
+    const dump = JSON.stringify({
+      version: 2,
+      snippets: ['try:\n    gate_res("x")\nexcept PermissionError:\n    pass\nv = echo("kept")'],
+      stdoutBytes: [0],
+      callCache: [
+        { key: 'gate_res::{"x":"x"}', result: "g:x" },
+        { key: 'echo::{"text":"kept"}', result: "kept" },
+      ],
+    });
+    const session = Session.load(dump, { registry });
+
+    const result = await session.run("v", { onApproval: () => false });
+    ok(result);
+    assert.equal(result.output, "kept");
+    assert.equal(echoExecutions, 0, "the non-gated entry after the denial executed for real");
+  });
+});
