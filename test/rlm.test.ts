@@ -5790,3 +5790,44 @@ describe("runRlm() — redaction marker hides the redacted size (#191)", () => {
     assertHidesMagnitude(result.answer, "nested answer");
   });
 });
+
+// ── Provider-error threat model is written down (#192, D99) ─────
+//
+// #192 asked which provider clients are in scope, because the answer decides
+// whether the 1 KiB head-only window (which passes a short or leading secret
+// verbatim) is an accepted bound or a defect. The decision — `LlmClient`
+// implementations are trusted host code; the bound is accepted — has to live
+// where the interface is declared and in the normative policy, not only in a
+// ship report. Pinned at the source, the way test 6 pins invariant 4.
+
+describe("LlmClient threat model is recorded where it is read (#192)", () => {
+  const here = fileURLToPath(import.meta.url);
+  const rlmSource = readFileSync(join(here, "..", "..", "src", "rlm.ts"), "utf-8");
+  const policy = readFileSync(
+    join(here, "..", "..", "docs", "truncation-policy.md"),
+    "utf-8",
+  );
+
+  it("the LlmClient doc block in src/rlm.ts declares implementations trusted host code", () => {
+    const at = rlmSource.indexOf("export interface LlmClient");
+    assert.ok(at > 0, "LlmClient is declared in src/rlm.ts (not src/types.ts)");
+    const docStart = rlmSource.lastIndexOf("/**", at);
+    const docBlock = rlmSource.slice(docStart, at);
+    assert.match(docBlock, /trusted host code/, `LlmClient doc lacks the trust sentence:\n${docBlock}`);
+    assert.match(docBlock, /1 KiB/, "the doc must name the accepted head-only bound");
+    assert.match(docBlock, /#192/, "the doc must cite the issue that recorded the decision");
+  });
+
+  it("the truncation policy records the #191 and #192 decisions", () => {
+    const p191 = policy.indexOf("**#191");
+    const p192 = policy.indexOf("**#192");
+    assert.ok(p191 > 0, "policy has no #191 narrative");
+    assert.ok(p192 > 0, "policy has no #192 narrative");
+    const n191 = policy.slice(p191, p191 + 1500);
+    const n192 = policy.slice(p192, p192 + 1500);
+    assert.match(n191, /unknownTotal/, "the #191 narrative must name the switch it flips");
+    assert.match(n191, /truncated at 1\.0KB/, "the #191 narrative must show the marker shape");
+    assert.match(n192, /trusted host code/, "the #192 narrative must state the trust decision");
+    assert.match(n192, /1 KiB/, "the #192 narrative must name the accepted bound");
+  });
+});
