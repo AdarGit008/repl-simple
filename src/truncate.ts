@@ -2,8 +2,10 @@
  * The one truncator.
  *
  * Every model-facing field that can grow without bound — `stdout`, `output`,
- * and the `builtins` file/HTTP reads — is cut here, by this code, so the three
- * sites cannot drift apart again. The policy it implements is recorded in
+ * the `builtins` file/HTTP reads, every RLM prompt section and the redaction
+ * cut — is cut here, by this code, so the sites cannot drift apart again (the
+ * consumers are `src/sandbox.ts`, `src/builtins.ts`, `src/rlm.ts` and
+ * `src/redact.ts`). The policy it implements is recorded in
  * `docs/truncation-policy.md`; that document is normative and this module is
  * what asserts against it.
  *

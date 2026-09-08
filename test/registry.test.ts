@@ -1,9 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { HostToolError, type HostTool } from "../src/types.js";
 import {
   ToolRegistry,
-  arg,
   requireString,
   renderPythonToolRules,
   probeImportableModules,
@@ -176,47 +178,36 @@ describe("ToolRegistry", () => {
   });
 });
 
-// ── arg ──────────────────────────────────────────────────────────
+// ── Dead public API (#85, decision 14, D133/D134) ───────────────
+//
+// `arg()` was a positional-or-keyword lookup that no production code called:
+// eighteen test references, zero consumers, re-exported from the barrel as if
+// it were API. The live resolver is `resolveToolArgs` in src/sandbox.ts
+// (direct matrix: test/resolve_tool_args.test.ts). The function, its seven
+// tests and the re-export went together; these pins make a re-introduction a
+// decision rather than drift. `CANDIDATE_MODULES`, filed alongside it, is
+// live — the default and the memo identity of `probeImportableModules`.
 
-describe("arg", () => {
-  it("returns positional argument when present", () => {
-    assert.equal(arg([42], {}, 0, "x"), 42);
+describe("dead public API (#85)", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+
+  it("arg() is gone from src/registry.ts — resolveToolArgs is the one argument resolver", () => {
+    assert.equal("arg" in registryModule, false, "arg() is dead API (decision 14)");
   });
 
-  it("returns keyword argument when positional is absent", () => {
-    assert.equal(arg([], { x: "hi" }, 0, "x"), "hi");
+  it("the barrel does not re-export arg", () => {
+    const barrel = readFileSync(join(here, "..", "src", "index.ts"), "utf-8");
+    assert.doesNotMatch(barrel, /^\s*arg,?\s*$/m, "src/index.ts still lists `arg`");
   });
 
-  it("throws when positional and keyword both provide same arg", () => {
-    // arg([1], {y:2}, 0, "y"): positional at index 0 and keyword "y" both
-    // target the same parameter → Python-style duplicate error
-    assert.throws(() => arg([1], { y: 2 }, 0, "y"), HostToolError);
-  });
-
-  it("returns undefined when missing from both", () => {
-    assert.equal(arg([], {}, 0, "x"), undefined);
-  });
-
-  it("throws HostToolError on duplicate (both positional and keyword for same name)", () => {
-    assert.throws(() => arg([1], { x: 2 }, 0, "x"), HostToolError);
-  });
-
-  it("throws with pythonType 'TypeError' on duplicate", () => {
-    try {
-      arg([1], { x: 2 }, 0, "x");
-      assert.fail("expected throw");
-    } catch (err) {
-      assert.ok(err instanceof HostToolError);
-      assert.equal((err as HostToolError).pythonType, "TypeError");
-    }
-  });
-
-  it("handles multiple positional args, keyword for later param", () => {
-    // f(10, y=20): args=[10], kwargs={y:20}
-    // arg for "x" at index 0 → 10
-    assert.equal(arg([10], { y: 20 }, 0, "x"), 10);
-    // arg for "y" at index 1 → kwargs[y]=20
-    assert.equal(arg([10], { y: 20 }, 1, "y"), 20);
+  it("CANDIDATE_MODULES is live: it is the default list probeImportableModules answers for", async () => {
+    // Green on main by design — the re-scope: the issue counted it as
+    // referenced nowhere, but #68 made it the memo's identity key.
+    resetProbeMemos();
+    assert.deepEqual(
+      await probeImportableModules(),
+      await probeImportableModules([...CANDIDATE_MODULES]),
+    );
   });
 });
 
@@ -262,6 +253,19 @@ describe("renderPythonToolRules", () => {
       rules.includes("ModuleNotFoundError") || rules.includes("exist"),
       `expected rules to warn about unavailable modules, got: ${rules}`,
     );
+  });
+
+  it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", {
+    todo:
+      "the rules say 'Class definitions and match statements are not supported'; measured on " +
+      "Monty 0.0.21 a plain class with __init__ and a method runs (A(3).get() -> 3) and only " +
+      "class inheritance / metaclasses / match raise NotImplementedError (README agrees). The " +
+      "line is model-facing prompt text, so rewording it is a behaviour change outside this " +
+      "chunk's scope (#86 comment sweep) — W3-2 rewords it to name inheritance and match.",
+  }, () => {
+    const rules = renderPythonToolRules(["json"]);
+    assert.doesNotMatch(rules, /Class definitions .* are not supported/);
+    assert.match(rules, /inheritance/);
   });
 });
 

@@ -1,10 +1,26 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { maskSecrets, redact, REDACTED, REDACTED_PRIVATE_KEY } from "../src/redact.js";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
+
+/**
+ * The PEM density test's constants, shared with the docs/redaction.md pin at
+ * the end of this file: the document describes this test, in these numbers.
+ */
+const DENSITY = {
+  LINE: "-----BEGIN PRIVATE KEY-----\n",
+  SIZE: 1024 * 1024,
+  RUNS: 5,
+  PASSES: 4,
+  COUNTS: [1, 1024],
+  BOUND: 3,
+} as const;
 
 /** One masking case: the input, what must survive, what must not. */
 interface MaskCase {
@@ -219,11 +235,78 @@ describe("maskSecrets — Authorization / Bearer (family 2)", () => {
       kept: [" user 7"],
       exact: `Authorization: ${REDACTED} user 7`,
     },
+    {
+      // The re-verifier's probe: a known scheme followed by a *quoted*
+      // credential masked nothing — the scheme branch wanted a bare value and
+      // the lone-value branch refuses a known scheme word. Non-standard, but
+      // the header's name is right there in front of it.
+      name: "a known scheme followed by a double-quoted credential",
+      input: 'Authorization: Bearer "abc123def456"\nAccept: 1',
+      gone: ["abc123def456"],
+      kept: ['Authorization: Bearer "', "Accept: 1"],
+      exact: `Authorization: Bearer "${REDACTED}"\nAccept: 1`,
+    },
+    {
+      name: "a known scheme followed by a single-quoted credential",
+      input: "authorization: Basic 'dXNlcjpwYXNzd29yZA=='",
+      gone: ["dXNlcjpwYXNzd29yZA=="],
+      kept: ["authorization: Basic '"],
+      exact: `authorization: Basic '${REDACTED}'`,
+    },
+    {
+      // Digest is a parameter list, not a token: the replayable parts are the
+      // response hash and the nonces; username, realm, uri and qop are the
+      // context a reader needs to see which request failed.
+      name: "Digest parameters — response, nonce and cnonce masked, the rest kept",
+      input:
+        'Authorization: Digest username="u", realm="r", nonce="dcd98b7102dd2f0e", uri="/v1/x", qop=auth, nc=00000001, cnonce="0a4f113b", response="6629fae49393a05397450978507c4ef1", opaque="5ccc069c"\nX-Request-Id: 42',
+      gone: ["dcd98b7102dd2f0e", "0a4f113b", "6629fae49393a05397450978507c4ef1"],
+      kept: [
+        'Authorization: Digest username="u", realm="r", nonce="',
+        'uri="/v1/x", qop=auth, nc=00000001, cnonce="',
+        'opaque="5ccc069c"',
+        "X-Request-Id: 42",
+      ],
+      exact: `Authorization: Digest username="u", realm="r", nonce="${REDACTED}", uri="/v1/x", qop=auth, nc=00000001, cnonce="${REDACTED}", response="${REDACTED}", opaque="5ccc069c"\nX-Request-Id: 42`,
+    },
+    {
+      name: "Digest parameters without quotes",
+      input: "Authorization: Digest username=u, realm=r, nonce=n0nce, response=abc123, uri=/",
+      gone: ["n0nce", "abc123"],
+      kept: ["username=u, realm=r, nonce=", ", uri=/"],
+      exact: `Authorization: Digest username=u, realm=r, nonce=${REDACTED}, response=${REDACTED}, uri=/`,
+    },
+    {
+      name: "a JSON-quoted Digest header",
+      input: '{"Authorization": "Digest username=\\"u\\", response=\\"abc123\\"", "Accept": "*/*"}',
+      gone: ["abc123"],
+      kept: ['"Accept": "*/*"', 'username=\\"u\\"'],
+    },
   ];
 
   for (const c of CASES) {
     it(`masks ${c.name}`, () => assertMasked(c));
   }
+
+  it("the Digest rule counts each masked parameter and leaves a header with none of them alone", () => {
+    const three = maskSecrets('Authorization: Digest nonce="a1", cnonce="b2", response="c3"');
+    assert.equal(three.masked, 3);
+    const none = 'Authorization: Digest username="u", realm="r", uri="/x", qop=auth';
+    const out = maskSecrets(none);
+    assert.equal(out.masked, 0, "username/realm/uri/qop are context, not credentials");
+    assert.equal(out.text, none, "the old rule masked `username=` here");
+  });
+
+  it("a Digest parameter list on a `;`-joined line leaves the next header to its own rule", () => {
+    const out = maskSecrets(
+      'Authorization: Digest username="u", response="abc123"; Authorization: Bearer bbbbbbbbbbbb',
+    );
+    assert.equal(out.masked, 2);
+    assert.equal(
+      out.text,
+      `Authorization: Digest username="u", response="${REDACTED}"; Authorization: Bearer ${REDACTED}`,
+    );
+  });
 
   it("masks both of two `;`-joined headers and keeps the separator", () => {
     const out = maskSecrets(
@@ -285,6 +368,52 @@ describe("maskSecrets — Authorization / Bearer (family 2)", () => {
     const out = maskSecrets("the bearer of this note");
     assert.equal(out.masked, 0);
     assert.equal(out.text, "the bearer of this note");
+  });
+
+  it("bare Bearer prose on ONE line is data: the word after it must look like a credential", () => {
+    // The re-verifier's probe. Outside a header there is no name to anchor
+    // on, so the token itself has to carry the evidence: 16+ characters or a
+    // digit / underscore / dash, and not a run of lowercase letters.
+    for (const text of [
+      "the Bearer authentication scheme is used",
+      "Bearer tokens expire after an hour",
+      "a Bearer credential is opaque to the client",
+      "send it in the Bearer AUTHORIZATION header",
+      "Bearer Authentication is defined in RFC 6750",
+      "the bearer authenticationscheme word runs on",
+    ]) {
+      const out = maskSecrets(text);
+      assert.equal(out.masked, 0, text);
+      assert.equal(out.text, text);
+    }
+  });
+
+  it("a bare Bearer token that looks like a credential still masks", () => {
+    for (const token of [
+      "0123456789abcdef",
+      "abc-def-ghi",
+      "a_b_c_d_e",
+      "AbCdEfGhIjKlMnOpQr",
+      "eyJhbGci.eyJzdWIi.sig",
+      "x9y8z7w6",
+    ]) {
+      const out = maskSecrets(`curl -H 'bearer ${token}' failed`);
+      assert.equal(out.masked, 1, token);
+      assert.equal(out.text, `curl -H 'bearer ${REDACTED}' failed`, token);
+    }
+  });
+
+  it("an all-lowercase-letter word after a bare Bearer is data even at 16+ characters (recorded false negative)", () => {
+    // Real bearer tokens are base64, hex or JWTs — digits, dots, uppercase —
+    // so the cost of this rule is a shape no issued token has; the gain is
+    // every English word after the word "Bearer". Inside a header the same
+    // token still masks: the header's name is the evidence there.
+    const bare = maskSecrets("bearer abcdefghijklmnop");
+    assert.equal(bare.masked, 0);
+    assert.equal(
+      maskSecrets("Authorization: Bearer abcdefghijklmnop").text,
+      `Authorization: Bearer ${REDACTED}`,
+    );
   });
 });
 
@@ -454,6 +583,45 @@ describe("maskSecrets — KEY / TOKEN / SECRET / PASSWORD assignments (family 4)
       kept: ["KEY=", " done"],
       exact: `KEY=${REDACTED} done`,
     },
+    {
+      // The re-verifier's probe: in a code dump the value ran to the closing
+      // paren and took it along. A value never *ends* in a closing bracket.
+      name: "a call argument — the closing paren survives",
+      input: "f(KEY=abc123)",
+      gone: ["abc123"],
+      kept: ["f(KEY=", ")"],
+      exact: `f(KEY=${REDACTED})`,
+    },
+    {
+      name: "a dict literal — the closing brace survives",
+      input: "config = {token: abc123}",
+      gone: ["abc123"],
+      kept: ["config = {token: ", "}"],
+      exact: `config = {token: ${REDACTED}}`,
+    },
+    {
+      name: "a list literal — the closing bracket survives",
+      input: "[SECRET=abc123]",
+      gone: ["abc123"],
+      kept: ["[SECRET=", "]"],
+      exact: `[SECRET=${REDACTED}]`,
+    },
+    {
+      name: "several closing brackets survive together",
+      input: "g(f(KEY=abc123))",
+      gone: ["abc123"],
+      kept: ["g(f(KEY=", "))"],
+      exact: `g(f(KEY=${REDACTED}))`,
+    },
+    {
+      // Only a *trailing* bracket is a terminator: a bracket inside the value
+      // is part of the value, so the secret still goes whole.
+      name: "a bracket inside the value masks whole",
+      input: "PASSWORD=ab)cd next",
+      gone: ["ab)cd", "cd"],
+      kept: ["PASSWORD=", " next"],
+      exact: `PASSWORD=${REDACTED} next`,
+    },
   ];
 
   for (const c of CASES) {
@@ -531,6 +699,15 @@ describe("maskSecrets — documented costs (decision 6, literally)", () => {
       kept: ["d = dict(key=", ", other=1)"],
       exact: `d = dict(key=${REDACTED}, other=1)`,
     },
+    {
+      // The kwarg is the last argument: the value is masked, the code keeps
+      // its shape (the re-verifier's probe lost the `)`).
+      name: "Python kwarg as the last argument — the closing paren survives",
+      input: "sorted(rows, key=str.lower)",
+      gone: ["str.lower"],
+      kept: ["sorted(rows, key=", ")"],
+      exact: `sorted(rows, key=${REDACTED})`,
+    },
   ];
 
   for (const c of COSTS) {
@@ -579,6 +756,16 @@ const CORPUS: Array<{ name: string; text: string }> = [
     name: "401 challenge header",
     text: 'WWW-Authenticate: Bearer realm="api", error="invalid_token"',
   },
+  {
+    name: "Digest challenge header (a server nonce is not a credential)",
+    text: 'WWW-Authenticate: Digest realm="api", nonce="dcd98b7102dd2f0e", qop="auth"',
+  },
+  {
+    name: "Digest header without a response",
+    text: 'Authorization: Digest username="u", realm="r", uri="/x"',
+  },
+  { name: "Bearer prose on one line", text: "the Bearer authentication scheme is used" },
+  { name: "Bearer as an adjective", text: "Bearer tokens expire after an hour" },
   { name: "PEM certificate", text: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----" },
   { name: "public key block", text: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----" },
   { name: "provider error", text: "429 rate limit exceeded; retry after 20s (request id req_1)" },
@@ -602,13 +789,16 @@ describe("maskSecrets / redact — idempotence", () => {
   const POSITIVES = [
     "sk-abcdefghijklmnopqrstuvwxyz0123456789",
     "Authorization: Bearer abcdefghijklmnop",
+    'Authorization: Bearer "abc123def456"',
     "Authorization: dXNlcjpwYXNzd29yZA==",
-    "bearer abcdefghijklmnop",
+    'Authorization: Digest username="u", nonce="n0nce", response="abc123"',
+    "bearer abcdefghijklmnop01",
     "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
     "-----BEGIN PRIVATE KEY-----\nMIIB",
     "API_KEY=abc123 TOKEN=def456 password: ghi789",
     "export KEY=abc123 key='def456'",
     'GITHUB_TOKEN="ghp_abcdefghijklmnopqrstuvwxyz0123"',
+    "f(KEY=abc123) [SECRET=def456]",
   ];
 
   it("a second masking pass changes nothing and masks nothing", () => {
@@ -728,6 +918,7 @@ const HEADER_LINES = [
   "Retry-After: 20",
   "Date: Tue, 08 Sep 2026 12:00:00 GMT",
   "Connection: keep-alive",
+  'WWW-Authenticate: Digest realm="api", nonce="dcd98b7102dd2f0e", qop="auth"',
 ];
 
 const ENV_LINES = [
@@ -763,6 +954,8 @@ const PROSE_LINES = [
   "tokens are counted per request",
   "see docs/redaction.md for the rules",
   "429 rate limit exceeded; retry after 20s (request id req_1)",
+  "the Bearer authentication scheme is used",
+  "Bearer tokens expire after an hour",
 ];
 
 const CODE_LINES = [
@@ -806,9 +999,12 @@ describe("maskSecrets — fuzz: random header, env and prose lines", () => {
       const form = pick(rand, [
         credential,
         `Bearer ${credential}`,
+        `Bearer "${credential}"`,
         `Basic ${credential}==`,
+        `Basic '${credential}=='`,
         `Bot ${credential}`,
         `Token ${credential}`,
+        `Digest username="u", realm="r", nonce="${credential}", uri="/v1", response="${credential}"`,
       ]);
       const headers = Array.from({ length: 1 + Math.floor(rand() * 4) }, () =>
         pick(rand, HEADER_LINES),
@@ -841,6 +1037,16 @@ describe("maskSecrets — bounded work on long inputs", () => {
     { name: "many separators", text: "a_b-c.".repeat(200 * 1024) },
     { name: "many BEGIN lines without END", text: "-----BEGIN PRIVATE KEY-----\n".repeat(37449) },
     { name: "many colons", text: "key: value: key: value:\n".repeat(50 * 1024) },
+    // The assignment rule's worst constant (re-verifier's observation): a
+    // word boundary at every character and up to ~130 lazy name expansions
+    // per position, ~0.4 s per MiB, linear. Half a MiB keeps the 2 s budget
+    // ten times away on this box.
+    { name: "alternating word and dash", text: "a-".repeat(256 * 1024) },
+    { name: "many Bearer words", text: "Bearer authentication ".repeat(40 * 1024) },
+    {
+      name: "many Digest parameters",
+      text: 'Authorization: Digest nonce="a", response="b"\n'.repeat(20 * 1024),
+    },
   ];
 
   for (const { name, text } of SHAPES) {
@@ -868,11 +1074,7 @@ describe("maskSecrets — bounded work on long inputs", () => {
     // size is held fixed. Runs are interleaved and the best of five is kept,
     // four passes per timing, so a transient stall cannot land on one text
     // alone and the figures are milliseconds rather than timer ticks.
-    const LINE = "-----BEGIN PRIVATE KEY-----\n";
-    const SIZE = 1024 * 1024;
-    const RUNS = 5;
-    const PASSES = 4;
-    const COUNTS = [1, 1024];
+    const { LINE, SIZE, RUNS, PASSES, COUNTS, BOUND } = DENSITY;
     const texts = COUNTS.map((k) => LINE.repeat(k) + "A".repeat(SIZE - k * LINE.length));
     const best = texts.map(() => Number.POSITIVE_INFINITY);
     for (let run = 0; run < RUNS; run++) {
@@ -886,10 +1088,38 @@ describe("maskSecrets — bounded work on long inputs", () => {
     // healthy 1× read as 30×.
     const ratio = (best[1] as number) / Math.max(best[0] as number, 1);
     assert.ok(
-      ratio < 3,
+      ratio < BOUND,
       `${COUNTS[1]} BEGIN lines cost ${ratio.toFixed(2)}× one (best of ${RUNS}, ${PASSES} passes each: ${best
         .map((t) => t.toFixed(1))
         .join(" / ")} ms)`,
+    );
+  });
+});
+
+// ── The normative document describes only tests that ship ───────
+//
+// docs/redaction.md is normative and this file is what asserts it. The
+// re-verifier found the document describing a size-doubling growth test
+// that was replaced by the density test above; the pin below reads the
+// document against that test's own constants, so the two cannot drift apart
+// again without one of them failing.
+
+describe("docs/redaction.md — the linearity claim describes the shipped test", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const doc = readFileSync(join(here, "..", "docs", "redaction.md"), "utf-8");
+
+  it("does not describe the retired per-doubling test", () => {
+    assert.doesNotMatch(doc, /3× per doubling/);
+    assert.doesNotMatch(doc, /256 KiB to 1 MiB/);
+  });
+
+  it("describes the density test with its constants", () => {
+    assert.match(doc, new RegExp(`${DENSITY.COUNTS[1]} \`BEGIN\` lines`));
+    assert.match(doc, /exactly 1 MiB/);
+    assert.match(doc, new RegExp(`under ${DENSITY.BOUND}×`));
+    assert.match(
+      doc,
+      new RegExp(`best of ${DENSITY.RUNS} interleaved runs, ${DENSITY.PASSES} passes each`),
     );
   });
 });
