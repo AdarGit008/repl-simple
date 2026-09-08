@@ -4,6 +4,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../src/registry.js";
+// The #169 memo exports are reached through the namespace so that, run
+// against a `src/` without them, only their test fails rather than this
+// whole file failing to link (D109).
+import * as registryModule from "../src/registry.js";
 import { estimateTokens, SpendBudget } from "../src/budget.js";
 import type { HostTool, RunErrorKind } from "../src/types.js";
 
@@ -5920,5 +5924,102 @@ describe("runRlm() — synthesised answer cap (D101)", () => {
     });
     assert.notEqual(overResult.answer, `${atBudget}!`);
     assert.ok(overResult.answer.includes(SYNTHESIS_RECOVERY));
+  });
+});
+
+// ── Unchecked tools are named in the system prompt (#67, D105) ──
+//
+// A tool whose stub degraded is one the model should be more careful with:
+// nothing checks its arguments. The registry now reports the list; the loop
+// surfaces it to the model in the prompt it builds (decision 10). The
+// `repl`-side notice is deferred, pinned as a todo below.
+
+describe("runRlm() — unchecked tools are listed in the system prompt (#67)", () => {
+  const broken: HostTool = {
+    name: "broken",
+    description: "a tool whose stub cannot parse",
+    params: [{ name: "class", type: "str", description: "a keyword as a name" }],
+    returns: "str",
+    execute: () => "",
+  };
+
+  it("lists a degraded tool under ## Unchecked Tools with its detail", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: new ToolRegistry([broken]),
+      maxIterations: 5,
+    });
+
+    assert.equal(result.status, "ok");
+    const prompt = llm.calls()[0].systemPrompt;
+    const at = prompt.indexOf("## Unchecked Tools");
+    assert.ok(at >= 0, `no Unchecked Tools section:\n${prompt}`);
+    const end = prompt.indexOf("## Python Rules", at);
+    assert.ok(end > at, "the section sits before the Python rules");
+    const section = prompt.slice(at, end);
+    assert.match(section, /^- broken — stub did not parse/m, `section:\n${section}`);
+    assert.match(section, /check their arguments yourself/i, `section:\n${section}`);
+    // The degraded stub itself still renders as the Any fallback above it.
+    assert.ok(prompt.includes("broken: Any = None"));
+  });
+
+  it("a clean registry has no such section, and SUBMIT no longer renders -> void", async () => {
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    await runRlm("q", { llmClient: llm, registry: new ToolRegistry([]), maxIterations: 5 });
+
+    const prompt = llm.calls()[0].systemPrompt;
+    assert.ok(!prompt.includes("## Unchecked Tools"), `unexpected section:\n${prompt}`);
+    assert.ok(!prompt.includes("Unchecked"), "no degradation wording on a clean registry");
+    assert.ok(prompt.includes("def SUBMIT(answer: str) -> None:"), `SUBMIT stub:\n${prompt}`);
+    assert.ok(!prompt.includes("-> void"), "void is not a Python name");
+  });
+
+  it("the repl tool reports degraded stubs to the user (deferred, decision 10)", {
+    todo:
+      "decision 10 defers the repl-side notice: src/repl.ts (not owned by W1-5) does not read " +
+      "registry.degradedStubs() yet. Intended approach: ReplRunner surfaces the `tools` list once " +
+      "per session in the repl tool result (the same slot the preamble status uses), so a user " +
+      "whose custom tool silently degraded is told. Flip this pin when src/repl.ts names it.",
+  }, () => {
+    const here = fileURLToPath(import.meta.url);
+    const replSource = readFileSync(join(here, "..", "..", "src", "repl.ts"), "utf-8");
+    assert.match(replSource, /degradedStubs/, "src/repl.ts does not consult the report");
+  });
+});
+
+// ── Stub validation is memoised across runRlm calls (#169, D106) ──
+
+describe("runRlm() — stub validation is memoised across calls and nesting (#169)", () => {
+  it("two runs and a nested child over the same caller registry validate the stubs once", async () => {
+    // Each runRlm builds a fresh merged ToolRegistry (caller tools + the RLM
+    // tools), and so does every nested child. The instance cache never hits
+    // across them; the content-addressed memo must.
+    const tool: HostTool = {
+      name: "my_tool",
+      description: "a caller tool",
+      params: [],
+      returns: "str",
+      execute: () => "hi",
+    };
+    const registry = new ToolRegistry([tool]);
+    registryModule.resetStubValidationMemo();
+
+    const { llm: first } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    await runRlm("q", { llmClient: first, registry, maxIterations: 5 });
+    const { llm: second } = mockLlmCodeGen([
+      '```python\nnested = rlm_query("sub")\nSUBMIT(nested)\n```',
+      '```python\nSUBMIT("from nested")\n```',
+    ]);
+    const result = await runRlm("q", { llmClient: second, registry, maxIterations: 5 });
+
+    assert.equal(result.answer, "from nested");
+    assert.equal(
+      registryModule.stubValidationInvocations(),
+      1,
+      "the parent, its second run and its child must share one validation",
+    );
   });
 });
