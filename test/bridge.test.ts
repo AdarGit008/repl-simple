@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
@@ -682,7 +682,13 @@ describe("createPiBridgeTools — pi's details survive the bridge (#46)", () => 
     await findTool(tools, "read").execute({ path: "details-big.txt" });
     assert.equal(events.length, 1);
     assert.equal(events[0].tool, "read");
-    assert.equal(events[0].args.path, bigFile, "the event carries the args pi ran with");
+    // The jailed path is canonical — realpath both sides (a macOS temp dir is
+    // `/var/…` by name and `/private/var/…` in fact).
+    assert.equal(
+      events[0].args.path,
+      realpathSync(bigFile),
+      "the event carries the args pi ran with",
+    );
     const truncation = (events[0].details as { truncation?: { truncated: boolean } }).truncation;
     assert.equal(truncation?.truncated, true, JSON.stringify(events[0].details));
 
