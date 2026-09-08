@@ -1,0 +1,8 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": ["extensions/repl-extension.ts", "test/**/*.test.ts", "scripts/*.mjs", "scripts/*.ts"],
+  "project": ["src/**/*.ts", "extensions/**/*.ts", "test/**/*.ts", "scripts/**/*.{mjs,ts}"],
+  "ignoreExportsUsedInFile": true,
+  "ignoreBinaries": ["systemd-run", "journalctl", "mkfifo"],
+  "ignoreDependencies": ["@stryker-mutator/core", "@stryker-mutator/command-runner"]
+}
