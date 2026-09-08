@@ -2901,11 +2901,40 @@ describe("tools annotate an unaccepted file (#198)", () => {
         "add [not loaded: project not trusted]",
       );
       await assert.rejects(
-        findTool(tools, "read_tool").execute({ name: "add" }),
+        async () => findTool(tools, "read_tool").execute({ name: "add" }),
         (err: unknown) => err instanceof HostToolError && err.pythonType === "PermissionError",
       );
     } finally {
       cleanup();
+    }
+  });
+});
+
+describe("preamble manifest store — a store it cannot even resolve (#198)", () => {
+  it("reports the error as unavailable and refuses to write", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const root = makeTempDir();
+    const outside = mkdtempSync(join(tmpdir(), "repl-store-"));
+    const locked = join(outside, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try {
+      // realpath fails with EACCES, not ENOENT: the walk cannot tell what is
+      // behind the directory, and guessing "outside" would be the fail-open.
+      const store = toolstore.createPreambleManifestStore(join(locked, "store"), root);
+      const read = await store.read();
+      assert.equal(read.status, "unavailable");
+      assert.match(JSON.stringify(read), /cannot resolve the manifest store/);
+      await assert.rejects(store.write(new Map()), /cannot resolve the manifest store/);
+    } finally {
+      try {
+        chmodSync(locked, 0o700);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

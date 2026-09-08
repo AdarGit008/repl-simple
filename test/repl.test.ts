@@ -2836,11 +2836,22 @@ describe("ReplRunner — acceptPreamble and the tools' view of withheld files (#
         "an untrusted accept wrote a manifest",
       );
 
-      // A preamble refused whole cannot be accepted in part.
+      // A preamble refused whole cannot be accepted in part — and a session
+      // built over an existing manifest reports the refusal alone: nothing
+      // loads, so there is nothing to call added, changed or removed.
+      await trustedRunner(cwd, store).run("1 + 1", "s"); // the implicit accept
       saveToolFile(cwd, "shadow", "def read_file(p):\n    return 'x'\n");
+      const refusedRun = await trustedRunner(cwd, store).run("1 + 1", "s");
+      assert.match(refusedRun, /^\[preamble refused\]/, refusedRun);
+      assert.doesNotMatch(refusedRun, /preamble changed/, refusedRun);
       const refused = await trustedRunner(cwd, store).acceptPreamble();
       assert.equal(refused.status, "refused");
       assert.match(JSON.stringify(refused), /shadow\.py/);
+      assert.deepEqual(
+        Object.keys((await readManifest(store, cwd)).files),
+        ["adder"],
+        "a refused accept touched the manifest",
+      );
       rmSync(join(cwd, ".pi", "code-tools", "shadow.py"));
 
       // A store the runner refuses to use.
