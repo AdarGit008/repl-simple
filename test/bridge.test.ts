@@ -664,3 +664,51 @@ describe("createPiBridgeTools — edit execution", () => {
     });
   });
 });
+
+// ── pi's details survive the bridge (#46) ───────────────────────
+//
+// Each built-in tool returns `{ content, details }`; the bridge used to keep
+// the text and drop the details — the truncation facts, bash's full-output
+// path, edit's diff. `HostTool.execute` still returns the string (that is the
+// sandbox's contract), and the details reach the caller through `onDetails`.
+
+describe("createPiBridgeTools — pi's details survive the bridge (#46)", () => {
+  it("onDetails receives read's truncation, edit's diff and patch, write's undefined — and nothing on a failure", async () => {
+    const events: Array<{ tool: string; args: Record<string, unknown>; details: unknown }> = [];
+    const tools = createPiBridgeTools(tmpDir, { onDetails: (event) => events.push(event) });
+    const bigFile = join(tmpDir, "details-big.txt");
+    writeFileSync(bigFile, `${Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n")}\n`);
+
+    await findTool(tools, "read").execute({ path: "details-big.txt" });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].tool, "read");
+    assert.equal(events[0].args.path, bigFile, "the event carries the args pi ran with");
+    const truncation = (events[0].details as { truncation?: { truncated: boolean } }).truncation;
+    assert.equal(truncation?.truncated, true, JSON.stringify(events[0].details));
+
+    await findTool(tools, "write").execute({ path: "details-w.txt", content: "one\ntwo\n" });
+    assert.equal(events.length, 2);
+    assert.equal(events[1].tool, "write");
+    assert.equal(events[1].details, undefined, "pi's write returns no details");
+
+    await findTool(tools, "edit").execute({
+      path: "details-w.txt",
+      edits: JSON.stringify([{ oldText: "two", newText: "TWO" }]),
+    });
+    assert.equal(events.length, 3);
+    const edit = events[2].details as { diff?: string; patch?: string };
+    assert.equal(typeof edit.diff, "string");
+    assert.equal(typeof edit.patch, "string");
+
+    // A refused read never reaches pi, and a failing edit produces no result:
+    // neither emits an event.
+    await assert.rejects(findTool(tools, "read").execute({ path: "../outside.txt" }));
+    await assert.rejects(
+      findTool(tools, "edit").execute({
+        path: "details-w.txt",
+        edits: JSON.stringify([{ oldText: "nope", newText: "x" }]),
+      }),
+    );
+    assert.equal(events.length, 3, "a failed call reported details");
+  });
+});

@@ -3071,3 +3071,436 @@ describe("ReplRunner — an unlistable .pi/code-tools never rewrites the accepte
     }
   });
 });
+
+// ── The trace API (#46, decision 11) ─────────────────────────────
+//
+// `run()` and `resume()` return the text the model reads and nothing else;
+// `RunResult.calls` — every ungated read, every gated call and its approval —
+// never left the runner. `runWithTrace()` / `resumeWithTrace()` return the
+// same text plus the calls. Additive: the string API is `.text` of the same
+// call, so the 188 call sites above are untouched and byte-identical.
+
+/** `[tool, ok, approved]` per call — what an audit reads first. */
+function outline(trace: {
+  calls: Array<{ tool: string; ok: boolean; approved?: boolean }>;
+}): Array<readonly [string, boolean, boolean | undefined]> {
+  return trace.calls.map((c) => [c.tool, c.ok, c.approved] as const);
+}
+
+describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", () => {
+  let cwd: string;
+  let runner: ReplRunner;
+
+  before(() => {
+    cwd = makeTempDir();
+    writeFileSync(join(cwd, "hello.txt"), "hello world\n");
+    // Over pi's 2000-line read limit, so the bridged read reports truncation.
+    writeFileSync(
+      join(cwd, "big.txt"),
+      `${Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n")}\n`,
+    );
+    runner = new ReplRunner(cwd);
+  });
+
+  after(cleanup);
+
+  const CODE = [
+    "read('hello.txt')",
+    "write('a.txt', 'x')",
+    "try:",
+    "    write('b.txt', 'y')",
+    "except PermissionError:",
+    "    print('denied')",
+  ].join("\n");
+
+  /** Approve the first gated call, deny every later one. */
+  function firstOnly(): () => Promise<ApprovalDecision> {
+    let n = 0;
+    return async () => n++ === 0;
+  }
+
+  it("text is byte-identical to run(), and calls carry the approval status", async () => {
+    const plain = await runner.run(CODE, "plain", firstOnly());
+    const traced = await runner.runWithTrace(CODE, "traced", firstOnly());
+    assert.equal(traced.text, plain);
+    assert.equal(traced.sessionId, "traced");
+    assert.equal(traced.status, "ok");
+    assert.deepEqual(outline(traced), [
+      ["read", true, undefined],
+      ["write", true, true],
+      ["write", false, false],
+    ]);
+    assert.deepEqual(traced.calls[0].args, ["hello.txt"]);
+    assert.match(traced.calls[2].error ?? "", /requires approval/);
+    assert.equal(traced.suspendedCall, undefined);
+  });
+
+  it("an error result carries errorKind and the calls up to the failure", async () => {
+    const code = "read('hello.txt')\nraise ValueError('x')";
+    const plain = await runner.run(code, "err-plain");
+    const traced = await runner.runWithTrace(code, "err-traced");
+    assert.equal(traced.text, plain);
+    assert.equal(traced.status, "error");
+    assert.equal(traced.errorKind, "runtime");
+    assert.deepEqual(outline(traced), [["read", true, undefined]]);
+  });
+
+  it("the resume early returns are statuses with no calls", async () => {
+    const none = await runner.resumeWithTrace("nope");
+    assert.deepEqual(none, {
+      text: "No session 'nope' exists. Run some code first.",
+      sessionId: "nope",
+      status: "no-session",
+      calls: [],
+    });
+
+    await runner.run("1", "idle");
+    const idle = await runner.resumeWithTrace("idle");
+    assert.equal(idle.status, "nothing-pending");
+    assert.deepEqual(idle.calls, []);
+    assert.equal(idle.text, await runner.resume("idle"));
+  });
+
+  it("a trust change during the pause is its own status", async () => {
+    const trustCwd = mkdtempSync(join(tmpdir(), "repl-test-trust-"));
+    const store = makeStore();
+    saveToolFile(trustCwd, "adder", ADDER);
+    try {
+      let trusted = true;
+      const flipping = trustedRunner(trustCwd, store, { trusted: () => trusted });
+      const paused = await flipping.runWithTrace("write('t.txt', 'x')", "t", suspend);
+      assert.equal(paused.status, "suspended");
+      assert.equal(paused.suspendedCall?.tool, "write");
+
+      trusted = false;
+      const rebuilt = await flipping.resumeWithTrace("t", approve);
+      assert.equal(rebuilt.status, "trust-changed");
+      assert.deepEqual(rebuilt.calls, []);
+      assert.match(rebuilt.text, /^\[trust changed\]/);
+      assert.equal(existsSync(join(trustCwd, "t.txt")), false, "the withdrawn call executed");
+    } finally {
+      rmSync(trustCwd, { recursive: true, force: true });
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("a suspended trace carries the calls so far and the waiting call; the resumed trace is the whole run and matches resume()", async () => {
+    const code = "read('hello.txt')\nwrite('s.txt', 'v')\nread('hello.txt')";
+    // Two sessions in lockstep, one through each API: the texts must agree at
+    // both steps.
+    const plainPaused = await runner.run(code, "s-plain", suspend);
+    const tracedPaused = await runner.runWithTrace(code, "s-traced", suspend);
+    assert.equal(tracedPaused.text, plainPaused);
+    assert.equal(tracedPaused.status, "suspended");
+    assert.deepEqual(outline(tracedPaused), [["read", true, undefined]]);
+    assert.equal(tracedPaused.suspendedCall?.tool, "write");
+    assert.deepEqual(tracedPaused.suspendedCall?.args, ["s.txt", "v"]);
+
+    const plainDone = await runner.resume("s-plain", approve);
+    const tracedDone = await runner.resumeWithTrace("s-traced", approve);
+    assert.equal(tracedDone.text, plainDone);
+    assert.equal(tracedDone.status, "ok");
+    assert.deepEqual(outline(tracedDone), [
+      ["read", true, undefined],
+      ["write", true, true],
+      ["read", true, undefined],
+    ]);
+    assert.equal(tracedDone.suspendedCall, undefined);
+  });
+
+  it("bridged details are merged, and stay aligned across a suspension", async () => {
+    const code = "read('big.txt')\nwrite('d.txt', 'x')\nread('hello.txt')";
+    const paused = await runner.runWithTrace(code, "details", suspend);
+    const big = paused.calls[0].details as { truncation?: { truncated: boolean } } | undefined;
+    assert.equal(big?.truncation?.truncated, true, JSON.stringify(paused.calls[0]));
+
+    const done = await runner.resumeWithTrace("details", approve);
+    assert.deepEqual(outline(done), [
+      ["read", true, undefined],
+      ["write", true, true],
+      ["read", true, undefined],
+    ]);
+    const first = done.calls[0].details as { truncation?: { truncated: boolean } } | undefined;
+    const last = done.calls[2].details as { truncation?: { truncated: boolean } } | undefined;
+    assert.equal(first?.truncation?.truncated, true, "the pre-suspension read lost its details");
+    assert.equal(done.calls[1].details, undefined, "pi's write has no details to merge");
+    assert.equal(last?.truncation?.truncated, false, "the post-suspension read lost its details");
+  });
+
+  it("replay-served entries are excluded from error and suspended results", async () => {
+    await runner.run("read('hello.txt')", "raw");
+
+    // The transcript re-executes the first snippet, whose read is served from
+    // the cache. Session filters that out of an ok result only (measured):
+    // the trace has to be what executed, whatever the outcome.
+    const failed = await runner.runWithTrace("read('big.txt', 1, 1)\nraise ValueError('e')", "raw");
+    assert.equal(failed.status, "error");
+    assert.deepEqual(
+      failed.calls.map((c) => [c.tool, c.args[0]]),
+      [["read", "big.txt"]],
+    );
+
+    const paused = await runner.runWithTrace(
+      "read('big.txt', 2, 1)\nwrite('raw.txt', 'x')",
+      "raw",
+      suspend,
+    );
+    assert.equal(paused.status, "suspended");
+    assert.deepEqual(
+      paused.calls.map((c) => c.args),
+      [["big.txt", 2, 1]],
+    );
+
+    // And the ok path, which Session filters itself, agrees.
+    runner.abandon("raw");
+    const ok = await runner.runWithTrace("read('big.txt', 3, 1)", "raw");
+    assert.equal(ok.status, "ok");
+    assert.deepEqual(
+      ok.calls.map((c) => c.args),
+      [["big.txt", 3, 1]],
+    );
+  });
+
+  it("a failed call is never mistaken for a replayed one", async () => {
+    // Failures are not cached, so they cannot be replayed — and must not be
+    // dropped as if they had been.
+    const traced = await runner.runWithTrace(
+      "try:\n    read('../outside.txt')\nexcept PermissionError:\n    print('refused')",
+      "fail",
+    );
+    assert.equal(traced.status, "ok");
+    assert.deepEqual(outline(traced), [["read", false, undefined]]);
+    assert.match(traced.calls[0].error ?? "", /outside the project root/);
+  });
+});
+
+describe("ReplRunner — the changed notice names the pi command (#198)", () => {
+  it("names /repl-accept-preamble next to acceptPreamble()", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const runner = trustedRunner(cwd, store);
+      await runner.run("1", "s1");
+      saveToolFile(cwd, "late", "def late():\n    return 1\n");
+      const out = await runner.run("1", "s2");
+      assert.match(out, /\[preamble changed\]/, out);
+      assert.match(out, /\/repl-accept-preamble/, "the notice must name the pi command");
+      assert.match(out, /acceptPreamble\(\)/, "and still the host API");
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Preamble carry-overs from W1-4 (#198) ────────────────────────
+
+describe("ReplRunner — the tools' view follows an in-session accept (#198 carry-over)", () => {
+  const LATE = "def late():\n    return 'late'\n";
+
+  it("re-saving a withheld file in the same session refreshes list_saved_tools and read_tool", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const runner = trustedRunner(cwd, store);
+      await runner.run("1", "s1");
+      saveToolFile(cwd, "late", LATE);
+      assert.match(await runner.run("1", "s2"), /\[preamble changed\]/);
+
+      const saved = await runner.run(
+        `save_tool('late', ${JSON.stringify(LATE)}, 'late')`,
+        "s2",
+        approve,
+      );
+      assert.match(saved, /recorded as accepted/, saved);
+
+      // The view was a creation-time snapshot: the reply and the next session
+      // were right, the list in this session was not.
+      const listed = await runner.run("list_saved_tools()", "s2");
+      assert.match(
+        listed,
+        /late \[not loaded: accepted after this session started — loads in new sessions\]/,
+        listed,
+      );
+      assert.doesNotMatch(listed, /not accepted/, listed);
+      const read = await runner.run("read_tool('late')", "s2");
+      assert.match(
+        read,
+        /# NOTE: not loaded in this session — accepted after this session started/,
+        read,
+      );
+      assert.doesNotMatch(read, /added since/, read);
+
+      // Still not defined here — live sessions are not rebuilt — and defined next.
+      assert.match(await runner.run("late()", "s2"), /used when not defined/);
+      const s3 = await runner.run("late()", "s3");
+      assert.doesNotMatch(s3, /preamble/, s3);
+      assert.match(s3, /\[result\]\nlate/);
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("acceptPreamble() refreshes every live session's view, and delete_tool drops the annotation", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const runner = trustedRunner(cwd, store);
+      await runner.run("1", "s1");
+      saveToolFile(cwd, "late", LATE);
+      saveToolFile(cwd, "adder", "def add_two(a, b):\n    return a + b + 0\n");
+      assert.match(await runner.run("1", "s2"), /\[preamble changed\]/);
+      assert.match(await runner.run("1", "s2b"), /\[preamble changed\]/);
+
+      const outcome = await runner.acceptPreamble();
+      assert.equal(outcome.status, "accepted");
+
+      for (const sessionId of ["s2", "s2b"]) {
+        const listed = await runner.run("list_saved_tools()", sessionId);
+        assert.match(listed, /late \[not loaded: accepted after this session started/, listed);
+        assert.match(listed, /adder \[not loaded: accepted after this session started/, listed);
+        assert.doesNotMatch(listed, /not accepted/, listed);
+      }
+      const read = await runner.run("read_tool('adder')", "s2");
+      assert.match(
+        read,
+        /# NOTE: not loaded in this session — accepted after this session started/,
+        read,
+      );
+
+      const deleted = await runner.run("delete_tool('late')", "s2");
+      assert.match(deleted, /removed from the accepted set/, deleted);
+      const after = await runner.run("list_saved_tools()", "s2");
+      assert.doesNotMatch(after, /late/, after);
+      assert.match(after, /adder \[not loaded: accepted after/, after);
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ReplRunner — an escaping .pi/code-tools is named as the cause (#198 carry-over)", () => {
+  it("nothing executes, the notice names the escape, the manifest is untouched, acceptPreamble answers unreadable", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    const outside = mkdtempSync(join(tmpdir(), "repl-test-outside-"));
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const runner = trustedRunner(cwd, store);
+      await runner.run("1", "s1");
+      const { path } = await readManifest(store, cwd);
+      const before = readFileSync(path, "utf8");
+
+      // The clone's `.pi/code-tools` becomes a link to somewhere else that
+      // holds the accepted file and a new one.
+      writeFileSync(join(outside, "adder.py"), ADDER);
+      writeFileSync(join(outside, "evil.py"), HOSTILE);
+      rmSync(join(cwd, ".pi", "code-tools"), { recursive: true });
+      symlinkSync(outside, join(cwd, ".pi", "code-tools"), "dir");
+
+      const { prompts, ask } = recorder();
+      const s2 = await runner.run("add_two(1, 2)", "s2", ask);
+      assert.equal(existsSync(join(cwd, "pwned.txt")), false, "the escaped file executed");
+      assert.equal(existsSync(join(outside, "pwned.txt")), false, "the escaped file executed");
+      assert.deepEqual(prompts, []);
+      assert.match(s2, /^\[preamble unreadable\]/, s2);
+      assert.match(s2, /outside the project root/, "the notice must name the real cause");
+      assert.doesNotMatch(s2, /no longer in/, "an escape was reported as removals");
+      assert.match(s2, /used when not defined/);
+      assert.equal(readFileSync(path, "utf8"), before, "the session build touched the manifest");
+
+      const outcome = await runner.acceptPreamble();
+      assert.equal(outcome.status, "unreadable", JSON.stringify(outcome));
+      assert.match(JSON.stringify(outcome), /outside the project root/);
+      assert.equal(readFileSync(path, "utf8"), before, "acceptPreamble touched the manifest");
+    } finally {
+      cleanup();
+      rmSync(outside, { recursive: true, force: true });
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ReplRunner — an unreadable .pi never rejects a session build (#198 carry-over)", () => {
+  it("trusted and untrusted runs resolve with a notice; acceptPreamble answers unreadable; the record survives", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    const pi = join(cwd, ".pi");
+    try {
+      const runner = trustedRunner(cwd, store);
+      await runner.run("1", "s1");
+      const { path } = await readManifest(store, cwd);
+      const before = readFileSync(path, "utf8");
+      chmodSync(pi, 0o000);
+
+      // `.pi` itself, not `.pi/code-tools`: the jail's realpath fails with
+      // EACCES before the directory is ever listed. That used to escape
+      // session creation as an uncaught OSError.
+      const s2 = await runner.run("add_two(1, 2)", "s2");
+      assert.match(s2, /^\[preamble unreadable\]/, s2);
+      assert.match(s2, /EACCES|permission/i, s2);
+      assert.match(s2, /used when not defined/, s2);
+      assert.doesNotMatch(s2, /no longer in/, s2);
+
+      const untrusted = new ReplRunner(cwd, { preambleStoreDir: store });
+      const u = await untrusted.run("1 + 1", "u");
+      assert.match(u, /\[result\]\n2/, u);
+
+      const outcome = await runner.acceptPreamble();
+      assert.equal(outcome.status, "unreadable", JSON.stringify(outcome));
+      assert.match(JSON.stringify(outcome), /EACCES|permission/i);
+      assert.equal(readFileSync(path, "utf8"), before, "the manifest was rewritten");
+
+      chmodSync(pi, 0o755);
+      const s3 = await runner.run("add_two(1, 2)", "s3");
+      assert.doesNotMatch(s3, /preamble/, `the acceptance record was lost: ${s3}`);
+      assert.match(s3, /\[result\]\n3/);
+    } finally {
+      try {
+        chmodSync(pi, 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ReplRunner — an unlistable directory and an unavailable store are both reported (#198 carry-over)", () => {
+  it("names the directory and the store, one notice each", async (t) => {
+    if (process.platform === "win32") return t.skip("chmod is a no-op on Windows");
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const cwd = makeTempDir();
+    const storeParent = makeStore();
+    const storeFile = join(storeParent, "not-a-dir");
+    writeFileSync(storeFile, "x");
+    saveToolFile(cwd, "adder", ADDER);
+    const dir = join(cwd, ".pi", "code-tools");
+    try {
+      chmodSync(dir, 0o000);
+      const out = await trustedRunner(cwd, storeFile).run("1 + 1", "s");
+      assert.match(out, /\[preamble unreadable\]/, out);
+      assert.match(out, /could not be listed/, out);
+      assert.match(out, /\[preamble unverified\]/, "the unavailable store was hidden");
+      assert.match(out, /REPL_PREAMBLE_STORE_DIR/, out);
+      assert.match(out, /\[result\]\n2/, out);
+    } finally {
+      try {
+        chmodSync(dir, 0o755);
+      } catch {
+        /* already gone */
+      }
+      cleanup();
+      rmSync(storeParent, { recursive: true, force: true });
+    }
+  });
+});
