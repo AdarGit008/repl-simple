@@ -2847,6 +2847,21 @@ describe("repl extension — the trace interleaves with stdout (#69 finding 4, D
     ]);
   });
 
+  it("an offset past an astral character still lands: bytes are counted per code point", async () => {
+    // "😀\n" is 5 bytes of UTF-8 (4 + 1) but two UTF-16 code units for the
+    // emoji; counting bytes per code unit would put the newline at 7.
+    const { expanded } = await view("😀\nxy\n\n[result]\nNone", [entry("echo", 0, 5, "a")]);
+    assert.deepEqual(expanded.render(80), [
+      "😀",
+      '  ✓ echo("a") 3ms',
+      "xy",
+      "",
+      "[result]",
+      "None",
+      "[trace] 1 host-tool call(s), 1 shown in place",
+    ]);
+  });
+
   it("a call before any output leads; several at one offset keep seq order", async () => {
     const { expanded } = await view("P1\n\n[result]\nNone", [
       entry("read", 0, 0, "first"),

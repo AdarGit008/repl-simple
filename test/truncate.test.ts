@@ -755,6 +755,8 @@ describe("formatValue — the boundary: exactly at the budget fits whole, one by
     ["nested", Array.from({ length: 50 }, (_, i) => new Map([[`k${i}`, [i, `v${i}`]]]))],
     ["string", "é".repeat(400)],
     ["unicode list", Array.from({ length: 100 }, (_, i) => `日${i}😀`)],
+    ["one huge element", ["é".repeat(20_000)]],
+    ["one huge entry", new Map([["k", Buffer.alloc(20_000, 0xe9)]])],
   ];
 
   it("fits whole at its own size; is cut and within budget at one less", () => {
@@ -822,6 +824,132 @@ describe("formatValue — the work is bounded by the budget, not by the value", 
     const { text, truncated } = formatValue(value, valueOpts(4096));
     assert.equal(truncated, false);
     assert.equal(text, `${"[".repeat(200)}1${"]".repeat(200)}`);
+  });
+
+  // A container dominated by one huge scalar used to be spelled in full — up
+  // to four times — before the flat cut kept 16 KiB of it: 3.5 s for a 10 MB
+  // string in a list, 42 s for 100 MB (fix round 1). The bound below is loose
+  // for a loaded CI host and still an order of magnitude under the old cost.
+  const WORK_BOUND_MS = 500;
+  const timed = (value: unknown, budget = truncate.OUTPUT_MAX_BYTES) => {
+    const t0 = performance.now();
+    const result = formatValue(value, valueOpts(budget));
+    return { ...result, took: performance.now() - t0 };
+  };
+
+  it("a 10 MB string in a list keeps both real ends within budget, in bounded time", () => {
+    const { text, truncated, took } = timed(["x".repeat(10_000_000)]);
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= truncate.OUTPUT_MAX_BYTES);
+    assert.ok(text.startsWith("['xxx"), text.slice(0, 20));
+    assert.ok(text.endsWith("xxx']"), text.slice(-20));
+    assert.ok(took < WORK_BOUND_MS, `took ${took.toFixed(0)} ms`);
+  });
+
+  it("a 10 MB string as a dict's only value, the same", () => {
+    const { text, took } = timed(new Map([["k", "x".repeat(10_000_000)]]));
+    assert.ok(bytes(text) <= truncate.OUTPUT_MAX_BYTES);
+    assert.ok(text.startsWith("{'k': 'xxx"), text.slice(0, 20));
+    assert.ok(text.endsWith("xxx'}"), text.slice(-20));
+    assert.ok(took < WORK_BOUND_MS, `took ${took.toFixed(0)} ms`);
+  });
+
+  it("10 MB of bytes in a list, the same", () => {
+    const { text, took } = timed([Buffer.alloc(10_000_000, 0x61)]);
+    assert.ok(bytes(text) <= truncate.OUTPUT_MAX_BYTES);
+    assert.ok(text.startsWith("[b'aaa"), text.slice(0, 20));
+    assert.ok(text.endsWith("aaa']"), text.slice(-20));
+    assert.ok(took < WORK_BOUND_MS, `took ${took.toFixed(0)} ms`);
+  });
+
+  it("an exception carrying a 10 MB message — the top-level scalar path — the same", () => {
+    const exc = tagged("Exception", { excType: "ValueError", message: "x".repeat(10_000_000) });
+    const { text, took } = timed(exc);
+    assert.ok(bytes(text) <= truncate.OUTPUT_MAX_BYTES);
+    assert.ok(text.startsWith("ValueError('xxx"), text.slice(0, 20));
+    assert.ok(text.endsWith("xxx')"), text.slice(-20));
+    assert.ok(took < WORK_BOUND_MS, `took ${took.toFixed(0)} ms`);
+  });
+});
+
+// ── formatValue — a value spelled from both ends, never whole (fix round 1) ──
+//
+// When the elision's ends fit nothing, the one huge element is rendered from
+// its head and from its tail under the budget and the flat cut joins them.
+// The whole was never spelled, so the cut's marker claims no total — the
+// path-5 marker, `[… truncated at 1.0KB. … …]`, rather than an `X of Y` it
+// could only know by doing the work the budget forbids.
+
+describe("formatValue — a value spelled from both ends claims no total", () => {
+  const noTotal = /\[… truncated at 1\.0KB\. Slice it\. …\]/;
+
+  it("a list whose only element is a huge string: both real ends, no total", () => {
+    const { text } = formatValue(["x".repeat(20_000)], valueOpts(1024));
+    assert.ok(bytes(text) <= 1024);
+    assert.match(text, noTotal);
+    assert.ok(!text.includes("KB of "), "a total was claimed for a value never spelled whole");
+    assert.ok(text.startsWith("['xxx") && text.endsWith("xxx']"), text);
+  });
+
+  it("the tail is the real tail: a string's closing escapes, bytes' closing escapes", () => {
+    const str = formatValue([`${"a".repeat(20_000)}\n\t'end`], valueOpts(1024)).text;
+    // The text holds a `'` and no `"`, so Python double-quotes it — at both ends.
+    assert.ok(str.startsWith('["aaa'), str.slice(0, 12));
+    assert.ok(str.endsWith("\\n\\t'end\"]"), str.slice(-16));
+    assert.match(str, noTotal);
+
+    const raw = Buffer.concat([Buffer.alloc(20_000, 0x61), Buffer.from([0, 255, 10])]);
+    const byt = formatValue([raw], valueOpts(1024)).text;
+    assert.ok(byt.startsWith("[b'aaa"), byt.slice(0, 12));
+    assert.ok(byt.endsWith("\\x00\\xff\\n']"), byt.slice(-16));
+  });
+
+  it("an astral string cut at both ends never shows a split surrogate", () => {
+    const { text } = formatValue(["😀".repeat(20_000)], valueOpts(1024));
+    assert.ok(bytes(text) <= 1024);
+    assert.ok(isWholeUtf8(text) && !text.includes("�"));
+    assert.ok(!/\\ud[89a-f]/.test(text), `a lone surrogate at an edge: ${text}`);
+    assert.ok(text.startsWith("['😀") && text.endsWith("😀']"), text);
+    assert.match(text, noTotal);
+  });
+
+  it("a dict's huge entry descends through its value behind the key, elided between elements", () => {
+    const inner = Array.from({ length: 100_000 }, (_, i) => i);
+    const { text, truncated } = formatValue(new Map([["k", inner]]), valueOpts(1024));
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= 1024);
+    assert.match(
+      text,
+      /^\{'k': \[0, 1, 2, .*\[… \d+ of 100000 elements elided\. Slice it\. …\], .*, 99999\]\}$/,
+    );
+    // Beyond the descent's depth the container is still spelled from both
+    // ends only — the tail walk mirrors the head's, last elements first.
+    let deep: unknown = inner;
+    for (let i = 0; i < 5; i++) deep = [deep];
+    const d = formatValue(deep, valueOpts(1024)).text;
+    assert.ok(d.startsWith("[[[[[[0, 1, 2, "), d.slice(0, 24));
+    assert.ok(d.endsWith(", 99998, 99999]]]]]]"), d.slice(-24));
+    assert.match(d, noTotal);
+  });
+
+  it("a huge key does not descend: the entry is spelled from both ends, its cyclic value included", () => {
+    const cyclic: unknown[] = ["x".repeat(20_000)];
+    cyclic.push(cyclic);
+    const value = new Map<unknown, unknown>([["k".repeat(20_000), cyclic]]);
+    const { text } = formatValue(value, valueOpts(1024));
+    assert.ok(bytes(text) <= 1024);
+    assert.ok(text.startsWith("{'kkk"), text.slice(0, 12));
+    assert.ok(text.endsWith("xxx', [...]]}"), text.slice(-20));
+    assert.match(text, noTotal);
+  });
+
+  it("a top-level exception with a huge message: both real ends, no total", () => {
+    const exc = tagged("Exception", { excType: "ValueError", message: "x".repeat(20_000) });
+    const { text, truncated } = formatValue(exc, valueOpts(1024));
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= 1024);
+    assert.ok(text.startsWith("ValueError('xxx") && text.endsWith("xxx')"), text);
+    assert.match(text, noTotal);
   });
 });
 
