@@ -182,10 +182,26 @@ export function clampModelLimits(maxDurationSecs?: unknown, maxMemoryMiB?: unkno
 // writes it to disk. Arguments are masked with the shared redaction helper
 // and cut head-only; the built-in tools' own details are projected down to
 // their facts; results, `stdout` and return values are never in the trace.
-// Unordered relative to `stdout` — the interleave is wave 3's (decision 11).
+// Each call carries its place in the run (`seq`) and the byte of `stdout` at
+// which it was dispatched (`stdoutOffset`), and `details` records where the
+// stdout section of the result text lies, so the expanded view can put every
+// call back where it happened (#69 finding 4, D144). Nothing about the
+// model-facing text changes.
 
 /** Byte ceiling on one call's rendered argument list, marker included. */
 export const TRACE_ARGS_MAX_BYTES = 256;
+
+/** Columns `TraceView` wraps at when pi hands it a width it cannot use. */
+const DEFAULT_COLUMNS = 80;
+
+/** A line the truncator wrote into `stdout`: the head before it is verbatim, nothing after it is positioned. */
+const STDOUT_MARKER_LINE = /^\[… .* …\]$/m;
+
+/** The separator `formatResult` puts between `stdout` and the value of an ok result. */
+const RESULT_SEPARATOR = "\n[result]\n";
+
+/** The heading `formatResult` puts before `stdout` on an error result. */
+const STDOUT_HEADING = "\n\n[stdout]\n";
 
 /** Most calls one `details` carries; the rest are counted, head-only. */
 export const TRACE_MAX_CALLS = 1000;
@@ -228,6 +244,16 @@ export interface TraceCallView {
   error?: string;
   /** The built-in pi tool's own details, projected to their facts. */
   details?: unknown;
+  /** The call's place in its run (`ToolCallTrace.seq`); absent on an entry restored from a dump. */
+  seq?: number;
+  /** The byte of the run's `stdout` at which the call was dispatched (`ToolCallTrace.stdoutOffset`). */
+  stdoutOffset?: number;
+}
+
+/** Where the stdout section of a result's text lies, as `[start, end)` code-unit offsets. */
+export interface StdoutSpan {
+  start: number;
+  end: number;
 }
 
 /** `details` on all four tools: the trace, or an empty one with the tool's own status. */
@@ -239,6 +265,8 @@ export interface ReplDetails {
   omittedCalls: number;
   /** The call waiting for approval, when `status` is `suspended`. */
   suspendedCall?: { tool: string; args: string };
+  /** The stdout section of the result text, when it has one (D144). */
+  stdoutSpan?: StdoutSpan;
 }
 
 /**
@@ -400,7 +428,51 @@ function viewCall(call: TracedCall): TraceCallView {
   if (call.error !== undefined) view.error = viewText(call.error, TRACE_ERROR_RECOVERY);
   const details = viewDetails(call.details);
   if (details !== undefined) view.details = details;
+  if (Number.isFinite(call.seq)) view.seq = call.seq;
+  if (Number.isFinite(call.stdoutOffset)) view.stdoutOffset = call.stdoutOffset;
   return view;
+}
+
+/**
+ * The stdout section of a result's text, or `null` when it has none.
+ *
+ * Read off the shapes `formatResult` (`src/repl.ts`) produces: an ok result
+ * is `stdout` then `\n[result]\n` then the value — the *last* separator is
+ * the real one, since the value's repr never holds a raw newline followed by
+ * `[result]` while printed text can hold anything; an error result puts
+ * `stdout` last, after `\n\n[stdout]\n`; a suspension and the resume's early
+ * returns carry no stdout. A discard notice (#129) precedes the body when the
+ * trace says one was dropped: its description sits on its own line, one more
+ * line follows, then a blank line — the section starts after that, and when
+ * the notice cannot be found where the trace says it is, nothing is guessed.
+ *
+ * Best effort by construction: the text is what the model reads and a print
+ * can imitate any of these markers. A wrong span misplaces trace lines in a
+ * display; it never changes what ran or what the model was told.
+ */
+export function stdoutSpan(
+  text: string,
+  status: ReplDetails["status"],
+  discarded?: { tool: string; description: string },
+): StdoutSpan | null {
+  let start = 0;
+  if (discarded !== undefined) {
+    const line = `\n${discarded.description}\n`;
+    const at = text.indexOf(line);
+    if (at < 0) return null;
+    const blank = text.indexOf("\n\n", at + line.length - 1);
+    if (blank < 0) return null;
+    start = blank + 2;
+  }
+  if (status === "ok") {
+    const separator = text.lastIndexOf(RESULT_SEPARATOR);
+    return separator >= start ? { start, end: separator } : null;
+  }
+  if (status === "error") {
+    const heading = text.indexOf(STDOUT_HEADING, start);
+    return heading < 0 ? null : { start: heading + STDOUT_HEADING.length, end: text.length };
+  }
+  return null;
 }
 
 /** The `details` for a `repl` / `repl_resume` result: the trace, display-safe. */
@@ -418,6 +490,8 @@ export function buildDetails(trace: RunTrace): ReplDetails {
       args: viewArgs(trace.suspendedCall.args, trace.suspendedCall.kwargs),
     };
   }
+  const span = stdoutSpan(trace.text, trace.status, trace.discardedSuspension);
+  if (span !== null) details.stdoutSpan = span;
   return details;
 }
 
@@ -487,15 +561,101 @@ export function formatTrace(details: ReplDetails, options: { expanded: boolean }
     ];
   }
 
-  const lines = [`[trace] ${total} host-tool call(s)`, ...details.calls.map(formatCall)];
+  return [
+    `[trace] ${total} host-tool call(s)`,
+    ...details.calls.map(formatCall),
+    ...closingLines(details),
+  ];
+}
+
+/** The lines that close an expanded trace: the omitted count and the call waiting for approval. */
+function closingLines(details: ReplDetails): string[] {
+  const lines: string[] = [];
   if (details.omittedCalls > 0) {
     lines.push(
       `  … ${details.omittedCalls} more call(s) not listed (trace capped at ${TRACE_MAX_CALLS})`,
     );
   }
+  const waiting = details.suspendedCall;
   if (waiting !== undefined)
     lines.push(`  ⏸ ${waiting.tool}(${waiting.args}) waiting for approval`);
   return lines;
+}
+
+/**
+ * The expanded view with every call put back where it happened (D144), or
+ * `null` when the text has no stdout section to place anything in.
+ *
+ * Each call with an offset lands at that byte of the section: at a line
+ * start, before the line; inside a line, after it — a call made in the middle
+ * of a partially printed line is shown once the line completes; at the end,
+ * after the last line. Only the verbatim head of a truncated stdout takes
+ * calls: an offset at or past the truncator's marker line has no place in
+ * what is shown. Whatever cannot be placed — no offset (an entry restored
+ * from a dump), an offset past the head, a call past `TRACE_MAX_CALLS` — is
+ * listed under the closing `[trace]` line as before.
+ */
+function interleave(
+  text: string,
+  details: ReplDetails,
+): { lines: string[]; placed: number; unplaced: TraceCallView[] } | null {
+  const span = details.stdoutSpan;
+  if (
+    span === undefined ||
+    !Number.isInteger(span.start) ||
+    !Number.isInteger(span.end) ||
+    span.start < 0 ||
+    span.end < span.start ||
+    span.end > text.length
+  ) {
+    return null;
+  }
+  const stdout = text.slice(span.start, span.end);
+  const markerAt = stdout.search(STDOUT_MARKER_LINE);
+  const head = markerAt < 0 ? stdout : stdout.slice(0, markerAt);
+
+  // Byte offset → code-unit index, for offsets that land on a character
+  // boundary of the head (the sandbox counts whole callbacks, so they do).
+  // Walked per code point: an astral character is two code units but four
+  // bytes, not the six that measuring each unit alone would count.
+  const indexAtByte = new Map<number, number>([[0, 0]]);
+  let byte = 0;
+  let index = 0;
+  for (const ch of head) {
+    byte += Buffer.byteLength(ch, "utf8");
+    index += ch.length;
+    indexAtByte.set(byte, index);
+  }
+
+  const insertions: Array<{ at: number; text: string; seq: number }> = [];
+  const unplaced: TraceCallView[] = [];
+  for (const call of details.calls) {
+    const index = call.stdoutOffset === undefined ? undefined : indexAtByte.get(call.stdoutOffset);
+    if (index === undefined) {
+      unplaced.push(call);
+      continue;
+    }
+    const line = formatCall(call);
+    const seq = call.seq ?? Number.MAX_SAFE_INTEGER;
+    if (index === 0 || head[index - 1] === "\n") {
+      insertions.push({ at: index, text: `${line}\n`, seq });
+    } else {
+      const newline = head.indexOf("\n", index);
+      insertions.push({ at: newline < 0 ? head.length : newline, text: `\n${line}`, seq });
+    }
+  }
+  insertions.sort((a, b) => a.at - b.at || a.seq - b.seq);
+
+  let placed = "";
+  let cursor = 0;
+  for (const insertion of insertions) {
+    placed += head.slice(cursor, insertion.at) + insertion.text;
+    cursor = insertion.at;
+  }
+  placed += head.slice(cursor);
+  const rendered =
+    text.slice(0, span.start) + placed + stdout.slice(head.length) + text.slice(span.end);
+  return { lines: rendered.split("\n"), placed: insertions.length, unplaced };
 }
 
 /**
@@ -512,7 +672,9 @@ class TraceView {
   }
 
   render(width: number): string[] {
-    const columns = Math.max(1, Math.floor(width));
+    // A width that is not a usable number — `NaN` made the wrap below grow
+    // its output until the array length limit — renders at the default.
+    const columns = Number.isFinite(width) && width >= 1 ? Math.floor(width) : DEFAULT_COLUMNS;
     const out: string[] = [];
     for (const line of this.lines) {
       let rest = [...line];
@@ -545,7 +707,11 @@ function isReplDetails(details: unknown): details is ReplDetails {
   );
 }
 
-/** `renderResult` for the two tools that run code: the result text, then the trace. */
+/**
+ * `renderResult` for the two tools that run code: the result text with the
+ * calls placed in its stdout when expanded (D144), then the trace — the whole
+ * of it collapsed, the rest of it expanded.
+ */
 function renderTrace(
   result: { content: Array<{ type: string; text?: string }>; details: unknown },
   options: { expanded: boolean },
@@ -557,8 +723,19 @@ function renderTrace(
     .map((block) => block.text ?? "")
     .join("");
   const body = text === "" ? [] : text.split("\n");
-  const trace = isReplDetails(result.details) ? formatTrace(result.details, options) : [];
-  view.setLines([...body, ...trace]);
+  const details = isReplDetails(result.details) ? result.details : undefined;
+  const placed = details !== undefined && options.expanded ? interleave(text, details) : null;
+  if (details === undefined || placed === null || placed.placed === 0) {
+    view.setLines([...body, ...(details === undefined ? [] : formatTrace(details, options))]);
+    return view;
+  }
+  const total = details.calls.length + details.omittedCalls;
+  view.setLines([
+    ...placed.lines,
+    `[trace] ${total} host-tool call(s), ${placed.placed} shown in place`,
+    ...placed.unplaced.map(formatCall),
+    ...closingLines(details),
+  ]);
   return view;
 }
 
@@ -628,29 +805,55 @@ interface ReplExtensionApi {
  * `sessionIds` is every id a `repl` call has handed the runner. `ReplRunner`
  * offers no way to list its sessions, and a shutdown has to abandon and
  * release each one to say what it dropped.
+ *
+ * `waiting` is the tool each suspended session is holding a call for, read
+ * off the trace API's suspended result and kept until that suspension is
+ * over — so the shutdown report can name it (D146). The name only: the
+ * arguments can hold a pasted credential, which is why `GrantSummary` omits
+ * them too.
  */
 class CwdRunner {
   trusted = false;
   readonly runner: ReplRunner;
   readonly sessionIds = new Set<string>();
+  private readonly waiting = new Map<string, string>();
 
   constructor(cwd: string) {
     this.runner = new ReplRunner(cwd, { isProjectTrusted: () => this.trusted });
   }
 
+  /** Remember what a `repl` / `repl_resume` call left waiting, or that nothing is. */
+  noteOutcome(sessionId: string, trace: RunTrace): void {
+    const tool = trace.status === "suspended" ? trace.suspendedCall?.tool : undefined;
+    if (tool === undefined) this.waiting.delete(sessionId);
+    else this.waiting.set(sessionId, tool);
+  }
+
+  /** The suspension is over by another route: `repl_reset`, `repl_abandon`. */
+  forget(sessionId: string): void {
+    this.waiting.delete(sessionId);
+  }
+
   /**
    * Abandon and release every session this runner was handed.
    *
-   * @returns the ids that were holding a call for approval — each is a call
-   *          that never executed and that somebody was asked about.
+   * @returns the sessions that were holding a call for approval, with the
+   *          tool's name — each is a call that never executed and that
+   *          somebody was asked about. A suspension only ever arrives through
+   *          the two tools that call `noteOutcome`, so an abandoned session
+   *          always has a name here.
    */
-  dispose(): string[] {
-    const dropped: string[] = [];
+  dispose(): Array<{ sessionId: string; tool: string }> {
+    const dropped: Array<{ sessionId: string; tool: string }> = [];
     for (const sessionId of this.sessionIds) {
-      if (this.runner.abandon(sessionId) === "abandoned") dropped.push(sessionId);
+      const tool = this.waiting.get(sessionId);
+      if (this.runner.abandon(sessionId) === "abandoned" && tool !== undefined) {
+        dropped.push({ sessionId, tool });
+      }
       this.runner.reset(sessionId);
     }
     this.sessionIds.clear();
+    this.waiting.clear();
     return dropped;
   }
 }
@@ -960,12 +1163,13 @@ export default function (pi: ReplExtensionApi) {
   pi.on("session_shutdown", (_event, ctx) => {
     // Idempotent by construction: a second shutdown finds nothing to dispose.
     for (const entry of runners.values()) {
-      for (const sessionId of entry.dispose()) {
-        // The session id and nothing else. The approval description can hold
-        // a pasted credential, which is why `GrantSummary` omits it too.
+      for (const { sessionId, tool } of entry.dispose()) {
+        // The session id and the tool's name, nothing else. The approval
+        // description can hold a pasted credential, which is why
+        // `GrantSummary` omits it too.
         ctx.ui.notify(
-          `repl: session '${sessionId}' still had a call waiting for approval when this ` +
-            "conversation ended. It was dropped and never executed; nothing was approved.",
+          `repl: session '${sessionId}' still had a '${tool}' call waiting for approval when ` +
+            "this conversation ended. It was dropped and never executed; nothing was approved.",
           "warning",
         );
       }
@@ -1050,6 +1254,7 @@ export default function (pi: ReplExtensionApi) {
           signal,
           clampModelLimits(params.maxDurationSecs, params.maxMemory),
         );
+        entry.noteOutcome(sessionId, trace);
         return {
           content: [{ type: "text" as const, text: withApprovalNotice(trace.text, gate) }],
           details: buildDetails(trace),
@@ -1081,11 +1286,10 @@ export default function (pi: ReplExtensionApi) {
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         // A fresh gate, so the dialog count restarts here (#35).
         const gate = makeOnApproval(ctx, signal);
-        const trace = await getRunner(ctx).runner.resumeWithTrace(
-          params.sessionId ?? "default",
-          gate.onApproval,
-          signal,
-        );
+        const entry = getRunner(ctx);
+        const sessionId = params.sessionId ?? "default";
+        const trace = await entry.runner.resumeWithTrace(sessionId, gate.onApproval, signal);
+        entry.noteOutcome(sessionId, trace);
         return {
           content: [{ type: "text" as const, text: withApprovalNotice(trace.text, gate) }],
           details: buildDetails(trace),
@@ -1119,6 +1323,7 @@ export default function (pi: ReplExtensionApi) {
         const { existed, revoked } = entry.runner.reset(sessionId);
         // Reset evicts the session, so there is nothing left to dispose.
         entry.sessionIds.delete(sessionId);
+        entry.forget(sessionId);
 
         // State the approval posture on the way out. A reset is the moment
         // someone is asking what this session is still holding, and "which
@@ -1170,14 +1375,15 @@ export default function (pi: ReplExtensionApi) {
       // is meaningless here, and noUnusedParameters makes the _-prefix the correct idiom
       // for a fixed-arity unused param.
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const r = getRunner(ctx).runner;
+        const entry = getRunner(ctx);
         const sessionId = params.sessionId ?? "default";
 
         // Three states, three sentences. "No pending suspension" for a
         // session that does not exist reads as a bug report about the one
         // the caller meant, and the two states need different next moves:
         // one is "run some code", the other is "the pause is over" (#48).
-        const outcome = r.abandon(sessionId);
+        const outcome = entry.runner.abandon(sessionId);
+        entry.forget(sessionId);
         const text = {
           abandoned: `Suspension in session '${sessionId}' abandoned. The suspended code was dropped; the session is ready for new code.`,
           "nothing-pending": `Session '${sessionId}' exists but has no pending approval. Nothing to abandon.`,

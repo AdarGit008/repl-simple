@@ -2048,15 +2048,11 @@ describe("repl extension — session lifecycle (#60)", () => {
     assert.equal(readFileSync(join(hostile, "pwned.txt"), "utf8"), "owned");
   });
 
-  // Residual, recorded as a todo rather than an issue (decision 9).
-  it("the shutdown report names the tool that was waiting, not only the session", {
-    todo:
-      "ReplRunner.abandon answers only 'abandoned' | 'nothing-pending' | 'no-session', so the " +
-      "extension cannot learn which tool the dropped call was for without a src/ change, and " +
-      "src/repl.ts is W1-2's file this wave. Intended approach: have abandon() return the " +
-      "dropped ApprovalRequest's tool name alongside the outcome — the name, never the " +
-      "arguments, which can hold a pasted credential — and interpolate it into the report.",
-  }, async () => {
+  // W1-3's residual, closed in W3-1 (D146): `ReplRunner.abandon` still answers
+  // only the outcome, but the trace API's suspended result names the call,
+  // and the extension remembers the name — never the arguments, which can
+  // hold a pasted credential — per session until the suspension is over.
+  it("the shutdown report names the tool that was waiting, not only the session", async () => {
     const { tools, handlers } = await load();
     const repl = tools.find((t) => t.name === "repl");
     assert.ok(repl);
@@ -2064,7 +2060,7 @@ describe("repl extension — session lifecycle (#60)", () => {
 
     await repl.execute(
       "n-1",
-      { code: "write('named.txt', 'x')", sessionId: "named" },
+      { code: "write('named.txt', 'secret-body')", sessionId: "named" },
       undefined,
       undefined,
       ctx,
@@ -2073,6 +2069,43 @@ describe("repl extension — session lifecycle (#60)", () => {
 
     assert.equal(notes.length, 1);
     assert.match(notes[0].message, /'write'/, "the report does not say which tool was waiting");
+    assert.match(notes[0].message, /session 'named'/);
+    assert.ok(!notes[0].message.includes("secret-body"), "the arguments must never be reported");
+  });
+
+  it("the name follows the suspension: a resume that ends the pause clears it, a later gate replaces it", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl && resume);
+    // Suspend on `write`, resume with "later" (still pending, same tool), then
+    // approve (over); a new run suspends on `bash`: the report names bash.
+    const { ctx, notes } = lifecycleCtx(cwdA, [
+      LATER_CHOICE,
+      LATER_CHOICE,
+      APPROVE_CHOICE,
+      LATER_CHOICE,
+    ]);
+    await repl.execute("f-1", { code: "write('follow.txt', 'x')" }, undefined, undefined, ctx);
+    await resume.execute("f-2", {}, undefined, undefined, ctx);
+    await resume.execute("f-3", {}, undefined, undefined, ctx);
+    await repl.execute("f-4", { code: "bash('true')" }, undefined, undefined, ctx);
+    await fire(handlers, "session_shutdown", "quit", ctx);
+    assert.equal(notes.length, 1);
+    assert.match(notes[0].message, /'bash'/);
+    assert.ok(!notes[0].message.includes("'write'"));
+  });
+
+  it("an abandoned or reset suspension is not reported at all", async () => {
+    const { tools, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const abandon = tools.find((t) => t.name === "repl_abandon");
+    assert.ok(repl && abandon);
+    const { ctx, notes } = lifecycleCtx(cwdA, [LATER_CHOICE]);
+    await repl.execute("g-1", { code: "write('gone.txt', 'x')" }, undefined, undefined, ctx);
+    await abandon.execute("g-2", {}, undefined, undefined, ctx);
+    await fire(handlers, "session_shutdown", "quit", ctx);
+    assert.deepEqual(notes, []);
   });
 });
 
@@ -2093,6 +2126,8 @@ type CallView = {
   args: string;
   error?: string;
   details?: unknown;
+  seq?: number;
+  stdoutOffset?: number;
 };
 
 type DetailsView = {
@@ -2685,6 +2720,358 @@ describe("repl extension — formatTrace and the trace view (#46)", () => {
       "1",
       "[trace] 1 host-tool call(s): 1 ok, 0 denied, 0 failed — expand to list them",
     ]);
+  });
+});
+
+// ── The trace in the stream: seq, stdoutOffset and the interleave (#69 finding 4, D144) ──
+//
+// Every entry the sandbox produces now carries `seq` (its place in the run)
+// and `stdoutOffset` (the byte of the call's stdout at which it was
+// dispatched). `buildDetails` carries both, plus the `[start, end)` of the
+// stdout section of the result text, so the expanded view can put each call
+// back where it happened. The model-facing text is untouched.
+
+describe("repl extension — the trace interleaves with stdout (#69 finding 4, D144)", () => {
+  type Span = { start: number; end: number } | null;
+  type Trace = {
+    text: string;
+    sessionId: string;
+    status: string;
+    calls: Array<Record<string, unknown>>;
+    discardedSuspension?: { tool: string; description: string };
+  };
+  const ext = extension as unknown as {
+    buildDetails: (trace: Trace) => DetailsView & { stdoutSpan?: Span };
+    stdoutSpan: (
+      text: string,
+      status: string,
+      discarded?: { tool: string; description: string },
+    ) => Span;
+  };
+  const entry = (tool: string, seq: number, stdoutOffset: number, arg = "a") => ({
+    tool,
+    args: [arg],
+    kwargs: {},
+    durationMs: 3,
+    ok: true,
+    seq,
+    stdoutOffset,
+  });
+  const trace = (text: string, calls: Array<Record<string, unknown>>, status = "ok"): Trace => ({
+    text,
+    sessionId: "s",
+    status,
+    calls,
+  });
+
+  it("buildDetails carries seq, stdoutOffset and the stdout span; entries without them stay without", () => {
+    const details = ext.buildDetails(
+      trace("P1\nP2\n\n[result]\nNone", [
+        entry("echo", 0, 3),
+        { ...entry("echo", 1, 6), seq: undefined, stdoutOffset: undefined },
+      ]),
+    );
+    assert.equal(details.calls[0].seq, 0);
+    assert.equal(details.calls[0].stdoutOffset, 3);
+    assert.equal("seq" in details.calls[1], false);
+    assert.equal("stdoutOffset" in details.calls[1], false);
+    assert.deepEqual(details.stdoutSpan, { start: 0, end: 6 });
+    // The span is JSON-safe like the rest of details.
+    assert.deepEqual(JSON.parse(JSON.stringify(details)).stdoutSpan, { start: 0, end: 6 });
+  });
+
+  it("stdoutSpan: ok up to the last [result], error after [stdout], none for the rest", () => {
+    assert.deepEqual(ext.stdoutSpan("P1\nP2\n\n[result]\n1", "ok"), { start: 0, end: 6 });
+    assert.equal(ext.stdoutSpan("[result]\n1", "ok"), null, "no stdout, no span");
+    // Printed text that looks like the separator does not fool the last-separator rule.
+    assert.deepEqual(ext.stdoutSpan("x\n[result]\ny\n\n[result]\n1", "ok"), { start: 0, end: 13 });
+    assert.deepEqual(ext.stdoutSpan("[error: runtime]\nboom\n\n[stdout]\nP1\nP2\n", "error"), {
+      start: 32,
+      end: 38,
+    });
+    assert.equal(ext.stdoutSpan("[error: runtime]\nboom", "error"), null);
+    assert.equal(ext.stdoutSpan("Tool 'write' requires approval.\nwrite(...)", "suspended"), null);
+    assert.equal(ext.stdoutSpan("No session 'x'.", "no-session"), null);
+  });
+
+  it("stdoutSpan skips a discard notice when the trace says there was one", () => {
+    const description = 'write(path="x.txt", content="…")';
+    const text =
+      `[discarded] An approval was still pending in session 's' and running this code dropped it. ` +
+      `The 'write' call never executed:\n${description}\nRun it again if you still want it.\n\n` +
+      "P1\n\n[result]\nNone";
+    const span = ext.stdoutSpan(text, "ok", { tool: "write", description });
+    assert.ok(span);
+    assert.equal(text.slice(span.start, span.end), "P1\n");
+    // Without the notice's description the structure is not recognised: no span, no guess.
+    assert.equal(ext.stdoutSpan(text, "ok", { tool: "write", description: "other" }), null);
+  });
+
+  async function view(text: string, calls: Array<Record<string, unknown>>, status = "ok") {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl?.renderResult);
+    const details = ext.buildDetails(trace(text, calls, status));
+    return {
+      expanded: repl.renderResult(
+        { content: [{ type: "text", text }], details },
+        { expanded: true, isPartial: false },
+        {},
+        { lastComponent: undefined },
+      ),
+      collapsed: repl.renderResult(
+        { content: [{ type: "text", text }], details },
+        { expanded: false, isPartial: false },
+        {},
+        { lastComponent: undefined },
+      ),
+    };
+  }
+
+  it("expanded: a call at a line start goes before the line, inside a line after it, at the end last", async () => {
+    // stdout "P1\nxy\n": a after "P1\n" (3), b inside "xy" (4), c at the end (6).
+    const { expanded } = await view("P1\nxy\n\n[result]\nNone", [
+      entry("echo", 0, 3, "a"),
+      entry("echo", 1, 4, "b"),
+      entry("echo", 2, 6, "c"),
+    ]);
+    assert.deepEqual(expanded.render(80), [
+      "P1",
+      '  ✓ echo("a") 3ms',
+      "xy",
+      '  ✓ echo("b") 3ms',
+      '  ✓ echo("c") 3ms',
+      "",
+      "[result]",
+      "None",
+      "[trace] 3 host-tool call(s), 3 shown in place",
+    ]);
+  });
+
+  it("an offset past an astral character still lands: bytes are counted per code point", async () => {
+    // "😀\n" is 5 bytes of UTF-8 (4 + 1) but two UTF-16 code units for the
+    // emoji; counting bytes per code unit would put the newline at 7.
+    const { expanded } = await view("😀\nxy\n\n[result]\nNone", [entry("echo", 0, 5, "a")]);
+    assert.deepEqual(expanded.render(80), [
+      "😀",
+      '  ✓ echo("a") 3ms',
+      "xy",
+      "",
+      "[result]",
+      "None",
+      "[trace] 1 host-tool call(s), 1 shown in place",
+    ]);
+  });
+
+  it("a call before any output leads; several at one offset keep seq order", async () => {
+    const { expanded } = await view("P1\n\n[result]\nNone", [
+      entry("read", 0, 0, "first"),
+      entry("read", 1, 0, "second"),
+      entry("read", 2, 3, "third"),
+    ]);
+    assert.deepEqual(expanded.render(80), [
+      '  ✓ read("first") 3ms',
+      '  ✓ read("second") 3ms',
+      "P1",
+      '  ✓ read("third") 3ms',
+      "",
+      "[result]",
+      "None",
+      "[trace] 3 host-tool call(s), 3 shown in place",
+    ]);
+  });
+
+  it("what cannot be placed is listed below: no offset, an offset past the section, no stdout at all", async () => {
+    const { expanded } = await view("P1\n\n[result]\nNone", [
+      entry("echo", 0, 3, "placed"),
+      { ...entry("echo", 1, 0, "restored"), stdoutOffset: undefined },
+      entry("echo", 2, 999, "beyond"),
+    ]);
+    assert.deepEqual(expanded.render(80), [
+      "P1",
+      '  ✓ echo("placed") 3ms',
+      "",
+      "[result]",
+      "None",
+      "[trace] 3 host-tool call(s), 1 shown in place",
+      '  ✓ echo("restored") 3ms',
+      '  ✓ echo("beyond") 3ms',
+    ]);
+
+    const none = await view("[result]\n1", [entry("echo", 0, 0)]);
+    assert.deepEqual(none.expanded.render(80), [
+      "[result]",
+      "1",
+      "[trace] 1 host-tool call(s)",
+      '  ✓ echo("a") 3ms',
+    ]);
+  });
+
+  it("an error result interleaves into its [stdout] section", async () => {
+    const { expanded } = await view(
+      "[error: runtime]\nboom\n\n[stdout]\nP1\nP2\n",
+      [{ ...entry("echo", 0, 3), ok: false, error: "boom" }],
+      "error",
+    );
+    assert.deepEqual(expanded.render(80), [
+      "[error: runtime]",
+      "boom",
+      "",
+      "[stdout]",
+      "P1",
+      '  ✗ echo("a") 3ms — boom',
+      "P2",
+      "",
+      "[trace] 1 host-tool call(s), 1 shown in place",
+    ]);
+  });
+
+  it("a truncated stdout places only the calls in its verbatim head", async () => {
+    const marker =
+      "[… 1.0KB of 2.0KB elided (lines 2-3 of 4). Re-run with a narrower print to see more. …]";
+    const text = `HEAD\n${marker}\nTAIL\n\n[result]\nNone`;
+    const { expanded } = await view(text, [
+      entry("echo", 0, 5, "in-head"),
+      entry("echo", 1, 6, "elided"),
+      entry("echo", 2, 2000, "in-tail"),
+    ]);
+    assert.deepEqual(expanded.render(200), [
+      "HEAD",
+      '  ✓ echo("in-head") 3ms',
+      marker,
+      "TAIL",
+      "",
+      "[result]",
+      "None",
+      "[trace] 3 host-tool call(s), 1 shown in place",
+      '  ✓ echo("elided") 3ms',
+      '  ✓ echo("in-tail") 3ms',
+    ]);
+  });
+
+  it("the omitted count and the waiting call still close the block", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl?.renderResult);
+    const text = "P1\n\n[result]\nNone";
+    const details = {
+      ...ext.buildDetails(trace(text, [entry("echo", 0, 3)])),
+      omittedCalls: 2,
+      suspendedCall: { tool: "write", args: '"x"' },
+    };
+    const v = repl.renderResult(
+      { content: [{ type: "text", text }], details },
+      { expanded: true, isPartial: false },
+      {},
+      { lastComponent: undefined },
+    );
+    assert.deepEqual(v.render(80), [
+      "P1",
+      '  ✓ echo("a") 3ms',
+      "",
+      "[result]",
+      "None",
+      "[trace] 3 host-tool call(s), 1 shown in place",
+      `  … 2 more call(s) not listed (trace capped at ${extension.TRACE_MAX_CALLS})`,
+      '  ⏸ write("x") waiting for approval',
+    ]);
+  });
+
+  it("collapsed: the text and the summary, exactly as before", async () => {
+    const { collapsed } = await view("P1\nxy\n\n[result]\nNone", [entry("echo", 0, 3)]);
+    assert.deepEqual(collapsed.render(80), [
+      "P1",
+      "xy",
+      "",
+      "[result]",
+      "None",
+      "[trace] 1 host-tool call(s): 1 ok, 0 denied, 0 failed — expand to list them",
+    ]);
+  });
+
+  it("a stale span that does not fit the text is ignored, never sliced", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl?.renderResult);
+    const text = "P1\n\n[result]\nNone";
+    const details = {
+      ...ext.buildDetails(trace(text, [entry("echo", 0, 3)])),
+      stdoutSpan: { start: 0, end: 999 },
+    };
+    const v = repl.renderResult(
+      { content: [{ type: "text", text }], details },
+      { expanded: true, isPartial: false },
+      {},
+      { lastComponent: undefined },
+    );
+    assert.deepEqual(v.render(80), [
+      "P1",
+      "",
+      "[result]",
+      "None",
+      "[trace] 1 host-tool call(s)",
+      '  ✓ echo("a") 3ms',
+    ]);
+  });
+
+  it("end to end: a real run's calls land between its prints", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-seq-"));
+    try {
+      const repl = (await loadTools()).find((t) => t.name === "repl");
+      assert.ok(repl?.renderResult);
+      const { ctx } = lifecycleCtx(cwd);
+      const result = await repl.execute(
+        "e-1",
+        { code: 'print("P1")\nlist_saved_tools()\nprint("P2")' },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const lines = repl
+        .renderResult(
+          result,
+          { expanded: true, isPartial: false },
+          {},
+          { lastComponent: undefined },
+        )
+        .render(120);
+      assert.equal(lines[0], "P1");
+      assert.match(lines[1], /^ {2}✓ list_saved_tools\(\) \d+ms$/);
+      assert.equal(lines[2], "P2");
+      assert.deepEqual(lines.slice(3), [
+        "",
+        "[result]",
+        "None",
+        "[trace] 1 host-tool call(s), 1 shown in place",
+      ]);
+      // And the model-facing text is the same string it always was.
+      assert.equal(result.content[0].text, "P1\nP2\n\n[result]\nNone");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── TraceView width guard (wave-2 carry-over, D145) ──────────────
+
+describe("repl extension — TraceView.render guards its width", () => {
+  it("NaN, zero, a negative and an infinite width render at the default 80 columns", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl?.renderResult);
+    const long = "word ".repeat(40).trim();
+    const v = repl.renderResult(
+      { content: [{ type: "text", text: `${long}\n[result]\n1` }], details: undefined },
+      { expanded: true, isPartial: false },
+      {},
+      { lastComponent: undefined },
+    );
+    const reference = v.render(80);
+    assert.ok(reference.length > 3, "the fixture must wrap at 80");
+    for (const width of [Number.NaN, 0, -5, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const t0 = performance.now();
+      const lines = v.render(width);
+      assert.ok(performance.now() - t0 < 1000, `render(${width}) took too long`);
+      assert.deepEqual(lines, reference, `render(${width}) differs from the 80-column render`);
+    }
+    // A fractional width still floors, as before.
+    assert.deepEqual(v.render(80.9), reference);
   });
 });
 

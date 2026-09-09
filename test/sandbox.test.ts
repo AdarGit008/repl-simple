@@ -15,8 +15,13 @@ import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { SubmitSignal } from "../src/submit_signal.js";
-import { STDOUT_MAX_LINES } from "../src/truncate.js";
+import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY } from "../src/truncate.js";
 import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
+// The finding-5 tripwire drives Monty directly: the fact under test is the
+// binding's, not the sandbox's.
+import { Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
+
+const byteSize = (s: string) => Buffer.byteLength(s, "utf8");
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -98,7 +103,8 @@ describe("runInSandbox — pure computation", () => {
     const result = await runInSandbox('print("a")\nprint("b")\n42', { registry });
     ok(result);
     assert.equal(result.output, "42");
-    // Monty calls printCallback once per print, no trailing newline
+    // One callback per print, newline included (0.0.21; the D122 tripwire
+    // below pins the exact shape). 0.0.18 delivered fragments.
     assert.ok(result.stdout.includes("a"));
     assert.ok(result.stdout.includes("b"));
   });
@@ -773,10 +779,10 @@ describe("runInSandbox — stdout truncation", () => {
       { onPrint: (text) => prints.push(text) },
     );
     ok(result);
-    // Monty sends newlines as separate callbacks: ('a','\n','b','\n')
-    const joined = prints.join("");
-    assert.ok(joined.includes("a"));
-    assert.ok(joined.includes("b"));
+    // One callback per print, newline included: ('a\n', 'b\n'). The exact
+    // shape is the D122 tripwire's to pin; this test only asks that every
+    // print reaches the live stream.
+    assert.deepEqual(prints, ["a\n", "b\n"]);
   });
 });
 
@@ -2005,8 +2011,10 @@ describe("output truncation — the [result] field is bounded", () => {
       { maxOutputBytes: 1024 },
     );
     ok(result);
-    assert.ok(result.output.startsWith("0,1,2,3"), "head lost");
-    assert.ok(result.output.endsWith("4999"), "tail lost");
+    // W3-1: the list renders as Python spells it and is elided between its
+    // elements (D140); before, `String(list)` gave `0,1,2,3` and a flat cut.
+    assert.ok(result.output.startsWith("[0, 1, 2, 3"), "head lost");
+    assert.ok(result.output.endsWith("4999]"), "tail lost");
     const marker = result.output.indexOf("[…");
     assert.ok(marker > 0, "marker missing");
     assert.ok(result.output.indexOf("4999") > marker, "the marker must sit between head and tail");
@@ -2863,5 +2871,657 @@ describe("runInSandbox — stdoutSkipBytes drops the replayed prefix's output (#
     const zero = await runInSandbox('print("only")', { registry }, { stdoutSkipBytes: 0 });
     ok(zero);
     assert.equal(zero.stdout, "only\n");
+  });
+});
+
+// ── The output contract (#65, #69; decision 15, D139–D142) ───────
+//
+// `RunOk.output` is declared a string. Until W3-1 it was one by luck:
+// `formatOutput` was `String(value)` — `[object Map]` for a dict, `1,2,3` for
+// a list, `true` for `True` — and the two SUBMIT sites capped `err.answer`
+// straight from a cast, so a runtime non-string answer threw an uncaught
+// `ERR_INVALID_ARG_TYPE` out of `runInSandbox`, and `SUBMIT(**{})` returned
+// an `ok` result with an empty output that `runRlm` accepted as the answer.
+
+/** The RLM tools with inert callbacks: SUBMIT is the one under test. */
+function rlmRegistry(...extra: HostTool[]): ToolRegistry {
+  return new ToolRegistry([
+    ...extra,
+    ...createRLMTools({ onLLMQuery: async () => "", onRLMQuery: async () => "" }),
+  ]);
+}
+
+/** A gated tool that ends the run with whatever `answer` it was handed, as SUBMIT does. */
+function gatedSubmit(name = "finish"): HostTool {
+  return {
+    name,
+    description: "Submits an answer",
+    params: [{ name: "answer", type: "str", description: "Answer" }],
+    returns: "void",
+    requiresApproval: true,
+    execute: (args) => {
+      throw new SubmitSignal(args.answer);
+    },
+  };
+}
+
+describe("RunOk.output is always a string, rendered as Python (#65 test 4, #69 finding 1)", () => {
+  const registry = rlmRegistry(echoTool());
+
+  const table: Array<[code: string, rendered: string]> = [
+    ["{'a': 1, 'b': 2}", "{'a': 1, 'b': 2}"],
+    ["{}", "{}"],
+    ["[1, 2, 3]", "[1, 2, 3]"],
+    ["{1, 2}", "{1, 2}"],
+    ["set()", "set()"],
+    ["True", "True"],
+    ["None", "None"],
+    ["42", "42"],
+    ["2.5", "2.5"],
+    ["(1, 2.0)", "[1, 2]"],
+    ["()", "[]"],
+    ["b'ab'", "b'ab'"],
+    ["1e400", "inf"],
+    ["float('nan')", "nan"],
+    ["10**20", "100000000000000000000"],
+    ["'hi'", "hi"],
+    ['"it\'s"', "it's"],
+    ["['it\\'s', \"q\\\"\"]", `["it's", 'q"']`],
+    ["{'a': (1, 2.0), 'b': [None, True]}", "{'a': [1, 2], 'b': [None, True]}"],
+    ["[(1, 2.0), {'k': {1}}, b'\\x00', 1e400, None]", "[[1, 2], {'k': {1}}, b'\\x00', inf, None]"],
+    ["ValueError('bad')", "ValueError('bad')"],
+    ["type(1)", "<class 'int'>"],
+    ["print('x')", "None"],
+    ["echo('hi')", "hi"],
+    ["SUBMIT('done')", "done"],
+  ];
+
+  for (const [code, rendered] of table) {
+    it(`${code} → ${JSON.stringify(rendered)}`, async () => {
+      const result = await runInSandbox(code, { registry });
+      ok(result);
+      assert.equal(typeof result.output, "string");
+      assert.equal(result.output, rendered);
+      assert.equal(result.outputTruncated, false);
+    });
+  }
+
+  it("an empty dict and a populated one are distinguishable (the collision behind the misdiagnosis)", async () => {
+    const empty = await runInSandbox("{}", { registry });
+    const full = await runInSandbox("{'a': 1}", { registry });
+    ok(empty);
+    ok(full);
+    assert.notEqual(empty.output, full.output);
+    assert.equal(empty.output, "{}");
+    assert.equal(full.output, "{'a': 1}");
+  });
+
+  it("Monty breaks a self-referential structure itself; the repr shows what arrived", async () => {
+    // A list that contains itself crosses the boundary as `["[...]"]` — the
+    // inner reference is Monty's own placeholder string — so the repr quotes
+    // it. Documented in the policy; the point is that nothing throws.
+    const result = await runInSandbox("a = []\na.append(a)\na", { registry });
+    ok(result);
+    assert.equal(result.output, "['[...]']");
+  });
+
+  it("holds through resumeSuspended: the resumed expression renders the same way", async () => {
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const gated = new ToolRegistry([gate]);
+    const susp = await runInSandbox(
+      "gate('x')\n{'k': [1, (2, 3)], 'n': None}",
+      {
+        registry: gated,
+      },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    const result = await resumeSuspended(susp, true, { registry: gated });
+    ok(result);
+    assert.equal(typeof result.output, "string");
+    assert.equal(result.output, "{'k': [1, [2, 3]], 'n': None}");
+  });
+});
+
+describe("the output repr elides between elements under the budget (#69, policy Q4)", () => {
+  const registry = new ToolRegistry();
+
+  it("a 300 000-element list is elided between its elements, both ends kept, under OUTPUT_MAX_BYTES", async () => {
+    const result = await runInSandbox("list(range(300000))", { registry });
+    ok(result);
+    assert.equal(result.outputTruncated, true);
+    assert.ok(byteSize(result.output) <= OUTPUT_MAX_BYTES, `${byteSize(result.output)} bytes`);
+    assert.ok(result.output.startsWith("[0, 1, 2, "), result.output.slice(0, 30));
+    assert.ok(result.output.endsWith(", 299999]"), result.output.slice(-30));
+    assert.match(result.output, /\[… \d+ of 300000 elements elided\. /);
+    assert.ok(result.output.includes(VALUE_RECOVERY), "the marker names the recovery route");
+  });
+
+  it("a dict elides entries; a long string still takes the flat cut", async () => {
+    const dict = await runInSandbox("{str(i): i for i in range(100000)}", { registry });
+    ok(dict);
+    assert.ok(dict.output.startsWith("{'0': 0, '1': 1, "));
+    assert.match(dict.output, /\[… \d+ of 100000 entries elided\. /);
+
+    const text = await runInSandbox("'x' * 100000", { registry }, { maxOutputBytes: 1024 });
+    ok(text);
+    assert.equal(text.outputTruncated, true);
+    assert.ok(byteSize(text.output) <= 1024);
+    assert.match(text.output, /\[… [\d.]+KB of [\d.]+KB elided\. /);
+  });
+
+  it("the caller's maxOutputBytes is the budget the repr elides under", async () => {
+    const result = await runInSandbox("list(range(5000))", { registry }, { maxOutputBytes: 256 });
+    ok(result);
+    assert.ok(byteSize(result.output) <= 256, `${byteSize(result.output)} bytes`);
+    assert.match(result.output, /^\[0, 1, .*\[… \d+ of 5000 elements elided\. .* …\], .*, 4999\]$/);
+  });
+});
+
+describe("SUBMIT rejects a non-str answer with a Python TypeError (#65 tests 1-2, D141)", () => {
+  const registry = rlmRegistry();
+
+  // `**json.loads(...)` is the form the type checker cannot see through; a
+  // dict literal is refused at check time (pinned below).
+  const runtimeShapes: Array<[json: string, pytype: string]> = [
+    ["42", "int"],
+    ["1.5", "float"],
+    ["[1, 2]", "list"],
+    ['{"a": 1}', "dict"],
+    ["true", "bool"],
+    ["null", "NoneType"],
+  ];
+
+  for (const [json, pytype] of runtimeShapes) {
+    it(`SUBMIT(**json.loads('{"answer": ${json}}')) is a RunError naming ${pytype}, never a throw or an empty ok`, async () => {
+      const result = await runInSandbox(
+        `import json\nSUBMIT(**json.loads('{"answer": ${json}}'))`,
+        { registry },
+      );
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(
+        result.error,
+        new RegExp(`TypeError: SUBMIT\\(\\) answer must be str, not ${pytype}`),
+      );
+      assert.equal(result.calls.length, 1);
+      assert.equal(result.calls[0].tool, "SUBMIT");
+      assert.equal(result.calls[0].ok, false, "a rejected SUBMIT must not be traced ok");
+      assert.equal(result.calls[0].error, `SUBMIT() answer must be str, not ${pytype}`);
+    });
+  }
+
+  it("the model can catch it and carry on — it is a Python exception, not a host fault", async () => {
+    const result = await runInSandbox(
+      [
+        "import json",
+        "try:",
+        "    SUBMIT(**json.loads('{\"answer\": 42}'))",
+        "except TypeError as e:",
+        "    print('caught:', e)",
+        "'continued'",
+      ].join("\n"),
+      { registry },
+    );
+    ok(result);
+    assert.equal(result.output, "continued");
+    assert.match(result.stdout, /caught: SUBMIT\(\) answer must be str, not int/);
+    assert.equal(result.calls[0].ok, false);
+  });
+
+  it("SUBMIT(**{}) is a TypeError for the missing answer, never an ok with an empty output", async () => {
+    const result = await runInSandbox("SUBMIT(**{})", { registry });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(
+      result.error,
+      /TypeError: SUBMIT\(\) missing 1 required positional argument: 'answer'/,
+    );
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].tool, "SUBMIT");
+    assert.equal(result.calls[0].ok, false);
+  });
+
+  it("a str answer through **kwargs still submits", async () => {
+    const result = await runInSandbox(`import json\nSUBMIT(**json.loads('{"answer": "ok"}'))`, {
+      registry,
+    });
+    ok(result);
+    assert.equal(result.output, "ok");
+    assert.equal(result.calls[0].ok, true);
+  });
+
+  it("the resume prologue applies the same guard to a gated submit", async () => {
+    // `finish` is gated, so its SubmitSignal is raised from the approval
+    // replay in `resumeSuspended` — the second SUBMIT site.
+    const gated = new ToolRegistry([gatedSubmit()]);
+    const susp = await runInSandbox(
+      `import json\nfinish(**json.loads('{"answer": [1, 2]}'))\n'after'`,
+      { registry: gated },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    const result = await resumeSuspended(susp, true, { registry: gated });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /TypeError: SUBMIT\(\) answer must be str, not list/);
+    assert.equal(result.calls.length, 1);
+    assert.equal(result.calls[0].ok, false);
+    assert.equal(
+      result.calls[0].approved,
+      true,
+      "the user did approve; the answer was the problem",
+    );
+
+    // And a str answer through the same prologue is the ok result it always was.
+    const good = await runInSandbox(
+      "finish('the-answer')",
+      { registry: gated },
+      {
+        onApproval: () => "suspend",
+      },
+    );
+    suspended(good);
+    const done = await resumeSuspended(good, true, { registry: gated });
+    ok(done);
+    assert.equal(done.output, "the-answer");
+  });
+
+  it("the type checker refuses the direct forms before anything runs (#65 test 5, pin)", async () => {
+    // D103 gave SUBMIT a real `-> None` stub, so `SUBMIT()` and `SUBMIT(42)`
+    // never reach the runtime guard. Green on main; pinned so a stub
+    // regression is caught here and not by a runtime TypeError.
+    const none = await runInSandbox("SUBMIT()", { registry });
+    err(none);
+    assert.equal(none.errorKind, "typing");
+    assert.match(none.error, /missing-argument/);
+    const num = await runInSandbox("SUBMIT(42)", { registry });
+    err(num);
+    assert.equal(num.errorKind, "typing");
+    assert.match(num.error, /invalid-argument-type/);
+    const literal = await runInSandbox("SUBMIT(**{'answer': None})", { registry });
+    err(literal);
+    assert.equal(literal.errorKind, "typing");
+    assert.equal(none.calls.length + num.calls.length + literal.calls.length, 0);
+  });
+});
+
+describe("a missing required argument on any tool is a Python TypeError (#65 test 3, D142)", () => {
+  const registry = new ToolRegistry([echoTool(), makeAddTool()]);
+
+  it("echo(**{}) and echo(*[]) raise, and are traced ok:false", async () => {
+    for (const code of ["echo(**{})", "echo(*[])"]) {
+      const result = await runInSandbox(code, { registry });
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(
+        result.error,
+        /TypeError: echo\(\) missing 1 required positional argument: 'text'/,
+        code,
+      );
+      assert.equal(result.calls.length, 1);
+      assert.equal(result.calls[0].ok, false);
+      assert.equal(result.calls[0].error, "echo() missing 1 required positional argument: 'text'");
+    }
+  });
+
+  it("a second tool: add(**{'a': 1}) names b, add(**{}) names both", async () => {
+    const one = await runInSandbox("add(**{'a': 1})", { registry });
+    err(one);
+    assert.match(one.error, /TypeError: add\(\) missing 1 required positional argument: 'b'/);
+    const both = await runInSandbox("add(**{})", { registry });
+    err(both);
+    assert.match(
+      both.error,
+      /TypeError: add\(\) missing 2 required positional arguments: 'a' and 'b'/,
+    );
+  });
+
+  it("the exception is catchable in Python and the tool never executed", async () => {
+    let executed = 0;
+    const counting: HostTool = {
+      ...echoTool(),
+      execute: (args) => {
+        executed++;
+        return String(args.text);
+      },
+    };
+    const result = await runInSandbox(
+      "try:\n    echo(**{})\nexcept TypeError as e:\n    print(e)\necho('ran')",
+      { registry: new ToolRegistry([counting]) },
+    );
+    ok(result);
+    assert.equal(result.output, "ran");
+    assert.equal(result.stdout, "echo() missing 1 required positional argument: 'text'\n");
+    assert.equal(executed, 1, "the failed call must not have reached execute");
+  });
+});
+
+describe("SubmitSignal — the answer is unknown until the sandbox checks it (100% floor)", () => {
+  it("a string answer keeps the historical message", () => {
+    const signal = new SubmitSignal("x");
+    assert.equal(signal.message, "SUBMIT: x");
+    assert.equal(signal.answer, "x");
+    assert.equal(signal.name, "SubmitSignal");
+  });
+
+  it("a non-string answer is carried as it is, and the message names its Python type", () => {
+    const signal = new SubmitSignal(42);
+    assert.equal(signal.answer, 42);
+    assert.equal(signal.message, "SUBMIT: <non-str answer (int)>");
+    assert.equal(new SubmitSignal(null).message, "SUBMIT: <non-str answer (NoneType)>");
+  });
+});
+
+// ── Ordering: seq and stdoutOffset (#69 finding 4, D143) ─────────
+//
+// Every entry the sandbox pushes now says where in the run it happened:
+// `seq`, a per-run counter that is strictly increasing across every push
+// site, and `stdoutOffset`, the byte of this call's stdout at which the call
+// was dispatched — so a consumer can put the trace back into the stream.
+
+describe("ToolCallTrace.seq and stdoutOffset", () => {
+  it("seq counts every call in dispatch order; stdoutOffset is the stdout position at the call", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox(
+      'print("P1")\necho("a")\nprint("x", end="")\necho("b")\nprint("y")\necho("c")',
+      { registry },
+    );
+    ok(result);
+    assert.equal(result.stdout, "P1\nxy\n");
+    assert.deepEqual(
+      result.calls.map((c) => c.seq),
+      [0, 1, 2],
+    );
+    // "P1\n" is 3 bytes; the partial "x" Monty flushes at the host boundary
+    // is already in the accumulator when `echo("b")` is dispatched (measured).
+    assert.deepEqual(
+      result.calls.map((c) => c.stdoutOffset),
+      [3, 4, 6],
+    );
+  });
+
+  it("every push site stamps one: ok, thrown, denied, unresolved, SUBMIT", async () => {
+    const thrower: HostTool = {
+      ...echoTool(),
+      name: "boom",
+      execute: () => {
+        throw new HostToolError("ValueError", "boom");
+      },
+    };
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const registry = rlmRegistry(echoTool(), thrower, gate);
+    const result = await runInSandbox(
+      [
+        "echo('ok')",
+        "try:",
+        "    boom('x')",
+        "except ValueError:",
+        "    pass",
+        "try:",
+        "    gate('x')",
+        "except PermissionError:",
+        "    pass",
+        "try:",
+        "    echo(**{})",
+        "except TypeError:",
+        "    pass",
+        "SUBMIT('done')",
+      ].join("\n"),
+      { registry },
+      { onApproval: () => false },
+    );
+    ok(result);
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.ok]),
+      [
+        ["echo", true],
+        ["boom", false],
+        ["gate", false],
+        ["echo", false],
+        ["SUBMIT", true],
+      ],
+    );
+    assert.deepEqual(
+      result.calls.map((c) => c.seq),
+      [0, 1, 2, 3, 4],
+    );
+    for (const call of result.calls) assert.equal(call.stdoutOffset, 0);
+  });
+
+  it("is preserved across resumeSuspended and continues after the carried entries", async () => {
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const registry = new ToolRegistry([echoTool(), gate]);
+    const susp = await runInSandbox(
+      'echo("a")\nprint("pre")\necho("b")\ngate("g")\nprint("post")\necho("c")',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+    assert.deepEqual(
+      susp.calls.map((c) => c.seq),
+      [0, 1],
+    );
+    const result = await resumeSuspended(susp, true, { registry });
+    ok(result);
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.seq, c.stdoutOffset]),
+      [
+        ["echo", 0, 0],
+        ["echo", 1, 4],
+        ["gate", 2, 4],
+        ["echo", 3, 9],
+      ],
+    );
+    assert.equal(result.stdout, "pre\npost\n");
+  });
+
+  it("the resume prologue's other outcomes stamp one too: denied, thrown, SUBMIT", async () => {
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const thrower: HostTool = {
+      ...gate,
+      name: "boom",
+      execute: () => {
+        throw new HostToolError("ValueError", "boom");
+      },
+    };
+    const registry = new ToolRegistry([echoTool(), gate, thrower, gatedSubmit()]);
+    const suspend = () => ({ onApproval: () => "suspend" as const });
+
+    const denied = await runInSandbox('echo("a")\ngate("g")', { registry }, suspend());
+    suspended(denied);
+    const d = await resumeSuspended(denied, false, { registry });
+    err(d);
+    assert.deepEqual(
+      d.calls.map((c) => [c.tool, c.ok, c.seq]),
+      [
+        ["echo", true, 0],
+        ["gate", false, 1],
+      ],
+    );
+
+    const thrown = await runInSandbox('echo("a")\nboom("g")', { registry }, suspend());
+    suspended(thrown);
+    const t = await resumeSuspended(thrown, true, { registry });
+    err(t);
+    assert.deepEqual(
+      t.calls.map((c) => [c.tool, c.ok, c.seq]),
+      [
+        ["echo", true, 0],
+        ["boom", false, 1],
+      ],
+    );
+
+    const submitted = await runInSandbox('echo("a")\nfinish("ans")', { registry }, suspend());
+    suspended(submitted);
+    const s = await resumeSuspended(submitted, true, { registry });
+    ok(s);
+    assert.equal(s.output, "ans");
+    assert.deepEqual(
+      s.calls.map((c) => [c.tool, c.ok, c.seq]),
+      [
+        ["echo", true, 0],
+        ["finish", true, 1],
+      ],
+    );
+  });
+
+  it("entries restored without the fields (a loaded dump) are continued from their count", async () => {
+    // `Session.load()` rebuilds suspended calls through a validator that
+    // knows neither field, so a resume may find carried entries without
+    // them. Numbering continues from the count, so the run stays strictly
+    // increasing when the bare entries are read by index.
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const registry = new ToolRegistry([echoTool(), gate]);
+    const susp = await runInSandbox(
+      'echo("a")\necho("b")\ngate("g")\necho("c")',
+      { registry },
+      {
+        onApproval: () => "suspend",
+      },
+    );
+    suspended(susp);
+    const bare = {
+      ...susp,
+      calls: susp.calls.map(({ seq: _seq, stdoutOffset: _at, ...rest }) => rest),
+    };
+    const result = await resumeSuspended(bare, true, { registry });
+    ok(result);
+    assert.deepEqual(
+      result.calls.map((c) => c.seq),
+      [undefined, undefined, 2, 3],
+    );
+  });
+
+  it("stdoutOffset counts this call's own bytes: the replay mark is not in it", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox(
+      'print("replayed")\nprint("own")\necho("x")',
+      { registry },
+      { stdoutSkipBytes: 9 },
+    );
+    ok(result);
+    assert.equal(result.stdout, "own\n");
+    assert.equal(result.calls[0].stdoutOffset, 4);
+  });
+
+  it("survives an in-process copy but is not serialised — the dump validator's shape is", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox('echo("a")', { registry });
+    ok(result);
+    const [call] = result.calls;
+    assert.equal(call.seq, 0);
+    assert.equal(call.stdoutOffset, 0);
+    // Spread and structuredClone keep them: the trace API's alignment copies
+    // entries by spread.
+    assert.equal({ ...call }.seq, 0);
+    assert.equal(structuredClone(call).stdoutOffset, 0);
+    // JSON does not: `Session.dump()` writes `calls` verbatim and
+    // `Session.load()` refuses a key its validator does not know.
+    const persisted = JSON.parse(JSON.stringify(result.calls))[0];
+    assert.deepEqual(Object.keys(persisted).sort(), ["args", "durationMs", "kwargs", "ok", "tool"]);
+    assert.equal(JSON.stringify([call]), JSON.stringify(result.calls));
+  });
+
+  it("filtering the trace by any predicate keeps seq strictly increasing (what replay filtering must preserve)", async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox(
+      Array.from({ length: 6 }, (_, i) => `echo("${i}")`).join("\n"),
+      { registry },
+    );
+    ok(result);
+    const seqs = result.calls.map((c) => c.seq);
+    assert.deepEqual(seqs, [0, 1, 2, 3, 4, 5]);
+    for (const keep of [
+      (_c: unknown, i: number) => i % 2 === 0,
+      (_c: unknown, i: number) => i > 2,
+      (_c: unknown, i: number) => i !== 3,
+    ]) {
+      const filtered = result.calls.filter(keep).map((c) => c.seq as number);
+      for (let i = 1; i < filtered.length; i++) {
+        assert.ok(filtered[i] > filtered[i - 1], `not increasing: ${filtered.join(",")}`);
+      }
+    }
+  });
+
+  // Residual (todo, decision 9): the fields do not survive a dump.
+  it("seq and stdoutOffset survive JSON serialisation, so a Session dump keeps the ordering", {
+    todo:
+      "src/session.ts `traces()` is a closed validator that refuses unknown keys and `dump()` " +
+      "writes `result.calls` verbatim, so the entries hide the two fields from JSON (`toJSON`) " +
+      "to keep a suspended session loadable. Intended approach: the validator accepts `seq` and " +
+      "`stdoutOffset` as optional finite numbers, then the `toJSON` in src/sandbox.ts is deleted.",
+  }, async () => {
+    const registry = new ToolRegistry([echoTool()]);
+    const result = await runInSandbox('echo("a")', { registry });
+    ok(result);
+    const persisted = JSON.parse(JSON.stringify(result.calls))[0];
+    assert.equal(persisted.seq, 0);
+    assert.equal(persisted.stdoutOffset, 0);
+  });
+});
+
+// ── #69 findings 3 and 5, pinned against the shipped Monty (D147) ──
+
+describe("there is no stderr: every route to it fails, and nothing reaches stdout (#69 finding 3)", () => {
+  const registry = new ToolRegistry();
+  const forms: Array<[code: string, kind: string, message: RegExp]> = [
+    [
+      "import sys\nprint('e', file=sys.stderr)",
+      "runtime",
+      /TypeError: print\(\) 'file' argument is not supported/,
+    ],
+    ["import sys\nsys.stderr.write('e')", "runtime", /AttributeError: .* has no attribute 'write'/],
+    ["import sys\nsys.stdout.write('o')", "runtime", /AttributeError: .* has no attribute 'write'/],
+    ["import os\nos.write(2, b'e')", "typing", /unresolved-attribute/],
+    ["import warnings\nwarnings.warn('w')", "typing", /unresolved-import/],
+  ];
+
+  for (const [code, kind, message] of forms) {
+    it(`${code.replace(/\n/g, "; ")} → ${kind}`, async () => {
+      const prints: string[] = [];
+      const result = await runInSandbox(code, { registry }, { onPrint: (t) => prints.push(t) });
+      err(result);
+      assert.equal(result.errorKind, kind);
+      assert.match(result.error, message);
+      assert.equal(result.stdout, "");
+      assert.deepEqual(prints, []);
+    });
+  }
+
+  it("the sys.stderr object exists and is write-less — a print()-only I/O model", async () => {
+    const result = await runInSandbox("import sys\nsys.stderr", { registry });
+    ok(result);
+    assert.equal(result.output, "<stderr>");
+  });
+});
+
+describe("the print callback's return value is ignored on 0.0.21 (#69 finding 5, dissolved)", () => {
+  it("a callback returning a value neither throws nor changes the run", async () => {
+    // 0.0.18 threw `TypeError: Value is not undefined` at a callback that
+    // returned anything, which made the block-bodied arrow in
+    // `makePrintCallback` load-bearing by accident. Measured on 0.0.21 through
+    // a raw session: tolerated. Pinned so a version bump that reinstates the
+    // rule fails here, with the reason, rather than in every print test.
+    const monty = await Monty.create({});
+    try {
+      const session = await monty.checkout({ scriptName: "finding-5" });
+      try {
+        const seen: string[] = [];
+        const snapshot = await session.feedStart('print("hi")\n1', {
+          printCallback: ((_stream: string, text: string) => {
+            seen.push(text);
+            return "not undefined";
+          }) as unknown as PrintCallback,
+        });
+        assert.ok(snapshot instanceof MontyComplete, "the run did not complete");
+        assert.equal(snapshot.output, 1);
+        assert.deepEqual(seen, ["hi\n"]);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      await monty.close();
+    }
   });
 });

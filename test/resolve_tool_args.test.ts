@@ -8,15 +8,13 @@ import { HostToolError, type HostTool } from "../src/types.js";
 // `resolveToolArgs` (src/sandbox.ts) is the one place a Python call's
 // positional and keyword arguments become the flat record every host tool's
 // `execute` receives. It is exported, called on both dispatch paths and on
-// resume, and until this file it had no direct test: its behaviour was
-// reachable only through whole sandbox runs. The matrix below is what #65
-// (required-parameter enforcement) will change — the `missing` and surplus
-// rows pin *today's* behaviour and say so, so the flip is a decision here and
-// not a surprise elsewhere.
+// resume. W2-3 pinned the matrix as it stood; W3-1 (#65, D142) flipped the
+// two `missing` rows — a missing required parameter is now the `TypeError`
+// a real Python call would raise — and the surplus rows still pin today's
+// behaviour and say so.
 //
-// These pass on main by design: the function is not changed in this chunk.
-// The file lives apart from test/sandbox.test.ts because that file belongs to
-// the wave-2 sandbox chunk.
+// The file lives apart from test/sandbox.test.ts because it tests the
+// function directly, without a sandbox run.
 
 /** A tool with the named parameters; a second tuple element marks one optional. */
 function tool(...params: Array<[name: string, optional?: boolean]>): HostTool {
@@ -91,22 +89,50 @@ describe("resolveToolArgs — duplicate arguments", () => {
   });
 });
 
-// ── Missing arguments — today's behaviour, pinned ───────────────
+// ── Missing arguments — the #65 contract (D142) ─────────────────
 //
-// #65 / W3-1 will make a missing *required* parameter a TypeError at this
-// layer. Until then the key is simply absent — `optional` is not consulted
-// here — and the tool's `execute` decides. When #65 lands, the two tests
-// marked "flips" change with it; the optional-parameter one stays.
+// A missing *required* parameter is a `TypeError` at this layer, worded as
+// CPython words it, so `echo(**{})` and `SUBMIT(**{})` — the forms the type
+// checker cannot see through — fail in Python instead of reaching `execute`
+// with an undefined argument. `optional` is what makes a parameter omittable;
+// the tool's `execute` still supplies the default for those.
 
-describe("resolveToolArgs — missing arguments (today's behaviour, pinned)", () => {
-  it("a missing required parameter is left out of the record (flips under #65)", () => {
-    const resolved = resolveToolArgs(AB, [], { b: 2 });
-    assert.deepEqual(resolved, { b: 2 });
-    assert.equal(Object.hasOwn(resolved, "a"), false, "no key at all, not an undefined value");
+/** The `TypeError` `resolveToolArgs` raises, asserted by its Python type and message. */
+function missing(fn: () => unknown, message: string): void {
+  assert.throws(fn, (err: unknown) => {
+    assert.ok(err instanceof HostToolError, "not a HostToolError");
+    assert.equal(err.pythonType, "TypeError");
+    assert.equal(err.message, message);
+    return true;
+  });
+}
+
+describe("resolveToolArgs — missing arguments (#65 test 3)", () => {
+  it("a missing required parameter is a Python TypeError naming it", () => {
+    missing(
+      () => resolveToolArgs(AB, [], { b: 2 }),
+      "add() missing 1 required positional argument: 'a'",
+    );
   });
 
-  it("nothing at all resolves to an empty record, not a throw (flips under #65)", () => {
-    assert.deepEqual(resolveToolArgs(AB, [], {}), {});
+  it("nothing at all names the required parameter and not the optional one", () => {
+    missing(() => resolveToolArgs(AB, [], {}), "add() missing 1 required positional argument: 'a'");
+  });
+
+  it("two and three missing use CPython's list wording", () => {
+    missing(
+      () => resolveToolArgs(tool(["a"], ["b"]), [], {}),
+      "add() missing 2 required positional arguments: 'a' and 'b'",
+    );
+    missing(
+      () => resolveToolArgs(tool(["a"], ["b"], ["c"]), [], {}),
+      "add() missing 3 required positional arguments: 'a', 'b', and 'c'",
+    );
+    // Only the missing ones are named, in parameter order.
+    missing(
+      () => resolveToolArgs(tool(["a"], ["b"], ["c"]), [], { b: 2 }),
+      "add() missing 2 required positional arguments: 'a' and 'c'",
+    );
   });
 
   it("a missing optional parameter is left out — the caller supplies the default", () => {
@@ -117,6 +143,13 @@ describe("resolveToolArgs — missing arguments (today's behaviour, pinned)", ()
     const resolved = resolveToolArgs(AB, [1], { b: undefined });
     assert.equal(Object.hasOwn(resolved, "b"), true);
     assert.equal(resolved.b, undefined);
+  });
+
+  it("a duplicate is reported before a missing one, as Python does", () => {
+    assert.throws(
+      () => resolveToolArgs(tool(["a"], ["b"]), [1], { a: 2 }),
+      /add\(\) got multiple values for argument 'a'/,
+    );
   });
 });
 
@@ -132,18 +165,21 @@ describe("resolveToolArgs — surplus arguments (today's behaviour, pinned)", ()
   });
 });
 
-// ── Residual (todo, decision 9) ─────────────────────────────────
+// ── Keyword presence is own-property presence (W2-3's residual, closed) ──
 
-describe("resolveToolArgs — residual", () => {
-  it("a parameter named like an Object.prototype member is not seen as a provided keyword", {
-    todo:
-      "`param.name in kwargs` walks the prototype chain, so an empty kwargs object 'has' " +
-      "`constructor` / `toString` / `valueOf`: a positional for such a parameter is refused as " +
-      "a duplicate and the keyword lookup hands back the prototype member. Fix: `Object.hasOwn` " +
-      "in src/sandbox.ts resolveToolArgs (not owned this wave).",
-  }, () => {
+describe("resolveToolArgs — a keyword is present only when kwargs owns it", () => {
+  it("a parameter named like an Object.prototype member is not seen as a provided keyword", () => {
+    // `param.name in kwargs` walked the prototype chain, so an empty kwargs
+    // object 'had' `constructor` / `toString` / `valueOf`: a positional for
+    // such a parameter was refused as a duplicate and the keyword lookup
+    // handed back the prototype member.
     const ctor = tool(["constructor"]);
     assert.deepEqual(resolveToolArgs(ctor, [1], {}), { constructor: 1 });
-    assert.deepEqual(resolveToolArgs(ctor, [], {}), {});
+    missing(
+      () => resolveToolArgs(ctor, [], {}),
+      "add() missing 1 required positional argument: 'constructor'",
+    );
+    const str = tool(["toString", true]);
+    assert.deepEqual(resolveToolArgs(str, [], {}), {});
   });
 });

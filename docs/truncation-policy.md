@@ -21,7 +21,7 @@ Nothing was tested against a live model; see [What was not tested](#what-was-not
 | **Marker inside the budget?** | yes | yes |
 | **Marker carries magnitude?** | yes | yes |
 | **Marker carries a recovery route?** | yes | yes |
-| **Structure-aware?** | no | no — **blocked**, see Q4 |
+| **Structure-aware?** | no | yes — between the elements of the outermost value (Q4, shipped by #69 / W3-1) |
 
 One tool result is therefore bounded at **48 KiB**, down from unbounded today.
 
@@ -60,7 +60,9 @@ directions: `sandbox` keeps characters intact and blows the budget, `builtins` h
 mangles a character. Neither cuts at a character boundary at or below the budget.
 
 **M6/M7 — `output` is not a repr.** `formatOutput` (`sandbox.ts:89-92`) is `String(value)`. So
-`[1,2,3]` → `"1,2,3"` and `{'a': 1}` → `"[object Map]"`. This is load-bearing for Q4.
+`[1,2,3]` → `"1,2,3"` and `{'a': 1}` → `"[object Map]"`. This is load-bearing for Q4. *(Historical:
+#69 / W3-1 replaced `formatOutput` with `formatValue` in `src/truncate.ts` — see [Value
+rendering](#value-rendering) below for what `output` is now.)*
 
 **M10 — but the values arrive intact.** Read directly off `MontyComplete.output`:
 
@@ -211,13 +213,17 @@ bulk. That is what licenses the 5× reduction in Q5.
 
 ### Q4 — Structure-aware truncation for `output`?
 
-**Decision: no. Not because it is a bad idea — because it is currently impossible. Revisit after
-#69.**
+**Decision (as first written): no. Not because it is a bad idea — because it is currently impossible.
+Revisit after #69.** **Resolved by #69 / W3-1 (D140): yes, shipped** — `output` is a Python-style
+repr built by `formatValue` in `src/truncate.ts`, which knows its byte budget and elides *between
+the elements* of the outermost value. The record of what shipped is in [Value
+rendering](#value-rendering); the reasoning that led there is kept below as written.
 
-The issue assumes `output` is "a structural repr of a Python value." **[measured, M6/M7]** It is not.
-`formatOutput` is `String(value)`, so by the time truncation could run, the structure is already gone:
+The issue assumes `output` is "a structural repr of a Python value." **[measured, M6/M7]** It was
+not. `formatOutput` was `String(value)`, so by the time truncation could run, the structure was
+already gone:
 
-| Python value | `output` today | A repr would give |
+| Python value | `output` then | `output` now |
 |---|---|---|
 | `[1,2,3]` | `"1,2,3"` | `"[1, 2, 3]"` |
 | `{'a': 1}` | `"[object Map]"` | `"{'a': 1}"` |
@@ -232,16 +238,16 @@ straight off `MontyComplete.output` on `@pydantic/monty@0.0.18`, a Python `dict`
 finding 1, which reads the `{}` from `JSON.stringify` as evidence that the boundary itself is lossy;
 `JSON.stringify` renders a `Map` as `{}` because its entries are not own enumerable properties.
 
-So Q4 has no complexity cliff to locate yet; it has a **dependency**, and a cheaper one than it looks.
-`#69 (8.5 — value conversion and print capture lose information silently)` is the blocker. Until it
-lands, `output` gets the same flat head+tail cut as `stdout`.
+So Q4 had no complexity cliff to locate; it had a **dependency**, and a cheaper one than it looked.
+`#69 (8.5 — value conversion and print capture lose information silently)` was the blocker. Until it
+landed, `output` got the same flat head+tail cut as `stdout`.
 
-**Recommendation for whoever takes #69:** emit a real repr, and make it truncation-aware at
-construction — a repr walking `.entries()` already knows the budget and can elide *between elements*,
-producing `[1, 2, 3, … 994 more … , 999, 1000]` for free. Retrofitting structure onto a flattened
-string afterwards is the expensive path, and the reason to fix it at the source. Because the values
-arrive intact, this is a local change to `formatOutput` rather than an upstream conversion fix, and it
-does not appear to depend on #40 the way #69's print-capture findings do.
+**Recommendation for whoever takes #69** (followed, W3-1): emit a real repr, and make it
+truncation-aware at construction — a repr walking `.entries()` already knows the budget and can
+elide *between elements*, producing `[1, 2, 3, … 994 more … , 999, 1000]` for free. Retrofitting
+structure onto a flattened string afterwards is the expensive path, and the reason to fix it at the
+source. Because the values arrive intact, this is a local change to `formatOutput` rather than an
+upstream conversion fix, and it does not depend on #40 the way #69's print-capture findings did.
 
 ### Q5 — One budget or two?
 
@@ -338,7 +344,9 @@ Rules:
 ### Non-goals
 
 - Token-based budgets. Bytes are cheap, deterministic and tokenizer-independent.
-- Structure-aware `output` elision — Q4, blocked on #69.
+- Structure-aware elision *below* the outermost value. A nested value is shown whole or skipped
+  (see [Value rendering](#value-rendering)); the one exception is a value dominated by a single
+  nested container, which is elided the same way one level down.
 - Truncating `errorKind`. The two `error` surfaces are now capped — `RunResult.error` (sandbox, 16 KiB, #144) and `RlmResult.error` (LLM provider error, 1 KiB, #167, plain `truncateText` with no sentinel wrap because the public return is an API surface); `errorKind` stays uncapped as a small bounded enum string.
 
 ---
@@ -378,6 +386,7 @@ spec above. Recorded here rather than left as drift, per #34's DoD.
 |---|---|---|---|
 | `stdout` | 32 KiB / 1000 lines | 25/75 head+tail | #29 |
 | `output` | 16 KiB | 50/50 head+tail | #34 |
+| `output` (a Python value) | 16 KiB | Python-style repr, elided between the elements of the outermost value; flat 50/50 for a bare string | #69 / W3-1 |
 | `read_file` | 256 KiB | 50/50 head+tail | #29 |
 | `http_get` | 256 KiB | head-only, total unknown | #29 |
 | `buildFeedback` `stdout` | 32 KiB | 25/75 head+tail | #74 |
@@ -550,6 +559,80 @@ still happens — callers who override it should restate the rule.
 **The budget-smaller-than-the-marker edge**, which #29 asked to decide explicitly: the result is
 **empty**, with the truncated flag set. A partial marker is misinformation and the budget is a hard
 ceiling, so an empty field plus an accurate flag is the only unambiguous answer.
+
+---
+
+## Value rendering
+
+Normative for `output` since #69 / W3-1 (session decision 15, D139–D140). `RunOk.output` is
+**always a string**: the `SUBMIT` answer verbatim when the run ended in `SUBMIT` (a non-`str` answer
+is a Python `TypeError` in the run, never an `output`), else the last expression's value rendered by
+`formatValue` (`src/truncate.ts`) — the same module as every other cut, so invariants 1–5 hold for it
+by construction. `test/truncate.test.ts` and `test/sandbox.test.ts` assert against this section.
+
+### Spelling
+
+Python's, for what crossed the boundary:
+
+| Python | arrives as (Monty 0.0.21, measured) | `output` |
+|---|---|---|
+| `None`, `True`, `False` | `null`, `true`, `false` | `None`, `True`, `False` |
+| `42`, `10**20` | `42`, `100000000000000000000n` | `42`, `100000000000000000000` |
+| `2.5`, `0.1 + 0.2`, `1e21` | the number | `2.5`, `0.30000000000000004`, `1e+21` |
+| `float('nan')`, `float('inf')` | `NaN`, `Infinity` | `nan`, `inf` |
+| `'hi'` (bare) | `"hi"` | `hi` — verbatim, as `print` would show it |
+| `['it\'s', "q\""]` | the array | `["it's", 'q"']` — Python's quoting and escapes inside a container |
+| `b'ab\x00'` | `Buffer` | `b'ab\x00'` |
+| `[1, 2]`, `{'a': 1}`, `{1, 2}`, `set()`, `{}` | `Array`, `Map`, `Set`, `Set`, `Map` | `[1, 2]`, `{'a': 1}`, `{1, 2}`, `set()`, `{}` |
+| `ValueError('bad')`, `type(1)` | `{__monty_type__: "Exception", …}`, `{__monty_type__: "Type", …}` | `ValueError('bad')`, `<class 'int'>` |
+| `range(3)`, a lambda, an instance | Monty's own repr string | `range(0, 3)`, `<function '<lambda>' at 0xc>`, … (verbatim) |
+| `a = []; a.append(a); a` | `["[...]"]` — Monty breaks the cycle itself | `['[...]']` |
+
+### Documented losses
+
+What the boundary does not carry, and so what `output` cannot show. Recorded rather than hidden:
+
+- **tuple → list**: `(1, 2.0)` renders `[1, 2]`; `()` renders `[]`.
+- **`1.0` → `1`**, **`-0.0` → `0`**: an integral float arrives as a plain integer.
+- **frozenset → set**.
+- **`1e400` → `inf`**: Python's own literal is `inf` too, so this one is a spelling, not a loss.
+- **a bare `str` is verbatim**: `'1'` and `1` both show `1` at the top level (inside a container they
+  do not). Chosen deliberately: inspecting text is what a REPL is for, and a 10 KiB document as one
+  escaped line is not an improvement.
+- **exponent spelling**: `1.5e-7` where Python writes `1.5e-07`.
+
+### Elision
+
+`formatValue(value, { maxBytes, recovery })` returns `byteLength(text) <= maxBytes`, always:
+
+1. A value that renders within the budget is returned whole, `truncated: false`.
+2. Over it, the **outermost container** is elided between its elements: elements are taken whole from
+   the front and from the back into a 50/50 split of the payload, and one marker stands where the
+   rest was — `[0, 1, 2, [… 299994 of 300000 elements elided. Assign the value to a name and slice
+   it to see more. …], 299998, 299999]` (`entries` for a dict). The counts are the true counts
+   (invariant 5). A nested value is shown whole or skipped.
+3. A value whose ends fit nothing is dominated by one huge element: a nested container is elided the
+   same way one level down (to a depth of 4) — a dict's entry through its value, behind its key
+   (`{'k': [0, 1, 2, [… 999994 of 1000000 elements elided. … …], 999998, 999999]}`); anything
+   else is spelled from its head and from its tail, each under the budget, and the flat 50/50 cut
+   joins the two real ends: `['xxx…[… truncated at 16.0KB. … …]…xxx']`. The whole was never
+   spelled, so that marker claims no total (the path-5 form), never an `X of Y` the renderer could
+   only know by doing the work the budget forbids.
+4. A bare string takes the flat 50/50 value cut it always did, with its true total. Any other
+   non-container (an exception with a huge message) is spelled from both ends as in 3.
+5. A container under a budget too small for its marker (< ~80 bytes) is cut head-only at the byte,
+   claiming no total (`[… truncated at 48B. … …]`), because the renderer stopped before the end.
+
+The renderer stops appending past the budget — from either end — so the work is the budget's and
+not the value's: a 10⁶-element set costs the boundary crossing (≈0.9 s, measured), not the repr,
+and a 10 MB string inside a list costs the same as one that fits (≈10 ms for the repr, measured;
+before fix round 1 it was spelled in full up to four times, 3.5 s, and 42 s for 100 MB). A `str` or
+`bytes` is spelled only as far as the budget can be exceeded — one code unit past the cap is
+enough to know it does not fit.
+
+The extension's argument renderer (`viewArgs` in `extensions/repl-extension.ts`) is a second,
+smaller Python-ish spelling with masking and a display cap. It is not a truncator and does not
+elide; it stays separate because its job (display-safe arguments) is not this one's.
 
 ---
 
