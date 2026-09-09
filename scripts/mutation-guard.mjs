@@ -96,7 +96,10 @@ function runSuite() {
     shell: true,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...process.env, REQUIRE_BRIDGE_TOOLS: "1" },
+    // MUTATION_RUN tells the suite it is reading an instrumented copy of the
+    // sources, so the text pins in `test/support/source-pin.ts` skip instead
+    // of failing the dry run and stopping the whole sweep (#175).
+    env: { ...process.env, REQUIRE_BRIDGE_TOOLS: "1", MUTATION_RUN: "1" },
   });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   return { output, status: result.status, signal: result.signal };

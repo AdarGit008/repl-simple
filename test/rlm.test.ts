@@ -10,6 +10,7 @@ import { ToolRegistry } from "../src/registry.js";
 import * as registryModule from "../src/registry.js";
 import { estimateTokens, SpendBudget } from "../src/budget.js";
 import type { HostTool, RunErrorKind } from "../src/types.js";
+import { SOURCE_PIN_SKIP } from "./support/source-pin.js";
 
 import {
   runRlm,
@@ -1411,7 +1412,14 @@ describe("runRlm() — provider-error rule consolidation (#189, #190)", () => {
     assert.equal(trace.error, await d53Redaction(thrown));
   });
 
-  it("carries the cause, and throws it from one place (#189/#190, source pin)", () => {
+  // Skipped under mutation testing, and only there: Stryker's sandbox holds an
+  // instrumented `src/rlm.ts`, in which the `{ cause: err }` this matches is
+  // wrapped in a `stryMutAct_*` switch. Uninstrumented — `npm test` and every
+  // CI leg — it runs. See `test/support/source-pin.ts`; measured as the one
+  // test in the suite that instrumentation breaks (#175).
+  it("carries the cause, and throws it from one place (#189/#190, source pin)", {
+    skip: SOURCE_PIN_SKIP,
+  }, () => {
     // `cause` is unobservable from every public surface by construction:
     // `src/sandbox.ts` reads `err.message` (plus the `HostToolError`
     // python-type discriminator) off a tool throw and discards the Error
