@@ -1,17 +1,16 @@
 # Mutation testing
 
-**Status:** Baseline re-measured on a guarded harness — **and now stale** · **Issue:** #24 (Bucket 1,
-step 6) · **Tree:** `b0d298d`
+**Status:** Re-baselined on Monty 0.0.21, on a coverage-analysing harness · **Issue:** #175 (the
+re-baseline) · #24 (the original) · **Tree:** `a32b1a7`
 
-> **The numbers below predate the Monty 0.0.21 migration (#40).** That change rewrote
-> `src/sandbox.ts`, added `src/pool.ts`, and moved Python execution into worker subprocesses, so the
-> mutant population, the per-file scores and the 58.09% baseline have all moved by an amount nobody
-> has measured. `thresholds.break` is still 58 and mutation is not part of CI, so nothing is
-> silently passing — but the floor is unverified until a full sweep re-baselines it. The per-file
-> analysis and the harness findings below remain valid for every file the migration did not touch.
-> The re-baseline is standalone infrastructure work (#175, session decision 17): the procedure —
-> fresh incremental cache, sharding, containment, the numbers to record — is
-> [`docs/mutation-rebaseline-runbook.md`](mutation-rebaseline-runbook.md).
+> **The harness changed with this re-baseline, and it is the reason the sweep is possible at all.**
+> `testRunner` is now [`tap`](https://stryker-mutator.io/docs/stryker-js/tap-runner/) rather than
+> `command`, and `coverageAnalysis` is `perTest` rather than `off`. The `command` runner cannot do
+> coverage analysis — Stryker's own configuration reference says so — so every mutant re-ran the
+> whole suite: 7269 mutants × 82 s, a **107-hour** sweep that nobody was ever going to run. With
+> real per-test-file coverage the same tree measures in **3h12m**. `scripts/mutation-guard.mjs` is
+> gone with the runner it existed to compensate for; see
+> [The guard, and why it retired](#the-guard-and-why-it-retired).
 
 This document records the full Stryker runs on this repository: the score, what it cost, how to
 reproduce it, and the findings the runs turned up that are not about the score at all.
@@ -23,46 +22,72 @@ reasoned, and stated so you can disagree with it.
 
 ## The baseline
 
-**58.09%** — 1296 detected of 2231 valid mutants. **[measured]** Measured at `b0d298d`, node 22.23.2,
-6-core/30 GB host, `concurrency: 2`, 140 minutes, **zero harness deaths**.
+**79.28%** — 5756 detected of 7263 valid mutants. **[measured]** Measured at `a32b1a7`, node 24,
+8-core/23 GB host, `concurrency: 6`, `coverageAnalysis: perTest`, **3h12m**, **zero harness deaths**.
+1.70 test files ran per mutant, against 27 in the tree.
 
 | | count |
 |---|---|
-| Killed | 1281 |
-| Timeout | 15 |
-| Survived | 935 |
-| NoCoverage | 0 |
-| Compile / runtime errors | 0 |
+| Killed | 5663 |
+| Timeout | 93 |
+| Survived | 1386 |
+| NoCoverage | 118 |
+| Compile / runtime errors | 9 |
 
 Per file, ascending:
 
-| File | Score | Detected / valid |
-|---|---|---|
-| `src/rlm.ts` | **30.58%** | 63 / 206 |
-| `extensions/repl-extension.ts` | **40.26%** | 31 / 77 |
-| `src/bridge.ts` | **41.51%** | 66 / 159 |
-| `src/truncate.ts` | 59.78% | 217 / 363 |
-| `src/rlm_loop.ts` | 60.21% | 115 / 191 |
-| `src/toolstore.ts` | 61.18% | 93 / 152 |
-| `src/registry.ts` | 61.69% | 95 / 154 |
-| `src/repl.ts` | 62.71% | 37 / 59 |
-| `src/sandbox.ts` | 63.17% | 295 / 467 |
-| `src/session.ts` | 68.39% | 119 / 174 |
-| `src/builtins.ts` | 71.35% | 127 / 178 |
-| `src/rlm_tools.ts` | 71.74% | 33 / 46 |
-| `src/types.ts` | 100% | 2 / 2 |
-| `src/submit_signal.ts` | 100% | 3 / 3 |
+| File | Score | Total | Killed | Timeout | Survived | NoCoverage |
+|---|---|---|---|---|---|---|
+| `src/bashenv.ts` | **65.49%** | 142 | 93 | 0 | 49 | 0 |
+| `src/rlm_tools.ts` | **68.75%** | 48 | 33 | 0 | 15 | 0 |
+| `src/sandbox.ts` | **72.68%** | 776 | 543 | 21 | 178 | 34 |
+| `src/builtins.ts` | 77.04% | 601 | 461 | 2 | 130 | 8 |
+| `extensions/repl-extension.ts` | 77.73% | 907 | 699 | 6 | 185 | 17 |
+| `src/repl.ts` | 78.55% | 578 | 435 | 19 | 119 | 5 |
+| `src/bridge.ts` | 78.84% | 241 | 190 | 0 | 47 | 4 |
+| `src/truncate.ts` | 78.90% | 834 | 634 | 24 | 174 | 2 |
+| `src/registry.ts` | 79.01% | 243 | 192 | 0 | 46 | 5 |
+| `src/rlm.ts` | 79.90% | 841 | 662 | 10 | 159 | 10 |
+| `src/toolstore.ts` | 82.55% | 1100 | 899 | 9 | 168 | 24 |
+| `src/session.ts` | 84.50% | 671 | 567 | 0 | 100 | 4 |
+| `src/pool.ts` | 89.47% | 38 | 34 | 0 | 4 | 0 |
+| `src/pathjail.ts` | 89.74% | 78 | 69 | 1 | 4 | 4 |
+| `src/redact.ts` | 91.59% | 116 | 97 | 1 | 8 | 1 |
+| `src/budget.ts` | 100% | 34 | 34 | 0 | 0 | 0 |
+| `src/preamble.ts` | 100% | 11 | 11 | 0 | 0 | 0 |
+| `src/submit_signal.ts` | 100% | 8 | 8 | 0 | 0 | 0 |
+| `src/types.ts` | 100% | 2 | 2 | 0 | 0 | 0 |
 
 `src/index.ts` is instrumented but yields 0 mutants — it is a barrel of re-exports with no
 mutable expressions. That is correct, not a coverage gap.
 
-`rlm.ts` being last is consistent with #24's hand campaign, which scored it **0/9**.
+**`src/rlm.ts` is no longer the worst file, and is no longer zero.** #24's hand campaign scored it
+**0/9**; the last sweep put it at 30.58%; it is now **79.90%**, 662 killed of 841. That closes
+#70's "`rlm.ts`'s mutation score is no longer zero" exit criterion. **[measured]**
 
-> **Calibration (2026-08-17, #110 sweep):** the per-file mutant counts in the table above are
-> stale post-#48/#59. A single-file `--mutate src/repl.ts` sweep that day took **~2h15m for
-> 287 mutants** (concurrency 2, ~55–60 s per mutant pair, plus 34 × 60 s timeouts) — not
-> 30–60 min/59 mutants. Before budgeting any sweep, count mutants from a dry run; do not size
-> from this table.
+### 79.28% is not comparable to 58.09%, and neither is a regression
+
+Two things changed at once, and both move the number: the tree grew (2231 → 7269 mutants across
+waves 1–3 and the 0.0.21 migration), and the instrument gained coverage analysis. Per Stryker's
+configuration reference, `perTest` "does *not* influence the resulting mutation testing score" —
+it only skips tests that could not have killed the mutant anyway — so the *instrument* change is
+score-neutral by construction. The rise is the tree's, not the harness's. **[judgement]**
+
+The one genuinely new column is **NoCoverage**: 118 mutants in code no test executes at all. The
+old `coverageAnalysis: "off"` harness could not distinguish those from survivors, because it never
+learned what any test covered. They count against the score exactly as survivors do; they are
+listed separately because "untested" and "weakly tested" are different repairs. Concentrated in
+`src/sandbox.ts` (34) and `src/toolstore.ts` (24). **[measured]**
+
+### Cross-file kills are the majority, and file-name mapping would have destroyed the number
+
+Worth recording because it was nearly done the other way. `src/pool.ts` scores 89.47%, and its
+kills come from **three** test files: `test/pool.test.ts` (9), `test/sandbox.test.ts` (16) and
+`test/toolstore.test.ts` (9). A harness that ran only each source file's like-named test — the
+obvious way to buy the same speedup without a coverage-analysing runner — would have scored
+`pool.ts` at roughly **24%** and reported a testing crisis in one of the better-tested files in the
+tree. **[measured]** Stryker's own [#4689](https://github.com/stryker-mutator/stryker-js/issues/4689)
+requests exactly that mapping and is closed unimplemented; real coverage is the supported path.
 
 ### This supersedes the 58.28% baseline, which was inflated
 
@@ -78,40 +103,55 @@ OOM. Elsewhere the tree genuinely improved: `registry.ts` gained 27 mutants and 
 
 ### The floor sits just under the baseline
 
-`thresholds.break` is **58**. The old floor of 57 was not slack for regressions — it was the
-reproducibility band of a broken instrument, and it cost a real point of gate strength. With the
-instrument fixed the band collapses: 63 pinned mutants held identical verdicts across 16 runs
-spanning two hosts, node 22 and 24, `--test-concurrency` 1/3/4 and Stryker `concurrency` 1 and 2.
-**[measured]**
+`thresholds.break` is **79**, against a measured 79.28. The 0.28 is rounding room, not drift budget
+— the same relationship 58 had to 58.09. If a run comes in under it, treat that as a regression to
+explain, not a threshold to lower. **[judgement]**
 
-58 rather than 58.09 leaves 0.09 for rounding, not for drift. If a run comes in under it, treat that
-as a regression to explain — not a threshold to lower. **[judgement]**
+The floor moved **up** 58 → 79 because the tree's score did. Raising it is the ratchet working; the
+history of this file is 57 → 58 → 79, and every step needed a measurement to justify it. **The one
+move that needs an explanation in the commit message is a floor going down.**
+
+A caveat this baseline carries that the previous one did not: it was measured in a single run, not
+across the 16 that established the old band's reproducibility. The 0.28 is therefore rounding room
+on *one* observation. If a re-run lands materially below 79, suspect the band before suspecting the
+tests. **[judgement]**
 
 ---
 
 ## What it costs
 
-**~32.9 CPU-hours for a full run.** **[measured]**
+**3h12m wall-clock, on one 8-core/23 GB host at `concurrency: 6`.** **[measured]** 7269 mutants,
+1.70 test files per mutant.
 
-The command runner re-runs the whole suite per mutant, and `coverageAnalysis` is `off` (the command
-runner cannot report per-test coverage), so there is no test filtering to win back. The cost is
-therefore fixed:
+Coverage analysis is the whole difference, and the arithmetic is worth keeping because it is what
+made this sweep possible:
 
-| | |
-|---|---|
-| One full suite run | **55.9 CPU-seconds** (426 tests) |
-| Mutants | 2119 |
-| Total | 2119 × 55.9 s ≈ **32.9 CPU-hours** |
+| | `coverageAnalysis: "off"` (command runner) | `perTest` (tap runner) |
+|---|---|---|
+| Test files per mutant | 27 (all of them) | **1.70** |
+| One mutant | ~82 s | ~1.6 s average |
+| 7269 mutants, concurrency 2 | **~107 hours** (measured ETA) | — |
+| 7269 mutants, concurrency 6 | — | **3h12m** (measured) |
 
-Measured wall-clock, sharded across two machines:
+The 107 hours is not an extrapolation: the sweep was started under the old config and Stryker's own
+ETA read `~107h 1m` at 16/7269 tested. That is why the runner changed. **[measured]**
 
-| Host | Cores | Mutants | Wall |
-|---|---|---|---|
-| srv1 | 6 | 466 | 64 min |
-| srv2 | 20 | 1653 | 216 min |
+Two things bound what is left:
 
-**Do not run this on a laptop or a dev box you are using.** The first attempt on an 8-core/24 GB
-machine took it down.
+- **`test/sandbox.test.ts` is 34.9 s**, 30% of the suite's serial time, and it covers most of
+  `src/`. Its slowest cases are genuinely waiting — pool exhaustion, runaway loops, duration
+  budgets — so this is real elapsed time, not waste. Every mutant in every file it covers pays it.
+  Making it fast needs injectable clocks through the sandbox's test surface. **[measured]**
+- **The box saturates before the cores do.** Raising `concurrency` 2 → 6 moved the ETA 32h → 17h
+  (~1.9×, not 3×) with load average at 8.7–11.4 on 8 cores. Above 6 there is nothing left to buy
+  here. **[measured]**
+
+Memory is no longer the binding constraint it was: test worker processes measured **~226 MB each**,
+6 of them against a 20G ceiling, 4 GB of 23 in use at peak. The 5.6 GB worst-case worker in the
+sizing note below was `rlm_loop.ts`, deleted by #78.
+
+**It is still not a laptop job**, and it must not share a host with anything else running the
+suite — but a dev box can now do it overnight instead of over a weekend.
 
 ### Concurrency is bounded by memory, not cores
 
@@ -166,20 +206,27 @@ Size the ceiling against the *worst mutant*, not the baseline suite: **~6 GB per
 npm run mutation
 ```
 
-That wraps Stryker in a transient systemd scope with a hard memory ceiling
-(`scripts/contained.mjs`), and runs `mutation-guard.mjs --report` afterwards so a run that scored any
-mutant from a dead harness fails instead of printing a number. The scope is a *sibling* of your
-terminal's, not a child, so a breach kills the mutation run alone — where an uncontained breach takes
-down the whole tmux pane, editor session included, via `DefaultOOMPolicy=stop`. Raise or lower the
-ceiling with `--limit`:
+That sets `REQUIRE_BRIDGE_TOOLS=1` and wraps Stryker in a transient systemd scope with a hard memory
+ceiling (`scripts/contained.mjs`). The scope is a *sibling* of your terminal's, not a child, so a
+breach kills the mutation run alone — where an uncontained breach takes down the whole tmux pane,
+editor session included, via `DefaultOOMPolicy=stop`. Raise or lower the ceiling with `--limit`:
 
 ```sh
 node scripts/contained.mjs --limit 20G stryker run
 ```
 
-`concurrency` is **2**, which needs a ~20G ceiling and a host with the RAM behind it — see the sizing
-note above. On a smaller box drop to `concurrency: 1` rather than lowering the ceiling; a breach now
-fails loudly, but a run that fails at 24% is still two wasted hours.
+There is no longer a `mutation-guard.mjs --report` step: the tap runner records a dead harness as a
+RuntimeError rather than a kill, at the runner level. See
+[The guard, and why it retired](#the-guard-and-why-it-retired).
+
+`REQUIRE_BRIDGE_TOOLS=1` is in the npm script and not in the runner, which is a change worth
+knowing about — the deleted guard used to set it. Invoking `stryker run` by hand without it does
+not fail; it *skips* the bridged find/grep tests and scores their mutants as survivors. Export it.
+
+`concurrency` is **6**, sized for an 8-core host. It is committed rather than left to Stryker's
+`cpuCount - 1` default because the 79.28% baseline was measured at that value, and a gate figure
+should be reproducible from the config that produced it. On a smaller box lower it; memory is not
+the constraint it was (~226 MB per worker), cores are.
 
 Containment is skipped automatically where there is no systemd user session (CI, containers), so
 the command still works everywhere — it just stops protecting you.
@@ -188,16 +235,18 @@ Sharding across machines: split `mutate` into disjoint file sets — mutants are
 `files` maps of the JSON reports merge by plain assignment. Give each host a `concurrency` sized by
 its own RAM. Overlapping shards would double-count, so any merge script must reject them.
 
-For pull requests, use `--incremental` (the config writes `.stryker-incremental.json`) or
-`--since`. A full run belongs on a schedule or on demand. **A mutation gate nobody can afford to
-run is not a gate.**
+For pull requests, use `--incremental` (the config writes `.stryker-incremental.json`) or scope the
+run with `--mutate`. **StrykerJS has no `--since` flag** — that is Stryker.NET's; `npx stryker run
+--help` on 9.6.1 lists no such option. **[measured]** A full run belongs on a schedule or on demand.
+**A mutation gate nobody can afford to run is not a gate.**
 
 Never assert "sweep exits 0" when the sweep is launched through a pipe
 (`contained.mjs … | tail -60`): bash returns the tail's status, and an orphaned run loses the
 transcript entirely. Run long sweeps with output tee'd to a log (`nohup … | tee sweep.log` or
 equivalent) so an agent death does not strand or silence the run, and read the verdict only from
-`node scripts/mutation-guard.mjs --report` plus machine-read statuses in
-`reports/mutation/mutation.json` — never the terminal. (Observed live on the #110 flight,
+machine-read statuses in `reports/mutation/mutation.json` — never the terminal. (The
+`node scripts/mutation-guard.mjs --report` half of this rule went with the guard in #175; the
+file-based half is the half that mattered.) (Observed live on the #110 flight,
 2026-08-17: the launching agent died mid-sweep; the verdicts were recoverable only because they
 are file-based.)
 
@@ -211,7 +260,16 @@ contain exactly the file(s) mutated. A `files` map with only `src/rlm.ts` while 
 
 ### Freshness is not provenance — the `coverageAnalysis: "off"` reuse trap
 
-With `coverageAnalysis: "off"` and `incremental: true` (this repo's config), a non-`--force`
+> **Partly historical since the `perTest` switch, and only partly.** The unconditional-reuse
+> mechanism below was specific to `coverageAnalysis: "off"`: the differ could not compare coverage
+> because the runner never reported any. Under `perTest` the runner does report it, so that
+> particular always-true path no longer applies. **The provenance check below still does** —
+> `incremental: true` is still set, a stale `.stryker-incremental.json` still carries statuses
+> forward, and a report whose `statusReason` strings cite another run's sandbox token is still
+> carried-over evidence. The 79.28% baseline was measured with `incremental: false` and a deleted
+> cache, precisely so none of this could apply to it. **[measured]**
+
+With `coverageAnalysis: "off"` and `incremental: true` (the config before #175), a non-`--force`
 sweep **re-executes zero mutants**: the incremental differ's `mutantCanBeReused` returns `true`
 unconditionally when the test runner reported no coverage
 (`@stryker-mutator/core` `dist/src/mutants/incremental-differ.js`). Every `status`,
@@ -261,9 +319,35 @@ files. Raising `--test-concurrency` from 3 to 4 raised the pressure, producing n
 Demonstrated, not inferred: SIGKILLing the harness *after a fully green suite*, for one chosen
 mutant, flips a stably-surviving mutant to `Killed`. **[measured]**
 
-### The guard
+### The guard, and why it retired
 
-`scripts/mutation-guard.mjs` is the test command now. Node's test runner prints a `fail N` summary
+**`scripts/mutation-guard.mjs` was deleted in #175.** It existed to compensate for one property of
+the `command` runner — that Stryker derives the whole verdict from an exit code — and the `tap`
+runner does not have that property, so the guard had nothing left to guard.
+
+tap-runner refuses the verdict at two independent points, both in
+`@stryker-mutator/tap-runner/dist/src`:
+
+- `tap-helper.js` — `if (exitCodeResult !== 0 && !tapResult.failedTests.length) throw`. A process
+  that exited non-zero while reporting no failed test is an error, not a kill.
+- `tap-test-runner.js` — `runFile` reads a temp file the hook writes from `process.on('exit')`. A
+  SIGKILLed process never fires `exit`, so the file is absent and `fs.readFile` throws ENOENT.
+
+Either throw lands in `run()`'s catch and becomes `DryRunStatus.Error`, which Stryker records as a
+**RuntimeError mutant, not a killed one**. Verified against the real command rather than by reading
+it — a test file SIGKILLed mid-run, with a clean run as the control: **[measured]**
+
+| | exit code | signal | temp file | verdict |
+|---|---|---|---|---|
+| SIGKILL (what the OOM killer sends) | `null` | SIGKILL | absent → ENOENT | **Error** |
+| clean run (control) | 0 | — | written | a real verdict |
+
+`exit code null` is exactly what the command runner scored as a killed mutant, and is the whole of
+#109. Two earlier attempts at this check were invalid — a relative hook path made the control fail
+identically to the kill, then the kill fired after the process had already finished — and the
+control is what caught both. A death test without a control proves nothing.
+
+The retired guard's logic, for the record. Node's test runner prints a `fail N` summary
 on every genuine outcome, so its absence means the suite did not finish, whatever the exit code says:
 
 | what the run produced | verdict |
@@ -324,6 +408,16 @@ harness deaths. The conclusion survives it — `Killed` and `Timeout` both count
 arithmetic, not measurement — but the 58.15% figure should not be read as a baseline. The guarded
 run reported 15 timeouts across the full tree. **[measured]**
 
+**The 0.0.21 re-baseline's 93 timeouts are real, and the distribution is how you can tell.**
+Mid-sweep the rate rose from 0.45% to 2.2% and the obvious suspicion was contention. It was wrong.
+The finished report puts the timeouts where the slow, genuinely-blocking tests are and nowhere
+else: `truncate.ts` 24, `sandbox.ts` 21, `repl.ts` 19 — every one of them covered by
+`test/sandbox.test.ts`, whose slowest cases are pool exhaustion, runaway loops and duration budgets
+(4.0 s, 3.8 s, 3.0 s, 3.0 s). Against that, **zero** timeouts in `session.ts` (671 mutants),
+`bridge.ts` (241), `registry.ts` (243) and `bashenv.ts` (142). Contention scatters roughly
+uniformly; it does not spare three files with 1155 mutants between them. The rule this gives you:
+**check the per-file distribution before blaming the machine.** **[measured]**
+
 ---
 
 ## Survivors worth naming
@@ -369,6 +463,27 @@ had verified only `:210` and `:235`):
 - The `StringLiteral` survived because every assertion matched only the first sentence
   (`/nothing waiting for approval/i`); the M7 test in "every tool answers, in every state (#48)"
   now asserts the second sentence too, so blanking the literal fails it. **[measured]**
+
+**Confirmed by the #175 full sweep (2026-09-10), and it found their sibling.** Both W3-2 closures
+hold on a real sweep rather than a hand-applied mutant — in `src/repl.ts`, `live.busy++ → --` at
+`:492` and `:575` are **Killed**, and the message `StringLiteral`s at `:563`, `:564` and `:566` are
+**Killed**. Of five `UpdateOperator` mutants in the file, four die. The fifth does not:
+
+> **`src/repl.ts:570` — `live.busy++` → `live.busy--` in `resume()` survives.** **[measured]**
+
+It is the increment one line above the killed `finally { live.busy-- }`, and the same eviction
+protection the #59 test pins for `run()`. Nothing drives a *resume* long enough to assert the
+session is protected while it is in flight. Filed as a todo test in `test/repl.test.ts` per session
+decision 9, not as an issue.
+
+The obvious test does **not** kill it, which is why the todo carries the negative result rather
+than just an intention. Parking a resume inside `onApproval` and inserting past `maxSessions`
+leaves the mutant alive: `evict` skips an entry that is *either* `isSuspended()` *or* `busy > 0`
+(`src/repl.ts:806-807`), and a session waiting on approval is still suspended, so `:806` protects
+it and `:570` never runs as the deciding guard. The window where `busy` is the only protection
+opens **after** approval — suspension cleared, `live.session.resume()` still executing the rest of
+the snippet. A pin has to hold the session open *there*. **[measured]** — hand-applied mutant, suite
+still green.
 
 Three more equivalent-mutant notes, so nobody re-investigates them:
 

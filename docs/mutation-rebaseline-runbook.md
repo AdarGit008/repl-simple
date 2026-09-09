@@ -1,44 +1,84 @@
 # Mutation re-baseline runbook (Monty 0.0.21)
 
-**Status:** Standalone infrastructure work, run out of session · **Issue:** #175 (re-homed from
-bucket 11 by session decision 17, 2026-09-08) · **Config:** `stryker.config.json` · **Harness:**
-`scripts/mutation-guard.mjs` inside `scripts/contained.mjs` · **Background:**
+**Status:** **Done — #175 closed.** · **Config:** `stryker.config.json` · **Harness:**
+`scripts/contained.mjs` (the tap runner reports its own harness deaths) · **Background:**
 [`docs/mutation-testing.md`](mutation-testing.md)
 
-The 58% floor (`thresholds.break`) and every per-file score in `docs/mutation-testing.md` were
-measured at `b0d298d`, before the Monty 0.0.21 migration rewrote `src/sandbox.ts`, added
-`src/pool.ts` and moved Python into worker subprocesses; `src/rlm.ts` has since absorbed
-`rlm_loop.ts` (#78) and grown the #165 charge/refusal branches that #175's comment asks to see in
-scope. Nobody has measured what any of that did to the mutant population or the score. This is the
-procedure for measuring it once, on a machine sized for it, and writing the result down where the
-next reader will look.
+> **Last run:** commit `a32b1a7` · 2026-09-10 · 8-core/23 GB dev host · **3h12m** ·
+> **79.28%** (5756 detected of 7263 valid, 7269 mutants) · zero harness deaths ·
+> `concurrency: 6`, `coverageAnalysis: perTest`, `incremental: false`, fresh cache.
+>
+> **Most of the procedure below is superseded, and kept because its *reasons* still hold.** The
+> sweep no longer needs a 32 GB host, sharding, or a separate harness guard — the run costs three
+> hours on an ordinary dev box. What changed and why is in
+> [`docs/mutation-testing.md`](mutation-testing.md); what to do now is
+> [The procedure, as of #175](#the-procedure-as-of-175). Read the rest for the traps, not the
+> commands: the incremental-reuse trap, `REQUIRE_BRIDGE_TOOLS=1`, and provenance-over-freshness are
+> all still live, and all still cost you a wrong number if ignored.
 
-It is deliberately not a session task: a full sweep is **tens of CPU-hours**, needs more memory
-than the development host has to spare, and must not share the machine with anything else that
-runs the suite. Do it on a big-memory host with nothing else scheduled, and come back with numbers.
+## The procedure, as of #175
+
+```bash
+rm -f .stryker-incremental.json && rm -rf .stryker-tmp reports
+npm run mutation                       # ~3h12m; sets REQUIRE_BRIDGE_TOOLS=1 and contains the run
+```
+
+Then verify before believing it, in this order:
+
+1. **It executed.** The progress line must climb from `0%` to `100%` over thousands of mutants. A
+   sweep that "finishes" in minutes hit the incremental-reuse trap below — that is the failure this
+   runbook was written for, and deleting the cache above is what prevents it.
+2. **No skips.** `skipped 0` in the dry run. A skipped bridged test is a survivor scored blind.
+3. **The distribution, before the machine.** If timeouts look high, check *where* they are
+   (`reports/mutation/mutation.json`) before blaming contention — real hangs cluster in the files
+   whose tests block; contention scatters uniformly.
+4. **Record the numbers** — [Step 4](#step-4--record-the-numbers) below is unchanged and is the
+   part that matters.
+
+Sharding (Step 2) is now only for restarting an interrupted sweep, not for fitting one into a host.
+
+**What this was written to answer, and the answer.** The 58% floor and every per-file score in
+`docs/mutation-testing.md` were measured at `b0d298d`, before the 0.0.21 migration rewrote
+`src/sandbox.ts`, added `src/pool.ts` and moved Python into worker subprocesses, and before
+`src/rlm.ts` absorbed `rlm_loop.ts` (#78). The measurement has now been made: **2231 → 7269
+mutants, 58.09% → 79.28%**, floor raised to 79.
+
+The premise that made this a standalone, big-host, out-of-session job was the **107-hour** sweep the
+`command` runner implied. That premise is gone: with `coverageAnalysis: perTest` the same tree
+measures in three hours on the dev box. The one constraint that survives is the last bullet under
+[What you need](#what-you-need) — do not share the host with anything else running the suite.
 
 ## What you need
 
-- A host with **≥ 32 GB RAM** and a systemd user session (`XDG_RUNTIME_DIR` set, `systemd-run`
+- **[superseded]** ~~A host with **≥ 32 GB RAM**~~ — 23 GB with `concurrency: 6` peaked at 4 GB
+  used; a test worker is ~226 MB. The 5.6 GB worker below was `rlm_loop.ts`, deleted by #78. Still
+  wanted: a systemd user session (`XDG_RUNTIME_DIR` set, `systemd-run`
   present), so `scripts/contained.mjs` can cap the run. 20G was ample for the last full run at
   `concurrency: 2` (`docs/mutation-testing.md`, "What the fix costs you in memory"); the three
   recursion-guard mutants in `src/rlm.ts` (`onRLMQuery`'s `depth >= maxDepth` branch) each drive one
   worker to **5.6 GB**, and two of them together exceeded a 12G ceiling. Size the ceiling for that,
   and remember every Stryker worker now spawns `monty` workers of its own.
-- Node ≥ 22.19 on glibc Linux; `fd` and `rg` installed (`apt install fd-find ripgrep`) — the guard
-  sets `REQUIRE_BRIDGE_TOOLS=1`, so a host without them fails the dry run rather than silently
-  scoring the bridged tools' mutants as survivors.
+- Node ≥ 22.19 on glibc Linux; `fd` and `rg` installed (`apt install fd-find ripgrep`). The
+  **`npm run mutation` script** sets `REQUIRE_BRIDGE_TOOLS=1` (the deleted guard used to), so a host
+  without them fails the dry run rather than silently scoring the bridged tools' mutants as
+  survivors. Invoking `stryker run` by hand skips that — export it yourself.
 - A **fresh clone** at the commit you are baselining (`git rev-parse HEAD` goes into the report),
   `npm ci`, and **no** `.stryker-incremental.json`, `.stryker-tmp/` or `reports/` from anywhere
   else. This is the whole reason the incremental file is in `.gitignore`.
 - Nothing else running the suite on that host, for the whole sweep. The harness scores a mutant on
   the test process's exit alone: a harness killed by the OOM killer, or starved into a timeout by a
-  sibling suite, is recorded as a *caught* mutant (#109), and `mutation-guard` can only catch the
-  deaths it sees. Contention inflates the score in the direction that hides survivors.
+  sibling suite, was recorded as a *caught* mutant under the old command runner (#109). The tap
+  runner no longer makes that mistake — a dead process is an error, not a kill — but contention
+  still produces spurious *timeouts*, which do count as detected. Check the per-file distribution
+  before trusting a timeout count: real hangs cluster in the files whose tests block.
 
 ## Why the incremental cache must be fresh
 
-`stryker.config.json` has `coverageAnalysis: "off"` and `incremental: true`. In that mode the
+**Read this for the trap, not for the current config.** `stryker.config.json` had
+`coverageAnalysis: "off"` with `incremental: true` when this was written; it is now `perTest`, so
+the *unconditional* reuse path below no longer applies — but `incremental: true` is still set and a
+stale cache still carries statuses forward, so the rule (delete the file, check provenance) is
+unchanged. With `coverageAnalysis: "off"` and `incremental: true`, the
 incremental differ's `mutantCanBeReused` answers *true* for every mutant whose source and tests did
 not change textually, because the runner reported no coverage to compare — so a sweep against an
 existing `.stryker-incremental.json` **re-executes nothing** and reproduces the previous run's
@@ -62,10 +102,9 @@ REQUIRE_BRIDGE_TOOLS=1 node scripts/contained.mjs --limit 20G stryker run --dryR
 
 `--dryRunOnly` runs the initial (unmutated) test pass and lists the mutant count per file without
 executing any mutant. Two numbers come out of it: the **total mutant count** on 0.0.21 (the last
-full run had 2231 valid mutants) and the **suite's own duration** under the harness. The last
-calibration was ~55–60 s per mutant pair at `concurrency: 2`, so
-
-    wall-clock hours ≈ mutants × 30 s / 3600 / (concurrency / 2)
+full run had 7269) and the **suite's own duration** under the harness (~88 s for the 27 files).
+At `concurrency: 6` with `perTest`, 7269 mutants took 3h12m — about 1.6 s of wall clock per mutant,
+against ~82 s under the old `off` harness.
 
 Write the estimate down before starting; a sweep that finishes far faster than it is the
 incremental-reuse trap above, not good news.
@@ -91,17 +130,20 @@ for shard in \
   node scripts/contained.mjs --limit 20G stryker run --mutate "$shard" \
     --incremental --incrementalFile .stryker-incremental.json \
     || { echo "shard $shard failed"; break; }
-  node scripts/mutation-guard.mjs --report || { echo "harness deaths in $shard"; break; }
 done
 ```
+
+> **`scripts/mutation-guard.mjs` no longer exists** (deleted in #175 — the tap runner records a
+> dead harness as a RuntimeError at the runner level, so there is nothing left to post-check).
+> Drop the `--report` line the loop used to carry after each shard.
 
 Notes on the loop:
 
 - `src/sandbox.ts` and `src/rlm.ts` are the big ones and the memory-hungry ones; they get shards of
   their own so a ceiling breach costs one file's progress.
-- `scripts/mutation-guard.mjs --report` after every shard: a shard whose harness died even once is
-  a shard whose kills are suspect. The deaths log names the mutant; re-run that shard with more
-  headroom before moving on.
+- A shard whose harness died even once is a shard whose kills are suspect. That check used to be
+  `mutation-guard --report`; it is now the `RuntimeError` count in the shard's own report, which
+  must be zero for the files it mutated.
 - `contained.mjs` exits 137 when the scope was OOM-killed *even if Stryker reported 0* — trust that
   exit code over Stryker's summary (`docs/mutation-testing.md`, "It stays fixed only if breaches
   stay loud").
@@ -127,8 +169,9 @@ reuse is the intent. Then verify the report before believing it:
 2. **Provenance** — the `statusReason` strings cite sandbox tokens from *this* sweep's shards (each
    shard's `.stryker-tmp/sandbox-XXXXXX` name is in its log), none from any earlier run. A token you
    do not recognise means a stale cache got in.
-3. **No harness deaths** — `node scripts/mutation-guard.mjs --report` exits 0 and
-   `.stryker-harness-deaths.log` is empty.
+3. **No harness deaths** — no mutant carries status `RuntimeError` in
+   `reports/mutation/mutation.json` for a reason other than a genuine compile/runtime failure in
+   the mutated code. (The #175 baseline had 9, all in `src/redact.ts`.)
 4. **Skips** — `grep -c "skip" ` over the shard logs is zero; a skipped bridged test is a survivor
    scored blind.
 

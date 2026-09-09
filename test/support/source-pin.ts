@@ -32,17 +32,18 @@
  * every CI leg, run them uninstrumented.
  *
  * Detected two ways, so neither has to be remembered:
- *   - the sandbox path, which Stryker names and this file sits inside; and
- *   - `MUTATION_RUN=1`, for a runner that lays the sandbox out differently.
+ *   - the sandbox path, which Stryker names and this file sits inside — this
+ *     is the one that fires in practice, and it needs nothing set; and
+ *   - `MUTATION_RUN=1`, an explicit override for a runner that lays the
+ *     sandbox out differently, or to reproduce a skip by hand.
  */
 export const SOURCE_PIN_SKIP: string | false = (() => {
   const reason =
     "source pins read the file as text, and Stryker's sandbox contains the " +
     "instrumented copy — see test/support/source-pin.ts";
 
-  // The same shape `scripts/mutation-guard.mjs` uses to find its way back out
-  // of the sandbox, so a changed `tempDirName` does not defeat one and not the
-  // other.
+  // `<tempDirName>/sandbox-<id>/`, matched loosely enough that changing
+  // `tempDirName` in stryker.config.json does not silently defeat it.
   if (/\/[^/]*stryker[^/]*\/sandbox-[^/]+\//.test(import.meta.url)) return reason;
   if (process.env.MUTATION_RUN === "1") return reason;
   return false;
