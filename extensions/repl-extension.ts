@@ -771,6 +771,7 @@ type SessionLifecycleHandler = (
  */
 interface CommandCtx {
   cwd: string;
+  hasUI: boolean;
   isProjectTrusted(): boolean;
   ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
 }
@@ -793,6 +794,38 @@ interface ReplExtensionApi {
    */
   on(event: "session_start", handler: SessionLifecycleHandler): void;
   on(event: "session_shutdown", handler: SessionLifecycleHandler): void;
+}
+
+// ── A store inside the project (docs/project-trust.md) ───────────
+
+/**
+ * The projects whose user has been warned that the manifest store is inside
+ * the project, for the life of the pi process.
+ *
+ * On `globalThis`, not in module state, because pi does not keep this module
+ * for the life of the process: a reload clears its extension cache
+ * (`resource-loader.js:266`, pi 0.85.1) and the next load re-imports with
+ * jiti's module cache off (`loader.js:416-417`), so a module-level set would
+ * warn again after every reload. A registered symbol is the same key in every
+ * copy of the module.
+ */
+function storeInsideProjectWarned(): Set<string> {
+  const holder = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  const key = Symbol.for("repl-simple.storeInsideProjectWarned");
+  holder[key] ??= new Set();
+  return holder[key];
+}
+
+/** The warning: where the store is, what it costs, and the fix — all three are the user's to act on. */
+function storeInsideProjectWarning({ store, project }: { store: string; project: string }): string {
+  return (
+    `repl: saved tools cannot work in this project. The accepted-set manifest store '${store}' ` +
+    `is inside the project '${project}', and a store the project could rewrite is refused — so ` +
+    "every saved tool in .pi/code-tools is withheld from new sessions, and acceptances " +
+    `(save_tool, /${ACCEPT_PREAMBLE_COMMAND}) are not recorded. To fix it, set ` +
+    "REPL_PREAMBLE_STORE_DIR to a directory outside the project, restart pi, then run " +
+    `/${ACCEPT_PREAMBLE_COMMAND} if the saved tools should load. Shown once per project.`
+  );
 }
 
 // ── Runner per working directory (#60) ───────────────────────────
@@ -821,12 +854,29 @@ interface ReplExtensionApi {
  */
 class CwdRunner {
   trusted = false;
+  /**
+   * A warning on pi's UI, as of the most recent event for this directory —
+   * refreshed like `trusted` — or `undefined` when that event had no UI, which
+   * is when nothing is shown.
+   */
+  notify: ((message: string) => void) | undefined;
   readonly runner: ReplRunner;
   readonly sessionIds = new Set<string>();
   private readonly waiting = new Map<string, string>();
 
   constructor(cwd: string) {
-    this.runner = new ReplRunner(cwd, { isProjectTrusted: () => this.trusted });
+    this.runner = new ReplRunner(cwd, {
+      isProjectTrusted: () => this.trusted,
+      onPreambleStoreInsideProject: (where) => this.warnStoreInsideProject(where),
+    });
+  }
+
+  /** Tell the user the store is inside the project: once per project per pi process, on a UI only. */
+  private warnStoreInsideProject(where: { store: string; project: string }): void {
+    const warned = storeInsideProjectWarned();
+    if (this.notify === undefined || warned.has(where.project)) return;
+    warned.add(where.project);
+    this.notify(storeInsideProjectWarning(where));
   }
 
   /** Remember what a `repl` / `repl_resume` call left waiting, or that nothing is. */
@@ -917,14 +967,21 @@ export default function (pi: ReplExtensionApi) {
    */
   const runners = new Map<string, CwdRunner>();
 
-  function getRunner(ctx: { cwd: string; isProjectTrusted(): boolean }): CwdRunner {
+  function getRunner(ctx: {
+    cwd: string;
+    isProjectTrusted(): boolean;
+    hasUI?: boolean;
+    ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
+  }): CwdRunner {
     let entry = runners.get(ctx.cwd);
     if (!entry) {
       entry = new CwdRunner(ctx.cwd);
       runners.set(ctx.cwd, entry);
     }
-    // Refreshed on the way in, every time — see `CwdRunner.trusted`.
+    // Refreshed on the way in, every time — see `CwdRunner.trusted` and `CwdRunner.notify`.
     entry.trusted = ctx.isProjectTrusted();
+    const ui = ctx.hasUI ? ctx.ui : undefined;
+    entry.notify = ui?.notify ? (message) => ui.notify?.(message, "warning") : undefined;
     return entry;
   }
 

@@ -221,8 +221,13 @@ never against the spelling the store was given.
   store is under `~/.local/state`, so running pi with `cwd = $HOME` (or any ancestor of the state
   dir) puts the store inside the project. That is refused, and every tool in `~/.pi/code-tools` is
   withheld with `[preamble unverified] … inside the project` until `REPL_PREAMBLE_STORE_DIR` (or the
-  embedder's `preambleStoreDir`) names a directory outside the project. Fail-closed by design; the
-  notice names the variable.
+  embedder's `preambleStoreDir`) names a directory outside the project; `save_tool`, `delete_tool`
+  and `/repl-accept-preamble` cannot record either. Fail-closed by design; the notice names the
+  variable. The model is not the only one told: pi warns the user once per project per pi process —
+  the store path, the project path, the consequence and the fix — when a session build withholds for
+  it, a `save_tool` / `delete_tool` cannot record, or an accept cannot write. Nothing is shown
+  without a UI, and an untrusted project never gets that far. An embedder hears the same thing, by
+  kind, through `ReplRunnerOptions.onPreambleStoreInsideProject`.
 - **`list_saved_tools` still compares size and mtime** for its in-session "changed since" note; only
   `read_tool` — which has the bytes anyway — compares the hash. The accepted-set check at session
   build always hashes.

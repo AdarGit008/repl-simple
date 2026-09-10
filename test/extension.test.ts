@@ -3304,10 +3304,15 @@ describe("repl extension — /repl-accept-preamble (#198, decision 5)", () => {
       try {
         const unavailable = cmdCtx(inside);
         await accept.handler("", unavailable.ctx);
-        assert.equal(unavailable.notes[0].type, "error");
-        assert.match(unavailable.notes[0].message, /could not be written/);
-        assert.match(unavailable.notes[0].message, /inside the project/);
-        assert.match(unavailable.notes[0].message, /REPL_PREAMBLE_STORE_DIR/);
+        // The store warning arrives first — the accept raises it on its way
+        // out — and the command's own answer after it, unchanged.
+        const [warning, answer] = unavailable.notes;
+        assert.equal(unavailable.notes.length, 2, JSON.stringify(unavailable.notes));
+        assert.equal(warning.type, "warning");
+        assert.equal(answer.type, "error");
+        assert.match(answer.message, /could not be written/);
+        assert.match(answer.message, /inside the project/);
+        assert.match(answer.message, /REPL_PREAMBLE_STORE_DIR/);
         assert.equal(existsSync(join(inside, "store")), false, "the refused store was created");
       } finally {
         process.env[STORE_VAR] = testStoreDir;

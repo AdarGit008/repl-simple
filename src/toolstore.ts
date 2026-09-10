@@ -1500,11 +1500,21 @@ export function resolvePreambleStoreDir(
   return join(base, "repl-simple");
 }
 
-/** What a manifest read found. `unavailable` is the fail-closed signal: withhold, and say why. */
+/**
+ * What a manifest read found. `unavailable` is the fail-closed signal: withhold, and say why.
+ * Its `kind` sets apart the one refusal only the user can fix — a store inside the project — from
+ * a store that is merely unusable, so a host can tell them apart without reading `reason`.
+ */
 export type PreambleManifestRead =
   | { status: "absent" }
   | { status: "ok"; files: Map<string, string> }
-  | { status: "unavailable"; reason: string };
+  | { status: "unavailable"; kind: "inside-project" | "unusable"; reason: string };
+
+/**
+ * The refusal of a store that resolves inside the project it guards. A class so a host can
+ * recognise it by kind; the message is the model's.
+ */
+export class PreambleStoreInsideProjectError extends Error {}
 
 /**
  * One project's accepted set, on disk.
@@ -1512,7 +1522,8 @@ export type PreambleManifestRead =
  * Every operation locates the manifest first and refuses a store that
  * resolves inside the project — textually, or through a symlink once the
  * path exists — before touching the filesystem. `read` reports that as
- * `unavailable`; `write` and `update` throw, and the message says so.
+ * `unavailable` of kind `inside-project`; the others throw
+ * `PreambleStoreInsideProjectError`, and the message says so.
  */
 export interface PreambleManifestStore {
   /**
@@ -1670,7 +1681,7 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
     const project = await canonicalRoot();
     const real = await canonicalStore();
     if (contains(store, root) || contains(real, project)) {
-      throw new Error(
+      throw new PreambleStoreInsideProjectError(
         `the manifest store '${store}' is inside the project '${root}' — it must live outside ` +
           `the repository (set ${PREAMBLE_STORE_DIR_VAR})`,
       );
@@ -1694,12 +1705,17 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
       if (code === "ENOENT") return { status: "absent" };
       return {
         status: "unavailable",
+        kind: "unusable",
         reason: `cannot read the manifest '${path}': ${(err as Error).message}`,
       };
     }
     const files = parseManifest(text);
     if (files === undefined) {
-      return { status: "unavailable", reason: `the manifest '${path}' is malformed` };
+      return {
+        status: "unavailable",
+        kind: "unusable",
+        reason: `the manifest '${path}' is malformed`,
+      };
     }
     return { status: "ok", files };
   }
@@ -1745,7 +1761,8 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
       try {
         ({ path } = await locate());
       } catch (err) {
-        return { status: "unavailable", reason: (err as Error).message };
+        const kind = err instanceof PreambleStoreInsideProjectError ? "inside-project" : "unusable";
+        return { status: "unavailable", kind, reason: (err as Error).message };
       }
       return readAt(path);
     },

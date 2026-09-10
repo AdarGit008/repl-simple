@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { Session, type GrantSummary } from "./session.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
@@ -8,6 +9,7 @@ import {
   createToolStoreTools,
   createPreambleManifestStore,
   resolvePreambleStoreDir,
+  PreambleStoreInsideProjectError,
   PREAMBLE_STORE_DIR_VAR,
   TOOLSTORE_TOOL_NAMES,
   escapeNoticeName,
@@ -308,6 +310,21 @@ export interface ReplRunnerOptions {
    * then `~/.local/state/repl-simple`; an explicit option wins over all three.
    */
   preambleStoreDir?: string;
+
+  /**
+   * Told when the store resolves inside the project, at each point that
+   * refusal costs something: a session build that withholds saved tools for
+   * it, a `save_tool` or `delete_tool` that cannot record, an
+   * `acceptPreamble()` that cannot write. `store` and `project` are the two
+   * paths compared.
+   *
+   * The refusal is unchanged and the model is still told in the tool output;
+   * this is for the host to tell the user, the only one who can move the
+   * store. Never called for an untrusted project, which never touches the
+   * store, nor for a store unusable for any other reason. Called every time —
+   * deduplicating is the host's business.
+   */
+  onPreambleStoreInsideProject?: (where: { store: string; project: string }) => void;
 }
 
 /**
@@ -415,15 +432,26 @@ export class ReplRunner {
   private maxSessions: number;
   /** This project's accepted-set manifest (#198). Never touched while the project is untrusted. */
   private manifest: PreambleManifestStore;
+  /** `onPreambleStoreInsideProject` with this runner's two paths bound; a no-op when unset. */
+  private reportStoreInsideProject: () => void;
 
   constructor(cwd: string, options: ReplRunnerOptions = {}) {
     this.cwd = cwd;
     this.isProjectTrusted = options.isProjectTrusted ?? (() => false);
     this.maxSessions = sessionCap(options.maxSessions);
-    this.manifest = createPreambleManifestStore(
-      resolvePreambleStoreDir(options.preambleStoreDir),
-      cwd,
-    );
+    const storeDir = resolvePreambleStoreDir(options.preambleStoreDir);
+    this.reportStoreInsideProject = () =>
+      options.onPreambleStoreInsideProject?.({ store: resolve(storeDir), project: resolve(cwd) });
+    // Every write goes through here — `acceptPreamble()`, a first load's
+    // implicit accept, the tools' updates — so a store refused for being
+    // inside the project is reported in one place. A read is reported by the
+    // session build, and only when it withheld something.
+    const store = createPreambleManifestStore(storeDir, cwd);
+    this.manifest = {
+      ...store,
+      write: (files) => this.reportingInsideProject(store.write(files)),
+      update: (mutate) => this.reportingInsideProject(store.update(mutate)),
+    };
   }
 
   // ── Public API ──────────────────────────────────────────────
@@ -668,6 +696,16 @@ export class ReplRunner {
   }
 
   // ── Private helpers ─────────────────────────────────────────
+
+  /** `operation`, reporting a store refused for being inside the project on its way out. */
+  private async reportingInsideProject<T>(operation: Promise<T>): Promise<T> {
+    try {
+      return await operation;
+    } catch (err) {
+      if (err instanceof PreambleStoreInsideProjectError) this.reportStoreInsideProject();
+      throw err;
+    }
+  }
 
   /**
    * The trace for a finished `run` / `resume` call, and the recorder's next
@@ -929,6 +967,10 @@ export class ReplRunner {
     if (load.refused.length > 0) return { load, notices: [] };
 
     if (read.status === "unavailable") {
+      // The host hears of it only when it cost the user something.
+      if (read.kind === "inside-project" && load.unaccepted.length > 0) {
+        this.reportStoreInsideProject();
+      }
       return { load, notices: unverifiedNotices(read.reason, load.unaccepted) };
     }
 
