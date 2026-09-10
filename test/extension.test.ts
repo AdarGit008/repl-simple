@@ -1518,9 +1518,13 @@ describe("repl extension — project trust gates the preamble (#53)", () => {
         isProjectTrusted: () => trusted,
         hasUI: true,
         ui: {
-          select: async () => {
+          // Every dialog approves — a gated call, and the saved-tools
+          // question the trusted build puts first.
+          select: async (_title: string, options: string[]) => {
             dialogs.count++;
-            return APPROVE_CHOICE;
+            return options.includes(extension.LOAD_SAVED_TOOLS_CHOICE)
+              ? extension.LOAD_SAVED_TOOLS_CHOICE
+              : APPROVE_CHOICE;
           },
         },
       },
@@ -2134,9 +2138,13 @@ describe("repl extension — session lifecycle (#60)", () => {
 
     // Trust makes no difference here: session_start creates no session, so
     // the preamble — which runs at session creation — cannot run before a
-    // `repl` call has consulted isProjectTrusted for itself. The one scripted
-    // answer is for the positive control below; session_start must not use it.
-    const trusted = lifecycleCtx(hostile, [APPROVE_CHOICE], true);
+    // `repl` call has consulted isProjectTrusted for itself. The scripted
+    // answers are for the positive control below; session_start must not use them.
+    const trusted = lifecycleCtx(
+      hostile,
+      [extension.LOAD_SAVED_TOOLS_CHOICE, APPROVE_CHOICE],
+      true,
+    );
     await fire(handlers, "session_start", "new", trusted.ctx);
     assert.equal(
       existsSync(join(hostile, "pwned.txt")),
@@ -2149,10 +2157,11 @@ describe("repl extension — session lifecycle (#60)", () => {
       "session_start opened an approval dialog",
     );
 
-    // Positive control: the same preamble does run — through the approval
-    // gate, like any gated call — once `repl` asks for a session under trust.
+    // Positive control: the same preamble does run — once the user approves
+    // it, and through the approval gate like any gated call — when `repl`
+    // asks for a session under trust. Two dialogs: the question, the write.
     await repl.execute("h-1", { code: "1 + 1" }, undefined, undefined, trusted.ctx);
-    assert.equal(trusted.ui.opened.length, 1, "the preamble's gated write did not ask");
+    assert.equal(trusted.ui.opened.length, 2, "the preamble's gated write did not ask");
     assert.equal(readFileSync(join(hostile, "pwned.txt"), "utf8"), "owned");
   });
 
@@ -3224,7 +3233,11 @@ describe("repl extension — /repl-accept-preamble (#198, decision 5)", () => {
       assert.ok(repl && accept);
       const { ctx, notes } = cmdCtx(cwd);
 
-      // The implicit accept, then a file pulled in afterwards.
+      // The user's first accept, then a file pulled in afterwards. This context
+      // answers every dialog as a gated-call approval, so the saved-tools
+      // question it meets for `late` is a no.
+      await accept.handler("", ctx);
+      assert.match(notes[0]?.message ?? "", /accepted 1 saved tool\(s\) as the current set: adder/);
       await repl.execute("ac-1", { code: "1 + 1", sessionId: "s1" }, undefined, undefined, ctx);
       writeFileSync(join(cwd, ".pi", "code-tools", "late.py"), "def late():\n    return 9\n");
       const s2 = await repl.execute(
@@ -3242,12 +3255,12 @@ describe("repl extension — /repl-accept-preamble (#198, decision 5)", () => {
       );
 
       await accept.handler("", ctx);
-      assert.equal(notes.length, 1);
-      assert.equal(notes[0].type, "info");
-      assert.match(notes[0].message, /accepted 2 saved tool\(s\)/);
-      assert.match(notes[0].message, /adder, late/);
-      assert.match(notes[0].message, /preambles/, "the manifest path must be named");
-      assert.match(notes[0].message, /new sessionId/);
+      assert.equal(notes.length, 2);
+      assert.equal(notes[1].type, "info");
+      assert.match(notes[1].message, /accepted 2 saved tool\(s\)/);
+      assert.match(notes[1].message, /adder, late/);
+      assert.match(notes[1].message, /preambles/, "the manifest path must be named");
+      assert.match(notes[1].message, /new sessionId/);
 
       // Live sessions keep the preamble they were built with; a new one loads it.
       const live = await repl.execute(

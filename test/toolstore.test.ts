@@ -2805,29 +2805,38 @@ describe("save_tool and delete_tool keep the manifest (#198)", () => {
     }
   });
 
-  it("without a manifest on disk, both are silent no-ops", async () => {
+  it("without a manifest on disk, save_tool starts the set with its own entry, and delete_tool is a silent no-op", async () => {
     const root = makeTempDir();
     const storeDir = makeStoreDir();
+    const bareDir = makeStoreDir();
     try {
+      // No manifest is nothing approved: the agent's own gated write is the
+      // first entry, and nothing else on disk comes with it.
       const manifest = toolstore.createPreambleManifestStore(storeDir, root);
-      const tools = createToolStoreTools({ root, manifest });
-
-      const saved = await findTool(tools, "save_tool").execute({
+      const saved = await findTool(createToolStoreTools({ root, manifest }), "save_tool").execute({
         name: "add",
         code: "def add():\n    return 1",
         description: "adds",
       });
       assert.match(saved, /saved/);
-      assert.doesNotMatch(saved, /accepted/, `nothing to accept into: ${saved}`);
-      assert.deepEqual(await manifest.read(), { status: "absent" });
+      assert.match(saved, /recorded as accepted/, saved);
+      const read = await manifest.read();
+      assert.equal(read.status, "ok");
+      assert.deepEqual(read.status === "ok" ? [...read.files.keys()] : [], ["add"]);
 
-      const deleted = await findTool(tools, "delete_tool").execute({ name: "add" });
+      // A delete has nothing to remove from a set that does not exist.
+      const bare = toolstore.createPreambleManifestStore(bareDir, root);
+      const deleted = await findTool(
+        createToolStoreTools({ root, manifest: bare }),
+        "delete_tool",
+      ).execute({ name: "add" });
       assert.match(deleted, /deleted/);
       assert.doesNotMatch(deleted, /accepted set/, deleted);
-      assert.deepEqual(await manifest.read(), { status: "absent" });
+      assert.deepEqual(await bare.read(), { status: "absent" });
     } finally {
       cleanup();
       rmSync(storeDir, { recursive: true, force: true });
+      rmSync(bareDir, { recursive: true, force: true });
     }
   });
 
@@ -3165,7 +3174,7 @@ describe("the tools report an accepted-since file (#198 carry-over)", () => {
       await del.execute({ name: "add" });
       assert.equal(changes.length, 2, "an untrusted write reported a manifest change");
 
-      // No manifest on disk: both are silent no-ops, and report nothing.
+      // No manifest on disk: the save starts the set, and reports it like any accept.
       trusted = true;
       const bare = mkdtempSync(join(tmpdir(), "repl-store-"));
       try {
@@ -3179,7 +3188,8 @@ describe("the tools report an accepted-since file (#198 carry-over)", () => {
           code: "def add():\n    return 1",
           description: "adds",
         });
-        assert.equal(changes.length, 2, "a save with no manifest reported a manifest change");
+        assert.equal(changes.length, 3, "a save that started the set did not report it");
+        assert.deepEqual(changes[2], { name: "add", change: "accepted" });
       } finally {
         rmSync(bare, { recursive: true, force: true });
       }

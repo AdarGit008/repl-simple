@@ -110,8 +110,11 @@ export interface PreambleFileIdentity {
   sha256: string;
 }
 
-/** Why a file was withheld from a trusted session: new since the accept, or rewritten since. */
-export type UnacceptedReason = "added" | "changed";
+/**
+ * Why a file was withheld from a trusted session: never approved (there is no
+ * accepted set yet), new since the accept, or rewritten since.
+ */
+export type UnacceptedReason = "unapproved" | "added" | "changed";
 
 /** One saved tool withheld pending acceptance (#198). */
 export interface UnacceptedTool {
@@ -163,7 +166,8 @@ export interface ToolStoreOptions {
    * hashes differently (`changed`) is reported in `unaccepted` and **not**
    * concatenated (#198). Absent, everything that fits loads — the caller
    * owns the decision, as with `hostToolNames`. `ReplRunner` passes what the
-   * manifest store read; `undefined` on a first-ever load.
+   * manifest store read — an empty map when there is none — and `undefined`
+   * only to read what an accept would record.
    */
   accepted?: ReadonlyMap<string, string>;
   /**
@@ -171,11 +175,12 @@ export interface ToolStoreOptions {
    *
    * The agent writes these files, so its own gated write records the hash of
    * what it wrote and its delete drops the entry — legitimate churn never
-   * withholds (#198). Both touch the manifest only when one exists and only
-   * while `isTrusted()` says the project is trusted: acceptance authority is
-   * the trust decision plus explicit accepts, and a session that never held
-   * trust must not decide what a trusted one runs. A failed update is
-   * appended to the reply, never thrown.
+   * withholds (#198). Both touch the manifest only while `isTrusted()` says
+   * the project is trusted — a session that never held trust must not decide
+   * what a trusted one runs — and `delete_tool` only when one exists;
+   * `save_tool` starts one with its own entry, since no manifest means
+   * nothing is approved. A failed update is appended to the reply, never
+   * thrown.
    */
   manifest?: PreambleManifestStore;
   /**
@@ -638,9 +643,15 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       if (options.manifest && trusted) {
         const sha256 = sha256Hex(Buffer.from(content, "utf-8"));
         try {
-          const outcome = await options.manifest.update((files) => {
+          let outcome = await options.manifest.update((files) => {
             files.set(name, sha256);
           });
+          // No manifest is nothing approved, so this write starts the set —
+          // with its own entry, never the files already on disk.
+          if (outcome === "absent") {
+            await options.manifest.write(new Map([[name, sha256]]));
+            outcome = "updated";
+          }
           if (outcome === "updated") {
             manifestNote =
               " Its bytes are recorded as accepted, so new sessions load it without a notice.";
@@ -811,6 +822,7 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
       return "accepted after this session started — loads in new sessions";
     }
     const unaccepted = view.unaccepted?.get(name);
+    if (unaccepted === "unapproved") return "not yet approved";
     if (unaccepted) return `not accepted — ${unaccepted} since the saved tools were last accepted`;
     // Trusted and in no category: either a benign sibling of a refused
     // preamble (the loader refuses the whole batch, #54) or a tool saved
@@ -1541,10 +1553,11 @@ export interface PreambleManifestStore {
   /** Replace the accepted set. Returns the manifest path. Throws when the store cannot be written. */
   write(files: ReadonlyMap<string, string>): Promise<string>;
   /**
-   * Read-modify-write. `absent` when there is no manifest to update — the
-   * first trusted load will accept what it finds, and there is nothing to
-   * keep current before that. Throws when the manifest cannot be read or
-   * written; a malformed manifest is never overwritten by an update.
+   * Read-modify-write. `absent` when there is no manifest to update: nothing
+   * has been accepted, and whether a change starts a set is the caller's
+   * decision (`save_tool` starts one with its own write). Throws when the
+   * manifest cannot be read or written; a malformed manifest is never
+   * overwritten by an update.
    */
   update(mutate: (files: Map<string, string>) => void): Promise<"updated" | "absent">;
 }
@@ -1594,7 +1607,7 @@ function parseManifest(text: string): Map<string, string> | undefined {
  * directory `0700`, file `0600`, written to a temp name and renamed so a
  * reader never sees half a manifest. The key is the project's *real* path so
  * one project reached through two spellings has one manifest — a different
- * key would be a first-ever load, and a first-ever load accepts.
+ * key would be a project with nothing approved, asked about all over again.
  */
 export function createPreambleManifestStore(storeDir: string, cwd: string): PreambleManifestStore {
   const root = resolve(cwd);
@@ -1697,7 +1710,7 @@ export function createPreambleManifestStore(storeDir: string, cwd: string): Prea
       text = await readFile(path, "utf-8");
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      // Nothing there yet — the first trusted load will write it. ENOTDIR is
+      // Nothing there yet — nothing has been approved. ENOTDIR is
       // the store path running through a file: no manifest can ever be there,
       // so it is unavailable now rather than "absent" until a write fails —
       // a load that writes nothing (an unlistable directory) would otherwise

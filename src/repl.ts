@@ -298,7 +298,7 @@ export interface ReplRunnerOptions {
   /**
    * Where the accepted-set manifests live (#198).
    *
-   * A trusted project's saved tools are hashed when they are first loaded,
+   * A trusted project's saved tools are hashed when they are approved,
    * and the manifest is what every later session build compares against: a
    * file added or rewritten since — pulled in by a compromised upstream,
    * say — is withheld until the set is accepted again. The manifest must
@@ -325,6 +325,23 @@ export interface ReplRunnerOptions {
    * deduplicating is the host's business.
    */
   onPreambleStoreInsideProject?: (where: { store: string; project: string }) => void;
+
+  /**
+   * Asked when a trusted project's session build finds saved tools that are
+   * not approved — never accepted, added, or changed since the accepted set
+   * was written. `tools` names them; `signal` is the call's abort. `true`
+   * accepts the whole current set, as `acceptPreamble()` does, and the
+   * session being built loads it; anything else — `false`, a rejection —
+   * withholds.
+   *
+   * A refusal holds for the runner's lifetime: nothing unapproved is asked
+   * about again, so a model opening sessions under new ids cannot repeat the
+   * question. Never asked for an untrusted project, a store that cannot
+   * record the answer, a refused or unlistable tools directory, or an aborted
+   * call. Without it, nothing unapproved loads until `acceptPreamble()` — or
+   * the agent's own `save_tool`, under its approval dialog — records it.
+   */
+  approvePreamble?: (tools: string[], signal?: AbortSignal) => Promise<boolean>;
 }
 
 /**
@@ -434,16 +451,23 @@ export class ReplRunner {
   private manifest: PreambleManifestStore;
   /** `onPreambleStoreInsideProject` with this runner's two paths bound; a no-op when unset. */
   private reportStoreInsideProject: () => void;
+  /** The host's question about unapproved saved tools, when it has one. */
+  private approvePreamble: ReplRunnerOptions["approvePreamble"];
+  /** Set by a refusal, for the runner's lifetime: the question is not put again. */
+  private preambleDeclined = false;
+  /** The open question and the accept it leads to; a build arriving meanwhile waits on it. */
+  private preambleApproval: Promise<boolean> | undefined;
 
   constructor(cwd: string, options: ReplRunnerOptions = {}) {
     this.cwd = cwd;
     this.isProjectTrusted = options.isProjectTrusted ?? (() => false);
     this.maxSessions = sessionCap(options.maxSessions);
+    this.approvePreamble = options.approvePreamble;
     const storeDir = resolvePreambleStoreDir(options.preambleStoreDir);
     this.reportStoreInsideProject = () =>
       options.onPreambleStoreInsideProject?.({ store: resolve(storeDir), project: resolve(cwd) });
-    // Every write goes through here — `acceptPreamble()`, a first load's
-    // implicit accept, the tools' updates — so a store refused for being
+    // Every write goes through here — `acceptPreamble()`, an approval, the
+    // tools' updates — so a store refused for being
     // inside the project is reported in one place. A read is reported by the
     // session build, and only when it withheld something.
     const store = createPreambleManifestStore(storeDir, cwd);
@@ -505,7 +529,9 @@ export class ReplRunner {
     signal?: AbortSignal,
     limits?: RunLimits | "unbounded",
   ): Promise<RunTrace> {
-    const live = await this.getOrCreateSession(sessionId);
+    // Before `session.run`, so a saved-tools question the build puts to the
+    // host is outside the run's host wall clock; the signal bounds it.
+    const live = await this.getOrCreateSession(sessionId, signal);
     live.busy++;
     // A run is a fresh call. Records a suspension left behind are not this
     // run's — `Session.run` drops that suspension anyway — unless another
@@ -656,9 +682,9 @@ export class ReplRunner {
    *
    * Re-hashes every file that loads — with the same loader and the same
    * host-tool names a session build uses, so what is accepted is exactly
-   * what would run — and writes the manifest. This is the explicit half of
-   * the accepted-set model: the first trusted load accepts implicitly, and
-   * everything that changes afterwards waits for this call. The pi command
+   * what would run — and writes the manifest. Nothing loads unapproved, so
+   * this — or a yes to `approvePreamble`, which accepts the same way — is
+   * what lets a trusted project's saved tools run. The pi command
    * that exposes it is `/repl-accept-preamble` (`extensions/repl-extension.ts`);
    * `save_tool` is the in-band path, its approval dialog being the consent.
    *
@@ -684,14 +710,8 @@ export class ReplRunner {
     } catch (err) {
       return { status: "store-unavailable", reason: (err as Error).message };
     }
-    // Live sessions keep their preamble; their tools stop calling the files
-    // "not accepted" (#198 carry-over). Only names this accept covers move.
-    const accepted = new Set(load.loaded);
-    for (const live of this.sessions.values()) {
-      for (const name of [...live.view.unaccepted.keys()]) {
-        if (accepted.has(name)) applyManifestChange(live.view, { name, change: "accepted" });
-      }
-    }
+    // Only names this accept covers move.
+    this.markAccepted(load.loaded);
     return { status: "accepted", accepted: load.loaded, manifestPath };
   }
 
@@ -704,6 +724,81 @@ export class ReplRunner {
     } catch (err) {
       if (err instanceof PreambleStoreInsideProjectError) this.reportStoreInsideProject();
       throw err;
+    }
+  }
+
+  /**
+   * Put a build's unapproved saved tools to the host's `approvePreamble`.
+   *
+   * What a yes accepts is read before the question — the whole current set,
+   * as `acceptPreamble()` accepts it — so a file swapped while the question
+   * is open is not what was approved: the load that follows is checked
+   * against those hashes like any other. One question at a time; a build
+   * that arrives while one is open waits for it and then reads the answer
+   * from the manifest. A refusal of any kind — `false`, a rejection, a
+   * dismissed dialog — holds for the runner's lifetime, and an aborted call
+   * is not asked at all.
+   *
+   * @returns what the build loads after a recorded yes; `undefined` to withhold.
+   */
+  private async askToApprove(
+    load: SavedToolsPreamble,
+    hostToolNames: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<{ load: SavedToolsPreamble; notices: string[] } | undefined> {
+    const open = this.preambleApproval;
+    if (open !== undefined) {
+      const yes = await open.catch(() => false);
+      return yes ? this.loadVerifiedPreamble(hostToolNames, signal) : undefined;
+    }
+    const ask = this.approvePreamble;
+    if (ask === undefined || this.preambleDeclined || signal?.aborted) return undefined;
+
+    const root = this.cwd;
+    const current = await loadSavedTools({ root, hostToolNames });
+    if (current.escaped !== undefined || current.unlistable !== undefined) return undefined;
+    if (current.refused.length > 0) return undefined;
+    const hashes = hashesOf(current.loadedIdentity);
+    const tools = load.unaccepted.map((u) => u.name);
+
+    const approval = (async () => {
+      const yes = await Promise.resolve()
+        .then(() => ask(tools, signal))
+        .then(
+          (answer) => answer === true,
+          () => false,
+        );
+      if (!yes) {
+        this.preambleDeclined = true;
+        return false;
+      }
+      await this.manifest.write(hashes);
+      this.markAccepted(current.loaded);
+      return true;
+    })();
+    this.preambleApproval = approval;
+    try {
+      if (!(await approval)) return undefined;
+    } catch (err) {
+      return { load, notices: unverifiedNotices((err as Error).message, load.unaccepted) };
+    } finally {
+      this.preambleApproval = undefined;
+    }
+    const approved = await loadSavedTools({ root, hostToolNames, accepted: hashes });
+    const notices = approved.unaccepted.length > 0 ? [changedNotice(approved.unaccepted, [])] : [];
+    return { load: approved, notices };
+  }
+
+  /**
+   * Live sessions keep the preamble they were built with; their tools stop
+   * calling `names` "not accepted" (#198 carry-over).
+   */
+  private markAccepted(names: readonly string[]): void {
+    const accepted = new Set(names);
+    for (const live of this.sessions.values()) {
+      for (const name of [...live.view.unaccepted.keys()]) {
+        if (accepted.has(name)) applyManifestChange(live.view, { name, change: "accepted" });
+      }
     }
   }
 
@@ -739,7 +834,7 @@ export class ReplRunner {
    * The cost is that a trust change clears variables, and it is charged in
    * both directions so the rule stays one sentence rather than two.
    */
-  private async getOrCreateSession(sessionId: string): Promise<LiveSession> {
+  private async getOrCreateSession(sessionId: string, signal?: AbortSignal): Promise<LiveSession> {
     let trustChanged = false;
     for (;;) {
       const existing = this.sessions.get(sessionId);
@@ -768,7 +863,7 @@ export class ReplRunner {
       // it directly would hand a session built under a now-revoked trust
       // decision to its first run — the stale snapshot the live callback
       // exists to prevent. A rejected creation still propagates out.
-      await this.joinOrStartCreation(sessionId);
+      await this.joinOrStartCreation(sessionId, signal);
     }
   }
 
@@ -789,11 +884,11 @@ export class ReplRunner {
   /**
    * Join the in-flight creation for `sessionId`, or start one.
    */
-  private joinOrStartCreation(sessionId: string): Promise<LiveSession> {
+  private joinOrStartCreation(sessionId: string, signal?: AbortSignal): Promise<LiveSession> {
     const pending = this.inflight.get(sessionId);
     if (pending) return pending;
 
-    const promise = this.createSession(this.isProjectTrusted())
+    const promise = this.createSession(this.isProjectTrusted(), signal)
       .then((live) => {
         this.inflight.delete(sessionId);
         this.insert(sessionId, live);
@@ -912,45 +1007,43 @@ export class ReplRunner {
   /**
    * Load a trusted project's preamble against its accepted set (#198).
    *
-   * Three manifest states, one load:
-   * - **absent** — the first load since trust. The trust dialog covered the
-   *   files present now, so everything loads and the manifest is written,
-   *   empty set included: a project trusted before it had any saved tools
-   *   must still catch the first one that appears. A write that fails is
-   *   not shrugged off — an acceptance that cannot be recorded would make
-   *   every later load "first-ever", and first-ever accepts — so the load
-   *   is redone with an empty accepted set, and everything is withheld.
+   * Nothing unapproved loads. Three manifest states, one load:
+   * - **absent** — nothing has been approved. Every file that would load is
+   *   withheld as `unapproved`, and nothing is written: a load is not
+   *   consent, however the project came to be trusted.
    * - **ok** — files the set does not cover are withheld and named; accepted
    *   names that are in no bucket at all are reported as removed, notice
    *   only.
    * - **unavailable** — unreadable, malformed, inside the project: fail
    *   closed, withhold everything that would have loaded, say why.
    *
+   * In the first two, the withheld files are put to the host's
+   * `approvePreamble` (see `askToApprove`), and a recorded yes is what the
+   * build loads. An unavailable store is never asked about: its answer could
+   * not be recorded.
+   *
    * Two things come before any of that. A refused preamble (#54) is the
    * whole story: nothing loads, nothing is accepted, and the refusal notice
    * says why. And a tools directory that cannot be listed loads nothing and
-   * **records nothing**: it is not an empty set — an implicit accept of a set
-   * the loader never saw would write `{}` over a real acceptance record on a
-   * transient EACCES, and a comparison against it would call every accepted
-   * file removed — so the manifest is left exactly as it was, and the model
-   * is told the directory could not be read.
+   * **records nothing**: it is not an empty set — a comparison against one
+   * would call every accepted file removed — so no question is put, the
+   * manifest is left exactly as it was, and the model is told the directory
+   * could not be read.
    *
    * The unverified notice is delivered only when something was actually
    * withheld: a project with nothing to load has nothing to be told.
    */
   private async loadVerifiedPreamble(
     hostToolNames: readonly string[],
+    signal?: AbortSignal,
   ): Promise<{ load: SavedToolsPreamble; notices: string[] }> {
     const root = this.cwd;
     const read = await this.manifest.read();
 
-    // What the loader compares against: the accepted set; nothing at all
-    // when the manifest cannot be trusted (everything is withheld); no
-    // comparison on a first-ever load (everything is accepted).
-    let accepted: ReadonlyMap<string, string> | undefined;
-    if (read.status === "ok") accepted = read.files;
-    else if (read.status === "unavailable") accepted = new Map();
-    const load = await loadSavedTools({ root, hostToolNames, accepted });
+    // What the loader compares against: the accepted set, or nothing at all —
+    // no manifest has approved anything, and an unusable one cannot be trusted.
+    const accepted = read.status === "ok" ? read.files : new Map<string, string>();
+    let load = await loadSavedTools({ root, hostToolNames, accepted });
 
     // Nothing was seen, so nothing is compared or recorded — and a store
     // that could not be used is reported alongside rather than after the
@@ -974,25 +1067,30 @@ export class ReplRunner {
       return { load, notices: unverifiedNotices(read.reason, load.unaccepted) };
     }
 
+    // With no manifest nothing was ever accepted, so nothing was "added" since.
     if (read.status === "absent") {
-      try {
-        await this.manifest.write(hashesOf(load.loadedIdentity));
-        return { load, notices: [] };
-      } catch (err) {
-        const withheld = await loadSavedTools({ root, hostToolNames, accepted: new Map() });
-        return {
-          load: withheld,
-          notices: unverifiedNotices((err as Error).message, withheld.unaccepted),
-        };
-      }
+      const unaccepted = load.unaccepted.map(
+        ({ name }): UnacceptedTool => ({ name, reason: "unapproved" }),
+      );
+      load = { ...load, unaccepted };
+    }
+    if (load.unaccepted.length > 0) {
+      const approved = await this.askToApprove(load, hostToolNames, signal);
+      if (approved !== undefined) return approved;
     }
 
+    if (read.status === "absent") {
+      return {
+        load,
+        notices: load.unaccepted.length > 0 ? [unapprovedNotice(load.unaccepted)] : [],
+      };
+    }
     const removed = removedSince(read.files, load);
     const changed = load.unaccepted.length > 0 || removed.length > 0;
     return { load, notices: changed ? [changedNotice(load.unaccepted, removed)] : [] };
   }
 
-  private async createSession(trusted: boolean): Promise<LiveSession> {
+  private async createSession(trusted: boolean, signal?: AbortSignal): Promise<LiveSession> {
     const sink: ExecutionSink = { records: [] };
     const { registry, hostToolNames } = this.buildRegistry(sink);
     const sandboxOpts: SandboxOptions = { registry };
@@ -1009,7 +1107,7 @@ export class ReplRunner {
       // A file that binds one of them refuses the whole preamble (#54), and
       // the loader reports it with the offending file and symbols. The
       // accepted-set check (#198) rides on the same load.
-      const verified = await this.loadVerifiedPreamble(hostToolNames);
+      const verified = await this.loadVerifiedPreamble(hostToolNames, signal);
       const load = verified.load;
       preamble = load.preamble;
       // The tool names, for the honest tool answers: `refused`/`unreadable`
@@ -1237,6 +1335,24 @@ function removedSince(accepted: ReadonlyMap<string, string>, load: SavedToolsPre
     ...load.unreadable.map((u) => u.file.slice(0, -3)),
   ]);
   return [...accepted.keys()].filter((name) => !present.has(name)).sort();
+}
+
+/**
+ * What the model is told when saved tools were withheld because this project
+ * has no accepted set: nothing has approved them. Only the user can — when pi
+ * asks, or with `/repl-accept-preamble` — or the agent's own `save_tool`, one
+ * file at a time under its approval dialog.
+ */
+function unapprovedNotice(unapproved: UnacceptedTool[]): string {
+  const names = unapproved.map((u) => escapeNoticeName(u.name)).join(", ");
+  return (
+    `[preamble unapproved] ${unapproved.length} saved tool(s) in .pi/code-tools are not yet ` +
+    `approved, and were NOT loaded: ${names}. They are not defined in this session — calling ` +
+    "one raises NameError. Only the user can approve them, in pi: when asked, or with " +
+    "/repl-accept-preamble (the host API is ReplRunner.acceptPreamble()). Review each with " +
+    "read_tool(); re-saving one with save_tool() (which asks for approval) approves that one. " +
+    "Then run `repl` with a new `sessionId` to load them."
+  );
 }
 
 /**
