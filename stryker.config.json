@@ -1,13 +1,14 @@
 {
   "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
   "packageManager": "npm",
-  "testRunner": "command",
-  "commandRunner": {
-    "command": "node scripts/mutation-guard.mjs"
+  "testRunner": "tap",
+  "tap": {
+    "testFiles": ["test/*.test.ts"],
+    "nodeArgs": ["--import", "tsx", "--test-reporter=tap", "-r", "{{hookFile}}", "{{testFile}}"]
   },
   "mutate": ["src/**/*.ts", "extensions/**/*.ts"],
-  "coverageAnalysis": "off",
-  "concurrency": 2,
+  "coverageAnalysis": "perTest",
+  "concurrency": 6,
   "incremental": true,
   "incrementalFile": ".stryker-incremental.json",
   "reporters": ["html", "json", "clear-text", "progress"],
@@ -15,5 +16,5 @@
   "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
   "timeoutMS": 60000,
   "tempDirName": ".stryker-tmp",
-  "thresholds": { "high": 100, "low": 0, "break": 58 }
+  "thresholds": { "high": 100, "low": 0, "break": 79 }
 }

@@ -498,39 +498,37 @@ universe is tracked `src/` and `extensions/` sources; the global is reported, no
 
 ### Mutation score
 
-`npm run mutation` mutates `src/` and `extensions/` and fails below a **58%** floor
-(`thresholds.break`), just under the **58.09%** baseline. Full write-up, per-file scores and the
-reasoning behind every config value: [docs/mutation-testing.md](docs/mutation-testing.md).
+`npm run mutation` mutates `src/` and `extensions/` and fails below a **79%** floor
+(`thresholds.break`), just under the **79.28%** baseline — 5756 detected of 7263 valid mutants,
+re-measured against Monty 0.0.21 on 2026-09-10
+([#175](https://github.com/AdarGit008/repl-simple/issues/175)). Full write-up, per-file scores and
+the reasoning behind every config value: [docs/mutation-testing.md](docs/mutation-testing.md).
 
-**The baseline predates the Monty 0.0.21 migration and has not been re-measured against it.**
-`src/sandbox.ts` was rewritten and `src/pool.ts` is new, so both the mutant population and the score
-have moved by an unknown amount, in an unknown direction. The floor is not a CI gate — mutation runs
-on demand, not in `.github/workflows/ci.yml` — so nothing is silently passing on a stale number, but
-treat the 58% as unverified until a full sweep re-baselines it. That sweep is standalone
-infrastructure work, not a session task ([#175](https://github.com/AdarGit008/repl-simple/issues/175),
-session decision 17): the procedure is
-[docs/mutation-rebaseline-runbook.md](docs/mutation-rebaseline-runbook.md).
+**The floor moved up 58 → 79 because the tree's score did, not because the instrument got kinder.**
+Stryker's `coverageAnalysis: "perTest"` only skips tests that could not have killed the mutant, so
+it is score-neutral by construction; the rise belongs to waves 1–3 and the 0.0.21 migration. A floor
+going *down* is what would need explaining.
 
-This is the quality gate the coverage floors above are explicitly *not*. It is also expensive —
-**~33 CPU-hours** for the 2231-mutant run that set the baseline, because the command runner re-runs
-the whole suite (465 tests then, ~1450 now) per mutant with no per-test filtering. Two consequences:
+This is the quality gate the coverage floors above are explicitly *not*. It used to be
+unaffordable: under the old `command` test runner every mutant re-ran the whole suite, and a full
+sweep of the current tree measured a **107-hour** ETA. Switching to
+[`@stryker-mutator/tap-runner`](https://stryker-mutator.io/docs/stryker-js/tap-runner/) with real
+per-test-file coverage brought the same sweep to **3h12m** (1.70 test files per mutant instead of
+27). Two consequences:
 
 - **Run it with `npm run mutation`**, which contains it in a systemd scope with a memory ceiling so
-  a breach cannot take your terminal session down with it. `npm test` is already parallel, so
-  Stryker's `concurrency` multiplies against node's own fan-out; size it by **RAM**, not by cores.
-  One worker is ~1 GB and the committed `concurrency: 2` is ~2 GB — see
-  [`docs/mutation-testing.md`](docs/mutation-testing.md), which records how that number was wrong
-  twice before it was right. The containment is **not** lifted by the move to worker subprocesses;
-  if anything it matters more, since a scope's cgroup accounts for a process tree while the
-  `REPL_MEMORY_CEILING_MB` guard only sees the host process. The sizing figures above predate the
-  migration and each Stryker worker now spawns monty workers of its own.
-- **Use `--incremental` or `--since` on pull requests**, and run the full sweep on a schedule or on
-  demand.
+  a breach cannot take your terminal session down with it, and sets `REQUIRE_BRIDGE_TOOLS=1` so a
+  host without `fd`/`rg` fails loudly instead of skipping those tests and scoring their mutants as
+  survivors. **Size `concurrency` by cores now, not RAM**: a test worker measured ~226 MB, and the
+  committed `concurrency: 6` peaked at 4 GB of 23 on an 8-core box. The containment stays — a
+  scope's cgroup accounts for a process tree while the `REPL_MEMORY_CEILING_MB` guard only sees the
+  host process — but memory has stopped being the binding constraint it was.
+- **Use `--incremental` or `--mutate` to scope a pull-request run**, and run the full sweep on a
+  schedule or on demand. StrykerJS has no `--since` flag; that is Stryker.NET's.
 
-The floor sits 0.09 under the baseline, which is rounding room rather than slack: the reproducibility
-band that once justified a wider gap was an artefact of a harness scoring runs that never happened,
-and it closed with [#109](https://github.com/AdarGit008/repl-simple/issues/109). A run coming in
-under the floor is a regression to explain, not a threshold to lower.
+The floor sits 0.28 under the baseline, which is rounding room rather than slack. A run coming in
+under it is a regression to explain, not a threshold to lower — though note this baseline is one
+run, where 58.09 had a reproducibility band established across sixteen.
 
 ### Optional: `fd` and `ripgrep`
 

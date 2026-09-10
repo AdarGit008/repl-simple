@@ -5,5 +5,5 @@
   "ignore": [".claude/**"],
   "ignoreExportsUsedInFile": true,
   "ignoreBinaries": ["systemd-run", "journalctl", "mkfifo"],
-  "ignoreDependencies": ["@stryker-mutator/core", "@stryker-mutator/command-runner"]
+  "ignoreDependencies": ["@stryker-mutator/core"]
 }

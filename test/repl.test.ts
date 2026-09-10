@@ -1844,6 +1844,43 @@ describe("ReplRunner — the pool is capped and never drops a pending approval (
       cleanup();
     }
   });
+
+  it("a session is protected from eviction *while* it is resuming", {
+    todo:
+      "#175's full sweep: `live.busy++` -> `live.busy--` at src/repl.ts:570 SURVIVES. The " +
+      "matching decrement in the same function's `finally` (:575) is killed, and both of `run`'s " +
+      "are, so this is the one unpinned side of the busy counter. Nothing holds a resume open " +
+      "long enough to observe the session mid-flight, so a resume that never marked its session " +
+      "busy leaves the suite green. NOT the shape written below: this body was tried against the " +
+      "hand-applied mutant and does NOT kill it, because `evict` skips an entry that is EITHER " +
+      "`isSuspended()` OR `busy > 0` (src/repl.ts:806-807), and a session parked in onApproval is " +
+      "still suspended — :806 protects it and :570 never matters. The window where `busy` is the " +
+      "only guard opens *after* approval, once suspension clears while `live.session.resume()` is " +
+      "still executing the rest of the snippet. Intended approach: approve immediately, have the " +
+      "resumed code block inside a host tool that awaits a deferred, insert past maxSessions while " +
+      "it runs, then assert liveSessionCount() stayed over cap. Keep this todo until it is RED " +
+      "against `live.busy--` at :570 — a green pin that catches nothing is worse than none.",
+  }, async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+    try {
+      await runner.run("write('r.txt', 'v1')", "resuming", suspend);
+      let release: (() => void) | undefined;
+      const parked = new Promise<void>((r) => {
+        release = r;
+      });
+      const resume = runner.resume("resuming", async () => {
+        await parked;
+        return true;
+      });
+      await runner.run("v = 1", "other");
+      assert.equal(runner.liveSessionCount(), 2, "a resuming session was evicted");
+      release?.();
+      await resume;
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 // ── Reset evicts: no hollow entries (#59) ───────────────────────
