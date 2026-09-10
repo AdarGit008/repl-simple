@@ -21,6 +21,11 @@
  *    the totals of what survived.
  */
 
+// A value, not a type: `formatValue` recognises a 0.0.23 class instance by
+// `instanceof`, not by the shape of its fields, so no plain record that
+// happens to carry `name` and `isDataclass` is ever mistaken for one.
+import { MontyClassProxy } from "@pydantic/monty/node";
+
 // ── Budgets ──────────────────────────────────────────────────────
 
 /** Byte ceiling for `stdout`. */
@@ -446,6 +451,7 @@ export function pythonTypeName(value: unknown): string {
   if (Array.isArray(obj)) return "list";
   if (obj instanceof Map) return "dict";
   if (obj instanceof Set) return "set";
+  if (obj instanceof MontyClassProxy) return obj.name;
   const tag = montyTag(obj);
   if (tag === "Exception") {
     const excType = (obj as { excType?: unknown }).excType;
@@ -640,7 +646,18 @@ class Repr {
 
   private container(obj: object): void {
     const tag = montyTag(obj);
-    if (tag === "Exception") {
+    if (obj instanceof MontyClassProxy) {
+      // A class instance, as 0.0.23 hands it over: a proxy carrying the class
+      // name, a uuid and the attributes, where 0.0.21 handed over Monty's own
+      // repr string. Spelled as Python spells it — `P(x=1)` for a dataclass,
+      // `<C object>` otherwise — without the address, which does not cross,
+      // and never with the uuid, which the dict fallback below would print.
+      if (obj.isDataclass) {
+        this.wrap(`${obj.name}(`, ")", () => this.fields(obj.attributes));
+      } else {
+        this.push(`<${obj.name} object>`);
+      }
+    } else if (tag === "Exception") {
       this.wrap(`${pythonTypeName(obj)}(`, ")", () =>
         this.value((obj as { message?: unknown }).message),
       );
@@ -662,6 +679,23 @@ class Repr {
     }
   }
 
+  /** A dataclass's `name=value` fields, in walk order (last field first from the end). */
+  private fields(attributes: Record<string, unknown>): void {
+    const names = Object.keys(attributes);
+    const n = names.length;
+    for (let k = 0; k < n && !this.overflow; k++) {
+      if (k > 0) this.push(", ");
+      const name = names[this.fromEnd ? n - 1 - k : k];
+      if (this.fromEnd) {
+        this.value(attributes[name]);
+        this.push(`${name}=`);
+      } else {
+        this.push(`${name}=`);
+        this.value(attributes[name]);
+      }
+    }
+  }
+
   private items(items: unknown[], areEntries: boolean): void {
     const n = items.length;
     for (let k = 0; k < n && !this.overflow; k++) {
@@ -669,6 +703,50 @@ class Repr {
       this.item(items[this.fromEnd ? n - 1 - k : k], areEntries);
     }
   }
+}
+
+/**
+ * `value` with every class instance inside it replaced by its repr string —
+ * `<C object>`, `P(x=1)` — and every other shape left as it was: lists stay
+ * lists, dicts stay `Map`s, strings stay strings.
+ *
+ * This is how a host-tool call's arguments are normalised at the dispatch
+ * boundary. 0.0.21 converted an instance to Monty's repr string before the
+ * host saw it; 0.0.23 sends a `MontyClassProxy` whose JSON carries a fresh uuid
+ * on every run and every attribute. Every consumer of a call's arguments reads
+ * them as JSON or as strings — the tool, `Session`'s cache key, the approval
+ * description, the trace persisted through `details` — so the proxy made a
+ * replayed call miss the cache and execute again, asked approval again, and
+ * wrote a plain instance's attributes (a `password` field included) to disk.
+ * The repr is the one form that is stable across runs and shows no more than
+ * `output` does.
+ *
+ * Rendered by the same `Repr` as `output`, but uncapped: a cache key must
+ * separate two instances that differ only past any cut, and 0.0.21's repr
+ * strings were whole too.
+ */
+export function instancesAsRepr(value: unknown): unknown {
+  if (value instanceof MontyClassProxy) {
+    const r = new Repr(Number.POSITIVE_INFINITY);
+    r.value(value);
+    return r.text;
+  }
+  if (Array.isArray(value)) return value.map(instancesAsRepr);
+  if (value instanceof Map) {
+    return new Map([...value].map(([k, v]) => [instancesAsRepr(k), instancesAsRepr(v)]));
+  }
+  if (value instanceof Set) return new Set([...value].map(instancesAsRepr));
+  if (value !== null && typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === null) {
+      // `kwargs`, and Monty's tagged records. Rebuilt on the same prototype so
+      // a null-prototype record stays one.
+      const out = Object.create(proto) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(value)) out[k] = instancesAsRepr(v);
+      return out;
+    }
+  }
+  return value;
 }
 
 /**

@@ -11,13 +11,14 @@ no evidence about the others.
 
 ## `@pydantic/monty` does not work on Alpine / musl
 
-**There is no musl build of `@pydantic/monty` at any published version** (checked through `0.0.21`).
+**There is no musl build of `@pydantic/monty` at any published version** (checked through `0.0.23`).
 The published platform packages are:
 
 | Version | Platform packages |
 |---|---|
-| `0.0.18` (previous) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc`, `wasm32-wasi` |
-| `0.0.21` (current) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc` |
+| `0.0.18` | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc`, `wasm32-wasi` |
+| `0.0.21` (previous) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc` |
+| `0.0.23` (current) | `darwin-arm64`, `darwin-x64`, `linux-arm64-gnu`, `linux-x64-gnu`, `win32-x64-msvc` |
 
 `platformTriple()` hard-codes `linux-${arch}-gnu`, so there is not even a triple for npm to miss.
 
@@ -27,23 +28,28 @@ host and exits 0.
 
 The WASI package is not an escape hatch. `@pydantic/monty-wasm32-wasi` is declared `"cpu": ["wasm32"]`,
 so npm skips it on an x64 or arm64 host — the napi loader's WASI fallback has nothing to fall back to.
-And `0.0.21` dropped the WASI package entirely.
+And `0.0.21` dropped the WASI package entirely; `0.0.23` has not brought it back.
 
-### The `0.0.21` wasm entry is a trap, not a replacement
+### The wasm entry is a trap, not a replacement
 
-`0.0.21` bundles a wasm runtime reachable at `@pydantic/monty/wasm`, and it is the more dangerous
-shape of the same gap, because **it runs**.
+`0.0.21` and `0.0.23` bundle a wasm runtime reachable at `@pydantic/monty/wasm`, and it is the more
+dangerous shape of the same gap, because **it runs**.
 
-It does not work out of the box: it imports `@bjorn3/browser_wasi_shim`, which `0.0.21` declares only
-in `devDependencies`, so the import fails with `ERR_MODULE_NOT_FOUND` until you install that package
-yourself. Do that and `feedRun('2 + 3')` returns `5`, which looks like an Alpine story.
+On `0.0.23` it runs out of the box. `0.0.21` imported `@bjorn3/browser_wasi_shim`, which it declared
+only in `devDependencies`, so the import failed with `ERR_MODULE_NOT_FOUND` until you installed that
+package yourself. `0.0.23` imports `@bytecodealliance/preview2-shim` instead and declares it a
+dependency, so with nothing extra installed `feedRun('2 + 3')` returns `5`, which looks like an
+Alpine story.
 
 It is not one. On Node the wasm entry selects an **in-process** factory — there is no worker
-subprocess at all. Measured on it: `session.workerPid` is `undefined`; `while True: pass` under a 1 s
-budget fires **0** host timer ticks against 9 on the native path; and with no `maxDurationSecs` set,
-the same loop wedges the host permanently and needs a SIGKILL. That is precisely the `0.0.18` failure
-mode this project migrated away from, so the wasm entry would forfeit crash isolation, event-loop
-survival and the host backstop in one step, while appearing to work.
+subprocess at all. Measured on `0.0.23` (Node 24.19.0): `session.workerPid` is `undefined`;
+`while True: pass` under a 1 s budget fires **0** host timer ticks at a 50 ms interval, against 19
+on the native path; and with no `maxDurationSecs` set, the same loop wedges the host until it is
+SIGKILLed (the probe killed it at 8 s). This section recorded the same on `0.0.21` — 0 ticks against
+9 on the native path, and a wedge that needed a SIGKILL — though it did not record the tick interval
+it used. That is precisely the `0.0.18` failure mode this project migrated away from, so
+the wasm entry would forfeit crash isolation, event-loop survival and the host backstop in one step,
+while appearing to work.
 
 Every result here is glibc x64 on Node 24; no container runtime was used, so actual Alpine behaviour
 is inferred rather than measured. `src/` therefore imports `@pydantic/monty/node` explicitly rather

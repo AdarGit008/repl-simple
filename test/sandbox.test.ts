@@ -15,11 +15,11 @@ import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { SubmitSignal } from "../src/submit_signal.js";
-import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY } from "../src/truncate.js";
-import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
+import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY, formatSize } from "../src/truncate.js";
+import type { ApprovalRequest, HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 // The finding-5 tripwire drives Monty directly: the fact under test is the
 // binding's, not the sandbox's.
-import { Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
+import { MAX_VALUE_DEPTH, Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
 
 const byteSize = (s: string) => Buffer.byteLength(s, "utf8");
 
@@ -779,10 +779,13 @@ describe("runInSandbox — stdout truncation", () => {
       { onPrint: (text) => prints.push(text) },
     );
     ok(result);
-    // One callback per print, newline included: ('a\n', 'b\n'). The exact
-    // shape is the D122 tripwire's to pin; this test only asks that every
-    // print reaches the live stream.
-    assert.deepEqual(prints, ["a\n", "b\n"]);
+    // Every print reaches the live stream, in order and byte for byte. How the
+    // stream is chunked is Monty's: 0.0.21 called back once per print
+    // (`'a\n', 'b\n'`, which this test used to pin), 0.0.23 batches a burst
+    // (`'a\nb\n'`, measured). The shape is the D122 tripwire's to pin; this
+    // test only asks that nothing is lost, duplicated or reordered.
+    assert.equal(prints.join(""), "a\nb\n");
+    assert.equal(result.stdout, "a\nb\n");
   });
 });
 
@@ -1556,18 +1559,29 @@ describe("resource-limit breach on the resume after a host tool call", () => {
   // has to keep working *after* the call returns — a tool that overruns with no
   // Python following it completes `ok`.
   //
-  // The loop is 5,000,000 iterations rather than 200,000 because the duration
-  // clock inverted with the move to a worker. On 0.0.18 `maxDurationSecs` was
-  // wall clock and the 250 ms sleep alone consumed a 200 ms budget, so a short
-  // loop only had to run long enough to *notice*. 0.0.21's clock advances only
-  // while the interpreter executes and stops while the sandbox is suspended on
-  // a host call, so the sleep now contributes nothing and the loop has to
-  // spend the whole budget by itself (measured: 200,000 iterations cost ~67 ms
-  // of interpreter time, 5,000,000 cost ~555 ms).
+  // The loop has to spend the whole 0.2 s budget by itself. Since 0.0.21 the
+  // duration clock advances only while the interpreter executes and stops while
+  // the sandbox is suspended on a host call, so the 250 ms sleep contributes
+  // nothing (on 0.0.18 it was wall clock, and the sleep alone breached).
+  //
+  // So the loop's size is a bet on interpreter speed, and 5,000,000 lost it.
+  // Measured: that loop took a median 752 ms on 0.0.21 and 463 ms on 0.0.23
+  // on a Linux x64 dev box (~92 ns an iteration); on the macOS arm64 CI runner
+  // the whole test took ~457 ms on 0.0.21 (250 ms sleep, loop cut off at
+  // 0.2 s) but ~408 ms on 0.0.23 — the loop finished in ~158 ms, under the
+  // budget, and the run came back `ok` (PR #218, run 34462982174).
+  //
+  // 200,000,000 is sized for hardware nobody here has: ~18.8 s of interpreter
+  // time on that dev box, ~6.3 s at the arm64 runner's 0.0.23 rate (32x the
+  // budget), and still ~0.94 s on a machine 20x faster than the dev box (4.7x).
+  // It is bounded rather than `while True` on purpose: a broken duration limit
+  // must fail as an assertion (the loop completes, the run is `ok`, `err()`
+  // fails) in seconds, not hold a worker until the 300 s host wall clock.
+  // Working limits cut it at 0.2 s whatever its size.
   const OVERRUN_THEN_LOOP = [
     "slow()",
     "total = 0",
-    "for i in range(5000000):",
+    "for i in range(200000000):",
     "    total += i",
     "total",
   ].join("\n");
@@ -2260,6 +2274,115 @@ describe("host tools survive being used as values", () => {
   });
 });
 
+// ── Class instances as tool arguments (Monty 0.0.23) ─────────────
+//
+// 0.0.21 turned an instance into Monty's repr string before a host tool saw
+// it: the tool received "<C object at 0x2>" or "P(x=1)" (measured by review).
+// 0.0.23 hands over a `MontyClassProxy`, whose JSON carries a fresh uuid on
+// every run and every attribute, and every consumer of the arguments — the
+// tool, the replay cache key, the approval description, the trace persisted
+// through `details` — saw that JSON. An untyped helper parameter carries an
+// instance past the type checker, so ordinary model code does this.
+
+describe("a class instance passed to a host tool arrives as its repr, never as a proxy (0.0.23)", () => {
+  const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+  const DC = "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\n";
+  /** JSON that spells a Map as an object, so a uuid inside a dict argument is visible. */
+  const json = (value: unknown) =>
+    JSON.stringify(value, (_k, v) => (v instanceof Map ? Object.fromEntries(v) : v));
+
+  /** A one-parameter tool that records exactly what `execute` received. */
+  function recordingTool(name = "echo", overrides: Partial<HostTool> = {}) {
+    const received: unknown[] = [];
+    const tool = makeTool({
+      name,
+      execute: (args) => {
+        received.push(args.text);
+        return "ok";
+      },
+      ...overrides,
+    });
+    return { tool, received };
+  }
+
+  it("a plain instance through an untyped helper: the tool and the trace see `<C object>`, no attributes", async () => {
+    const { tool, received } = recordingTool();
+    const result = await runInSandbox(
+      "class C:\n    def __init__(self):\n        self.password = 'hunter2'\ndef g(v):\n    return echo(v)\ng(C())",
+      { registry: new ToolRegistry([tool]) },
+    );
+    ok(result);
+    assert.deepEqual(received, ["<C object>"]);
+    assert.deepEqual(result.calls[0].args, ["<C object>"]);
+    assert.doesNotMatch(json(result.calls), UUID);
+    assert.doesNotMatch(json(result.calls), /hunter2|password/, "an attribute reached the trace");
+  });
+
+  it("a dataclass arrives as its field repr, passed by keyword too", async () => {
+    const { tool, received } = recordingTool();
+    const result = await runInSandbox(`${DC}def g(v):\n    return echo(text=v)\ng(P(1))`, {
+      registry: new ToolRegistry([tool]),
+    });
+    ok(result);
+    assert.deepEqual(received, ["P(x=1)"]);
+    // Spread: Monty's kwargs record has a null prototype, and normalising keeps it.
+    assert.deepEqual({ ...result.calls[0].kwargs }, { text: "P(x=1)" });
+    assert.doesNotMatch(json(result.calls), UUID);
+  });
+
+  it("instances nested inside a list or a dict argument are each replaced in place", async () => {
+    const { tool, received } = recordingTool();
+    const result = await runInSandbox(
+      `${DC}class C:\n    pass\ndef g(v):\n    return echo(v)\ng([C(), {'k': P(2)}, 'plain'])`,
+      { registry: new ToolRegistry([tool]) },
+    );
+    ok(result);
+    const [arg] = received as [unknown[]];
+    assert.equal(arg[0], "<C object>");
+    assert.ok(arg[1] instanceof Map, `a dict argument must stay a dict: ${json(arg[1])}`);
+    assert.equal((arg[1] as Map<string, unknown>).get("k"), "P(x=2)");
+    assert.equal(arg[2], "plain");
+    assert.doesNotMatch(json(received), UUID);
+    assert.doesNotMatch(json(result.calls), UUID);
+  });
+
+  it("a gated tool is asked about the repr, with no uuid and no attribute dump", async () => {
+    const { tool, received } = recordingTool("gate", { requiresApproval: true });
+    const asked: ApprovalRequest[] = [];
+    const result = await runInSandbox(
+      "class C:\n    def __init__(self):\n        self.token = 'sk-secret'\ndef g(v):\n    return gate(v)\ng(C())",
+      { registry: new ToolRegistry([tool]) },
+      {
+        onApproval: (request) => {
+          asked.push(request);
+          return true;
+        },
+      },
+    );
+    ok(result);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].description, 'gate(text="<C object>")');
+    assert.deepEqual(asked[0].args, ["<C object>"]);
+    assert.doesNotMatch(json(asked), UUID);
+    assert.doesNotMatch(json(asked), /sk-secret|token/);
+    assert.deepEqual(received, ["<C object>"]);
+  });
+
+  it("a suspended call carries the repr across resumeSuspended", async () => {
+    const { tool, received } = recordingTool("gate", { requiresApproval: true });
+    const registry = new ToolRegistry([tool]);
+    const paused = await runInSandbox(
+      `${DC}def g(v):\n    return gate(v)\ng(P(3))`,
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(paused);
+    assert.equal(paused.suspendedCall.description, 'gate(text="P(x=3)")');
+    ok(await resumeSuspended(paused, true, { registry }));
+    assert.deepEqual(received, ["P(x=3)"]);
+  });
+});
+
 // ── Calls that never reach a tool ───────────────────────────────
 
 describe("dispatch failures before a tool runs", () => {
@@ -2316,7 +2439,15 @@ describe("a crashed sandbox worker", () => {
   // kills the worker `durationLimitGrace` later. That is the one path to
   // `MontyCrashedError`, and it has no 0.0.18 analogue — there the same code
   // froze the event loop until something SIGKILLed the whole process.
-  const UNCHECKPOINTED_RUNAWAY = "x = 10 ** 100000000\n1";
+  //
+  // The primitive has to outlast the kill point (the 0.5 s budget plus the
+  // watchdog's grace: `crashed` after ~1.55 s, measured) on any runner.
+  // `10 ** 100000000` finished in ~43 s unenforced on a Linux x64 dev box, which
+  // left ~10x on the macOS arm64 CI runner and ~1.4x on a machine 20x faster
+  // than that box. `10 ** 200000000` was still computing when a 60 s budget
+  // killed it (measured), so at least 40x here, and it still ends in a crash
+  // at ~1.5 s whatever its size.
+  const UNCHECKPOINTED_RUNAWAY = "x = 10 ** 200000000\n1";
 
   it("returns errorKind 'crashed', not 'runtime'", async () => {
     const result = await runInSandbox(
@@ -2471,8 +2602,15 @@ describe("the shipped resource limits", () => {
         maxMemory: 7 * 1_048_576,
         gcInterval: 500,
         maxRecursionDepth: 64,
+        maxSuspensions: 11,
       }),
-      { maxDurationSecs: 3, maxMemory: 7 * 1_048_576, gcInterval: 500, maxRecursionDepth: 64 },
+      {
+        maxDurationSecs: 3,
+        maxMemory: 7 * 1_048_576,
+        gcInterval: 500,
+        maxRecursionDepth: 64,
+        maxSuspensions: 11,
+      },
     );
 
     // Unset knobs take the default; `maxWallClockSecs` is the host's and is not
@@ -2483,10 +2621,13 @@ describe("the shipped resource limits", () => {
       maxMemory: defaults.maxMemory,
       gcInterval: undefined,
       maxRecursionDepth: undefined,
+      maxSuspensions: defaults.maxSuspensions,
     });
 
-    // The one path to no limits at all, and it has to be typed.
-    assert.equal(toResourceLimits("unbounded"), undefined);
+    // The one path to no limits at all, and it has to be typed. Not
+    // `undefined` any more: on 0.0.23 an omitted `maxSuspensions` is a
+    // 1000-call ceiling, so "no limits" has to name a count no run reaches.
+    assert.deepEqual(toResourceLimits("unbounded"), { maxSuspensions: Number.MAX_SAFE_INTEGER });
     assert.notEqual(toResourceLimits(undefined), undefined);
   });
 
@@ -2514,6 +2655,156 @@ describe("the shipped resource limits", () => {
 
     const unbounded = await runInSandbox(recurse, { registry });
     ok(unbounded, "100 frames is well inside Monty's default of 1000");
+  });
+
+  // ── The suspension budget (Monty 0.0.23 `maxSuspensions`) ──
+  //
+  // 0.0.23 counts every time a checkout hands control to the host — each
+  // host-tool call is one (measured) — and aborts the feed past
+  // `maxSuspensions`, which defaults to 1000 when the field is omitted.
+  // Omitted is what this repository passed, so a plain loop of 1001 `echo`
+  // calls, and a `Session` replaying a full call cache, started failing on
+  // the bump with `RuntimeError: suspension limit 1000 exceeded`.
+
+  /** An echo that counts what actually executed: the budget is about calls. */
+  function countingEcho(): { registry: ToolRegistry; executions: () => number } {
+    let executions = 0;
+    const tool = makeTool({
+      execute: (args) => {
+        executions++;
+        return String(args.text);
+      },
+    });
+    return { registry: new ToolRegistry([tool]), executions: () => executions };
+  }
+
+  /** `n` sequential `echo` calls in a loop. */
+  const echoLoop = (n: number) => `for i in range(${n}):\n    echo(str(i))\nlen("done")`;
+
+  it("suspensions: a run making more than 1000 host-tool calls completes on the default budget", async () => {
+    const prior = process.env.REPL_MAX_SUSPENSIONS;
+    delete process.env.REPL_MAX_SUSPENSIONS;
+    try {
+      const { registry: echoes, executions } = countingEcho();
+      const result = await runInSandbox(echoLoop(1500), { registry: echoes });
+      ok(result, `expected ok, got ${JSON.stringify((result as RunError).error)}`);
+      assert.equal(result.calls.length, 1500);
+      assert.equal(executions(), 1500);
+    } finally {
+      if (prior !== undefined) process.env.REPL_MAX_SUSPENSIONS = prior;
+    }
+  });
+
+  it("suspensions: a caller's maxSuspensions is enforced — uncatchable, `runtime`, the trace stops at the budget", async () => {
+    const { registry: echoes, executions } = countingEcho();
+    const result = await runInSandbox(
+      `try:\n    for i in range(10):\n        echo(str(i))\nexcept BaseException:\n    pass\nlen("swallowed")`,
+      { registry: echoes },
+      { limits: { maxSuspensions: 5 } },
+    );
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /suspension limit 5 exceeded/);
+    assert.equal(executions(), 5, "a call past the budget reached the host");
+    assert.equal(result.calls.length, 5);
+  });
+
+  it("suspensions: REPL_MAX_SUSPENSIONS is read at call time, rejecting values that are not positive", async () => {
+    const shipped = limitsConfig().maxSuspensions;
+    assert.ok(Number.isSafeInteger(shipped) && shipped > 0, `shipped ${shipped}`);
+    await withEnv({ REPL_MAX_SUSPENSIONS: "7" }, async () => {
+      assert.equal(limitsConfig().maxSuspensions, 7);
+      assert.equal(toResourceLimits(undefined).maxSuspensions, 7);
+    });
+    for (const bad of ["0", "-1", "not-a-number", ""]) {
+      await withEnv({ REPL_MAX_SUSPENSIONS: bad }, async () => {
+        assert.equal(
+          limitsConfig().maxSuspensions,
+          shipped,
+          `'${bad}' should not become the suspension budget — 0 permits no host call at all`,
+        );
+      });
+    }
+  });
+
+  it("suspensions: limits 'unbounded' does not leave Monty's 1000 default in force", async () => {
+    // Paired like the memory test: the same environment enforces on the
+    // default path, so the only difference is the opt-out itself.
+    await withEnv({ REPL_MAX_SUSPENSIONS: "5" }, async () => {
+      const bounded = await runInSandbox(echoLoop(10), countingEcho());
+      err(bounded);
+      assert.match(bounded.error, /suspension limit 5 exceeded/, "the env default must enforce");
+
+      const { registry: echoes, executions } = countingEcho();
+      const unbounded = await runInSandbox(
+        echoLoop(1500),
+        { registry: echoes },
+        { limits: "unbounded" },
+      );
+      ok(unbounded, `expected ok, got ${JSON.stringify((unbounded as RunError).error)}`);
+      assert.equal(executions(), 1500);
+    });
+  });
+
+  it("suspensions: a name lookup and a mounted-file read each spend one, like a call", async () => {
+    // What the budget counts, pinned so the README's list stays true: aliasing
+    // a tool is a name lookup the host answers, and a mounted read is an OS
+    // call `resumeAuto()` answers — neither is a tool call in the trace.
+    const aliased = "f = echo\nf('a')\nf('b')";
+    const tight = await runInSandbox(aliased, countingEcho(), { limits: { maxSuspensions: 2 } });
+    err(tight);
+    assert.match(tight.error, /suspension limit 2 exceeded/, "the lookup was free");
+    assert.equal(tight.calls.length, 1);
+    ok(await runInSandbox(aliased, countingEcho(), { limits: { maxSuspensions: 3 } }));
+
+    const dir = mkdtempSync(join(tmpdir(), "repl-suspensions-"));
+    try {
+      writeFileSync(join(dir, "x.txt"), "hello");
+      const reads =
+        "from pathlib import Path\n[Path('/mnt/data/x.txt').read_text() for _ in range(3)]";
+      const runOpts = (maxSuspensions: number) => ({
+        mount: { "/mnt/data": dir },
+        limits: { maxSuspensions },
+      });
+      const short = await runInSandbox(reads, { registry }, runOpts(2));
+      err(short);
+      assert.match(short.error, /suspension limit 2 exceeded/, "a mounted read was free");
+      assert.equal(short.calls.length, 0, "a mounted read is not a traced tool call");
+      const enough = await runInSandbox(reads, { registry }, runOpts(3));
+      ok(enough);
+      assert.equal(enough.output, "['hello', 'hello', 'hello']");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("suspensions: a resume cannot lift the suspended run's budget, and its count restarts", async () => {
+    // Measured on 0.0.23: a restored snapshot is held to the lower of the
+    // dump's `maxSuspensions` and the resuming checkout's, and the count
+    // starts again at the restore with the pending call counted as one. So
+    // the resume below — on the default budget — still stops at the run's 3,
+    // and it gets there only after two more calls, not at once.
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const gated = new ToolRegistry([echoTool(), gate]);
+    const paused = await runInSandbox(
+      `echo("a")\necho("b")\ngate("g")\n${echoLoop(4)}`,
+      { registry: gated },
+      { limits: { maxSuspensions: 3 }, onApproval: () => "suspend" },
+    );
+    suspended(paused);
+    const finished = await resumeSuspended(paused, true, { registry: gated });
+    err(finished);
+    assert.match(finished.error, /suspension limit 3 exceeded/);
+    assert.deepEqual(
+      finished.calls.map((c) => [c.tool, c.args]),
+      [
+        ["echo", ["a"]],
+        ["echo", ["b"]],
+        ["gate", ["g"]],
+        ["echo", ["0"]],
+        ["echo", ["1"]],
+      ],
+    );
   });
 });
 
@@ -2683,15 +2974,25 @@ describe("a pool with no worker to give", () => {
 // `Session` de-duplicates stdout across replays with a byte mark: the
 // number of bytes the replayed prefix printed, handed to the sandbox as
 // `RunOptions.stdoutSkipBytes` and dropped before `onPrint` and the
-// accumulator see anything (D121). The arithmetic assumes Monty's callback
-// shape stays what was measured on 0.0.21, so the shape is pinned here as a
-// tripwire (D122): if an upstream bump changes it, this is the test that
-// says so, rather than a session quietly swallowing or re-emitting a line.
+// accumulator see anything (D121). The mark is a byte count, so it is
+// indifferent to how a deterministic stream is chunked; what it and the
+// trace's `stdoutOffset` do rely on is *when* bytes arrive — before a host
+// call, and by the end of the feed. The shape is pinned here as a tripwire
+// (D122): if an upstream bump changes it, this is the test that says so,
+// rather than a session quietly swallowing or re-emitting a line. Re-pinned
+// for 0.0.23, which batches output (the evidence for accepting that is the
+// "print batching" block below).
 
 describe("print callback shape — the tripwire under the stdout mark (#61 D122)", () => {
   const registry = new ToolRegistry([echoTool()]);
 
-  it("fires once per print, newline included", async () => {
+  it("batches a burst into fewer callbacks than prints, every byte in order (0.0.23)", async () => {
+    // 0.0.21 fired once per print, and this test pinned
+    // ['a\n', 'b c\n', 'x\ny\n', '0\n', '1\n', '2\n']. 0.0.23 holds output for
+    // up to 5 ms (`printFlushInterval`) and measured one callback for these
+    // six prints and one for a thousand; `printFlushInterval: 0` gives one per
+    // *line*, splitting `x\ny`. The split is timing, so the bytes are pinned
+    // exactly and the batching by a burst no timing can deliver line by line.
     const prints: string[] = [];
     const result = await runInSandbox(
       'print("a")\nprint("b", "c")\nprint("x\\ny")\nfor i in range(3):\n    print(i)',
@@ -2699,10 +3000,24 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
       { onPrint: (text) => prints.push(text) },
     );
     ok(result);
-    assert.deepEqual(prints, ["a\n", "b c\n", "x\ny\n", "0\n", "1\n", "2\n"]);
+    assert.equal(prints.join(""), "a\nb c\nx\ny\n0\n1\n2\n");
+
+    const burst: string[] = [];
+    ok(
+      await runInSandbox(
+        "for i in range(1000):\n    print(i)",
+        { registry },
+        { onPrint: (text) => burst.push(text) },
+      ),
+    );
+    assert.equal(burst.join(""), Array.from({ length: 1000 }, (_, i) => `${i}\n`).join(""));
+    assert.ok(
+      burst.length < 1000,
+      `one callback per print (${burst.length}): batching is off — re-read what the mark assumes`,
+    );
   });
 
-  it("holds a partial line until the next newline, a host boundary, or the end", async () => {
+  it("delivers a partial line at a host boundary, at the end, and once the flush interval lapses", async () => {
     const merged: string[] = [];
     ok(
       await runInSandbox(
@@ -2711,7 +3026,30 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
         { onPrint: (text) => merged.push(text) },
       ),
     );
-    assert.deepEqual(merged, ["abc\n"], "partials are held until a newline");
+    // 0.0.21 held a partial until the next newline, and this pinned ['abc\n'].
+    // 0.0.23 still gives that here, but only because the three prints fall
+    // inside one flush interval — so the bytes are what is pinned.
+    assert.equal(merged.join(""), "abc\n");
+
+    const lapsed: string[] = [];
+    ok(
+      await runInSandbox(
+        // 10,000,000 iterations, because the busy loop has to outlast the 5 ms
+        // flush interval on any runner: ~900 ms on a Linux x64 dev box, ~45 ms
+        // (9x the interval) on a machine 20x faster. Measured with the interval
+        // stretched to stand in for faster hardware: 1,000,000 (~95 ms) merges
+        // into ['ab\n'] from a 0.1 s interval up; 10,000,000 still separates at
+        // 0.5 s and merges only at 1 s.
+        'print("a", end="")\nn = 0\nfor i in range(10000000):\n    n += i\nprint("b")',
+        { registry },
+        { onPrint: (text) => lapsed.push(text) },
+      ),
+    );
+    assert.deepEqual(
+      lapsed,
+      ["a", "b\n"],
+      "a partial is no longer held past the flush interval (line-buffered, printFlushInterval 0: ['ab\\n'])",
+    );
 
     const flushed: string[] = [];
     ok(
@@ -2813,6 +3151,158 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
       Buffer.byteLength(replayed.join("")),
       "the mark taken across the suspension must equal the replay's byte count",
     );
+  });
+});
+
+// ── Print batching (Monty 0.0.23, pydantic/monty#809): what stdout is built on ──
+//
+// 0.0.23 holds `print()` output in the worker for up to
+// `CheckoutOptions.printFlushInterval` (5 ms by default) and hands a burst to
+// the print callback as one chunk; `printFlushInterval: 0` would restore one
+// callback per line. These tests are the evidence the sandbox keeps upstream's
+// default: every property stdout, the trace and the replay mark rely on is
+// asserted against the batched stream. Where a property only means something
+// if a chunk really spanned several prints, the test also checks that it did,
+// so it cannot pass by the stream happening to arrive line by line.
+
+describe("print batching — the properties stdout is built on hold on the batched stream (0.0.23)", () => {
+  /** `n` numbered lines printed in a tight loop, and the exact bytes they make. */
+  const burst = (n: number, label = "line") => ({
+    code: `for i in range(${n}):\n    print("${label}", i)`,
+    text: Array.from({ length: n }, (_, i) => `${label} ${i}\n`).join(""),
+  });
+
+  /** A no-argument tool that records what the live stream held when it ran. */
+  function probeTool(chunks: string[], seen: string[]): HostTool {
+    return makeTool({
+      name: "probe",
+      params: [],
+      execute: () => {
+        seen.push(chunks.join(""));
+        return "p";
+      },
+    });
+  }
+
+  it("a burst printed before a host call is delivered before the call runs, and traced below it", async () => {
+    const before = burst(200);
+    const chunks: string[] = [];
+    const seen: string[] = [];
+    const result = await runInSandbox(
+      `${before.code}\nprint("partial", end="")\nprobe()\nprint("after")`,
+      { registry: new ToolRegistry([probeTool(chunks, seen)]) },
+      { onPrint: (text) => chunks.push(text) },
+    );
+    ok(result);
+    assert.ok(chunks.length < 200, `not batched (${chunks.length} callbacks for 202 prints)`);
+    const printedBefore = `${before.text}partial`;
+    assert.deepEqual(seen, [printedBefore], "output printed before the call arrived after it ran");
+    assert.equal(result.calls[0].stdoutOffset, byteSize(printedBefore));
+    assert.equal(result.stdout, `${printedBefore}after\n`);
+  });
+
+  it("every call in an interleaved loop sees exactly what preceded it", async () => {
+    const chunks: string[] = [];
+    const seen: string[] = [];
+    const result = await runInSandbox(
+      'for i in range(30):\n    print("a", i)\n    print("b", i, end="")\n    print("")\n    probe()',
+      { registry: new ToolRegistry([probeTool(chunks, seen)]) },
+      { onPrint: (text) => chunks.push(text) },
+    );
+    ok(result);
+    const perIteration = (i: number) => `a ${i}\nb ${i}\n`;
+    const prefixes = Array.from({ length: 30 }, (_, n) =>
+      Array.from({ length: n + 1 }, (_, i) => perIteration(i)).join(""),
+    );
+    assert.deepEqual(seen, prefixes);
+    assert.deepEqual(
+      result.calls.map((c) => c.stdoutOffset),
+      prefixes.map(byteSize),
+    );
+  });
+
+  it("the stdout budget holds when one batched chunk straddles the cap", async () => {
+    const stream = burst(400);
+    const cap = 256;
+    const chunks: string[] = [];
+    const result = await runInSandbox(
+      stream.code,
+      { registry: new ToolRegistry() },
+      { maxStdoutBytes: cap, onPrint: (text) => chunks.push(text) },
+    );
+    ok(result);
+    // The case under test: a single callback carries bytes from both sides of
+    // the cap.
+    let offset = 0;
+    const straddles = chunks.some((chunk) => {
+      const start = offset;
+      offset += byteSize(chunk);
+      return start < cap && offset > cap && chunk.split("\n").length > 2;
+    });
+    assert.ok(straddles, `no multi-line chunk spans the cap: ${chunks.map(byteSize).join(",")}`);
+
+    assert.equal(chunks.join(""), stream.text, "the live stream is not the model's budget (M9)");
+    assert.equal(result.stdoutTruncated, true);
+    assert.ok(byteSize(result.stdout) <= cap, `${byteSize(result.stdout)} bytes for a ${cap} cap`);
+    const [head, tail] = result.stdout.split(/\n?\[… [^\]]*…\]\n?/);
+    assert.ok(stream.text.startsWith(head), `head is not the stream's: ${JSON.stringify(head)}`);
+    assert.ok(stream.text.endsWith(tail), `tail is not the stream's: ${JSON.stringify(tail)}`);
+    assert.match(
+      result.stdout,
+      new RegExp(
+        `of ${formatSize(byteSize(stream.text)).replace(".", "\\.")} elided \\(lines \\d+-\\d+ of 400\\)`,
+      ),
+    );
+  });
+
+  it("an abort mid-output returns everything printed before it, the batched burst included", async () => {
+    const controller = new AbortController();
+    const stop = makeTool({
+      name: "stop",
+      params: [],
+      execute: () => {
+        controller.abort();
+        return "s";
+      },
+    });
+    const before = burst(300);
+    const chunks: string[] = [];
+    const result = await runInSandbox(
+      `${before.code}\nstop()\n${burst(300, "after").code}`,
+      { registry: new ToolRegistry([stop]) },
+      { signal: controller.signal, onPrint: (text) => chunks.push(text) },
+    );
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.ok(chunks.length < 300, `not batched (${chunks.length} callbacks)`);
+    assert.ok(result.stdout.startsWith(before.text), "output printed before the abort is missing");
+    assert.equal(result.stdoutTruncated, false);
+  });
+
+  it("an abort during a print loop with no host call returns what the flush interval delivered", async () => {
+    // No host call ever flushes this stream: only the interval does. The run is
+    // cut off by the abort race, so what it reports is whatever had arrived.
+    // The 1 s budget is only what hands the worker back afterwards; the abort
+    // (300 ms, plus the 250 ms settle grace) ends the run well before it.
+    const controller = new AbortController();
+    let delivered = 0;
+    const pending = runInSandbox(
+      'i = 0\nwhile True:\n    print("tick", i)\n    i += 1',
+      { registry: new ToolRegistry() },
+      {
+        signal: controller.signal,
+        limits: { maxDurationSecs: 1 },
+        onPrint: (text) => {
+          delivered += byteSize(text);
+        },
+      },
+    );
+    setTimeout(() => controller.abort(), 300);
+    const result = await pending;
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.ok(delivered > 0, "300 ms of printing delivered nothing");
+    assert.ok(result.stdout.startsWith("tick 0\ntick 1\n"), result.stdout.slice(0, 80));
   });
 });
 
@@ -2931,6 +3421,14 @@ describe("RunOk.output is always a string, rendered as Python (#65 test 4, #69 f
     ["[(1, 2.0), {'k': {1}}, b'\\x00', 1e400, None]", "[[1, 2], {'k': {1}}, b'\\x00', inf, None]"],
     ["ValueError('bad')", "ValueError('bad')"],
     ["type(1)", "<class 'int'>"],
+    // Instances: 0.0.21 sent Monty's repr string, 0.0.23 sends a
+    // MontyClassProxy (the address is not carried; see the policy's losses).
+    ["class C:\n    def __init__(self):\n        self.x = 1\nC()", "<C object>"],
+    ["class C:\n    pass\n[C(), C()]", "[<C object>, <C object>]"],
+    [
+      "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\n    y: str\nP(1, 'a')",
+      "P(x=1, y='a')",
+    ],
     ["print('x')", "None"],
     ["echo('hi')", "hi"],
     ["SUBMIT('done')", "done"],
@@ -2963,6 +3461,68 @@ describe("RunOk.output is always a string, rendered as Python (#65 test 4, #69 f
     const result = await runInSandbox("a = []\na.append(a)\na", { registry });
     ok(result);
     assert.equal(result.output, "['[...]']");
+  });
+
+  // ── What 0.0.23 changed about instances in `output`, pinned so a bump says so ──
+
+  it("a user-defined __repr__ does not reach output (0.0.23 loss); repr() inside the sandbox does", async () => {
+    // 0.0.21 sent Monty's repr string, so `C()` rendered `CUSTOM` and the
+    // dataclass `PCUSTOM` (measured by review). 0.0.23's proxy carries the
+    // class name and the attributes, not the method, and the host cannot call
+    // back into a finished feed to run it.
+    const custom = "class C:\n    def __repr__(self):\n        return 'CUSTOM'\n";
+    const bare = await runInSandbox(`${custom}C()`, { registry });
+    ok(bare);
+    assert.equal(bare.output, "<C object>");
+    const called = await runInSandbox(`${custom}repr(C())`, { registry });
+    ok(called);
+    assert.equal(called.output, "CUSTOM", "the workaround the policy documents");
+    const dataclass = await runInSandbox(
+      "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\n    def __repr__(self):\n        return 'PCUSTOM'\nP(1)",
+      { registry },
+    );
+    ok(dataclass);
+    assert.equal(dataclass.output, "P(x=1)");
+  });
+
+  it("a cycle inside an instance renders quoted, exactly like a real '...' string (0.0.23)", async () => {
+    // Monty breaks the cycle itself and sends the string '...' in its place,
+    // which is the same value a real '...' attribute arrives as (measured on
+    // the raw pool: both `{"x":"..."}`). Spelling it `N(x=...)` as 0.0.21 did
+    // would misspell genuine data, so the placeholder shows as what arrived.
+    const DC =
+      "from dataclasses import dataclass\nfrom typing import Any\n@dataclass\nclass N:\n    x: Any\n";
+    const cycle = await runInSandbox(`${DC}n = N(None)\nn.x = n\nn`, { registry });
+    ok(cycle);
+    assert.equal(cycle.output, "N(x='...')");
+    const real = await runInSandbox(`${DC}N('...')`, { registry });
+    ok(real);
+    assert.equal(real.output, "N(x='...')");
+    const inList = await runInSandbox(`${DC}n = N([])\nn.x.append(n)\nn`, { registry });
+    ok(inList);
+    assert.equal(inList.output, "N(x=['...'])");
+  });
+
+  it("output nests a list 48 deep and an instance 24 deep; one more fails the whole run (0.0.23)", async () => {
+    // Monty's native value conversion is capped at MAX_VALUE_DEPTH, and no
+    // option sets it. A nested instance hits the cap at half a list's depth
+    // (measured by bisection: 24 ok / 25 fails, lists 48 / 49). Past it the run
+    // fails with `RuntimeError: Max output depth exceeded` when the value is
+    // handed over — after its side effects. 0.0.21 had the same list ceiling but
+    // sent instances as repr strings, so instances returned 256 deep.
+    const list = (d: number) => `v = None\nfor i in range(${d}):\n    v = [v]\nv`;
+    const instance = (d: number) =>
+      `class C:\n    def __init__(self, x):\n        self.x = x\nv = None\nfor i in range(${d}):\n    v = C(v)\nv`;
+    assert.equal(MAX_VALUE_DEPTH, 48, "the native ceiling moved: re-bisect and update the policy");
+    ok(await runInSandbox(list(48), { registry }));
+    ok(await runInSandbox(instance(24), { registry }));
+    for (const code of [list(49), instance(25)]) {
+      const result = await runInSandbox(`echo('side effect')\n${code}`, { registry });
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(result.error, /Max output depth exceeded/);
+      assert.equal(result.calls.length, 1, "the side effect before the value still happened");
+    }
   });
 
   it("holds through resumeSuspended: the resumed expression renders the same way", async () => {
@@ -3050,6 +3610,21 @@ describe("SUBMIT rejects a non-str answer with a Python TypeError (#65 tests 1-2
       assert.equal(result.calls[0].error, `SUBMIT() answer must be str, not ${pytype}`);
     });
   }
+
+  it("SUBMIT(instance) submits the instance's repr, as 0.0.21 did — an instance is not a non-str answer", async () => {
+    // 0.0.21 converted the instance to its repr string before SUBMIT saw it,
+    // so the answer was "<C object at 0x2>" (measured by review). 0.0.23's
+    // proxy made it `TypeError: … not C`. The dispatch boundary normalises
+    // every tool argument, SUBMIT's included, so the 0.0.21 answer is back —
+    // minus the address, which does not cross.
+    const result = await runInSandbox(
+      "class C:\n    pass\nfrom typing import Any\nv: Any = C()\nSUBMIT(v)",
+      { registry },
+    );
+    ok(result);
+    assert.equal(result.output, "<C object>");
+    assert.equal(result.calls[0].ok, true);
+  });
 
   it("the model can catch it and carry on — it is a Python exception, not a host fault", async () => {
     const result = await runInSandbox(

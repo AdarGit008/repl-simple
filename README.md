@@ -8,18 +8,18 @@ Code runs in [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly),
 Python, so the standard library is a fixed, closed set: **there are no third-party packages** and
 no way to install one, and most of the stdlib is absent.
 
-**Importable modules** — exactly these, verified against the pinned Monty 0.0.21. The code probes
+**Importable modules** — exactly these, verified against the pinned Monty 0.0.23. The code probes
 this at runtime (`probeImportableModules()` over `CANDIDATE_MODULES` in `src/registry.ts`), so the
 live answer follows the installed interpreter:
 
 `os`, `sys`, `json`, `re`, `datetime`, `math`, `typing`, `pathlib`, `asyncio`, `collections`,
-`itertools`, `dataclasses`
+`itertools`, `functools`, `base64`, `dataclasses`
 
-Anything else — `time`, `random`, `subprocess`, `socket`, `functools`, `hashlib`, `requests`,
-`numpy` and the rest — is refused by Monty's type checker as an unresolved import, before any code
-runs. There is no `subprocess` or `socket`: sandboxed Python cannot spawn processes or open
-sockets, and filesystem access goes through the host tools (and, for embedded use, an explicit
-mount) — never through `open()` on arbitrary host paths.
+Anything else — `time`, `random`, `subprocess`, `socket`, `hashlib`, `requests`, `numpy` and the
+rest — is refused by Monty's type checker as an unresolved import, before any code runs. There is
+no `subprocess` or `socket`: sandboxed Python cannot spawn processes or open sockets, and
+filesystem access goes through the host tools (and, for embedded use, an explicit mount) — never
+through `open()` on arbitrary host paths.
 
 **Language limits.** A few Python features raise `NotImplementedError` instead of running:
 
@@ -27,6 +27,13 @@ mount) — never through `open()` on arbitrary host paths.
 - **`match` statements** — pattern matching is not implemented.
 - **class inheritance and metaclasses** — a plain `class` with methods and `__init__` works, but
   `class B(A)` raises `NotImplementedError`.
+
+**Returned values.** The value a snippet ends on crosses to the host as data, with two limits on
+Monty 0.0.23. Nesting is capped: a list 48 levels deep and a class instance 24 deep are fine, and
+one level more fails the whole run with `RuntimeError: Max output depth exceeded`, after its side
+effects. An instance also crosses without its methods, so `output` shows `<C object>` or `P(x=1)`
+even when the class defines `__repr__`; end the snippet on `repr(obj)` to see that. See
+[docs/truncation-policy.md](docs/truncation-policy.md).
 
 ## Tools
 
@@ -258,9 +265,10 @@ copy alongside the one pi already owns. It stays in `devDependencies` so local d
 and factories match the host's, exactly as upstream pi-code-tool does.
 
 Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
-`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. 0.0.21
-also ships a wasm runtime at `@pydantic/monty/wasm` that looks like a way around this and is not:
-it runs Python in-process, so a runaway blocks the event loop and there is no crash isolation. See
+`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. The
+pinned 0.0.23 also ships a wasm runtime at `@pydantic/monty/wasm`, which now loads with no extra
+install and looks like a way around this. It is not: it runs Python in-process, so a runaway
+blocks the event loop and there is no crash isolation. See
 [docs/platform-support.md](docs/platform-support.md).
 
 ## Dev
@@ -297,9 +305,9 @@ A rename would orphan the `coverage-baseline.json` keys, reopen the package `fil
 touch the pinned `scriptName` default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) that the
 diagnostic line-number regex reads; the map is what makes the names harmless.
 
-Nine environment variables tune the sandbox, all read at call time.
+Ten environment variables tune the sandbox, all read at call time.
 
-Three are the default resource limits every run gets. A caller who passes no `limits` gets these,
+Four are the default resource limits every run gets. A caller who passes no `limits` gets these,
 not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
 anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
 which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
@@ -309,9 +317,10 @@ lasts.
 |---|---|---|
 | `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
 | `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
+| `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
 | `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included. The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
 
-The last of those is the fail-safe the other two cannot be. Monty's clock is polled inside the
+The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
 worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
 otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
 `createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails
@@ -344,7 +353,7 @@ exhausted pool hangs with no error and no log rather than failing.
 
 | variable | default | effect |
 |---|---|---|
-| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~8.5 MB each), not by core count. |
+| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~9 MB each idle, ~16 MB once it has type-checked a run), not by core count. |
 | `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
 
 ### The worker pool
@@ -463,18 +472,25 @@ Four things worth knowing before relying on it:
   execute every line of it. The floor still catches a *regression* in `truncate.ts`, which is its job;
   it will not notice its test file leaving. Nothing here substitutes for
   [#24](https://github.com/AdarGit008/repl-simple/issues/24).
-- **Two files' coverage varies between identical runs**, so `coverage:update` alone can write a floor
-  that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts` reports
-  99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in `truncate.ts` is
-  `truncateText`'s declaration, and the lcov record shows it is the *instrument* that varies, not the
-  suite — in the low run the function's body carries a hit count of 380 while its declaration line
-  reads 0:
+- **Three files' coverage varies between identical runs**, so `coverage:update` alone can write a
+  floor that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts`
+  reports 99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in
+  `truncate.ts` is `truncateText`'s declaration, and the lcov record shows it is the *instrument*
+  that varies, not the suite — in the low run the function's body carries a hit count of 380 while
+  its declaration line reads 0:
 
   ```
   DA:384,0      export function truncateText(     ← the declaration
   DA:385,380      text: string,
   DA:388,380      const t = new Truncator(opts);  ← the body, 380 executions
   ```
+
+  The third file is `src/preamble.ts`, and it is the same artefact: in the low run
+  `getReplPreamble`'s declaration reads 0 while the function is recorded as called twice
+  (`FNDA:2`) and its body line twice. `truncate.ts` shows it on `formatValue`'s declaration too
+  (0 against `FNDA:1299`). Measured 2026-09-10 with the gate's own invocation on this tree and on
+  `origin/main` at Monty 0.0.21 alike, so neither is a regression; one gate run that day read both
+  files at 100.00%, three read 97.05% and 99.88%.
 
   A function cannot run its body 380 times without being called. Nothing about test execution
   differed between the runs; V8's per-function range count is lost when coverage from several test

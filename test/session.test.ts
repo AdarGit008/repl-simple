@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { Session } from "../src/session.js";
+import { limitsConfig } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
@@ -850,6 +851,65 @@ describe("Session — a resumed run honours the suspended run's limits (#177)", 
     const result = await session.resume({ onApproval: () => true });
     err(result);
     assert.equal(result.errorKind, "memory");
+  });
+
+  // `maxSuspensions` (Monty 0.0.23) travels in the snapshot like the memory
+  // ceiling does, but only as a ceiling: the restored feed is held to the lower
+  // of the dump's value and the resuming checkout's, counting afresh from the
+  // restore with the pending call as one. So below, the gate is suspension 1
+  // of the resume, `tick("0")` 2, `tick("1")` 3, and `tick("2")` is refused.
+  const suspensionCode = 'gated_limits("x")\nfor i in range(4):\n    tick(str(i))';
+  const tick: HostTool = {
+    name: "tick",
+    description: "Counts",
+    params: [{ name: "i", type: "str", description: "Index" }],
+    returns: "str",
+    execute: (args) => String(args.i),
+  };
+
+  /** A session suspended at the gate under `maxSuspensions: 3`. */
+  async function suspendedUnderThree(): Promise<{ session: Session; registry: ToolRegistry }> {
+    const registry = new ToolRegistry([gatedTool, tick]);
+    const session = new Session({ registry });
+    suspended(
+      await session.run(suspensionCode, {
+        onApproval: () => "suspend",
+        limits: { maxSuspensions: 3 },
+      }),
+    );
+    return { session, registry };
+  }
+
+  function assertStoppedAtThree(result: unknown): void {
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /suspension limit 3 exceeded/);
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.args]),
+      [
+        ["gated_limits", ["x"]],
+        ["tick", ["0"]],
+        ["tick", ["1"]],
+      ],
+    );
+  }
+
+  it("resumed run honours the suspended maxSuspensions, counting afresh from the resume", async () => {
+    const { session } = await suspendedUnderThree();
+    assertStoppedAtThree(await session.resume({ onApproval: () => true }));
+  });
+
+  it("a resume caller's larger maxSuspensions cannot lift the snapshot's", async () => {
+    const { session } = await suspendedUnderThree();
+    assertStoppedAtThree(
+      await session.resume({ onApproval: () => true, limits: { maxSuspensions: 1000 } }),
+    );
+  });
+
+  it("the suspended maxSuspensions survives dump()/load(), which carries no limits", async () => {
+    const { session, registry } = await suspendedUnderThree();
+    const restored = Session.load(session.dump(), { registry });
+    assertStoppedAtThree(await restored.resume({ onApproval: () => true }));
   });
 });
 
@@ -2228,9 +2288,10 @@ describe("Session — stdout is this call's, not the transcript's (#61)", () => 
 
   it("a prefix ending in a partial line is cut at the mark, not at a callback (bytes, not entries)", async () => {
     // Run 1 prints `x` with no newline: one callback, flushed at the end of
-    // the run. On replay that `x` merges with run 2's `y\n` into a single
-    // callback `xy\n`. Skipping a callback would lose `y`; skipping one byte
-    // keeps it.
+    // the run. On replay that `x` can reach the callback in the same chunk as
+    // run 2's `y\n` — here it does whenever both fall inside one flush
+    // interval (0.0.23), and it always did on 0.0.21. Skipping a callback
+    // would lose `y`; skipping one byte keeps it.
     const session = new Session({ registry: new ToolRegistry() });
     const first = await session.run('print("x", end="")');
     ok(first);
@@ -2256,6 +2317,44 @@ describe("Session — stdout is this call's, not the transcript's (#61)", () => 
     const result = await s2.run('print("beta")');
     ok(result);
     assert.equal(result.stdout, "beta\n");
+  });
+
+  it("a replayed burst batched together with this call's output is cut at the mark (Monty 0.0.23)", async () => {
+    // 0.0.23 batches print output in the worker, and nothing separates a
+    // replayed prefix from this call's first print but the flush interval —
+    // so run 2's replay of run 1's burst and run 2's own line can reach the
+    // callback as one chunk, with the mark inside it. Run 3 puts host calls
+    // (one of them a partial-line flush) between replayed and new output; run
+    // 4 replays all of it.
+    const session = new Session({ registry: new ToolRegistry([makeEchoTool()]) });
+    const burst = Array.from({ length: 200 }, (_, i) => `old ${i}\n`).join("");
+
+    const first = await session.run('for i in range(200):\n    print("old", i)');
+    ok(first);
+    assert.equal(first.stdout, burst);
+
+    const streamed: string[] = [];
+    const second = await session.run('print("new")', { onPrint: (text) => streamed.push(text) });
+    ok(second);
+    assert.equal(second.stdout, "new\n");
+    assert.deepEqual(streamed, ["new\n"], "the replayed burst reached the live stream");
+
+    const third = await session.run(
+      'echo("x")\nprint("partial", end="")\necho("y")\nprint("after")',
+    );
+    ok(third);
+    assert.equal(third.stdout, "partialafter\n");
+    assert.deepEqual(
+      third.calls.map((c) => [c.args, c.stdoutOffset]),
+      [
+        [["x"], 0],
+        [["y"], 7],
+      ],
+    );
+
+    const fourth = await session.run('print("last")');
+    ok(fourth);
+    assert.equal(fourth.stdout, "last\n");
   });
 });
 
@@ -2503,6 +2602,27 @@ describe("Session — cache and replay semantics recovered (#62 A14–A17)", () 
     assert.equal(dump.callCache.length, MAX_CACHE_ENTRIES);
   });
 
+  it("A17 — the sandbox's suspension budget sits well above the cache a replay re-issues", () => {
+    // A replayed call is served from the cache but still crosses the host, so
+    // on Monty 0.0.23 it spends one of the run's `maxSuspensions` exactly as a
+    // real call does. A run can replay a full cache and then make as many
+    // suspensions again that the cache never holds — denied gated calls,
+    // mounted-file reads — so the shipped budget is pinned at twice the cap at
+    // least. The previous test is the behavioural half: 1023 replayed entries
+    // plus two calls, which Monty's own default of 1000 refused.
+    const prior = process.env.REPL_MAX_SUSPENSIONS;
+    delete process.env.REPL_MAX_SUSPENSIONS;
+    try {
+      const { maxSuspensions } = limitsConfig();
+      assert.ok(
+        maxSuspensions >= 2 * MAX_CACHE_ENTRIES,
+        `shipped maxSuspensions ${maxSuspensions} is under twice MAX_CACHE_ENTRIES`,
+      );
+    } finally {
+      if (prior !== undefined) process.env.REPL_MAX_SUSPENSIONS = prior;
+    }
+  });
+
   it("A17 — load() refuses a dump beyond either cap", () => {
     const registry = new ToolRegistry([makeEchoTool()]);
     assert.throws(
@@ -2514,6 +2634,56 @@ describe("Session — cache and replay semantics recovered (#62 A14–A17)", () 
       new RegExp(`Invalid session dump: .*callCache.*${MAX_CACHE_ENTRIES}`),
     );
   });
+});
+
+// ── A class instance as a tool argument, across replays (Monty 0.0.23) ──
+//
+// The cache key is the tool name plus the JSON of its arguments. On 0.0.23 an
+// instance argument was a proxy whose JSON carried a fresh uuid on every run,
+// so no replay ever matched: the call re-executed on every later `run()`, a
+// new cache entry piled up each time, and a gated call asked again each time
+// with the proxy's JSON as its description (measured by review: 3 executions,
+// 3 keys, 3 prompts over 3 runs; 0.0.21: 1, 1, 1).
+
+describe("Session — a class instance passed to a tool keeps the replay cache and the gate stable (0.0.23)", () => {
+  const code =
+    "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\ndef g(v):\n    return act(v)\nz = g(P(1))\nz";
+
+  for (const gated of [false, true]) {
+    it(`${gated ? "a gated" : "an ungated"} call executes once across replays, under one cache key${gated ? ", asking once" : ""}`, async () => {
+      let executions = 0;
+      const act: HostTool = {
+        name: "act",
+        description: "A side effect",
+        params: [{ name: "text", type: "str", description: "Text" }],
+        returns: "str",
+        requiresApproval: gated,
+        execute: () => `r${++executions}`,
+      };
+      const asked: string[] = [];
+      const onApproval = (request: ApprovalRequest) => {
+        asked.push(request.description);
+        return true;
+      };
+      const session = new Session({ registry: new ToolRegistry([act]) });
+
+      const first = await session.run(code, { onApproval });
+      ok(first);
+      assert.equal(first.output, "r1");
+      for (let i = 0; i < 2; i++) {
+        const again = await session.run("z", { onApproval });
+        ok(again);
+        assert.equal(again.output, "r1", "a replay was not served from the cache");
+      }
+      assert.equal(executions, 1, "the replay re-executed the call");
+      const dump = JSON.parse(session.dump());
+      assert.deepEqual(
+        dump.callCache.map((entry: { key: string }) => entry.key),
+        ['act::{"text":"P(x=1)"}'],
+      );
+      assert.deepEqual(asked, gated ? ['act(text="P(x=1)")'] : []);
+    });
+  }
 });
 
 // ── Persistence hardening (#63) ───────────────────────────────────

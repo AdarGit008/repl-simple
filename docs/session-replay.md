@@ -36,21 +36,26 @@ a callback that straddles the mark. Consequences, all pinned:
 - A call that suspends and resumes reports its whole output once; the next call none of it.
 - `reset()` resets the mark.
 
-**Why a byte mark and not a callback count.** Measured on 0.0.21 (`test/sandbox.test.ts`, the
-tripwire block): the print callback fires once per `print`, *except* that a partial line
-(`end=""`) is held until the next newline-terminated print, a host-call boundary, or the end of the
-run, and a single large print arrives in 8 KiB chunks. So a prefix that ended in a partial line
-merges with the next call's first print into one callback on replay; a callback count would swallow
-that line, a byte count cuts it exactly. The mark is also indifferent to chunking. The tripwire pins
-the shape; if an upstream bump changes it, that test fails before a session quietly swallows or
-re-emits a line.
+**Why a byte mark and not a callback count.** Measured on 0.0.23 (`test/sandbox.test.ts`, the
+tripwire and print-batching blocks): the worker holds `print()` output for up to 5 ms
+(`printFlushInterval`, pydantic/monty#809) and hands the callback whatever accumulated — a thousand
+prints in a tight loop arrive as one callback, and a partial line (`end=""`) arrives on its own once
+the interval lapses. It always flushes before a host call and by the end of the run, and a single
+large print still arrives in 8 KiB chunks. So whether a replayed prefix's last bytes share a
+callback with this call's first print is timing: a callback count would swallow or re-emit lines
+depending on it, while a byte count cuts at the same byte however the stream is chunked. (0.0.21
+called back once per `print` and held a partial until the next newline; the mark was made bytes
+then, for the partial-line case, and batching is why it still has to be.) The sandbox keeps
+upstream's batching rather than pinning `printFlushInterval: 0`; the reasoning is at
+`makePrintCallback`. The tripwire pins the shape; if an upstream bump changes it, that test fails
+before a session quietly swallows or re-emits a line.
 
 **Determinism.** The mark taken from the original run describes the replay only if the replay prints
 the same bytes. It does, because the replay runs the same code with the same cached tool results and
-crosses the same host boundaries (a cached call still crosses the host, so a partial line flushes at
-the same point — measured across a gate in the original call and in the replay). Code that prints
-non-deterministically without a tool call is the exception, and it would break a callback count
-just the same.
+crosses the same host boundaries (a cached call still crosses the host, so buffered output is
+flushed there in both — measured across a gate in the original call and in the replay). Code that
+prints non-deterministically without a tool call is the exception, and it would break a callback
+count just the same.
 
 `calls` is likewise this call's on **every** outcome — success, error, and suspension (and so the
 resumed call's) — not the replayed prior calls (A16 below).
@@ -58,6 +63,10 @@ resumed call's) — not the replayed prior calls (A16 below).
 ## The call cache, and what a replay is
 
 Every host-tool call a retained snippet made is in an ordered list, keyed on `tool::{sorted args}`.
+The arguments are the ones the tool received, and a class instance in them has already become its
+repr string (`<C object>`, `P(x=1)`; `instancesAsRepr`). Monty 0.0.23 hands an instance over as a
+proxy with a fresh uuid per run, which gave the same call a new key on every replay: it executed
+again and a gated one asked again (pinned in `test/session.test.ts`).
 A replay serves them **positionally**: the cursor advances only on a key match, and a mismatch (the
 code changed between runs) falls through to real execution from that point. `docs/approval-grants.md`
 explains why the approval gate treats "the next entry the cursor will serve" — and only that — as a
@@ -96,7 +105,10 @@ starvation is #61's fix. The caps (D126): **256 snippets** — `run()` refuses b
 inside the caching registry *before* the tool executes, so the call that would exceed the cap
 raises a Python `RuntimeError` naming the limit, no side effect happens, the run fails `runtime`,
 nothing is appended, and a replay meets the same refusal at the same position. `reset()` is the way
-out of either. `load()` refuses a dump beyond either cap.
+out of either. `load()` refuses a dump beyond either cap. A replayed call is served from the cache
+but still crosses the host, so on Monty 0.0.23 it spends one of the run's `maxSuspensions` like a
+real call; the sandbox's default (`REPL_MAX_SUSPENSIONS`, 10 000) is pinned at twice the cache cap
+at least, because Monty's own 1000 refused a full cache before this cap could.
 
 ## Failure, in one table
 

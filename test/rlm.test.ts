@@ -2730,7 +2730,9 @@ describe("runRlm() — a crashed sandbox", () => {
     // and the model is told nothing at all, then retries against state that no
     // longer exists.
     const { llm } = mockLlmCodeGen([
-      "```python\nx = 10 ** 100000000\n1\n```",
+      // Sized to outlast the watchdog's kill on fast runners — see
+      // UNCHECKPOINTED_RUNAWAY in test/sandbox.test.ts for the measurements.
+      "```python\nx = 10 ** 200000000\n1\n```",
       '```python\nSUBMIT("recovered")\n```',
     ]);
     const result = await runRlm("q", {
@@ -2759,8 +2761,14 @@ describe("runRlm() — a run that hit a limit", () => {
   // defect that is not there will rewrite the wrong thing.
   const CASES = [
     {
+      // 200,000,000, not 50,000,000: the loop must outrun the 0.3 s budget on
+      // any runner. 50M took ~4.6 s on a Linux x64 dev box on 0.0.23, which a
+      // machine 20x faster finishes in ~230 ms — under budget, so the case
+      // would come back `ok` (the failure mode CI hit in test/sandbox.test.ts,
+      // PR #218). 200M is ~0.94 s even there, and bounded, so a broken limit
+      // still fails as an assertion rather than hanging.
       name: "duration",
-      code: "total = 0\nfor i in range(50000000):\n    total += i\ntotal",
+      code: "total = 0\nfor i in range(200000000):\n    total += i\ntotal",
       limits: { maxDurationSecs: 0.3 },
       kind: "timeout",
       advice: /out of time/,

@@ -14,6 +14,12 @@ export interface HostTool {
   description: string;
   params: HostToolParam[];
   returns: "str" | "void";
+  /**
+   * Runs the call. A class instance anywhere in an argument arrives as its
+   * repr string (`<C object>`, `P(x=1)`), never as Monty's proxy object — the
+   * sandbox normalises arguments before any tool, cache key, approval request
+   * or trace sees them (`instancesAsRepr`, src/truncate.ts).
+   */
   execute(args: Record<string, unknown>): string | Promise<string>;
   requiresApproval?: boolean;
   /**
@@ -71,6 +77,15 @@ export type ApprovalDecision = boolean | "suspend";
  * opposite — that suspension resets the sandbox clock — which was 0.0.18's
  * behaviour and was measured false on 0.0.21 (#38, #84).
  *
+ * **`maxSuspensions` counts crossings, not time** (Monty 0.0.23). Every
+ * host-tool call — a call a `Session` serves from its replay cache included —
+ * name lookup and OS call is one; past the budget the feed is aborted with a
+ * `RuntimeError` Python cannot catch. Across a suspension it is a ceiling that
+ * only tightens: the restored run is held to the lower of its own value and
+ * the resume's, and the count starts again at the restore (measured). The
+ * `repl` tool does not let the model set it, so a model-driven run gets the
+ * operator's `REPL_MAX_SUSPENSIONS` (see `limitsConfig()`).
+ *
  * **`maxAllocations` is deliberately absent.** Monty 0.0.18 accepted it and did
  * not enforce it — `{maxAllocations: 1000}` let a 500,000-iteration append loop
  * finish normally (measured) — and 0.0.21 removed it upstream. Exposing it would
@@ -87,6 +102,11 @@ export interface RunLimits {
   gcInterval?: number;
   /** Python recursion ceiling. Monty defaults to 1000; breach → `RecursionError`. */
   maxRecursionDepth?: number;
+  /**
+   * Host crossings per run segment. Breach → uncatchable `RuntimeError`,
+   * `errorKind: "runtime"`. Defaults from `limitsConfig()`, not Monty's 1000.
+   */
+  maxSuspensions?: number;
 }
 
 /**
@@ -181,9 +201,10 @@ export interface RunOptions {
  * could not resolve its arguments — and continuing after the carried entries
  * when a suspended run resumes. `stdoutOffset` is the byte of the run's own
  * `stdout` (after the replay mark, before truncation) at which the call was
- * dispatched: everything printed before the call lies below it, the partial
- * line Monty flushes at a host boundary included. A consumer that filters
- * entries out — replay filtering does — leaves gaps; the order is the point.
+ * dispatched: everything printed before the call lies below it, output Monty
+ * had buffered included — it flushes at every host boundary. A consumer that
+ * filters entries out — replay filtering does — leaves gaps; the order is the
+ * point.
  *
  * Both are optional in the type because a `Session` dump restores entries
  * through a validator that predates them, and they are deliberately *not*

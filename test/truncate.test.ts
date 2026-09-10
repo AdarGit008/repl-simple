@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { MontyClassProxy } from "@pydantic/monty/node";
 // The #69 repr is read off the namespace rather than named-imported so that
 // this file still *loads* against a `src/truncate.ts` without it: a missing
 // named export is a link error that fails every test here, not the ones about
@@ -552,6 +553,49 @@ describe("formatValue — bytes, containers, tagged records, the rest", () => {
     );
   });
 
+  it("a class instance (0.0.23's MontyClassProxy) as `<Name object>`, a dataclass as `Name(field=…)`", () => {
+    // 0.0.21 handed an instance over as Monty's own repr string
+    // (`<C object at 0x2>`, `P(x=1)`, measured). 0.0.23 hands over a
+    // `MontyClassProxy` — class name, a uuid, attributes, the class record — and
+    // the dict fallback below spelled all of it, uuids included (measured:
+    // `{'name': 'C', 'isDataclass': False, 'id': 'b226…', …}`).
+    const id = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    const plain = new MontyClassProxy({ name: "C", isDataclass: false }, id, [["x", 1]]);
+    const point = new MontyClassProxy({ name: "P", isDataclass: true }, id, [
+      ["x", 1],
+      ["y", "a"],
+    ]);
+    const empty = new MontyClassProxy({ name: "E", isDataclass: true }, id, []);
+    const nested = new MontyClassProxy({ name: "N", isDataclass: true }, id, [
+      ["p", point],
+      ["items", [1, "b"]],
+      ["m", new Map([["k", plain]])],
+    ]);
+
+    assert.equal(repr(plain), "<C object>");
+    assert.equal(repr(point), "P(x=1, y='a')");
+    assert.equal(repr(empty), "E()");
+    assert.equal(repr([plain, point]), "[<C object>, P(x=1, y='a')]");
+    assert.equal(repr(nested), "N(p=P(x=1, y='a'), items=[1, 'b'], m={'k': <C object>})");
+    for (const value of [plain, point, nested]) {
+      assert.doesNotMatch(repr(value), new RegExp(id), "the proxy's uuid reached the output");
+    }
+  });
+
+  it("a dataclass too large for the budget keeps both real ends", () => {
+    const id = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    const big = new MontyClassProxy({ name: "Big", isDataclass: true }, id, [
+      ["head", "h"],
+      ["body", "x".repeat(5000)],
+      ["tail", "t"],
+    ]);
+    const { text, truncated } = formatValue(big, valueOpts(200));
+    assert.equal(truncated, true);
+    assert.ok(bytes(text) <= 200, `${bytes(text)} bytes`);
+    assert.ok(text.startsWith("Big(head='h', body='xxx"), text);
+    assert.ok(text.endsWith("xxx', tail='t')"), text);
+  });
+
   it("an untagged plain object renders like a dict; a function or symbol by kind", () => {
     assert.equal(repr({ k: 1, s: "v" }), "{'k': 1, 's': 'v'}");
     assert.equal(
@@ -610,6 +654,73 @@ describe("pythonTypeName — the name a TypeError names", () => {
     for (const [value, name] of table) {
       assert.equal(pythonTypeName(value), name, `for ${String(name)}`);
     }
+  });
+
+  it("names a class instance by its class, as `must be str, not Point` would", () => {
+    const id = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    assert.equal(
+      pythonTypeName(new MontyClassProxy({ name: "Point", isDataclass: true }, id, [])),
+      "Point",
+    );
+    assert.equal(
+      pythonTypeName(new MontyClassProxy({ name: "C", isDataclass: false }, id, [])),
+      "C",
+    );
+  });
+});
+
+// ── instancesAsRepr — how a tool call's arguments are normalised (0.0.23) ──
+
+describe("instancesAsRepr — instances become their repr, every other shape is kept", () => {
+  const instancesAsRepr = (value: unknown): unknown =>
+    (truncate as unknown as { instancesAsRepr: (v: unknown) => unknown }).instancesAsRepr(value);
+  const id = "0f0e0d0c-0b0a-4908-8706-050403020100";
+
+  it("replaces an instance at any depth and keeps each container's kind", () => {
+    const c = new MontyClassProxy({ name: "C", isDataclass: false }, id, [["secret", "s"]]);
+    const p = new MontyClassProxy({ name: "P", isDataclass: true }, id, [
+      ["x", 1],
+      ["inner", c],
+    ]);
+    assert.equal(instancesAsRepr(c), "<C object>");
+    assert.equal(instancesAsRepr(p), "P(x=1, inner=<C object>)");
+
+    const kwargs = Object.assign(Object.create(null), {
+      a: c,
+      b: [p, new Set([c])],
+      m: new Map([[c, p]]),
+    });
+    const out = instancesAsRepr(kwargs) as Record<string, unknown>;
+    assert.equal(Object.getPrototypeOf(out), null, "a null-prototype record must stay one");
+    assert.equal(out.a, "<C object>");
+    assert.deepEqual(out.b, ["P(x=1, inner=<C object>)", new Set(["<C object>"])]);
+    assert.deepEqual(out.m, new Map([["<C object>", "P(x=1, inner=<C object>)"]]));
+  });
+
+  it("leaves every value that is not an instance as it was", () => {
+    const buf = Buffer.from("b");
+    assert.equal(instancesAsRepr(buf), buf);
+    const date = new Date(0);
+    assert.equal(instancesAsRepr(date), date);
+    for (const value of [null, undefined, 1, 10n, "s", true]) {
+      assert.equal(instancesAsRepr(value), value);
+    }
+    const exc = tagged("Exception", { excType: "ValueError", message: "m" });
+    assert.deepEqual(instancesAsRepr(exc), exc);
+    assert.deepEqual(instancesAsRepr([1, ["a", new Map([["k", 2]])]]), [
+      1,
+      ["a", new Map([["k", 2]])],
+    ]);
+  });
+
+  it("is uncapped: two instances differing only past any output budget stay distinct", () => {
+    const big = (tail: string) =>
+      new MontyClassProxy({ name: "B", isDataclass: true }, id, [
+        ["s", `${"x".repeat(100_000)}${tail}`],
+      ]);
+    const a = instancesAsRepr(big("a")) as string;
+    assert.notEqual(a, instancesAsRepr(big("b")), "a cache key would collide");
+    assert.ok(a.endsWith("a')"), a.slice(-20));
   });
 });
 

@@ -33,6 +33,7 @@ import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import {
   Truncator,
   formatValue,
+  instancesAsRepr,
   pythonTypeName,
   STDOUT_MAX_BYTES,
   STDOUT_MAX_LINES,
@@ -155,8 +156,9 @@ class DispatchAccumulators {
 
   /**
    * Trace a call. `stdoutOffset` is the accumulator's byte total right now:
-   * Monty flushes a partial line at a host boundary before the call reaches
-   * the loop (measured), so what was printed before the call is all in.
+   * Monty flushes whatever output it holds — a batched burst, a partial line
+   * — before the call reaches the loop (measured on 0.0.23, and pinned in the
+   * "print batching" tests), so what was printed before the call is all in.
    */
   record(entry: Omit<ToolCallTrace, "seq" | "stdoutOffset">): void {
     const call: ToolCallTrace = {
@@ -442,11 +444,23 @@ function crashMessage(err: MontyCrashedError): string {
  * earlier call, and this is where that output is dropped — before `onPrint`,
  * so the terminal is not shown it again, and before the accumulator, so the
  * budget is spent on this call's bytes alone. A callback that straddles the
- * mark is sliced at it rather than skipped whole: Monty holds a partial line
- * until the next newline or host boundary, so a prefix that ended in one
- * arrives merged with this call's first print (measured), and skipping the
- * callback would take this call's line with it. The mark is a byte count for
- * the same reason — it is indifferent to how the stream is chunked.
+ * mark is sliced at it rather than skipped whole: since 0.0.23 the worker
+ * batches print output for up to 5 ms, so a replayed prefix's last bytes can
+ * arrive in the same callback as this call's first print (on 0.0.21 a prefix
+ * ending in a partial line did the same), and skipping the callback would
+ * take this call's output with it. The mark is a byte count for the same
+ * reason — it is indifferent to how the stream is chunked.
+ *
+ * Batching is upstream's default (`CheckoutOptions.printFlushInterval`, 5 ms)
+ * and is kept rather than pinned to `0`, because nothing here reads the chunk
+ * shape: stdout, the replay mark and the trace's `stdoutOffset` need the bytes
+ * and need them to arrive before a host call and by the end of the feed, which
+ * Monty guarantees in either mode. The evidence, measured against the batched
+ * stream, is the "print batching" block in test/sandbox.test.ts (flush before
+ * a call and the offsets it stamps, a chunk straddling the stdout cap, abort
+ * mid-output) and the batched replay test in test/session.test.ts. What `0`
+ * would buy is one callback per line for the live `onPrint` stream, at up to
+ * 5 ms of lag saved — not worth a knob nothing needs.
  *
  * The callback's return value is ignored by Monty 0.0.21 (measured; pinned
  * in test/sandbox.test.ts). 0.0.18 threw `TypeError: Value is not undefined`
@@ -852,6 +866,31 @@ const DEFAULT_MAX_MEMORY_MB = 512;
  * second-guess a slow one. `bash("npm test")` is a legitimate five minutes.
  */
 const DEFAULT_MAX_WALL_CLOCK_SECS = 300;
+/**
+ * Host crossings per run segment: every host-tool call, name lookup and OS
+ * call the sandbox hands to the host counts one (measured on 0.0.23 and pinned
+ * in test/sandbox.test.ts: one per tool call, a replayed one included; one
+ * for `f = echo`; one per mounted `read_text()`). Monty 0.0.23 introduced the
+ * ceiling and fills an omitted one with 1000 — a default that fails *closed*,
+ * but no less silently for that. A `Session` re-issues every cached call inside the
+ * run that replays it, and its cache holds up to `MAX_CACHE_ENTRIES` (1024,
+ * src/session.ts), so the upstream default refused a session before the
+ * session's own cap could (measured: 1023 replayed calls plus one new).
+ *
+ * Roughly ten times that cap: a full replay still leaves room for as many
+ * uncached crossings again — denied gated calls, mounted-file reads — several
+ * times over. `test/session.test.ts` pins the default at twice the cap at
+ * least, so the two numbers cannot drift past each other unnoticed. This is
+ * not the bound on a host loop that runs too long; the wall clock is.
+ */
+const DEFAULT_MAX_SUSPENSIONS = 10_000;
+/**
+ * What `"unbounded"` passes for `maxSuspensions`. Omitting the field is not
+ * "no limit" on 0.0.23 — it is Monty's 1000 — so the opt-out has to name a
+ * count no run reaches. The largest integer a JS number holds exactly; Monty
+ * takes it as a u64 (measured: 2500 calls ran under it).
+ */
+const UNBOUNDED_SUSPENSIONS = Number.MAX_SAFE_INTEGER;
 
 /**
  * The limits as they would apply right now. Exists for the same reason
@@ -862,11 +901,13 @@ export function limitsConfig(): {
   maxDurationSecs: number;
   maxMemory: number;
   maxWallClockSecs: number;
+  maxSuspensions: number;
 } {
   return {
     maxDurationSecs: envInt("REPL_MAX_DURATION_SECS", DEFAULT_MAX_DURATION_SECS),
     maxMemory: envInt("REPL_MAX_MEMORY_MB", DEFAULT_MAX_MEMORY_MB) * 1_048_576,
     maxWallClockSecs: envInt("REPL_MAX_WALL_CLOCK_SECS", DEFAULT_MAX_WALL_CLOCK_SECS),
+    maxSuspensions: envInt("REPL_MAX_SUSPENSIONS", DEFAULT_MAX_SUSPENSIONS),
   };
 }
 
@@ -887,27 +928,34 @@ function envInt(name: string, fallback: number): number {
  * Convert our `RunLimits` to Monty's `ResourceLimits`, filling every unset knob
  * from `limitsConfig()`.
  *
- * Returns `undefined` — genuinely no limits — only for the explicit
- * `"unbounded"`. That is the whole point: the one path to an uncontained run is
- * one a caller had to type.
+ * Only the explicit `"unbounded"` gets no budget. That is the whole point: the
+ * one path to an uncontained run is one a caller had to type. It is no longer
+ * spelled `undefined`, because on 0.0.23 an omitted field is unlimited for
+ * every knob *except* `maxRecursionDepth` and `maxSuspensions`, which keep
+ * Monty's 1000 — so `"unbounded"` names a suspension count no run reaches.
+ * `maxRecursionDepth` keeps Monty's ceiling under `"unbounded"` exactly as it
+ * did on 0.0.21: it guards the interpreter's stack, it is not a budget.
  *
  * `maxWallClockSecs` is ours and is not passed on; Monty has no host-side
  * clock. `gcInterval` and `maxRecursionDepth` are passed through undefaulted,
  * so Monty's own defaults apply — they are tuning knobs, not containment, and
  * dropping a knob the caller set is the other half of the bug being fixed here.
+ * `maxSuspensions` is defaulted like the budgets are, for the reason at
+ * `DEFAULT_MAX_SUSPENSIONS`.
  *
  * Exported for the test that asserts the mapping field by field. `gcInterval`
  * has no observable effect to assert behaviourally, so a silent drop of it —
  * the exact defect being fixed — is catchable only here.
  */
-export function toResourceLimits(limits?: RunLimits | "unbounded"): ResourceLimits | undefined {
-  if (limits === "unbounded") return undefined;
+export function toResourceLimits(limits?: RunLimits | "unbounded"): ResourceLimits {
+  if (limits === "unbounded") return { maxSuspensions: UNBOUNDED_SUSPENSIONS };
   const defaults = limitsConfig();
   return {
     maxDurationSecs: limits?.maxDurationSecs ?? defaults.maxDurationSecs,
     maxMemory: limits?.maxMemory ?? defaults.maxMemory,
     gcInterval: limits?.gcInterval,
     maxRecursionDepth: limits?.maxRecursionDepth,
+    maxSuspensions: limits?.maxSuspensions ?? defaults.maxSuspensions,
   };
 }
 
@@ -1155,19 +1203,25 @@ async function runDispatchLoop(
       continue;
     }
 
+    // The call's arguments as everything below sees them: every class instance
+    // replaced by its repr string. On 0.0.23 an instance arrives as a proxy
+    // whose JSON holds a fresh uuid per run and every attribute, and the tool,
+    // the approval request, the trace and a `Session`'s cache key all read the
+    // arguments — so a replayed call missed its cache entry and ran again, a
+    // gated one asked again, and a plain instance's attributes were written to
+    // the trace. See `instancesAsRepr`.
+    const args = instancesAsRepr(snapshot.args) as unknown[];
+    const kwargs = instancesAsRepr(snapshot.kwargs) as Record<string, unknown>;
+
     // Resolve args from positional+keyword to flat Record
     let resolvedArgs: Record<string, unknown>;
     try {
-      resolvedArgs = resolveToolArgs(
-        tool,
-        snapshot.args as unknown[],
-        snapshot.kwargs as Record<string, unknown>,
-      );
+      resolvedArgs = resolveToolArgs(tool, args, kwargs);
     } catch (err) {
       acc.record({
         tool: tool.name,
-        args: snapshot.args as unknown[],
-        kwargs: snapshot.kwargs as Record<string, unknown>,
+        args: args,
+        kwargs: kwargs,
         durationMs: 0,
         ok: false,
         error: err instanceof Error ? err.message : String(err),
@@ -1188,11 +1242,7 @@ async function runDispatchLoop(
     // Approval gate
     let approved: boolean | undefined;
     if (tool.requiresApproval) {
-      const req = buildApprovalRequest(
-        tool,
-        snapshot.args as unknown[],
-        snapshot.kwargs as Record<string, unknown>,
-      );
+      const req = buildApprovalRequest(tool, args, kwargs);
       const decision = runOpts?.onApproval ? await runOpts.onApproval(req) : false;
 
       if (decision === "suspend") {
@@ -1210,8 +1260,8 @@ async function runDispatchLoop(
         // Denied (or no callback) → PermissionError in Python
         acc.record({
           tool: tool.name,
-          args: snapshot.args as unknown[],
-          kwargs: snapshot.kwargs as Record<string, unknown>,
+          args: args,
+          kwargs: kwargs,
           durationMs: 0,
           ok: false,
           approved: false,
@@ -1249,8 +1299,8 @@ async function runDispatchLoop(
       if (answer !== undefined) {
         acc.record({
           tool: tool.name,
-          args: snapshot.args as unknown[],
-          kwargs: snapshot.kwargs as Record<string, unknown>,
+          args: args,
+          kwargs: kwargs,
           durationMs,
           ok: true,
           approved,
@@ -1268,8 +1318,8 @@ async function runDispatchLoop(
       const { pythonType, message } = toolFailure(err);
       acc.record({
         tool: tool.name,
-        args: snapshot.args as unknown[],
-        kwargs: snapshot.kwargs as Record<string, unknown>,
+        args: args,
+        kwargs: kwargs,
         durationMs,
         ok: false,
         error: message,
@@ -1288,8 +1338,8 @@ async function runDispatchLoop(
     // same call a second time.
     acc.record({
       tool: tool.name,
-      args: snapshot.args as unknown[],
-      kwargs: snapshot.kwargs as Record<string, unknown>,
+      args: args,
+      kwargs: kwargs,
       durationMs: performance.now() - t0,
       ok: true,
       approved,
@@ -1469,9 +1519,13 @@ export async function resumeSuspended(
   // Not options of the load at all: `inputs` are globals in the snapshot; the
   // compute budget travels with it, limit and elapsed both (measured — the
   // checkout's `limits` below govern nothing the restored feed does except
-  // the host wall clock, which restarts per segment by decision), as does the
-  // memory ceiling (#177); `scriptName` named the feed for diagnostics a
-  // resume cannot raise.
+  // the host wall clock, which restarts per segment by decision, and
+  // `maxSuspensions`, below), as does the memory ceiling (#177); `scriptName`
+  // named the feed for diagnostics a resume cannot raise. `maxSuspensions`
+  // travels too, but only as a ceiling: the restored feed is held to the lower
+  // of the dump's value and the checkout's, and counts afresh from the restore
+  // with the pending call as one (measured on 0.0.23) — a resume can tighten
+  // the suspension budget and cannot lift it.
   const deadlineAt = hostDeadlineAt(runOpts?.limits);
 
   try {
