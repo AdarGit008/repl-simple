@@ -2740,7 +2740,9 @@ describe("ReplRunner — saved tools load only once approved", () => {
     const store = makeStore();
     saveToolFile(cwd, "adder", ADDER);
     try {
-      const out = await trustedRunner(cwd, store).run("add_two(1, 2)", "s1");
+      // No question at all: a trusted runner with no `approvePreamble`.
+      const runner = new ReplRunner(cwd, { isProjectTrusted: () => true, preambleStoreDir: store });
+      const out = await runner.run("add_two(1, 2)", "s1");
       assert.match(out, /used when not defined/, "an unapproved saved tool ran");
       assert.match(out, /not yet approved/, out);
       assert.match(out, /adder/, "the notice must name what was withheld");
