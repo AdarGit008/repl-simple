@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { Session } from "../src/session.js";
+import { limitsConfig } from "../src/sandbox.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
@@ -2501,6 +2502,27 @@ describe("Session — cache and replay semantics recovered (#62 A14–A17)", () 
     const dump = JSON.parse(session.dump());
     assert.equal(dump.snippets.length, 2, "the refused snippet was appended");
     assert.equal(dump.callCache.length, MAX_CACHE_ENTRIES);
+  });
+
+  it("A17 — the sandbox's suspension budget sits well above the cache a replay re-issues", () => {
+    // A replayed call is served from the cache but still crosses the host, so
+    // on Monty 0.0.23 it spends one of the run's `maxSuspensions` exactly as a
+    // real call does. A run can replay a full cache and then make as many
+    // suspensions again that the cache never holds — denied gated calls,
+    // mounted-file reads — so the shipped budget is pinned at twice the cap at
+    // least. The previous test is the behavioural half: 1023 replayed entries
+    // plus two calls, which Monty's own default of 1000 refused.
+    const prior = process.env.REPL_MAX_SUSPENSIONS;
+    delete process.env.REPL_MAX_SUSPENSIONS;
+    try {
+      const { maxSuspensions } = limitsConfig();
+      assert.ok(
+        maxSuspensions >= 2 * MAX_CACHE_ENTRIES,
+        `shipped maxSuspensions ${maxSuspensions} is under twice MAX_CACHE_ENTRIES`,
+      );
+    } finally {
+      if (prior !== undefined) process.env.REPL_MAX_SUSPENSIONS = prior;
+    }
   });
 
   it("A17 — load() refuses a dump beyond either cap", () => {

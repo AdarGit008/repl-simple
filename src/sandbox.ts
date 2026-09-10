@@ -852,6 +852,30 @@ const DEFAULT_MAX_MEMORY_MB = 512;
  * second-guess a slow one. `bash("npm test")` is a legitimate five minutes.
  */
 const DEFAULT_MAX_WALL_CLOCK_SECS = 300;
+/**
+ * Host crossings per run segment: every host-tool call, name lookup and OS
+ * call the sandbox hands to the host counts one (measured on 0.0.23: one per
+ * tool call, a replayed one included). Monty 0.0.23 introduced the ceiling
+ * and fills an omitted one with 1000 — a default that fails *closed*, but no
+ * less silently for that. A `Session` re-issues every cached call inside the
+ * run that replays it, and its cache holds up to `MAX_CACHE_ENTRIES` (1024,
+ * src/session.ts), so the upstream default refused a session before the
+ * session's own cap could (measured: 1023 replayed calls plus one new).
+ *
+ * Roughly ten times that cap: a full replay still leaves room for as many
+ * uncached crossings again — denied gated calls, mounted-file reads — several
+ * times over. `test/session.test.ts` pins the default at twice the cap at
+ * least, so the two numbers cannot drift past each other unnoticed. This is
+ * not the bound on a host loop that runs too long; the wall clock is.
+ */
+const DEFAULT_MAX_SUSPENSIONS = 10_000;
+/**
+ * What `"unbounded"` passes for `maxSuspensions`. Omitting the field is not
+ * "no limit" on 0.0.23 — it is Monty's 1000 — so the opt-out has to name a
+ * count no run reaches. The largest integer a JS number holds exactly; Monty
+ * takes it as a u64 (measured: 2500 calls ran under it).
+ */
+const UNBOUNDED_SUSPENSIONS = Number.MAX_SAFE_INTEGER;
 
 /**
  * The limits as they would apply right now. Exists for the same reason
@@ -862,11 +886,13 @@ export function limitsConfig(): {
   maxDurationSecs: number;
   maxMemory: number;
   maxWallClockSecs: number;
+  maxSuspensions: number;
 } {
   return {
     maxDurationSecs: envInt("REPL_MAX_DURATION_SECS", DEFAULT_MAX_DURATION_SECS),
     maxMemory: envInt("REPL_MAX_MEMORY_MB", DEFAULT_MAX_MEMORY_MB) * 1_048_576,
     maxWallClockSecs: envInt("REPL_MAX_WALL_CLOCK_SECS", DEFAULT_MAX_WALL_CLOCK_SECS),
+    maxSuspensions: envInt("REPL_MAX_SUSPENSIONS", DEFAULT_MAX_SUSPENSIONS),
   };
 }
 
@@ -887,27 +913,34 @@ function envInt(name: string, fallback: number): number {
  * Convert our `RunLimits` to Monty's `ResourceLimits`, filling every unset knob
  * from `limitsConfig()`.
  *
- * Returns `undefined` — genuinely no limits — only for the explicit
- * `"unbounded"`. That is the whole point: the one path to an uncontained run is
- * one a caller had to type.
+ * Only the explicit `"unbounded"` gets no budget. That is the whole point: the
+ * one path to an uncontained run is one a caller had to type. It is no longer
+ * spelled `undefined`, because on 0.0.23 an omitted field is unlimited for
+ * every knob *except* `maxRecursionDepth` and `maxSuspensions`, which keep
+ * Monty's 1000 — so `"unbounded"` names a suspension count no run reaches.
+ * `maxRecursionDepth` keeps Monty's ceiling under `"unbounded"` exactly as it
+ * did on 0.0.21: it guards the interpreter's stack, it is not a budget.
  *
  * `maxWallClockSecs` is ours and is not passed on; Monty has no host-side
  * clock. `gcInterval` and `maxRecursionDepth` are passed through undefaulted,
  * so Monty's own defaults apply — they are tuning knobs, not containment, and
  * dropping a knob the caller set is the other half of the bug being fixed here.
+ * `maxSuspensions` is defaulted like the budgets are, for the reason at
+ * `DEFAULT_MAX_SUSPENSIONS`.
  *
  * Exported for the test that asserts the mapping field by field. `gcInterval`
  * has no observable effect to assert behaviourally, so a silent drop of it —
  * the exact defect being fixed — is catchable only here.
  */
-export function toResourceLimits(limits?: RunLimits | "unbounded"): ResourceLimits | undefined {
-  if (limits === "unbounded") return undefined;
+export function toResourceLimits(limits?: RunLimits | "unbounded"): ResourceLimits {
+  if (limits === "unbounded") return { maxSuspensions: UNBOUNDED_SUSPENSIONS };
   const defaults = limitsConfig();
   return {
     maxDurationSecs: limits?.maxDurationSecs ?? defaults.maxDurationSecs,
     maxMemory: limits?.maxMemory ?? defaults.maxMemory,
     gcInterval: limits?.gcInterval,
     maxRecursionDepth: limits?.maxRecursionDepth,
+    maxSuspensions: limits?.maxSuspensions ?? defaults.maxSuspensions,
   };
 }
 
@@ -1469,9 +1502,13 @@ export async function resumeSuspended(
   // Not options of the load at all: `inputs` are globals in the snapshot; the
   // compute budget travels with it, limit and elapsed both (measured — the
   // checkout's `limits` below govern nothing the restored feed does except
-  // the host wall clock, which restarts per segment by decision), as does the
-  // memory ceiling (#177); `scriptName` named the feed for diagnostics a
-  // resume cannot raise.
+  // the host wall clock, which restarts per segment by decision, and
+  // `maxSuspensions`, below), as does the memory ceiling (#177); `scriptName`
+  // named the feed for diagnostics a resume cannot raise. `maxSuspensions`
+  // travels too, but only as a ceiling: the restored feed is held to the lower
+  // of the dump's value and the checkout's, and counts afresh from the restore
+  // with the pending call as one (measured on 0.0.23) — a resume can tighten
+  // the suspension budget and cannot lift it.
   const deadlineAt = hostDeadlineAt(runOpts?.limits);
 
   try {

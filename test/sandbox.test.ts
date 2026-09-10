@@ -2471,8 +2471,15 @@ describe("the shipped resource limits", () => {
         maxMemory: 7 * 1_048_576,
         gcInterval: 500,
         maxRecursionDepth: 64,
+        maxSuspensions: 11,
       }),
-      { maxDurationSecs: 3, maxMemory: 7 * 1_048_576, gcInterval: 500, maxRecursionDepth: 64 },
+      {
+        maxDurationSecs: 3,
+        maxMemory: 7 * 1_048_576,
+        gcInterval: 500,
+        maxRecursionDepth: 64,
+        maxSuspensions: 11,
+      },
     );
 
     // Unset knobs take the default; `maxWallClockSecs` is the host's and is not
@@ -2483,10 +2490,13 @@ describe("the shipped resource limits", () => {
       maxMemory: defaults.maxMemory,
       gcInterval: undefined,
       maxRecursionDepth: undefined,
+      maxSuspensions: defaults.maxSuspensions,
     });
 
-    // The one path to no limits at all, and it has to be typed.
-    assert.equal(toResourceLimits("unbounded"), undefined);
+    // The one path to no limits at all, and it has to be typed. Not
+    // `undefined` any more: on 0.0.23 an omitted `maxSuspensions` is a
+    // 1000-call ceiling, so "no limits" has to name a count no run reaches.
+    assert.deepEqual(toResourceLimits("unbounded"), { maxSuspensions: Number.MAX_SAFE_INTEGER });
     assert.notEqual(toResourceLimits(undefined), undefined);
   });
 
@@ -2514,6 +2524,124 @@ describe("the shipped resource limits", () => {
 
     const unbounded = await runInSandbox(recurse, { registry });
     ok(unbounded, "100 frames is well inside Monty's default of 1000");
+  });
+
+  // ── The suspension budget (Monty 0.0.23 `maxSuspensions`) ──
+  //
+  // 0.0.23 counts every time a checkout hands control to the host — each
+  // host-tool call is one (measured) — and aborts the feed past
+  // `maxSuspensions`, which defaults to 1000 when the field is omitted.
+  // Omitted is what this repository passed, so a plain loop of 1001 `echo`
+  // calls, and a `Session` replaying a full call cache, started failing on
+  // the bump with `RuntimeError: suspension limit 1000 exceeded`.
+
+  /** An echo that counts what actually executed: the budget is about calls. */
+  function countingEcho(): { registry: ToolRegistry; executions: () => number } {
+    let executions = 0;
+    const tool = makeTool({
+      execute: (args) => {
+        executions++;
+        return String(args.text);
+      },
+    });
+    return { registry: new ToolRegistry([tool]), executions: () => executions };
+  }
+
+  /** `n` sequential `echo` calls in a loop. */
+  const echoLoop = (n: number) => `for i in range(${n}):\n    echo(str(i))\nlen("done")`;
+
+  it("suspensions: a run making more than 1000 host-tool calls completes on the default budget", async () => {
+    const prior = process.env.REPL_MAX_SUSPENSIONS;
+    delete process.env.REPL_MAX_SUSPENSIONS;
+    try {
+      const { registry: echoes, executions } = countingEcho();
+      const result = await runInSandbox(echoLoop(1500), { registry: echoes });
+      ok(result, `expected ok, got ${JSON.stringify((result as RunError).error)}`);
+      assert.equal(result.calls.length, 1500);
+      assert.equal(executions(), 1500);
+    } finally {
+      if (prior !== undefined) process.env.REPL_MAX_SUSPENSIONS = prior;
+    }
+  });
+
+  it("suspensions: a caller's maxSuspensions is enforced — uncatchable, `runtime`, the trace stops at the budget", async () => {
+    const { registry: echoes, executions } = countingEcho();
+    const result = await runInSandbox(
+      `try:\n    for i in range(10):\n        echo(str(i))\nexcept BaseException:\n    pass\nlen("swallowed")`,
+      { registry: echoes },
+      { limits: { maxSuspensions: 5 } },
+    );
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /suspension limit 5 exceeded/);
+    assert.equal(executions(), 5, "a call past the budget reached the host");
+    assert.equal(result.calls.length, 5);
+  });
+
+  it("suspensions: REPL_MAX_SUSPENSIONS is read at call time, rejecting values that are not positive", async () => {
+    const shipped = limitsConfig().maxSuspensions;
+    assert.ok(Number.isSafeInteger(shipped) && shipped > 0, `shipped ${shipped}`);
+    await withEnv({ REPL_MAX_SUSPENSIONS: "7" }, async () => {
+      assert.equal(limitsConfig().maxSuspensions, 7);
+      assert.equal(toResourceLimits(undefined).maxSuspensions, 7);
+    });
+    for (const bad of ["0", "-1", "not-a-number", ""]) {
+      await withEnv({ REPL_MAX_SUSPENSIONS: bad }, async () => {
+        assert.equal(
+          limitsConfig().maxSuspensions,
+          shipped,
+          `'${bad}' should not become the suspension budget — 0 permits no host call at all`,
+        );
+      });
+    }
+  });
+
+  it("suspensions: limits 'unbounded' does not leave Monty's 1000 default in force", async () => {
+    // Paired like the memory test: the same environment enforces on the
+    // default path, so the only difference is the opt-out itself.
+    await withEnv({ REPL_MAX_SUSPENSIONS: "5" }, async () => {
+      const bounded = await runInSandbox(echoLoop(10), countingEcho());
+      err(bounded);
+      assert.match(bounded.error, /suspension limit 5 exceeded/, "the env default must enforce");
+
+      const { registry: echoes, executions } = countingEcho();
+      const unbounded = await runInSandbox(
+        echoLoop(1500),
+        { registry: echoes },
+        { limits: "unbounded" },
+      );
+      ok(unbounded, `expected ok, got ${JSON.stringify((unbounded as RunError).error)}`);
+      assert.equal(executions(), 1500);
+    });
+  });
+
+  it("suspensions: a resume cannot lift the suspended run's budget, and its count restarts", async () => {
+    // Measured on 0.0.23: a restored snapshot is held to the lower of the
+    // dump's `maxSuspensions` and the resuming checkout's, and the count
+    // starts again at the restore with the pending call counted as one. So
+    // the resume below — on the default budget — still stops at the run's 3,
+    // and it gets there only after two more calls, not at once.
+    const gate: HostTool = { ...echoTool(), name: "gate", requiresApproval: true };
+    const gated = new ToolRegistry([echoTool(), gate]);
+    const paused = await runInSandbox(
+      `echo("a")\necho("b")\ngate("g")\n${echoLoop(4)}`,
+      { registry: gated },
+      { limits: { maxSuspensions: 3 }, onApproval: () => "suspend" },
+    );
+    suspended(paused);
+    const finished = await resumeSuspended(paused, true, { registry: gated });
+    err(finished);
+    assert.match(finished.error, /suspension limit 3 exceeded/);
+    assert.deepEqual(
+      finished.calls.map((c) => [c.tool, c.args]),
+      [
+        ["echo", ["a"]],
+        ["echo", ["b"]],
+        ["gate", ["g"]],
+        ["echo", ["0"]],
+        ["echo", ["1"]],
+      ],
+    );
   });
 });
 

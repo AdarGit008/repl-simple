@@ -71,6 +71,15 @@ export type ApprovalDecision = boolean | "suspend";
  * opposite — that suspension resets the sandbox clock — which was 0.0.18's
  * behaviour and was measured false on 0.0.21 (#38, #84).
  *
+ * **`maxSuspensions` counts crossings, not time** (Monty 0.0.23). Every
+ * host-tool call — a call a `Session` serves from its replay cache included —
+ * name lookup and OS call is one; past the budget the feed is aborted with a
+ * `RuntimeError` Python cannot catch. Across a suspension it is a ceiling that
+ * only tightens: the restored run is held to the lower of its own value and
+ * the resume's, and the count starts again at the restore (measured). The
+ * `repl` tool does not let the model set it, so a model-driven run gets the
+ * operator's `REPL_MAX_SUSPENSIONS` (see `limitsConfig()`).
+ *
  * **`maxAllocations` is deliberately absent.** Monty 0.0.18 accepted it and did
  * not enforce it — `{maxAllocations: 1000}` let a 500,000-iteration append loop
  * finish normally (measured) — and 0.0.21 removed it upstream. Exposing it would
@@ -87,6 +96,11 @@ export interface RunLimits {
   gcInterval?: number;
   /** Python recursion ceiling. Monty defaults to 1000; breach → `RecursionError`. */
   maxRecursionDepth?: number;
+  /**
+   * Host crossings per run segment. Breach → uncatchable `RuntimeError`,
+   * `errorKind: "runtime"`. Defaults from `limitsConfig()`, not Monty's 1000.
+   */
+  maxSuspensions?: number;
 }
 
 /**

@@ -297,9 +297,9 @@ A rename would orphan the `coverage-baseline.json` keys, reopen the package `fil
 touch the pinned `scriptName` default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) that the
 diagnostic line-number regex reads; the map is what makes the names harmless.
 
-Nine environment variables tune the sandbox, all read at call time.
+Ten environment variables tune the sandbox, all read at call time.
 
-Three are the default resource limits every run gets. A caller who passes no `limits` gets these,
+Four are the default resource limits every run gets. A caller who passes no `limits` gets these,
 not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
 anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
 which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
@@ -309,9 +309,10 @@ lasts.
 |---|---|---|
 | `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
 | `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
+| `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
 | `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included. The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
 
-The last of those is the fail-safe the other two cannot be. Monty's clock is polled inside the
+The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
 worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
 otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
 `createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails

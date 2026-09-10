@@ -96,7 +96,10 @@ starvation is #61's fix. The caps (D126): **256 snippets** — `run()` refuses b
 inside the caching registry *before* the tool executes, so the call that would exceed the cap
 raises a Python `RuntimeError` naming the limit, no side effect happens, the run fails `runtime`,
 nothing is appended, and a replay meets the same refusal at the same position. `reset()` is the way
-out of either. `load()` refuses a dump beyond either cap.
+out of either. `load()` refuses a dump beyond either cap. A replayed call is served from the cache
+but still crosses the host, so on Monty 0.0.23 it spends one of the run's `maxSuspensions` like a
+real call; the sandbox's default (`REPL_MAX_SUSPENSIONS`, 10 000) is pinned at twice the cache cap
+at least, because Monty's own 1000 refused a full cache before this cap could.
 
 ## Failure, in one table
 
