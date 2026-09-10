@@ -947,6 +947,12 @@ export class Session {
    * compute already spent included, and a resume can neither lift nor lower
    * it (measured; see {@link RunLimits}). `maxWallClockSecs` is the one knob
    * in `limits` a resume caller changes — it restarts on every resume.
+   * `maxSuspensions` sits between the two: the snapshot pins it too, so a
+   * resume cannot lift it — neither a carried value nor a caller's larger one,
+   * and not across `dump()`/`load()`, which drops the carried `limits` but not
+   * the snapshot — while a caller's *smaller* value does tighten it, and the
+   * count starts again at each resume (measured on Monty 0.0.23; pinned in
+   * test/session.test.ts).
    *
    * On success the original code is appended to the snippet list, with the
    * calls it made before the gate and after it, in order (A14). Whatever

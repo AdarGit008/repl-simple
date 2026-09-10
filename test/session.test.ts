@@ -852,6 +852,65 @@ describe("Session — a resumed run honours the suspended run's limits (#177)", 
     err(result);
     assert.equal(result.errorKind, "memory");
   });
+
+  // `maxSuspensions` (Monty 0.0.23) travels in the snapshot like the memory
+  // ceiling does, but only as a ceiling: the restored feed is held to the lower
+  // of the dump's value and the resuming checkout's, counting afresh from the
+  // restore with the pending call as one. So below, the gate is suspension 1
+  // of the resume, `tick("0")` 2, `tick("1")` 3, and `tick("2")` is refused.
+  const suspensionCode = 'gated_limits("x")\nfor i in range(4):\n    tick(str(i))';
+  const tick: HostTool = {
+    name: "tick",
+    description: "Counts",
+    params: [{ name: "i", type: "str", description: "Index" }],
+    returns: "str",
+    execute: (args) => String(args.i),
+  };
+
+  /** A session suspended at the gate under `maxSuspensions: 3`. */
+  async function suspendedUnderThree(): Promise<{ session: Session; registry: ToolRegistry }> {
+    const registry = new ToolRegistry([gatedTool, tick]);
+    const session = new Session({ registry });
+    suspended(
+      await session.run(suspensionCode, {
+        onApproval: () => "suspend",
+        limits: { maxSuspensions: 3 },
+      }),
+    );
+    return { session, registry };
+  }
+
+  function assertStoppedAtThree(result: unknown): void {
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.match(result.error, /suspension limit 3 exceeded/);
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.args]),
+      [
+        ["gated_limits", ["x"]],
+        ["tick", ["0"]],
+        ["tick", ["1"]],
+      ],
+    );
+  }
+
+  it("resumed run honours the suspended maxSuspensions, counting afresh from the resume", async () => {
+    const { session } = await suspendedUnderThree();
+    assertStoppedAtThree(await session.resume({ onApproval: () => true }));
+  });
+
+  it("a resume caller's larger maxSuspensions cannot lift the snapshot's", async () => {
+    const { session } = await suspendedUnderThree();
+    assertStoppedAtThree(
+      await session.resume({ onApproval: () => true, limits: { maxSuspensions: 1000 } }),
+    );
+  });
+
+  it("the suspended maxSuspensions survives dump()/load(), which carries no limits", async () => {
+    const { session, registry } = await suspendedUnderThree();
+    const restored = Session.load(session.dump(), { registry });
+    assertStoppedAtThree(await restored.resume({ onApproval: () => true }));
+  });
 });
 
 // ── a resumed run honours the suspended host wall-clock budget (#177) ──
