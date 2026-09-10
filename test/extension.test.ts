@@ -3350,6 +3350,247 @@ describe("repl extension — /repl-accept-preamble (#198, decision 5)", () => {
   });
 });
 
+// ── Saved tools ask once per pi session ──────────────────────────
+//
+// Trust is not consent to the saved tools: a project can be trusted without
+// the user having been asked about it. So nothing unapproved loads. A session
+// build that finds unapproved saved tools asks the user once per pi session;
+// a yes accepts the current set, anything else withholds it until the next
+// pi session.
+
+describe("repl extension — unapproved saved tools ask once per pi session", () => {
+  const TOOL = "def add_two(a, b):\n    return a + b\n";
+  const LATE = "def late():\n    return 9\n";
+  const SAVE_LATE = 'save_tool("late", "def late():\\n    return 9\\n", "nine")';
+  const WITHHELD = /unresolved-reference|NameError|used when not defined/;
+
+  /** A project with `tools` saved in `.pi/code-tools`. */
+  function project(prefix: string, tools: Record<string, string>): string {
+    const cwd = mkdtempSync(join(tmpdir(), `repl-ext-approve-${prefix}-`));
+    mkdirSync(join(cwd, ".pi", "code-tools"), { recursive: true });
+    for (const [name, source] of Object.entries(tools)) {
+      writeFileSync(join(cwd, ".pi", "code-tools", `${name}.py`), source);
+    }
+    return cwd;
+  }
+
+  /**
+   * A UI that approves every gated call and answers the saved-tools question
+   * from `answers` in turn: `yes` picks the first option, `no` the second,
+   * `undefined` is Escape. Past the script it answers Escape.
+   */
+  function savedToolsUi(
+    cwd: string,
+    answers: Array<"yes" | "no" | undefined>,
+    { trusted = true, hasUI = true } = {},
+  ) {
+    const questions: string[] = [];
+    const notes: Array<{ message: string; type?: string }> = [];
+    let next = 0;
+    const select = async (title: string, options: string[]) => {
+      if (options.includes(APPROVE_CHOICE)) return APPROVE_CHOICE;
+      questions.push(title);
+      const answer = answers[next++];
+      return answer === "yes" ? options[0] : answer === "no" ? options[1] : undefined;
+    };
+    return {
+      questions,
+      notes,
+      ctx: {
+        cwd,
+        hasUI,
+        isProjectTrusted: () => trusted,
+        ui: {
+          select,
+          notify: (message: string, type?: string) => notes.push({ message, type }),
+        },
+      },
+    };
+  }
+
+  async function loaded() {
+    const { tools, commands, handlers } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const accept = commands.find((c) => c.name === "repl-accept-preamble");
+    assert.ok(repl && accept);
+    const run = (code: string, sessionId: string, ctx: unknown) =>
+      repl.execute("ap", { code, sessionId }, undefined, undefined, ctx);
+    const restart = async (ctx: unknown) => {
+      await fire(handlers, "session_shutdown", "new", ctx);
+      await fire(handlers, "session_start", "new", ctx);
+    };
+    return { run, accept, restart };
+  }
+
+  it("the first repl call runs no unapproved tool; a yes loads and records it, and later sessions do not ask", async () => {
+    const cwd = project("yes", { adder: TOOL });
+    try {
+      const { run, restart } = await loaded();
+      const ui = savedToolsUi(cwd, ["yes"]);
+
+      const first = await run("add_two(1, 2)", "s1", ui.ctx);
+      assert.equal(ui.questions.length, 1, "the user was not asked");
+      assert.match(ui.questions[0], /adder/, "the question must name the tool");
+      assert.match(ui.questions[0], /every/, "the question must say they run in every session");
+      assert.match(first.content[0].text, /\[result\]\n3/);
+
+      assert.match((await run("add_two(1, 2)", "s2", ui.ctx)).content[0].text, /\[result\]\n3/);
+      await restart(ui.ctx);
+      assert.match((await run("add_two(1, 2)", "s3", ui.ctx)).content[0].text, /\[result\]\n3/);
+      assert.equal(ui.questions.length, 1, "an approved set was asked about again");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("a no withholds for the rest of the pi session — new session ids included — and the next pi session asks again", async () => {
+    const cwd = project("no", { adder: TOOL });
+    try {
+      const { run, restart } = await loaded();
+      const ui = savedToolsUi(cwd, ["no", "no"]);
+
+      for (const sessionId of ["s1", "s2", "s3"]) {
+        assert.match((await run("add_two(1, 2)", sessionId, ui.ctx)).content[0].text, WITHHELD);
+      }
+      assert.equal(ui.questions.length, 1, "the question was repeated in one pi session");
+
+      await restart(ui.ctx);
+      assert.match((await run("add_two(1, 2)", "s4", ui.ctx)).content[0].text, WITHHELD);
+      assert.equal(ui.questions.length, 2, "the next pi session did not ask");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("Escape and the dialog timeout both count as a no", async () => {
+    const escaped = project("escape", { adder: TOOL });
+    const timedOut = project("timeout", { adder: TOOL });
+    const prior = process.env.REPL_APPROVAL_TIMEOUT_MS;
+    try {
+      const { run } = await loaded();
+      const esc = savedToolsUi(escaped, [undefined]);
+      assert.match((await run("add_two(1, 2)", "s1", esc.ctx)).content[0].text, WITHHELD);
+      assert.match((await run("add_two(1, 2)", "s2", esc.ctx)).content[0].text, WITHHELD);
+      assert.equal(esc.questions.length, 1);
+
+      process.env.REPL_APPROVAL_TIMEOUT_MS = "200";
+      const ui = clobberingSelect();
+      const ctx = {
+        cwd: timedOut,
+        isProjectTrusted: () => true,
+        hasUI: true,
+        ui: { select: ui.select },
+      };
+      assert.match((await run("add_two(1, 2)", "s1", ctx)).content[0].text, WITHHELD);
+      assert.equal(
+        ui.opened[0]?.timeout,
+        200,
+        "the question was not bounded by the dialog timeout",
+      );
+      assert.match((await run("add_two(1, 2)", "s2", ctx)).content[0].text, WITHHELD);
+      assert.equal(ui.opened.length, 1);
+      ui.dispose();
+    } finally {
+      if (prior === undefined) delete process.env.REPL_APPROVAL_TIMEOUT_MS;
+      else process.env.REPL_APPROVAL_TIMEOUT_MS = prior;
+      rmSync(escaped, { recursive: true, force: true });
+      rmSync(timedOut, { recursive: true, force: true });
+    }
+  });
+
+  it("without a UI the tools are withheld and nothing is asked", async () => {
+    const cwd = project("headless", { adder: TOOL });
+    try {
+      const { run } = await loaded();
+      const ui = savedToolsUi(cwd, ["yes"], { hasUI: false });
+      assert.match((await run("add_two(1, 2)", "s1", ui.ctx)).content[0].text, WITHHELD);
+      assert.equal(ui.questions.length, 0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("an added or a changed file asks again", async () => {
+    const cwd = project("changed", { adder: TOOL });
+    try {
+      const { run } = await loaded();
+      const ui = savedToolsUi(cwd, ["yes", "yes", "yes"]);
+      await run("1", "s1", ui.ctx);
+
+      writeFileSync(join(cwd, ".pi", "code-tools", "late.py"), LATE);
+      assert.match((await run("late()", "s2", ui.ctx)).content[0].text, /\[result\]\n9/);
+      assert.match(ui.questions[1] ?? "", /late/);
+
+      writeFileSync(join(cwd, ".pi", "code-tools", "adder.py"), `${TOOL}# edited\n`);
+      await run("1", "s3", ui.ctx);
+      assert.match(ui.questions[2] ?? "", /adder/);
+      assert.equal(ui.questions.length, 3);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("an untrusted project is not asked", async () => {
+    const cwd = project("untrusted", { adder: TOOL });
+    try {
+      const { run } = await loaded();
+      const ui = savedToolsUi(cwd, ["yes"], { trusted: false });
+      const out = (await run("add_two(1, 2)", "s1", ui.ctx)).content[0].text;
+      assert.match(out, /not trusted/);
+      assert.match(out, WITHHELD);
+      assert.equal(ui.questions.length, 0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("a store inside the project asks nothing, and the store warning still fires", async () => {
+    const cwd = project("inside", { adder: TOOL });
+    process.env[STORE_VAR] = join(cwd, "state");
+    try {
+      const { run } = await loaded();
+      const ui = savedToolsUi(cwd, ["yes"]);
+      assert.match((await run("add_two(1, 2)", "s1", ui.ctx)).content[0].text, WITHHELD);
+      assert.equal(ui.questions.length, 0);
+      const warnings = ui.notes.filter(
+        (n) => n.type === "warning" && /REPL_PREAMBLE_STORE_DIR/.test(n.message),
+      );
+      assert.equal(warnings.length, 1);
+    } finally {
+      process.env[STORE_VAR] = testStoreDir;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("save_tool records its own write in a project with no manifest", async () => {
+    const cwd = project("save", {});
+    try {
+      const { run, restart } = await loaded();
+      const ui = savedToolsUi(cwd, []);
+      await run(SAVE_LATE, "s1", ui.ctx);
+      await restart(ui.ctx);
+      assert.match((await run("late()", "s2", ui.ctx)).content[0].text, /\[result\]\n9/);
+      assert.equal(ui.questions.length, 0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("/repl-accept-preamble still accepts the set, and the next repl call does not ask", async () => {
+    const cwd = project("accept", { adder: TOOL });
+    try {
+      const { run, accept } = await loaded();
+      const ui = savedToolsUi(cwd, []);
+      await accept.handler("", ui.ctx);
+      assert.equal(ui.notes[0]?.type, "info", JSON.stringify(ui.notes));
+      assert.match((await run("add_two(1, 2)", "s1", ui.ctx)).content[0].text, /\[result\]\n3/);
+      assert.equal(ui.questions.length, 0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── A store inside the project warns the user ────────────────────
 //
 // Found live: pi run with cwd = $HOME puts the default store

@@ -2704,6 +2704,197 @@ describe("ReplRunner — the accepted set is a hash, not a stat (#198)", () => {
   });
 });
 
+describe("ReplRunner — saved tools load only once approved", () => {
+  // Trust is not consent to the saved tools. A host can report a project as
+  // trusted without the user ever having been asked about it, and a first
+  // load used to accept whatever `.pi/code-tools` held. Nothing unapproved
+  // loads now: the host's `approvePreamble` is asked, or the set is accepted
+  // explicitly, and a first load records nothing on its own.
+
+  const LATE = "def late():\n    return 9\n";
+  const SAVE_LATE = 'save_tool("late", "def late():\\n    return 9\\n", "nine")';
+
+  /** A runner under `store` whose question is answered by `answer`, recording each ask. */
+  function asking(
+    cwd: string,
+    store: string,
+    answer: (tools: string[]) => boolean | Promise<boolean>,
+    trusted = true,
+  ) {
+    const asked: string[][] = [];
+    // A variable, not a literal: the option is new, and this file must still
+    // typecheck against a runner that lacks it.
+    const options = {
+      isProjectTrusted: () => trusted,
+      preambleStoreDir: store,
+      approvePreamble: async (tools: string[]) => {
+        asked.push(tools);
+        return answer(tools);
+      },
+    };
+    return { runner: new ReplRunner(cwd, options), asked };
+  }
+
+  it("a first load with no manifest runs nothing unapproved, and records nothing", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const out = await trustedRunner(cwd, store).run("add_two(1, 2)", "s1");
+      assert.match(out, /used when not defined/, "an unapproved saved tool ran");
+      assert.match(out, /not yet approved/, out);
+      assert.match(out, /adder/, "the notice must name what was withheld");
+      assert.deepEqual(readdirSync(store), [], "a first load recorded an acceptance");
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("a yes loads the current set and records it; the next runner builds without asking", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const first = asking(cwd, store, () => true);
+      assert.match(await first.runner.run("add_two(1, 2)", "s1"), /\[result\]\n3/);
+      assert.deepEqual(first.asked, [["adder"]]);
+      assert.deepEqual(Object.keys((await readManifest(store, cwd)).files), ["adder"]);
+
+      const next = asking(cwd, store, () => false);
+      assert.match(await next.runner.run("add_two(1, 2)", "s1"), /\[result\]\n3/);
+      assert.deepEqual(next.asked, [], "an approved set was asked about again");
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("a no withholds and is not asked again on this runner — new session ids included", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const first = asking(cwd, store, () => false);
+      for (const sessionId of ["s1", "s2", "s3"]) {
+        assert.match(await first.runner.run("add_two(1, 2)", sessionId), /used when not defined/);
+      }
+      assert.equal(first.asked.length, 1, "the question was repeated after a no");
+      assert.deepEqual(readdirSync(store), [], "a no recorded something");
+
+      const next = asking(cwd, store, () => false);
+      await next.runner.run("1", "s1");
+      assert.equal(next.asked.length, 1, "a new runner did not ask");
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("an added or a changed file asks again, naming it", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const { runner, asked } = asking(cwd, store, () => true);
+      await runner.run("1", "s1");
+      saveToolFile(cwd, "late", LATE);
+      assert.match(await runner.run("late()", "s2"), /\[result\]\n9/);
+      saveToolFile(cwd, "adder", "def add_two(a, b):\n    return a + b + 0\n");
+      await runner.run("1", "s3");
+      assert.deepEqual(asked, [["adder"], ["late"], ["adder"]]);
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("no question for an untrusted project, or for a store that cannot record the answer", async () => {
+    const untrusted = makeTempDir();
+    const inside = makeTempDir();
+    const unusable = makeTempDir();
+    for (const cwd of [untrusted, inside, unusable]) saveToolFile(cwd, "adder", ADDER);
+    const store = makeStore();
+    const notADir = join(store, "not-a-dir");
+    writeFileSync(notADir, "");
+    try {
+      const u = asking(untrusted, store, () => true, false);
+      assert.match(await u.runner.run("add_two(1, 2)", "s1"), /used when not defined/);
+      assert.deepEqual(readdirSync(store), ["not-a-dir"], "an untrusted project touched the store");
+
+      for (const [cwd, dir] of [
+        [inside, join(inside, "state")],
+        [unusable, notADir],
+      ]) {
+        const r = asking(cwd, dir, () => true);
+        assert.match(await r.runner.run("add_two(1, 2)", "s1"), /used when not defined/);
+        assert.deepEqual(r.asked, [], dir);
+      }
+      assert.deepEqual(u.asked, []);
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("an aborted call is not asked, and a question that fails counts as a no", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const aborted = asking(cwd, store, () => true);
+      const controller = new AbortController();
+      controller.abort();
+      await aborted.runner.run("add_two(1, 2)", "s1", undefined, controller.signal);
+      assert.deepEqual(aborted.asked, [], "an aborted call was asked");
+      assert.deepEqual(readdirSync(store), [], "an aborted call recorded an acceptance");
+
+      const failing = asking(cwd, store, () => {
+        throw new Error("the dialog broke");
+      });
+      assert.match(await failing.runner.run("add_two(1, 2)", "s1"), /used when not defined/);
+      assert.match(await failing.runner.run("add_two(1, 2)", "s2"), /used when not defined/);
+      assert.equal(failing.asked.length, 1, "a failed question was repeated");
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("save_tool records its own write when there is no manifest yet — and only its own", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const first = asking(cwd, store, () => false);
+      await first.runner.run(SAVE_LATE, "s1", async () => true);
+      assert.deepEqual(Object.keys((await readManifest(store, cwd)).files), ["late"]);
+
+      const next = asking(cwd, store, () => false);
+      assert.match(await next.runner.run("late()", "s1"), /\[result\]\n9/);
+      assert.deepEqual(next.asked, [["adder"]], "the save accepted a file it did not write");
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+
+  it("acceptPreamble() still accepts the whole set, and the next build does not ask", async () => {
+    const cwd = makeTempDir();
+    const store = makeStore();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const { runner, asked } = asking(cwd, store, () => false);
+      assert.equal((await runner.acceptPreamble()).status, "accepted");
+      assert.match(await runner.run("add_two(1, 2)", "s1"), /\[result\]\n3/);
+      assert.deepEqual(asked, []);
+    } finally {
+      cleanup();
+      rmSync(store, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("ReplRunner — a store inside the project is reported to the host", () => {
   // Found live: pi run with cwd = $HOME puts the default store inside the
   // project. The refusal is right and stays; but its only witness was the
