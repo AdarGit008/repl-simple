@@ -586,7 +586,7 @@ Python's, for what crossed the boundary:
 | `[1, 2]`, `{'a': 1}`, `{1, 2}`, `set()`, `{}` | `Array`, `Map`, `Set`, `Set`, `Map` | `[1, 2]`, `{'a': 1}`, `{1, 2}`, `set()`, `{}` |
 | `ValueError('bad')`, `type(1)` | `{__monty_type__: "Exception", …}`, `{__monty_type__: "Type", …}` | `ValueError('bad')`, `<class 'int'>` |
 | `range(3)`, a lambda | Monty's own repr string | `range(0, 3)`, `<function '<lambda>' at 0xc>` (verbatim) |
-| an instance, a dataclass instance | `MontyClassProxy` — class name, uuid, attributes (0.0.21: Monty's repr string, `<C object at 0x2>`, `P(x=1)`) | `<C object>`, `P(x=1)` |
+| an instance, a dataclass instance | `MontyClassProxy` — class name, uuid, attributes (0.0.21: Monty's repr string, `<C object at 0x2>`, `P(x=1)`) | `<C object>`, `P(x=1)` — a user-defined `__repr__` is not shown; see the losses below |
 | `a = []; a.append(a); a` | `["[...]"]` — Monty breaks the cycle itself | `['[...]']` |
 
 ### Documented losses
@@ -605,6 +605,21 @@ What the boundary does not carry, and so what `output` cannot show. Recorded rat
   `<C object at 0x50>`. Since 0.0.23 an instance crosses as a proxy carrying its class name and
   attributes, not a repr; the proxy's uuid is an identity for passing it back, not an address, and
   is never rendered.
+- **a user-defined `__repr__`** (since 0.0.23): `C()` renders `<C object>` and a dataclass its
+  fields even when the class defines `__repr__`; 0.0.21 showed its result (`CUSTOM`). The proxy
+  carries the class name and attributes, not the method, and the host cannot call back into a
+  finished feed to run it. End the snippet on `repr(obj)` instead — that runs in the sandbox and
+  returns the string.
+- **a cycle inside an instance** (since 0.0.23): Monty replaces the back-reference with the string
+  `'...'`, which is the same value a real `'...'` attribute arrives as, so the cycle renders
+  `N(x='...')` (0.0.21: `N(x=...)`). Spelling it bare would misspell genuine data. A list cycle was
+  already `['[...]']` on 0.0.21.
+- **nesting depth** (since 0.0.23 for instances): Monty's native conversion caps a returned value at
+  `MAX_VALUE_DEPTH` (48), and no option sets it. A list 48 deep returns and 49 fails; a class
+  instance reaches the cap at half that, 24 returns and 25 fails (measured by bisection). Past it
+  the whole run fails with `RuntimeError: Max output depth exceeded` — after the snippet's side
+  effects. 0.0.21 had the same list ceiling but sent instances as repr strings, so instances
+  returned 256 deep.
 
 ### Elision
 

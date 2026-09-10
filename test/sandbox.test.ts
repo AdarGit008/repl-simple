@@ -19,7 +19,7 @@ import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY, formatSize } from "
 import type { ApprovalRequest, HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 // The finding-5 tripwire drives Monty directly: the fact under test is the
 // binding's, not the sandbox's.
-import { Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
+import { MAX_VALUE_DEPTH, Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
 
 const byteSize = (s: string) => Buffer.byteLength(s, "utf8");
 
@@ -3436,6 +3436,68 @@ describe("RunOk.output is always a string, rendered as Python (#65 test 4, #69 f
     const result = await runInSandbox("a = []\na.append(a)\na", { registry });
     ok(result);
     assert.equal(result.output, "['[...]']");
+  });
+
+  // ── What 0.0.23 changed about instances in `output`, pinned so a bump says so ──
+
+  it("a user-defined __repr__ does not reach output (0.0.23 loss); repr() inside the sandbox does", async () => {
+    // 0.0.21 sent Monty's repr string, so `C()` rendered `CUSTOM` and the
+    // dataclass `PCUSTOM` (measured by review). 0.0.23's proxy carries the
+    // class name and the attributes, not the method, and the host cannot call
+    // back into a finished feed to run it.
+    const custom = "class C:\n    def __repr__(self):\n        return 'CUSTOM'\n";
+    const bare = await runInSandbox(`${custom}C()`, { registry });
+    ok(bare);
+    assert.equal(bare.output, "<C object>");
+    const called = await runInSandbox(`${custom}repr(C())`, { registry });
+    ok(called);
+    assert.equal(called.output, "CUSTOM", "the workaround the policy documents");
+    const dataclass = await runInSandbox(
+      "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\n    def __repr__(self):\n        return 'PCUSTOM'\nP(1)",
+      { registry },
+    );
+    ok(dataclass);
+    assert.equal(dataclass.output, "P(x=1)");
+  });
+
+  it("a cycle inside an instance renders quoted, exactly like a real '...' string (0.0.23)", async () => {
+    // Monty breaks the cycle itself and sends the string '...' in its place,
+    // which is the same value a real '...' attribute arrives as (measured on
+    // the raw pool: both `{"x":"..."}`). Spelling it `N(x=...)` as 0.0.21 did
+    // would misspell genuine data, so the placeholder shows as what arrived.
+    const DC =
+      "from dataclasses import dataclass\nfrom typing import Any\n@dataclass\nclass N:\n    x: Any\n";
+    const cycle = await runInSandbox(`${DC}n = N(None)\nn.x = n\nn`, { registry });
+    ok(cycle);
+    assert.equal(cycle.output, "N(x='...')");
+    const real = await runInSandbox(`${DC}N('...')`, { registry });
+    ok(real);
+    assert.equal(real.output, "N(x='...')");
+    const inList = await runInSandbox(`${DC}n = N([])\nn.x.append(n)\nn`, { registry });
+    ok(inList);
+    assert.equal(inList.output, "N(x=['...'])");
+  });
+
+  it("output nests a list 48 deep and an instance 24 deep; one more fails the whole run (0.0.23)", async () => {
+    // Monty's native value conversion is capped at MAX_VALUE_DEPTH, and no
+    // option sets it. A nested instance hits the cap at half a list's depth
+    // (measured by bisection: 24 ok / 25 fails, lists 48 / 49). Past it the run
+    // fails with `RuntimeError: Max output depth exceeded` when the value is
+    // handed over — after its side effects. 0.0.21 had the same list ceiling but
+    // sent instances as repr strings, so instances returned 256 deep.
+    const list = (d: number) => `v = None\nfor i in range(${d}):\n    v = [v]\nv`;
+    const instance = (d: number) =>
+      `class C:\n    def __init__(self, x):\n        self.x = x\nv = None\nfor i in range(${d}):\n    v = C(v)\nv`;
+    assert.equal(MAX_VALUE_DEPTH, 48, "the native ceiling moved: re-bisect and update the policy");
+    ok(await runInSandbox(list(48), { registry }));
+    ok(await runInSandbox(instance(24), { registry }));
+    for (const code of [list(49), instance(25)]) {
+      const result = await runInSandbox(`echo('side effect')\n${code}`, { registry });
+      err(result);
+      assert.equal(result.errorKind, "runtime");
+      assert.match(result.error, /Max output depth exceeded/);
+      assert.equal(result.calls.length, 1, "the side effect before the value still happened");
+    }
   });
 
   it("holds through resumeSuspended: the resumed expression renders the same way", async () => {

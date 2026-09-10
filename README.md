@@ -28,6 +28,13 @@ through `open()` on arbitrary host paths.
 - **class inheritance and metaclasses** — a plain `class` with methods and `__init__` works, but
   `class B(A)` raises `NotImplementedError`.
 
+**Returned values.** The value a snippet ends on crosses to the host as data, with two limits on
+Monty 0.0.23. Nesting is capped: a list 48 levels deep and a class instance 24 deep are fine, and
+one level more fails the whole run with `RuntimeError: Max output depth exceeded`, after its side
+effects. An instance also crosses without its methods, so `output` shows `<C object>` or `P(x=1)`
+even when the class defines `__repr__`; end the snippet on `repr(obj)` to see that. See
+[docs/truncation-policy.md](docs/truncation-policy.md).
+
 ## Tools
 
 ### REPL (direct)
@@ -465,18 +472,25 @@ Four things worth knowing before relying on it:
   execute every line of it. The floor still catches a *regression* in `truncate.ts`, which is its job;
   it will not notice its test file leaving. Nothing here substitutes for
   [#24](https://github.com/AdarGit008/repl-simple/issues/24).
-- **Two files' coverage varies between identical runs**, so `coverage:update` alone can write a floor
-  that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts` reports
-  99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in `truncate.ts` is
-  `truncateText`'s declaration, and the lcov record shows it is the *instrument* that varies, not the
-  suite — in the low run the function's body carries a hit count of 380 while its declaration line
-  reads 0:
+- **Three files' coverage varies between identical runs**, so `coverage:update` alone can write a
+  floor that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts`
+  reports 99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in
+  `truncate.ts` is `truncateText`'s declaration, and the lcov record shows it is the *instrument*
+  that varies, not the suite — in the low run the function's body carries a hit count of 380 while
+  its declaration line reads 0:
 
   ```
   DA:384,0      export function truncateText(     ← the declaration
   DA:385,380      text: string,
   DA:388,380      const t = new Truncator(opts);  ← the body, 380 executions
   ```
+
+  The third file is `src/preamble.ts`, and it is the same artefact: in the low run
+  `getReplPreamble`'s declaration reads 0 while the function is recorded as called twice
+  (`FNDA:2`) and its body line twice. `truncate.ts` shows it on `formatValue`'s declaration too
+  (0 against `FNDA:1299`). Measured 2026-09-10 with the gate's own invocation on this tree and on
+  `origin/main` at Monty 0.0.21 alike, so neither is a regression; one gate run that day read both
+  files at 100.00%, three read 97.05% and 99.88%.
 
   A function cannot run its body 380 times without being called. Nothing about test execution
   differed between the runs; V8's per-function range count is lost when coverage from several test
