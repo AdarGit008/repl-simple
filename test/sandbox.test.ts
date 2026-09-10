@@ -15,7 +15,7 @@ import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { SubmitSignal } from "../src/submit_signal.js";
-import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY } from "../src/truncate.js";
+import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY, formatSize } from "../src/truncate.js";
 import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 // The finding-5 tripwire drives Monty directly: the fact under test is the
 // binding's, not the sandbox's.
@@ -779,10 +779,13 @@ describe("runInSandbox — stdout truncation", () => {
       { onPrint: (text) => prints.push(text) },
     );
     ok(result);
-    // One callback per print, newline included: ('a\n', 'b\n'). The exact
-    // shape is the D122 tripwire's to pin; this test only asks that every
-    // print reaches the live stream.
-    assert.deepEqual(prints, ["a\n", "b\n"]);
+    // Every print reaches the live stream, in order and byte for byte. How the
+    // stream is chunked is Monty's: 0.0.21 called back once per print
+    // (`'a\n', 'b\n'`, which this test used to pin), 0.0.23 batches a burst
+    // (`'a\nb\n'`, measured). The shape is the D122 tripwire's to pin; this
+    // test only asks that nothing is lost, duplicated or reordered.
+    assert.equal(prints.join(""), "a\nb\n");
+    assert.equal(result.stdout, "a\nb\n");
   });
 });
 
@@ -2811,15 +2814,25 @@ describe("a pool with no worker to give", () => {
 // `Session` de-duplicates stdout across replays with a byte mark: the
 // number of bytes the replayed prefix printed, handed to the sandbox as
 // `RunOptions.stdoutSkipBytes` and dropped before `onPrint` and the
-// accumulator see anything (D121). The arithmetic assumes Monty's callback
-// shape stays what was measured on 0.0.21, so the shape is pinned here as a
-// tripwire (D122): if an upstream bump changes it, this is the test that
-// says so, rather than a session quietly swallowing or re-emitting a line.
+// accumulator see anything (D121). The mark is a byte count, so it is
+// indifferent to how a deterministic stream is chunked; what it and the
+// trace's `stdoutOffset` do rely on is *when* bytes arrive — before a host
+// call, and by the end of the feed. The shape is pinned here as a tripwire
+// (D122): if an upstream bump changes it, this is the test that says so,
+// rather than a session quietly swallowing or re-emitting a line. Re-pinned
+// for 0.0.23, which batches output (the evidence for accepting that is the
+// "print batching" block below).
 
 describe("print callback shape — the tripwire under the stdout mark (#61 D122)", () => {
   const registry = new ToolRegistry([echoTool()]);
 
-  it("fires once per print, newline included", async () => {
+  it("batches a burst into fewer callbacks than prints, every byte in order (0.0.23)", async () => {
+    // 0.0.21 fired once per print, and this test pinned
+    // ['a\n', 'b c\n', 'x\ny\n', '0\n', '1\n', '2\n']. 0.0.23 holds output for
+    // up to 5 ms (`printFlushInterval`) and measured one callback for these
+    // six prints and one for a thousand; `printFlushInterval: 0` gives one per
+    // *line*, splitting `x\ny`. The split is timing, so the bytes are pinned
+    // exactly and the batching by a burst no timing can deliver line by line.
     const prints: string[] = [];
     const result = await runInSandbox(
       'print("a")\nprint("b", "c")\nprint("x\\ny")\nfor i in range(3):\n    print(i)',
@@ -2827,10 +2840,24 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
       { onPrint: (text) => prints.push(text) },
     );
     ok(result);
-    assert.deepEqual(prints, ["a\n", "b c\n", "x\ny\n", "0\n", "1\n", "2\n"]);
+    assert.equal(prints.join(""), "a\nb c\nx\ny\n0\n1\n2\n");
+
+    const burst: string[] = [];
+    ok(
+      await runInSandbox(
+        "for i in range(1000):\n    print(i)",
+        { registry },
+        { onPrint: (text) => burst.push(text) },
+      ),
+    );
+    assert.equal(burst.join(""), Array.from({ length: 1000 }, (_, i) => `${i}\n`).join(""));
+    assert.ok(
+      burst.length < 1000,
+      `one callback per print (${burst.length}): batching is off — re-read what the mark assumes`,
+    );
   });
 
-  it("holds a partial line until the next newline, a host boundary, or the end", async () => {
+  it("delivers a partial line at a host boundary, at the end, and once the flush interval lapses", async () => {
     const merged: string[] = [];
     ok(
       await runInSandbox(
@@ -2839,7 +2866,24 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
         { onPrint: (text) => merged.push(text) },
       ),
     );
-    assert.deepEqual(merged, ["abc\n"], "partials are held until a newline");
+    // 0.0.21 held a partial until the next newline, and this pinned ['abc\n'].
+    // 0.0.23 still gives that here, but only because the three prints fall
+    // inside one flush interval — so the bytes are what is pinned.
+    assert.equal(merged.join(""), "abc\n");
+
+    const lapsed: string[] = [];
+    ok(
+      await runInSandbox(
+        'print("a", end="")\nn = 0\nfor i in range(1000000):\n    n += i\nprint("b")',
+        { registry },
+        { onPrint: (text) => lapsed.push(text) },
+      ),
+    );
+    assert.deepEqual(
+      lapsed,
+      ["a", "b\n"],
+      "a partial is no longer held past the flush interval (line-buffered, printFlushInterval 0: ['ab\\n'])",
+    );
 
     const flushed: string[] = [];
     ok(
@@ -2941,6 +2985,158 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
       Buffer.byteLength(replayed.join("")),
       "the mark taken across the suspension must equal the replay's byte count",
     );
+  });
+});
+
+// ── Print batching (Monty 0.0.23, pydantic/monty#809): what stdout is built on ──
+//
+// 0.0.23 holds `print()` output in the worker for up to
+// `CheckoutOptions.printFlushInterval` (5 ms by default) and hands a burst to
+// the print callback as one chunk; `printFlushInterval: 0` would restore one
+// callback per line. These tests are the evidence the sandbox keeps upstream's
+// default: every property stdout, the trace and the replay mark rely on is
+// asserted against the batched stream. Where a property only means something
+// if a chunk really spanned several prints, the test also checks that it did,
+// so it cannot pass by the stream happening to arrive line by line.
+
+describe("print batching — the properties stdout is built on hold on the batched stream (0.0.23)", () => {
+  /** `n` numbered lines printed in a tight loop, and the exact bytes they make. */
+  const burst = (n: number, label = "line") => ({
+    code: `for i in range(${n}):\n    print("${label}", i)`,
+    text: Array.from({ length: n }, (_, i) => `${label} ${i}\n`).join(""),
+  });
+
+  /** A no-argument tool that records what the live stream held when it ran. */
+  function probeTool(chunks: string[], seen: string[]): HostTool {
+    return makeTool({
+      name: "probe",
+      params: [],
+      execute: () => {
+        seen.push(chunks.join(""));
+        return "p";
+      },
+    });
+  }
+
+  it("a burst printed before a host call is delivered before the call runs, and traced below it", async () => {
+    const before = burst(200);
+    const chunks: string[] = [];
+    const seen: string[] = [];
+    const result = await runInSandbox(
+      `${before.code}\nprint("partial", end="")\nprobe()\nprint("after")`,
+      { registry: new ToolRegistry([probeTool(chunks, seen)]) },
+      { onPrint: (text) => chunks.push(text) },
+    );
+    ok(result);
+    assert.ok(chunks.length < 200, `not batched (${chunks.length} callbacks for 202 prints)`);
+    const printedBefore = `${before.text}partial`;
+    assert.deepEqual(seen, [printedBefore], "output printed before the call arrived after it ran");
+    assert.equal(result.calls[0].stdoutOffset, byteSize(printedBefore));
+    assert.equal(result.stdout, `${printedBefore}after\n`);
+  });
+
+  it("every call in an interleaved loop sees exactly what preceded it", async () => {
+    const chunks: string[] = [];
+    const seen: string[] = [];
+    const result = await runInSandbox(
+      'for i in range(30):\n    print("a", i)\n    print("b", i, end="")\n    print("")\n    probe()',
+      { registry: new ToolRegistry([probeTool(chunks, seen)]) },
+      { onPrint: (text) => chunks.push(text) },
+    );
+    ok(result);
+    const perIteration = (i: number) => `a ${i}\nb ${i}\n`;
+    const prefixes = Array.from({ length: 30 }, (_, n) =>
+      Array.from({ length: n + 1 }, (_, i) => perIteration(i)).join(""),
+    );
+    assert.deepEqual(seen, prefixes);
+    assert.deepEqual(
+      result.calls.map((c) => c.stdoutOffset),
+      prefixes.map(byteSize),
+    );
+  });
+
+  it("the stdout budget holds when one batched chunk straddles the cap", async () => {
+    const stream = burst(400);
+    const cap = 256;
+    const chunks: string[] = [];
+    const result = await runInSandbox(
+      stream.code,
+      { registry: new ToolRegistry() },
+      { maxStdoutBytes: cap, onPrint: (text) => chunks.push(text) },
+    );
+    ok(result);
+    // The case under test: a single callback carries bytes from both sides of
+    // the cap.
+    let offset = 0;
+    const straddles = chunks.some((chunk) => {
+      const start = offset;
+      offset += byteSize(chunk);
+      return start < cap && offset > cap && chunk.split("\n").length > 2;
+    });
+    assert.ok(straddles, `no multi-line chunk spans the cap: ${chunks.map(byteSize).join(",")}`);
+
+    assert.equal(chunks.join(""), stream.text, "the live stream is not the model's budget (M9)");
+    assert.equal(result.stdoutTruncated, true);
+    assert.ok(byteSize(result.stdout) <= cap, `${byteSize(result.stdout)} bytes for a ${cap} cap`);
+    const [head, tail] = result.stdout.split(/\n?\[… [^\]]*…\]\n?/);
+    assert.ok(stream.text.startsWith(head), `head is not the stream's: ${JSON.stringify(head)}`);
+    assert.ok(stream.text.endsWith(tail), `tail is not the stream's: ${JSON.stringify(tail)}`);
+    assert.match(
+      result.stdout,
+      new RegExp(
+        `of ${formatSize(byteSize(stream.text)).replace(".", "\\.")} elided \\(lines \\d+-\\d+ of 400\\)`,
+      ),
+    );
+  });
+
+  it("an abort mid-output returns everything printed before it, the batched burst included", async () => {
+    const controller = new AbortController();
+    const stop = makeTool({
+      name: "stop",
+      params: [],
+      execute: () => {
+        controller.abort();
+        return "s";
+      },
+    });
+    const before = burst(300);
+    const chunks: string[] = [];
+    const result = await runInSandbox(
+      `${before.code}\nstop()\n${burst(300, "after").code}`,
+      { registry: new ToolRegistry([stop]) },
+      { signal: controller.signal, onPrint: (text) => chunks.push(text) },
+    );
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.ok(chunks.length < 300, `not batched (${chunks.length} callbacks)`);
+    assert.ok(result.stdout.startsWith(before.text), "output printed before the abort is missing");
+    assert.equal(result.stdoutTruncated, false);
+  });
+
+  it("an abort during a print loop with no host call returns what the flush interval delivered", async () => {
+    // No host call ever flushes this stream: only the interval does. The run is
+    // cut off by the abort race, so what it reports is whatever had arrived.
+    // The 1 s budget is only what hands the worker back afterwards; the abort
+    // (300 ms, plus the 250 ms settle grace) ends the run well before it.
+    const controller = new AbortController();
+    let delivered = 0;
+    const pending = runInSandbox(
+      'i = 0\nwhile True:\n    print("tick", i)\n    i += 1',
+      { registry: new ToolRegistry() },
+      {
+        signal: controller.signal,
+        limits: { maxDurationSecs: 1 },
+        onPrint: (text) => {
+          delivered += byteSize(text);
+        },
+      },
+    );
+    setTimeout(() => controller.abort(), 300);
+    const result = await pending;
+    err(result);
+    assert.equal(result.errorKind, "aborted");
+    assert.ok(delivered > 0, "300 ms of printing delivered nothing");
+    assert.ok(result.stdout.startsWith("tick 0\ntick 1\n"), result.stdout.slice(0, 80));
   });
 });
 

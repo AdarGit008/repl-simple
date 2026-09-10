@@ -2229,9 +2229,10 @@ describe("Session — stdout is this call's, not the transcript's (#61)", () => 
 
   it("a prefix ending in a partial line is cut at the mark, not at a callback (bytes, not entries)", async () => {
     // Run 1 prints `x` with no newline: one callback, flushed at the end of
-    // the run. On replay that `x` merges with run 2's `y\n` into a single
-    // callback `xy\n`. Skipping a callback would lose `y`; skipping one byte
-    // keeps it.
+    // the run. On replay that `x` can reach the callback in the same chunk as
+    // run 2's `y\n` — here it does whenever both fall inside one flush
+    // interval (0.0.23), and it always did on 0.0.21. Skipping a callback
+    // would lose `y`; skipping one byte keeps it.
     const session = new Session({ registry: new ToolRegistry() });
     const first = await session.run('print("x", end="")');
     ok(first);
@@ -2257,6 +2258,44 @@ describe("Session — stdout is this call's, not the transcript's (#61)", () => 
     const result = await s2.run('print("beta")');
     ok(result);
     assert.equal(result.stdout, "beta\n");
+  });
+
+  it("a replayed burst batched together with this call's output is cut at the mark (Monty 0.0.23)", async () => {
+    // 0.0.23 batches print output in the worker, and nothing separates a
+    // replayed prefix from this call's first print but the flush interval —
+    // so run 2's replay of run 1's burst and run 2's own line can reach the
+    // callback as one chunk, with the mark inside it. Run 3 puts host calls
+    // (one of them a partial-line flush) between replayed and new output; run
+    // 4 replays all of it.
+    const session = new Session({ registry: new ToolRegistry([makeEchoTool()]) });
+    const burst = Array.from({ length: 200 }, (_, i) => `old ${i}\n`).join("");
+
+    const first = await session.run('for i in range(200):\n    print("old", i)');
+    ok(first);
+    assert.equal(first.stdout, burst);
+
+    const streamed: string[] = [];
+    const second = await session.run('print("new")', { onPrint: (text) => streamed.push(text) });
+    ok(second);
+    assert.equal(second.stdout, "new\n");
+    assert.deepEqual(streamed, ["new\n"], "the replayed burst reached the live stream");
+
+    const third = await session.run(
+      'echo("x")\nprint("partial", end="")\necho("y")\nprint("after")',
+    );
+    ok(third);
+    assert.equal(third.stdout, "partialafter\n");
+    assert.deepEqual(
+      third.calls.map((c) => [c.args, c.stdoutOffset]),
+      [
+        [["x"], 0],
+        [["y"], 7],
+      ],
+    );
+
+    const fourth = await session.run('print("last")');
+    ok(fourth);
+    assert.equal(fourth.stdout, "last\n");
   });
 });
 

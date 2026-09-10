@@ -155,8 +155,9 @@ class DispatchAccumulators {
 
   /**
    * Trace a call. `stdoutOffset` is the accumulator's byte total right now:
-   * Monty flushes a partial line at a host boundary before the call reaches
-   * the loop (measured), so what was printed before the call is all in.
+   * Monty flushes whatever output it holds — a batched burst, a partial line
+   * — before the call reaches the loop (measured on 0.0.23, and pinned in the
+   * "print batching" tests), so what was printed before the call is all in.
    */
   record(entry: Omit<ToolCallTrace, "seq" | "stdoutOffset">): void {
     const call: ToolCallTrace = {
@@ -442,11 +443,23 @@ function crashMessage(err: MontyCrashedError): string {
  * earlier call, and this is where that output is dropped — before `onPrint`,
  * so the terminal is not shown it again, and before the accumulator, so the
  * budget is spent on this call's bytes alone. A callback that straddles the
- * mark is sliced at it rather than skipped whole: Monty holds a partial line
- * until the next newline or host boundary, so a prefix that ended in one
- * arrives merged with this call's first print (measured), and skipping the
- * callback would take this call's line with it. The mark is a byte count for
- * the same reason — it is indifferent to how the stream is chunked.
+ * mark is sliced at it rather than skipped whole: since 0.0.23 the worker
+ * batches print output for up to 5 ms, so a replayed prefix's last bytes can
+ * arrive in the same callback as this call's first print (on 0.0.21 a prefix
+ * ending in a partial line did the same), and skipping the callback would
+ * take this call's output with it. The mark is a byte count for the same
+ * reason — it is indifferent to how the stream is chunked.
+ *
+ * Batching is upstream's default (`CheckoutOptions.printFlushInterval`, 5 ms)
+ * and is kept rather than pinned to `0`, because nothing here reads the chunk
+ * shape: stdout, the replay mark and the trace's `stdoutOffset` need the bytes
+ * and need them to arrive before a host call and by the end of the feed, which
+ * Monty guarantees in either mode. The evidence, measured against the batched
+ * stream, is the "print batching" block in test/sandbox.test.ts (flush before
+ * a call and the offsets it stamps, a chunk straddling the stdout cap, abort
+ * mid-output) and the batched replay test in test/session.test.ts. What `0`
+ * would buy is one callback per line for the live `onPrint` stream, at up to
+ * 5 ms of lag saved — not worth a knob nothing needs.
  *
  * The callback's return value is ignored by Monty 0.0.21 (measured; pinned
  * in test/sandbox.test.ts). 0.0.18 threw `TypeError: Value is not undefined`

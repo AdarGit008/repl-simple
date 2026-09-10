@@ -195,8 +195,8 @@ export interface RunOptions {
  * could not resolve its arguments — and continuing after the carried entries
  * when a suspended run resumes. `stdoutOffset` is the byte of the run's own
  * `stdout` (after the replay mark, before truncation) at which the call was
- * dispatched: everything printed before the call lies below it, the partial
- * line Monty flushes at a host boundary included. A consumer that filters
+ * dispatched: everything printed before the call lies below it, output Monty
+ * had buffered included — it flushes at every host boundary. A consumer that filters
  * entries out — replay filtering does — leaves gaps; the order is the point.
  *
  * Both are optional in the type because a `Session` dump restores entries
