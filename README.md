@@ -150,13 +150,13 @@ question was enough to run its author's Python. They are now loaded **only in a 
 trusted in pi** — an untrusted project's files are never even read, the session works without them,
 and the model is told by name what was withheld so it does not call one and get a bare `NameError`.
 Trusted or not, the preamble is capped at 32 files and 64 KiB, and revoking trust stops the code
-running rather than waiting for the next session. Once trusted, the set of saved tools is
-remembered — a sha256 manifest under `$XDG_STATE_HOME/repl-simple` (or `REPL_PREAMBLE_STORE_DIR`),
-never inside the project — and a file added or rewritten afterwards is withheld with a
-`[preamble changed]` notice until the set is accepted again; the agent's own `save_tool` /
-`delete_tool` keep it current in a trusted project, and `/repl-accept-preamble` accepts the whole
-current set. A `.pi/code-tools` that cannot be listed, or that resolves outside the project, loads
-nothing and says which.
+running rather than waiting for the next session. Trust alone approves nothing: saved tools load
+only once approved, and pi asks — once per pi session — about any that are not approved yet, or
+were added or rewritten since. Approvals are remembered in a sha256 manifest under
+`$XDG_STATE_HOME/repl-simple` (or `REPL_PREAMBLE_STORE_DIR`), never inside the project; the agent's
+own `save_tool` / `delete_tool` keep it current in a trusted project, and `/repl-accept-preamble`
+accepts the whole current set. A `.pi/code-tools` that cannot be listed, or that resolves outside
+the project, loads nothing and says which.
 See [docs/project-trust.md](docs/project-trust.md).
 
 The four management tools resolve inside `repl` in every session, and they tell the truth about what
@@ -188,7 +188,8 @@ timeout and an abort all **deny**.
 See [#51](https://github.com/AdarGit008/repl-simple/issues/51).
 
 Every approval dialog is also **counted**. One `repl` or `repl_resume` call opens at most **8**
-dialogs (`MAX_DIALOGS_PER_CALL`); gated calls past that are denied without a dialog, and the result
+approval dialogs (`MAX_DIALOGS_PER_CALL`) — the saved-tools question, at most once per pi session,
+is not one of them; gated calls past that are denied without a dialog, and the result
 ends with an `[approval cap]` paragraph so the model asks you rather than retrying. Only dialogs
 actually opened count — yolo mode, a headless run and a replayed call spend nothing — and the count
 restarts on every `repl_resume`. The dialog title says where it sits (`dialog 3 of 8`). A cap and a

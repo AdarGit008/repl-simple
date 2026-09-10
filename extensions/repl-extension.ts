@@ -4,6 +4,7 @@ import { maskSecrets, redact } from "../src/redact.js";
 import { ReplRunner } from "../src/repl.js";
 import type { RunTrace, TracedCall, TraceStatus } from "../src/repl.js";
 import { limitsConfig } from "../src/sandbox.js";
+import { escapeNoticeName } from "../src/toolstore.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
 
 /**
@@ -828,6 +829,22 @@ function storeInsideProjectWarning({ store, project }: { store: string; project:
   );
 }
 
+// ── Unapproved saved tools (docs/project-trust.md) ───────────────
+
+/** The saved-tools question's answers. Anything but the first withholds. */
+export const LOAD_SAVED_TOOLS_CHOICE = "Approve — load them now and in future sessions";
+const KEEP_SAVED_TOOLS_UNLOADED_CHOICE = "Not now — keep them unloaded until the next pi session";
+
+/** The saved-tools question: which tools, and that approving runs them in every later session. */
+function savedToolsQuestion(tools: string[]): string {
+  const names = tools.map(escapeNoticeName).join(", ");
+  return (
+    `Load this project's saved tools? ${tools.length} saved tool(s) in .pi/code-tools ` +
+    `have not been approved: ${names}. Approved tools run automatically at the start of every ` +
+    "repl session in this project, in this and future pi sessions, until one is added or changed."
+  );
+}
+
 // ── Runner per working directory (#60) ───────────────────────────
 
 /**
@@ -860,6 +877,14 @@ class CwdRunner {
    * is when nothing is shown.
    */
   notify: ((message: string) => void) | undefined;
+  /** pi's `ui.select`, refreshed like `notify`; `undefined` when that event had no UI. */
+  select:
+    | ((
+        title: string,
+        options: string[],
+        opts: { signal?: AbortSignal; timeout?: number },
+      ) => Promise<string | undefined>)
+    | undefined;
   readonly runner: ReplRunner;
   readonly sessionIds = new Set<string>();
   private readonly waiting = new Map<string, string>();
@@ -868,7 +893,25 @@ class CwdRunner {
     this.runner = new ReplRunner(cwd, {
       isProjectTrusted: () => this.trusted,
       onPreambleStoreInsideProject: (where) => this.warnStoreInsideProject(where),
+      approvePreamble: (tools, signal) => this.askToLoadSavedTools(tools, signal),
     });
+  }
+
+  /**
+   * The saved-tools question, on pi's dialog. "Once per pi session" follows
+   * from two lifetimes: this runner lives for one conversation (#60), and
+   * `ReplRunner` stops asking after its first refusal. Bounded like an
+   * approval dialog — `REPL_APPROVAL_TIMEOUT_MS` and the call's signal — and
+   * either ending is a no, as is having no UI to ask on.
+   */
+  private async askToLoadSavedTools(tools: string[], signal?: AbortSignal): Promise<boolean> {
+    if (this.select === undefined) return false;
+    const choice = await this.select(
+      savedToolsQuestion(tools),
+      [LOAD_SAVED_TOOLS_CHOICE, KEEP_SAVED_TOOLS_UNLOADED_CHOICE],
+      { signal, timeout: approvalTimeoutMs() },
+    );
+    return choice === LOAD_SAVED_TOOLS_CHOICE;
   }
 
   /** Tell the user the store is inside the project: once per project per pi process, on a UI only. */
@@ -971,17 +1014,28 @@ export default function (pi: ReplExtensionApi) {
     cwd: string;
     isProjectTrusted(): boolean;
     hasUI?: boolean;
-    ui?: { notify?: (message: string, type?: "info" | "warning" | "error") => void };
+    ui?: {
+      notify?: (message: string, type?: "info" | "warning" | "error") => void;
+      select?: (
+        title: string,
+        options: string[],
+        opts?: { signal?: AbortSignal; timeout?: number },
+      ) => Promise<string | undefined>;
+    };
   }): CwdRunner {
     let entry = runners.get(ctx.cwd);
     if (!entry) {
       entry = new CwdRunner(ctx.cwd);
       runners.set(ctx.cwd, entry);
     }
-    // Refreshed on the way in, every time — see `CwdRunner.trusted` and `CwdRunner.notify`.
+    // Refreshed on the way in, every time — see `CwdRunner.trusted`, `.notify` and `.select`.
     entry.trusted = ctx.isProjectTrusted();
     const ui = ctx.hasUI ? ctx.ui : undefined;
     entry.notify = ui?.notify ? (message) => ui.notify?.(message, "warning") : undefined;
+    const select = ui?.select;
+    entry.select = select
+      ? (title, options, opts) => select.call(ui, title, options, opts)
+      : undefined;
     return entry;
   }
 
