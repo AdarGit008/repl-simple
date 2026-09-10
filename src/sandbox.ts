@@ -867,10 +867,11 @@ const DEFAULT_MAX_MEMORY_MB = 512;
 const DEFAULT_MAX_WALL_CLOCK_SECS = 300;
 /**
  * Host crossings per run segment: every host-tool call, name lookup and OS
- * call the sandbox hands to the host counts one (measured on 0.0.23: one per
- * tool call, a replayed one included). Monty 0.0.23 introduced the ceiling
- * and fills an omitted one with 1000 — a default that fails *closed*, but no
- * less silently for that. A `Session` re-issues every cached call inside the
+ * call the sandbox hands to the host counts one (measured on 0.0.23 and pinned
+ * in test/sandbox.test.ts: one per tool call, a replayed one included; one
+ * for `f = echo`; one per mounted `read_text()`). Monty 0.0.23 introduced the
+ * ceiling and fills an omitted one with 1000 — a default that fails *closed*,
+ * but no less silently for that. A `Session` re-issues every cached call inside the
  * run that replays it, and its cache holds up to `MAX_CACHE_ENTRIES` (1024,
  * src/session.ts), so the upstream default refused a session before the
  * session's own cap could (measured: 1023 replayed calls plus one new).

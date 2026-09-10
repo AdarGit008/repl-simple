@@ -2618,6 +2618,38 @@ describe("the shipped resource limits", () => {
     });
   });
 
+  it("suspensions: a name lookup and a mounted-file read each spend one, like a call", async () => {
+    // What the budget counts, pinned so the README's list stays true: aliasing
+    // a tool is a name lookup the host answers, and a mounted read is an OS
+    // call `resumeAuto()` answers — neither is a tool call in the trace.
+    const aliased = "f = echo\nf('a')\nf('b')";
+    const tight = await runInSandbox(aliased, countingEcho(), { limits: { maxSuspensions: 2 } });
+    err(tight);
+    assert.match(tight.error, /suspension limit 2 exceeded/, "the lookup was free");
+    assert.equal(tight.calls.length, 1);
+    ok(await runInSandbox(aliased, countingEcho(), { limits: { maxSuspensions: 3 } }));
+
+    const dir = mkdtempSync(join(tmpdir(), "repl-suspensions-"));
+    try {
+      writeFileSync(join(dir, "x.txt"), "hello");
+      const reads =
+        "from pathlib import Path\n[Path('/mnt/data/x.txt').read_text() for _ in range(3)]";
+      const runOpts = (maxSuspensions: number) => ({
+        mount: { "/mnt/data": dir },
+        limits: { maxSuspensions },
+      });
+      const short = await runInSandbox(reads, { registry }, runOpts(2));
+      err(short);
+      assert.match(short.error, /suspension limit 2 exceeded/, "a mounted read was free");
+      assert.equal(short.calls.length, 0, "a mounted read is not a traced tool call");
+      const enough = await runInSandbox(reads, { registry }, runOpts(3));
+      ok(enough);
+      assert.equal(enough.output, "['hello', 'hello', 'hello']");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("suspensions: a resume cannot lift the suspended run's budget, and its count restarts", async () => {
     // Measured on 0.0.23: a restored snapshot is held to the lower of the
     // dump's `maxSuspensions` and the resuming checkout's, and the count
