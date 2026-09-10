@@ -944,6 +944,114 @@ describe("repl extension — a dialog always settles (#49)", () => {
   });
 });
 
+// ── An unanswered dialog denies, whatever the wall clock ─────────
+//
+// Found live on pi 0.85.1: `print(bash(...))` with nobody at the dialog ended
+// at 300.003 s as `[error: timeout] run exceeded its host wall-clock budget`,
+// `trace=[]`. Both bounds were five minutes and the wall clock was counting
+// the dialog, so the run timed out where the README promises a denial. Each
+// test below runs a dialog timeout longer than the wall-clock budget, which is
+// the whole of that race made deterministic.
+
+describe("repl extension — an unanswered dialog denies, whatever the wall clock", () => {
+  let cwd: string;
+  const prior = {
+    timeout: process.env.REPL_APPROVAL_TIMEOUT_MS,
+    wallClock: process.env.REPL_MAX_WALL_CLOCK_SECS,
+  };
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-late-"));
+    process.env.REPL_MAX_WALL_CLOCK_SECS = "2";
+    process.env.REPL_APPROVAL_TIMEOUT_MS = "2500";
+  });
+
+  after(() => {
+    if (prior.timeout === undefined) delete process.env.REPL_APPROVAL_TIMEOUT_MS;
+    else process.env.REPL_APPROVAL_TIMEOUT_MS = prior.timeout;
+    if (prior.wallClock === undefined) delete process.env.REPL_MAX_WALL_CLOCK_SECS;
+    else process.env.REPL_MAX_WALL_CLOCK_SECS = prior.wallClock;
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  /** Answers the scripted dialogs in order, and leaves any after them to their timeout. */
+  function answersThenWalksAway(answers: string[]) {
+    const unanswered = clobberingSelect();
+    let next = 0;
+    const select = (title: string, options: string[], opts?: DialogOpts) =>
+      next < answers.length
+        ? Promise.resolve<string | undefined>(answers[next++])
+        : unanswered.select(title, options, opts);
+    return {
+      ctx: { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select } },
+      dispose: unanswered.dispose,
+    };
+  }
+
+  it("repl: the dialog's timeout denies the call and the trace says so", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+    const ui = answersThenWalksAway([]);
+
+    const result = await withDeadline(
+      repl.execute(
+        "late-1",
+        { code: "write('late.txt', 'x')", sessionId: "late-run" },
+        undefined,
+        undefined,
+        ui.ctx,
+      ),
+      15_000,
+      "the repl call never returned",
+    );
+
+    const text = result.content[0].text;
+    assert.doesNotMatch(text, /wall-clock/, text);
+    assert.match(text, /PermissionError/);
+    assert.deepEqual(outline(detailsOf(result)), [["write", false, false]]);
+    assert.equal(existsSync(join(cwd, "late.txt")), false);
+    ui.dispose();
+  });
+
+  it("repl_resume: a later dialog's timeout denies its call and the trace says so", async () => {
+    const tools = await loadTools();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl && resume);
+    const code = "write('first.txt', 'x')\nwrite('second.txt', 'x')";
+
+    const parked = answersThenWalksAway([LATER_CHOICE]);
+    await repl.execute(
+      "late-2",
+      { code, sessionId: "late-resume" },
+      undefined,
+      undefined,
+      parked.ctx,
+    );
+    parked.dispose();
+
+    // The pending call is approved at once; the one after it is asked inside
+    // the resumed continuation, and nobody answers.
+    const ui = answersThenWalksAway([APPROVE_CHOICE]);
+    const result = await withDeadline(
+      resume.execute("late-3", { sessionId: "late-resume" }, undefined, undefined, ui.ctx),
+      15_000,
+      "the repl_resume call never returned",
+    );
+
+    const text = result.content[0].text;
+    assert.doesNotMatch(text, /wall-clock/, text);
+    assert.match(text, /PermissionError/);
+    assert.deepEqual(outline(detailsOf(result)), [
+      ["write", true, true],
+      ["write", false, false],
+    ]);
+    assert.equal(existsSync(join(cwd, "first.txt")), true);
+    assert.equal(existsSync(join(cwd, "second.txt")), false);
+    ui.dispose();
+  });
+});
+
 // ── repl_reset surfaces the approval state (#44) ─────────────────
 
 describe("repl extension — repl_reset reports approvals", () => {
@@ -3196,10 +3304,15 @@ describe("repl extension — /repl-accept-preamble (#198, decision 5)", () => {
       try {
         const unavailable = cmdCtx(inside);
         await accept.handler("", unavailable.ctx);
-        assert.equal(unavailable.notes[0].type, "error");
-        assert.match(unavailable.notes[0].message, /could not be written/);
-        assert.match(unavailable.notes[0].message, /inside the project/);
-        assert.match(unavailable.notes[0].message, /REPL_PREAMBLE_STORE_DIR/);
+        // The store warning arrives first — the accept raises it on its way
+        // out — and the command's own answer after it, unchanged.
+        const [warning, answer] = unavailable.notes;
+        assert.equal(unavailable.notes.length, 2, JSON.stringify(unavailable.notes));
+        assert.equal(warning.type, "warning");
+        assert.equal(answer.type, "error");
+        assert.match(answer.message, /could not be written/);
+        assert.match(answer.message, /inside the project/);
+        assert.match(answer.message, /REPL_PREAMBLE_STORE_DIR/);
         assert.equal(existsSync(join(inside, "store")), false, "the refused store was created");
       } finally {
         process.env[STORE_VAR] = testStoreDir;
@@ -3232,6 +3345,210 @@ describe("repl extension — /repl-accept-preamble (#198, decision 5)", () => {
       } catch {
         /* already gone */
       }
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── A store inside the project warns the user ────────────────────
+//
+// Found live: pi run with cwd = $HOME puts the default store
+// (`~/.local/state/repl-simple`) inside the project. The guard refuses it, as
+// designed (docs/project-trust.md), so every saved tool was withheld and
+// `save_tool` could not record — and only the model was told. The user, the
+// one person who can set REPL_PREAMBLE_STORE_DIR, saw nothing. The guard
+// stays; the user is warned, once.
+
+describe("repl extension — a store inside the project warns the user, once", () => {
+  const TOOL = "def add_two(a, b):\n    return a + b\n";
+  const SAVE_LATE = 'save_tool("late", "def late():\\n    return 9\\n", "nine")';
+
+  /** A project with `tools` saved in `.pi/code-tools`. */
+  function project(prefix: string, tools: Record<string, string>): string {
+    const cwd = mkdtempSync(join(tmpdir(), `repl-ext-inside-${prefix}-`));
+    mkdirSync(join(cwd, ".pi", "code-tools"), { recursive: true });
+    for (const [name, source] of Object.entries(tools)) {
+      writeFileSync(join(cwd, ".pi", "code-tools", `${name}.py`), source);
+    }
+    return cwd;
+  }
+
+  /** A context for tools and commands alike: trust, UI, a dialog that approves, a notify sink. */
+  function uiCtx(cwd: string, { trusted = true, hasUI = true } = {}) {
+    const notes: Array<{ message: string; type?: string }> = [];
+    return {
+      notes,
+      ctx: {
+        cwd,
+        hasUI,
+        isProjectTrusted: () => trusted,
+        ui: {
+          select: async () => APPROVE_CHOICE,
+          notify: (message: string, type?: string) => notes.push({ message, type }),
+        },
+      },
+    };
+  }
+
+  /** The store warnings among what the user was told — the command's own answers excluded. */
+  function storeWarnings(notes: Array<{ message: string; type?: string }>) {
+    return notes.filter((n) => n.type === "warning" && /REPL_PREAMBLE_STORE_DIR/.test(n.message));
+  }
+
+  /** Run `fn` with the store variable at `store` — read when a runner is built — then restore it. */
+  async function withStore(store: string, fn: () => Promise<void>): Promise<void> {
+    process.env[STORE_VAR] = store;
+    try {
+      await fn();
+    } finally {
+      process.env[STORE_VAR] = testStoreDir;
+    }
+  }
+
+  async function replAndAccept() {
+    const { tools, commands } = await load();
+    const repl = tools.find((t) => t.name === "repl");
+    const accept = commands.find((c) => c.name === "repl-accept-preamble");
+    assert.ok(repl && accept);
+    return { repl, accept };
+  }
+
+  it("warns once per project — from the session build, save_tool and the accept command", async () => {
+    const built = project("build", { adder: TOOL });
+    const saved = project("save", {});
+    const accepted = project("accept", { adder: TOOL });
+    try {
+      const { repl, accept } = await replAndAccept();
+
+      // The session build that withholds `adder`; a second build withholds again.
+      await withStore(join(built, "state"), async () => {
+        const b = uiCtx(built);
+        await repl.execute("in-1", { code: "1", sessionId: "s1" }, undefined, undefined, b.ctx);
+        await repl.execute("in-2", { code: "1", sessionId: "s2" }, undefined, undefined, b.ctx);
+        const warnings = storeWarnings(b.notes);
+        assert.equal(warnings.length, 1, JSON.stringify(b.notes));
+        const message = warnings[0].message;
+        assert.ok(message.includes(join(built, "state")), `the store path: ${message}`);
+        assert.ok(message.includes(built), `the project path: ${message}`);
+        assert.match(message, /withheld/, "the consequence for saved tools");
+        assert.match(message, /not recorded/, "the consequence for acceptances");
+        assert.match(message, /outside the project/);
+        assert.match(message, /restart pi/);
+        assert.match(message, /\/repl-accept-preamble/);
+
+        // A reloaded extension is the same pi process: still once.
+        const again = await replAndAccept();
+        await again.repl.execute(
+          "in-3",
+          { code: "1", sessionId: "s3" },
+          undefined,
+          undefined,
+          b.ctx,
+        );
+        assert.equal(storeWarnings(b.notes).length, 1, "a reload warned again");
+      });
+
+      // save_tool, in a project whose build has nothing to withhold.
+      await withStore(join(saved, "state"), async () => {
+        const s = uiCtx(saved);
+        await repl.execute("in-4", { code: "1", sessionId: "s1" }, undefined, undefined, s.ctx);
+        assert.equal(storeWarnings(s.notes).length, 0, "a build that withheld nothing warned");
+        await repl.execute(
+          "in-5",
+          { code: SAVE_LATE, sessionId: "s1" },
+          undefined,
+          undefined,
+          s.ctx,
+        );
+        assert.equal(storeWarnings(s.notes).length, 1, "save_tool did not warn");
+      });
+
+      // The accept command; its own answer stays an error, beside the warning.
+      await withStore(join(accepted, "state"), async () => {
+        const a = uiCtx(accepted);
+        await accept.handler("", a.ctx);
+        await accept.handler("", a.ctx);
+        assert.equal(storeWarnings(a.notes).length, 1, JSON.stringify(a.notes));
+        assert.equal(a.notes.filter((n) => n.type === "error").length, 2);
+      });
+    } finally {
+      for (const dir of [built, saved, accepted]) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never warns when the store is outside the project — healthy, or unusable for another reason", async () => {
+    const healthy = project("outside-ok", { adder: TOOL });
+    const unusable = project("outside-bad", { adder: TOOL });
+    const parent = mkdtempSync(join(tmpdir(), "repl-ext-outside-store-"));
+    const notADir = join(parent, "not-a-dir");
+    writeFileSync(notADir, "");
+    try {
+      const { repl, accept } = await replAndAccept();
+      for (const [cwd, store] of [
+        [healthy, testStoreDir],
+        [unusable, notADir],
+      ]) {
+        await withStore(store, async () => {
+          const c = uiCtx(cwd);
+          await repl.execute(
+            "out-1",
+            { code: SAVE_LATE, sessionId: "s1" },
+            undefined,
+            undefined,
+            c.ctx,
+          );
+          await accept.handler("", c.ctx);
+          assert.deepEqual(storeWarnings(c.notes), [], store);
+        });
+      }
+    } finally {
+      for (const dir of [healthy, unusable, parent]) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never warns in an untrusted project", async () => {
+    const cwd = project("untrusted", { adder: TOOL });
+    try {
+      const { repl, accept } = await replAndAccept();
+      await withStore(join(cwd, "state"), async () => {
+        const u = uiCtx(cwd, { trusted: false });
+        await repl.execute(
+          "un-1",
+          { code: SAVE_LATE, sessionId: "s1" },
+          undefined,
+          undefined,
+          u.ctx,
+        );
+        await accept.handler("", u.ctx);
+        assert.match(u.notes[0]?.message ?? "", /not trusted/, "the accept command's own answer");
+        assert.deepEqual(storeWarnings(u.notes), []);
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("never warns without a UI — and a later call that has one still does", async () => {
+    const cwd = project("headless", { adder: TOOL });
+    try {
+      const { repl, accept } = await replAndAccept();
+      await withStore(join(cwd, "state"), async () => {
+        const headless = uiCtx(cwd, { hasUI: false });
+        await repl.execute(
+          "hl-1",
+          { code: "1", sessionId: "s1" },
+          undefined,
+          undefined,
+          headless.ctx,
+        );
+        await accept.handler("", headless.ctx);
+        assert.deepEqual(storeWarnings(headless.notes), []);
+
+        const seen = uiCtx(cwd);
+        await repl.execute("hl-2", { code: "1", sessionId: "s2" }, undefined, undefined, seen.ctx);
+        assert.equal(storeWarnings(seen.notes).length, 1, "the unshown warning was spent");
+      });
+    } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
   });

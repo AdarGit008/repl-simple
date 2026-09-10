@@ -864,6 +864,7 @@ const DEFAULT_MAX_MEMORY_MB = 512;
  * Host wall-clock seconds for a whole run, host-tool time included. Generous
  * on purpose: its job is to catch a tool that will never return, not to
  * second-guess a slow one. `bash("npm test")` is a legitimate five minutes.
+ * Waiting for an approval answer is not charged; see `withHostDeadline`.
  */
 const DEFAULT_MAX_WALL_CLOCK_SECS = 300;
 /**
@@ -988,6 +989,12 @@ function hostDeadlineAt(limits?: RunLimits | "unbounded"): number | null {
 const ABORT_SETTLE_GRACE_MS = 250;
 
 /**
+ * Await `wait` with the host wall clock stopped, restarting it with the budget
+ * that was left once `wait` settles. See `withHostDeadline`.
+ */
+type OffTheClock = <T>(wait: () => Promise<T>) => Promise<T>;
+
+/**
  * Bound `fn` by the host wall clock and the abort signal.
  *
  * This is the fail-safe the in-sandbox limits cannot be. Monty's clock is
@@ -1007,40 +1014,74 @@ const ABORT_SETTLE_GRACE_MS = 250;
  * What this does *not* do is stop the losing work. A host tool's promise runs
  * to completion in the background; a runaway inside the sandbox is stopped by
  * `maxDurationSecs`, not by this. It bounds the caller and frees the worker.
+ *
+ * One wait is not the run's to be charged for: a person answering an approval.
+ * The dispatch loop awaits `onApproval` through the `offTheClock` handed to
+ * `fn`, which stops the deadline for as long as the answer takes and restarts
+ * it with what was left, so host-tool time before, between and after dialogs
+ * is still one budget. (A resume's pending call is asked before its segment's
+ * clock starts at all — `Session.resume`.) Counting the dialog was found live:
+ * this budget and the extension's dialog timeout were both five minutes, so a
+ * dialog nobody answered ended as this timeout with nothing traced, instead of
+ * expiring into the denial it is documented to be. What that leaves a caller
+ * to bound is stated once, at `RunLimits`.
  */
 async function withHostDeadline(
   deadlineAt: number | null,
   runOpts: RunOptions | undefined,
   acc: DispatchAccumulators,
-  fn: () => Promise<RunResult>,
+  fn: (offTheClock: OffTheClock) => Promise<RunResult>,
 ): Promise<RunResult> {
   const signal = runOpts?.signal;
-  if (deadlineAt === null && !signal) return await fn();
+  if (deadlineAt === null && !signal) return await fn((wait) => wait());
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abortTimer: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
-  // `Promise.race` subscribes to every entry, so a body that loses and rejects
-  // later is already observed and cannot surface as an unhandled rejection.
-  const racers: Promise<RunResult>[] = [fn()];
+  /** Stops the deadline and returns what restarts it; unset without a deadline. */
+  let stopClock: (() => () => void) | undefined;
+  /** Set once the race is decided, so a wait settling later arms no timer nobody clears. */
+  let decided = false;
+
+  const offTheClock: OffTheClock = async (wait) => {
+    const restartClock = stopClock?.();
+    try {
+      return await wait();
+    } finally {
+      restartClock?.();
+    }
+  };
+
+  const racers: Promise<RunResult>[] = [];
 
   if (deadlineAt !== null) {
-    const remainingMs = Math.max(0, deadlineAt - Date.now());
+    let expiresAt = deadlineAt;
     racers.push(
       new Promise<RunResult>((resolve) => {
-        timer = setTimeout(
-          () =>
-            resolve(
-              runError(
-                "timeout",
-                "run exceeded its host wall-clock budget — a host tool did not return in time, " +
-                  "or the run as a whole took too long. This budget covers host-tool time, " +
-                  "which the sandbox's own duration limit does not.",
-                acc,
+        const arm = () => {
+          timer = setTimeout(
+            () =>
+              resolve(
+                runError(
+                  "timeout",
+                  "run exceeded its host wall-clock budget — a host tool did not return in time, " +
+                    "or the run as a whole took too long. This budget covers host-tool time, " +
+                    "which the sandbox's own duration limit does not.",
+                  acc,
+                ),
               ),
-            ),
-          remainingMs,
-        );
+            Math.max(0, expiresAt - Date.now()),
+          );
+        };
+        arm();
+        stopClock = () => {
+          clearTimeout(timer);
+          const stoppedAt = Date.now();
+          return () => {
+            expiresAt += Date.now() - stoppedAt;
+            if (!decided) arm();
+          };
+        };
       }),
     );
   }
@@ -1061,9 +1102,15 @@ async function withHostDeadline(
     );
   }
 
+  // The body starts last, once the clock it can stop exists. `Promise.race`
+  // subscribes to every entry, so a body that loses and rejects later is
+  // already observed and cannot surface as an unhandled rejection.
+  racers.push(fn(offTheClock));
+
   try {
     return await Promise.race(racers);
   } finally {
+    decided = true;
     // All three are mandatory, not tidiness: a live timer keeps the event loop
     // alive past the run that armed it, and a listener left on a caller-owned
     // signal outlives every run that shares it.
@@ -1117,12 +1164,16 @@ async function withMounts<T>(
  * `acc` is owned by the caller and mutated in place — by this loop, and
  * concurrently by the caller's `printCallback` and abort listener, which
  * Monty invokes while the loop is awaiting a resume.
+ *
+ * `offTheClock` is the enclosing `withHostDeadline`'s: every `onApproval` is
+ * awaited through it.
  */
 async function runDispatchLoop(
   current: Snapshot,
   registry: ToolRegistry,
   runOpts: RunOptions | undefined,
   acc: DispatchAccumulators,
+  offTheClock: OffTheClock,
 ): Promise<RunResult> {
   while (true) {
     // Abort check between iterations
@@ -1243,7 +1294,9 @@ async function runDispatchLoop(
     let approved: boolean | undefined;
     if (tool.requiresApproval) {
       const req = buildApprovalRequest(tool, args, kwargs);
-      const decision = runOpts?.onApproval ? await runOpts.onApproval(req) : false;
+      // Awaited off the host wall clock — see `withHostDeadline`.
+      const onApproval = runOpts?.onApproval;
+      const decision = onApproval ? await offTheClock(async () => await onApproval(req)) : false;
 
       if (decision === "suspend") {
         return {
@@ -1419,7 +1472,7 @@ export async function runInSandbox(
         // Inside the checkout, so that losing the race settles this body and
         // runs the `finally` that returns the worker.
         async (session) =>
-          await withHostDeadline(deadlineAt, runOpts, acc, async () => {
+          await withHostDeadline(deadlineAt, runOpts, acc, async (offTheClock) => {
             let current: Snapshot;
             try {
               current = await session.feedStart(code, {
@@ -1430,7 +1483,7 @@ export async function runInSandbox(
             } catch (err) {
               return classifyStartError(err, acc, runOpts?.lineOffset);
             }
-            return await runDispatchLoop(current, registry, runOpts, acc);
+            return await runDispatchLoop(current, registry, runOpts, acc, offTheClock);
           }),
       ),
     );
@@ -1537,11 +1590,17 @@ export async function resumeSuspended(
             deadlineAt,
             runOpts,
             acc,
-            async () =>
-              await resumeInSession(session, suspended, decision, options, runOpts, acc, {
-                printCallback,
-                mount,
-              }),
+            async (offTheClock) =>
+              await resumeInSession(
+                session,
+                suspended,
+                decision,
+                options,
+                runOpts,
+                acc,
+                { printCallback, mount },
+                offTheClock,
+              ),
           ),
       ),
     );
@@ -1560,6 +1619,7 @@ async function resumeInSession(
   runOpts: RunOptions | undefined,
   acc: DispatchAccumulators,
   loadOpts: { printCallback: PrintCallback; mount: MountDir[] | undefined },
+  offTheClock: OffTheClock,
 ): Promise<RunResult> {
   const registry = options.registry;
 
@@ -1676,5 +1736,5 @@ async function resumeInSession(
   }
 
   // Continue via shared dispatch loop
-  return await runDispatchLoop(current, registry, runOpts, acc);
+  return await runDispatchLoop(current, registry, runOpts, acc, offTheClock);
 }
