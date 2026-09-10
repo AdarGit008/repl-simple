@@ -16,7 +16,14 @@ import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { SubmitSignal } from "../src/submit_signal.js";
 import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY, formatSize } from "../src/truncate.js";
-import type { ApprovalRequest, HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
+import type {
+  ApprovalDecision,
+  ApprovalRequest,
+  HostTool,
+  RunOk,
+  RunError,
+  RunSuspended,
+} from "../src/types.js";
 // The finding-5 tripwire drives Monty directly: the fact under test is the
 // binding's, not the sandbox's.
 import { MAX_VALUE_DEPTH, Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
@@ -2889,6 +2896,150 @@ describe("the host wall clock", () => {
 
     err(result);
     assert.equal(result.errorKind, "aborted");
+  });
+
+  // ── A dialog is off the clock ──
+  //
+  // Found live on pi 0.85.1: a dialog nobody answered ended its `repl` call at
+  // 300.003 s with `run exceeded its host wall-clock budget` and an empty trace.
+  // The budget (300 s) had been counting the dialog, and beat the dialog's own
+  // timeout (300 s) to it, so the expiry that should have denied the call never
+  // got the chance. The budget bounds host tools; a person reading a dialog is
+  // not one.
+
+  /** A gated tool that says what it ran with. */
+  function gateTool(): HostTool {
+    return {
+      name: "gate",
+      description: "Needs approval",
+      params: [{ name: "x", type: "str", description: "Value" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: (args) => `ran ${args.x}`,
+    };
+  }
+
+  /** Host time, not compute: Monty's clock does not advance while it waits. */
+  function napTool(ms: number): HostTool {
+    return {
+      name: "nap",
+      description: "Sleeps on the host",
+      params: [],
+      returns: "str",
+      execute: () => new Promise((resolve) => setTimeout(() => resolve("napped"), ms)),
+    };
+  }
+
+  /** An `onApproval` that answers `ms` after it is asked — a person reading the dialog. */
+  function answersAfter(ms: number, decision: ApprovalDecision): () => Promise<ApprovalDecision> {
+    return () => new Promise((resolve) => setTimeout(() => resolve(decision), ms));
+  }
+
+  it("dialogs answered after the budget ran out still decide their calls", async () => {
+    // Deterministic on the side that matters (D132). Four dialogs of 750 ms are
+    // 3 s of waiting under a 2 s budget: a clock that counted them expires
+    // before the third answer, and one that stopped for the first alone still
+    // expires before the last. Nothing else in the run spends host time.
+    const registry = new ToolRegistry([gateTool()]);
+
+    const result = await runInSandbox(
+      'gate("a")\ngate("b")\ngate("c")\ngate("d")',
+      { registry },
+      { limits: { maxWallClockSecs: 2 }, onApproval: answersAfter(750, true) },
+    );
+
+    ok(result, (result as RunError).error);
+    assert.equal(result.output, "ran d");
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.ok, c.approved]),
+      Array.from({ length: 4 }, () => ["gate", true, true]),
+    );
+  });
+
+  it("host-tool time either side of a dialog is still one budget", async () => {
+    // Stopped, not restarted. Two 700 ms naps are 1.4 s of host-tool time under
+    // a 1 s budget, whatever the dialog between them costs — deterministic on
+    // the timeout side. A deadline the answer started afresh would give the
+    // second nap a whole second and let the run finish.
+    const registry = new ToolRegistry([gateTool(), napTool(700)]);
+
+    const result = await runInSandbox(
+      'nap()\ngate("x")\nnap()',
+      { registry },
+      { limits: { maxWallClockSecs: 1 }, onApproval: answersAfter(1200, true) },
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+  });
+
+  it("a host tool that never returns after a dialog still times out", {
+    timeout: 20_000,
+  }, async () => {
+    // The clock runs again once the answer is in: a deadline stopped for the
+    // dialog and never restarted would park this run for good.
+    const registry = new ToolRegistry([gateTool(), hangingTool()]);
+
+    const result = await runInSandbox(
+      'gate("x")\nhang()',
+      { registry },
+      { limits: { maxWallClockSecs: 1 }, onApproval: answersAfter(1200, true) },
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "timeout");
+    assert.match(result.error, /host wall-clock/);
+  });
+
+  it("an abort ends a run waiting on a dialog past its budget", { timeout: 20_000 }, async () => {
+    // Off the clock is not off the signal. The dialog never settles and the
+    // abort lands after the 1 s budget would have run out, so the abort race is
+    // the only thing that can end this run — and it ends it as aborted.
+    const registry = new ToolRegistry([gateTool()]);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 1200);
+
+    const result = await runInSandbox(
+      'gate("x")',
+      { registry },
+      {
+        signal: controller.signal,
+        limits: { maxWallClockSecs: 1 },
+        onApproval: () => new Promise<ApprovalDecision>(() => {}),
+      },
+    );
+
+    err(result);
+    assert.equal(result.errorKind, "aborted", result.error);
+  });
+
+  it("a dialog in a resumed continuation is off the clock too", async () => {
+    // `resumeSuspended` runs the continuation under a deadline of its own, and
+    // every gated call after the pending one is asked inside it.
+    const registry = new ToolRegistry([gateTool()]);
+    const susp = await runInSandbox(
+      'gate("a")\ngate("b")',
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(susp);
+
+    const result = await resumeSuspended(
+      susp,
+      true,
+      { registry },
+      { limits: { maxWallClockSecs: 2 }, onApproval: answersAfter(2500, true) },
+    );
+
+    ok(result, (result as RunError).error);
+    assert.equal(result.output, "ran b");
+    assert.deepEqual(
+      result.calls.map((c) => [c.tool, c.ok, c.approved]),
+      [
+        ["gate", true, true],
+        ["gate", true, true],
+      ],
+    );
   });
 });
 

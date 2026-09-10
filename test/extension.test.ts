@@ -944,6 +944,114 @@ describe("repl extension — a dialog always settles (#49)", () => {
   });
 });
 
+// ── An unanswered dialog denies, whatever the wall clock ─────────
+//
+// Found live on pi 0.85.1: `print(bash(...))` with nobody at the dialog ended
+// at 300.003 s as `[error: timeout] run exceeded its host wall-clock budget`,
+// `trace=[]`. Both bounds were five minutes and the wall clock was counting
+// the dialog, so the run timed out where the README promises a denial. Each
+// test below runs a dialog timeout longer than the wall-clock budget, which is
+// the whole of that race made deterministic.
+
+describe("repl extension — an unanswered dialog denies, whatever the wall clock", () => {
+  let cwd: string;
+  const prior = {
+    timeout: process.env.REPL_APPROVAL_TIMEOUT_MS,
+    wallClock: process.env.REPL_MAX_WALL_CLOCK_SECS,
+  };
+
+  before(() => {
+    cwd = mkdtempSync(join(tmpdir(), "repl-ext-late-"));
+    process.env.REPL_MAX_WALL_CLOCK_SECS = "2";
+    process.env.REPL_APPROVAL_TIMEOUT_MS = "2500";
+  });
+
+  after(() => {
+    if (prior.timeout === undefined) delete process.env.REPL_APPROVAL_TIMEOUT_MS;
+    else process.env.REPL_APPROVAL_TIMEOUT_MS = prior.timeout;
+    if (prior.wallClock === undefined) delete process.env.REPL_MAX_WALL_CLOCK_SECS;
+    else process.env.REPL_MAX_WALL_CLOCK_SECS = prior.wallClock;
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  /** Answers the scripted dialogs in order, and leaves any after them to their timeout. */
+  function answersThenWalksAway(answers: string[]) {
+    const unanswered = clobberingSelect();
+    let next = 0;
+    const select = (title: string, options: string[], opts?: DialogOpts) =>
+      next < answers.length
+        ? Promise.resolve<string | undefined>(answers[next++])
+        : unanswered.select(title, options, opts);
+    return {
+      ctx: { cwd, isProjectTrusted: () => true, hasUI: true, ui: { select } },
+      dispose: unanswered.dispose,
+    };
+  }
+
+  it("repl: the dialog's timeout denies the call and the trace says so", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl);
+    const ui = answersThenWalksAway([]);
+
+    const result = await withDeadline(
+      repl.execute(
+        "late-1",
+        { code: "write('late.txt', 'x')", sessionId: "late-run" },
+        undefined,
+        undefined,
+        ui.ctx,
+      ),
+      15_000,
+      "the repl call never returned",
+    );
+
+    const text = result.content[0].text;
+    assert.doesNotMatch(text, /wall-clock/, text);
+    assert.match(text, /PermissionError/);
+    assert.deepEqual(outline(detailsOf(result)), [["write", false, false]]);
+    assert.equal(existsSync(join(cwd, "late.txt")), false);
+    ui.dispose();
+  });
+
+  it("repl_resume: a later dialog's timeout denies its call and the trace says so", async () => {
+    const tools = await loadTools();
+    const repl = tools.find((t) => t.name === "repl");
+    const resume = tools.find((t) => t.name === "repl_resume");
+    assert.ok(repl && resume);
+    const code = "write('first.txt', 'x')\nwrite('second.txt', 'x')";
+
+    const parked = answersThenWalksAway([LATER_CHOICE]);
+    await repl.execute(
+      "late-2",
+      { code, sessionId: "late-resume" },
+      undefined,
+      undefined,
+      parked.ctx,
+    );
+    parked.dispose();
+
+    // The pending call is approved at once; the one after it is asked inside
+    // the resumed continuation, and nobody answers.
+    const ui = answersThenWalksAway([APPROVE_CHOICE]);
+    const result = await withDeadline(
+      resume.execute("late-3", { sessionId: "late-resume" }, undefined, undefined, ui.ctx),
+      15_000,
+      "the repl_resume call never returned",
+    );
+
+    const text = result.content[0].text;
+    assert.doesNotMatch(text, /wall-clock/, text);
+    assert.match(text, /PermissionError/);
+    assert.deepEqual(outline(detailsOf(result)), [
+      ["write", true, true],
+      ["write", false, false],
+    ]);
+    assert.equal(existsSync(join(cwd, "first.txt")), true);
+    assert.equal(existsSync(join(cwd, "second.txt")), false);
+    ui.dispose();
+  });
+});
+
 // ── repl_reset surfaces the approval state (#44) ─────────────────
 
 describe("repl extension — repl_reset reports approvals", () => {
