@@ -63,6 +63,10 @@ resumed call's) — not the replayed prior calls (A16 below).
 ## The call cache, and what a replay is
 
 Every host-tool call a retained snippet made is in an ordered list, keyed on `tool::{sorted args}`.
+The arguments are the ones the tool received, and a class instance in them has already become its
+repr string (`<C object>`, `P(x=1)`; `instancesAsRepr`). Monty 0.0.23 hands an instance over as a
+proxy with a fresh uuid per run, which gave the same call a new key on every replay: it executed
+again and a gated one asked again (pinned in `test/session.test.ts`).
 A replay serves them **positionally**: the cursor advances only on a key match, and a mismatch (the
 code changed between runs) falls through to real execution from that point. `docs/approval-grants.md`
 explains why the approval gate treats "the next entry the cursor will serve" — and only that — as a

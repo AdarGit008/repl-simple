@@ -33,6 +33,7 @@ import { type ToolRegistry, probeTypeCheckerGaps } from "./registry.js";
 import {
   Truncator,
   formatValue,
+  instancesAsRepr,
   pythonTypeName,
   STDOUT_MAX_BYTES,
   STDOUT_MAX_LINES,
@@ -1202,19 +1203,25 @@ async function runDispatchLoop(
       continue;
     }
 
+    // The call's arguments as everything below sees them: every class instance
+    // replaced by its repr string. On 0.0.23 an instance arrives as a proxy
+    // whose JSON holds a fresh uuid per run and every attribute, and the tool,
+    // the approval request, the trace and a `Session`'s cache key all read the
+    // arguments — so a replayed call missed its cache entry and ran again, a
+    // gated one asked again, and a plain instance's attributes were written to
+    // the trace. See `instancesAsRepr`.
+    const args = instancesAsRepr(snapshot.args) as unknown[];
+    const kwargs = instancesAsRepr(snapshot.kwargs) as Record<string, unknown>;
+
     // Resolve args from positional+keyword to flat Record
     let resolvedArgs: Record<string, unknown>;
     try {
-      resolvedArgs = resolveToolArgs(
-        tool,
-        snapshot.args as unknown[],
-        snapshot.kwargs as Record<string, unknown>,
-      );
+      resolvedArgs = resolveToolArgs(tool, args, kwargs);
     } catch (err) {
       acc.record({
         tool: tool.name,
-        args: snapshot.args as unknown[],
-        kwargs: snapshot.kwargs as Record<string, unknown>,
+        args: args,
+        kwargs: kwargs,
         durationMs: 0,
         ok: false,
         error: err instanceof Error ? err.message : String(err),
@@ -1235,11 +1242,7 @@ async function runDispatchLoop(
     // Approval gate
     let approved: boolean | undefined;
     if (tool.requiresApproval) {
-      const req = buildApprovalRequest(
-        tool,
-        snapshot.args as unknown[],
-        snapshot.kwargs as Record<string, unknown>,
-      );
+      const req = buildApprovalRequest(tool, args, kwargs);
       const decision = runOpts?.onApproval ? await runOpts.onApproval(req) : false;
 
       if (decision === "suspend") {
@@ -1257,8 +1260,8 @@ async function runDispatchLoop(
         // Denied (or no callback) → PermissionError in Python
         acc.record({
           tool: tool.name,
-          args: snapshot.args as unknown[],
-          kwargs: snapshot.kwargs as Record<string, unknown>,
+          args: args,
+          kwargs: kwargs,
           durationMs: 0,
           ok: false,
           approved: false,
@@ -1296,8 +1299,8 @@ async function runDispatchLoop(
       if (answer !== undefined) {
         acc.record({
           tool: tool.name,
-          args: snapshot.args as unknown[],
-          kwargs: snapshot.kwargs as Record<string, unknown>,
+          args: args,
+          kwargs: kwargs,
           durationMs,
           ok: true,
           approved,
@@ -1315,8 +1318,8 @@ async function runDispatchLoop(
       const { pythonType, message } = toolFailure(err);
       acc.record({
         tool: tool.name,
-        args: snapshot.args as unknown[],
-        kwargs: snapshot.kwargs as Record<string, unknown>,
+        args: args,
+        kwargs: kwargs,
         durationMs,
         ok: false,
         error: message,
@@ -1335,8 +1338,8 @@ async function runDispatchLoop(
     // same call a second time.
     acc.record({
       tool: tool.name,
-      args: snapshot.args as unknown[],
-      kwargs: snapshot.kwargs as Record<string, unknown>,
+      args: args,
+      kwargs: kwargs,
       durationMs: performance.now() - t0,
       ok: true,
       approved,

@@ -706,6 +706,50 @@ class Repr {
 }
 
 /**
+ * `value` with every class instance inside it replaced by its repr string —
+ * `<C object>`, `P(x=1)` — and every other shape left as it was: lists stay
+ * lists, dicts stay `Map`s, strings stay strings.
+ *
+ * This is how a host-tool call's arguments are normalised at the dispatch
+ * boundary. 0.0.21 converted an instance to Monty's repr string before the
+ * host saw it; 0.0.23 sends a `MontyClassProxy` whose JSON carries a fresh uuid
+ * on every run and every attribute. Every consumer of a call's arguments reads
+ * them as JSON or as strings — the tool, `Session`'s cache key, the approval
+ * description, the trace persisted through `details` — so the proxy made a
+ * replayed call miss the cache and execute again, asked approval again, and
+ * wrote a plain instance's attributes (a `password` field included) to disk.
+ * The repr is the one form that is stable across runs and shows no more than
+ * `output` does.
+ *
+ * Rendered by the same `Repr` as `output`, but uncapped: a cache key must
+ * separate two instances that differ only past any cut, and 0.0.21's repr
+ * strings were whole too.
+ */
+export function instancesAsRepr(value: unknown): unknown {
+  if (value instanceof MontyClassProxy) {
+    const r = new Repr(Number.POSITIVE_INFINITY);
+    r.value(value);
+    return r.text;
+  }
+  if (Array.isArray(value)) return value.map(instancesAsRepr);
+  if (value instanceof Map) {
+    return new Map([...value].map(([k, v]) => [instancesAsRepr(k), instancesAsRepr(v)]));
+  }
+  if (value instanceof Set) return new Set([...value].map(instancesAsRepr));
+  if (value !== null && typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === null) {
+      // `kwargs`, and Monty's tagged records. Rebuilt on the same prototype so
+      // a null-prototype record stays one.
+      const out = Object.create(proto) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(value)) out[k] = instancesAsRepr(v);
+      return out;
+    }
+  }
+  return value;
+}
+
+/**
  * Both real ends of one rendering, for the flat cut: the head under `cap`
  * and, only when that did not reach the end, the tail under the same cap.
  * `whole` says the head was the whole thing. The cut keeps a real head and a

@@ -14,6 +14,12 @@ export interface HostTool {
   description: string;
   params: HostToolParam[];
   returns: "str" | "void";
+  /**
+   * Runs the call. A class instance anywhere in an argument arrives as its
+   * repr string (`<C object>`, `P(x=1)`), never as Monty's proxy object — the
+   * sandbox normalises arguments before any tool, cache key, approval request
+   * or trace sees them (`instancesAsRepr`, src/truncate.ts).
+   */
   execute(args: Record<string, unknown>): string | Promise<string>;
   requiresApproval?: boolean;
   /**

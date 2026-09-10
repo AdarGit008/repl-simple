@@ -16,7 +16,7 @@ import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { SubmitSignal } from "../src/submit_signal.js";
 import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY, formatSize } from "../src/truncate.js";
-import type { HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
+import type { ApprovalRequest, HostTool, RunOk, RunError, RunSuspended } from "../src/types.js";
 // The finding-5 tripwire drives Monty directly: the fact under test is the
 // binding's, not the sandbox's.
 import { Monty, MontyComplete, type PrintCallback } from "@pydantic/monty/node";
@@ -2263,6 +2263,115 @@ describe("host tools survive being used as values", () => {
   });
 });
 
+// ── Class instances as tool arguments (Monty 0.0.23) ─────────────
+//
+// 0.0.21 turned an instance into Monty's repr string before a host tool saw
+// it: the tool received "<C object at 0x2>" or "P(x=1)" (measured by review).
+// 0.0.23 hands over a `MontyClassProxy`, whose JSON carries a fresh uuid on
+// every run and every attribute, and every consumer of the arguments — the
+// tool, the replay cache key, the approval description, the trace persisted
+// through `details` — saw that JSON. An untyped helper parameter carries an
+// instance past the type checker, so ordinary model code does this.
+
+describe("a class instance passed to a host tool arrives as its repr, never as a proxy (0.0.23)", () => {
+  const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+  const DC = "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\n";
+  /** JSON that spells a Map as an object, so a uuid inside a dict argument is visible. */
+  const json = (value: unknown) =>
+    JSON.stringify(value, (_k, v) => (v instanceof Map ? Object.fromEntries(v) : v));
+
+  /** A one-parameter tool that records exactly what `execute` received. */
+  function recordingTool(name = "echo", overrides: Partial<HostTool> = {}) {
+    const received: unknown[] = [];
+    const tool = makeTool({
+      name,
+      execute: (args) => {
+        received.push(args.text);
+        return "ok";
+      },
+      ...overrides,
+    });
+    return { tool, received };
+  }
+
+  it("a plain instance through an untyped helper: the tool and the trace see `<C object>`, no attributes", async () => {
+    const { tool, received } = recordingTool();
+    const result = await runInSandbox(
+      "class C:\n    def __init__(self):\n        self.password = 'hunter2'\ndef g(v):\n    return echo(v)\ng(C())",
+      { registry: new ToolRegistry([tool]) },
+    );
+    ok(result);
+    assert.deepEqual(received, ["<C object>"]);
+    assert.deepEqual(result.calls[0].args, ["<C object>"]);
+    assert.doesNotMatch(json(result.calls), UUID);
+    assert.doesNotMatch(json(result.calls), /hunter2|password/, "an attribute reached the trace");
+  });
+
+  it("a dataclass arrives as its field repr, passed by keyword too", async () => {
+    const { tool, received } = recordingTool();
+    const result = await runInSandbox(`${DC}def g(v):\n    return echo(text=v)\ng(P(1))`, {
+      registry: new ToolRegistry([tool]),
+    });
+    ok(result);
+    assert.deepEqual(received, ["P(x=1)"]);
+    // Spread: Monty's kwargs record has a null prototype, and normalising keeps it.
+    assert.deepEqual({ ...result.calls[0].kwargs }, { text: "P(x=1)" });
+    assert.doesNotMatch(json(result.calls), UUID);
+  });
+
+  it("instances nested inside a list or a dict argument are each replaced in place", async () => {
+    const { tool, received } = recordingTool();
+    const result = await runInSandbox(
+      `${DC}class C:\n    pass\ndef g(v):\n    return echo(v)\ng([C(), {'k': P(2)}, 'plain'])`,
+      { registry: new ToolRegistry([tool]) },
+    );
+    ok(result);
+    const [arg] = received as [unknown[]];
+    assert.equal(arg[0], "<C object>");
+    assert.ok(arg[1] instanceof Map, `a dict argument must stay a dict: ${json(arg[1])}`);
+    assert.equal((arg[1] as Map<string, unknown>).get("k"), "P(x=2)");
+    assert.equal(arg[2], "plain");
+    assert.doesNotMatch(json(received), UUID);
+    assert.doesNotMatch(json(result.calls), UUID);
+  });
+
+  it("a gated tool is asked about the repr, with no uuid and no attribute dump", async () => {
+    const { tool, received } = recordingTool("gate", { requiresApproval: true });
+    const asked: ApprovalRequest[] = [];
+    const result = await runInSandbox(
+      "class C:\n    def __init__(self):\n        self.token = 'sk-secret'\ndef g(v):\n    return gate(v)\ng(C())",
+      { registry: new ToolRegistry([tool]) },
+      {
+        onApproval: (request) => {
+          asked.push(request);
+          return true;
+        },
+      },
+    );
+    ok(result);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].description, 'gate(text="<C object>")');
+    assert.deepEqual(asked[0].args, ["<C object>"]);
+    assert.doesNotMatch(json(asked), UUID);
+    assert.doesNotMatch(json(asked), /sk-secret|token/);
+    assert.deepEqual(received, ["<C object>"]);
+  });
+
+  it("a suspended call carries the repr across resumeSuspended", async () => {
+    const { tool, received } = recordingTool("gate", { requiresApproval: true });
+    const registry = new ToolRegistry([tool]);
+    const paused = await runInSandbox(
+      `${DC}def g(v):\n    return gate(v)\ng(P(3))`,
+      { registry },
+      { onApproval: () => "suspend" },
+    );
+    suspended(paused);
+    assert.equal(paused.suspendedCall.description, 'gate(text="P(x=3)")');
+    ok(await resumeSuspended(paused, true, { registry }));
+    assert.deepEqual(received, ["P(x=3)"]);
+  });
+});
+
 // ── Calls that never reach a tool ───────────────────────────────
 
 describe("dispatch failures before a tool runs", () => {
@@ -3414,6 +3523,21 @@ describe("SUBMIT rejects a non-str answer with a Python TypeError (#65 tests 1-2
       assert.equal(result.calls[0].error, `SUBMIT() answer must be str, not ${pytype}`);
     });
   }
+
+  it("SUBMIT(instance) submits the instance's repr, as 0.0.21 did — an instance is not a non-str answer", async () => {
+    // 0.0.21 converted the instance to its repr string before SUBMIT saw it,
+    // so the answer was "<C object at 0x2>" (measured by review). 0.0.23's
+    // proxy made it `TypeError: … not C`. The dispatch boundary normalises
+    // every tool argument, SUBMIT's included, so the 0.0.21 answer is back —
+    // minus the address, which does not cross.
+    const result = await runInSandbox(
+      "class C:\n    pass\nfrom typing import Any\nv: Any = C()\nSUBMIT(v)",
+      { registry },
+    );
+    ok(result);
+    assert.equal(result.output, "<C object>");
+    assert.equal(result.calls[0].ok, true);
+  });
 
   it("the model can catch it and carry on — it is a Python exception, not a host fault", async () => {
     const result = await runInSandbox(

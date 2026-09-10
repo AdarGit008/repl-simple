@@ -2577,6 +2577,56 @@ describe("Session — cache and replay semantics recovered (#62 A14–A17)", () 
   });
 });
 
+// ── A class instance as a tool argument, across replays (Monty 0.0.23) ──
+//
+// The cache key is the tool name plus the JSON of its arguments. On 0.0.23 an
+// instance argument was a proxy whose JSON carried a fresh uuid on every run,
+// so no replay ever matched: the call re-executed on every later `run()`, a
+// new cache entry piled up each time, and a gated call asked again each time
+// with the proxy's JSON as its description (measured by review: 3 executions,
+// 3 keys, 3 prompts over 3 runs; 0.0.21: 1, 1, 1).
+
+describe("Session — a class instance passed to a tool keeps the replay cache and the gate stable (0.0.23)", () => {
+  const code =
+    "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\ndef g(v):\n    return act(v)\nz = g(P(1))\nz";
+
+  for (const gated of [false, true]) {
+    it(`${gated ? "a gated" : "an ungated"} call executes once across replays, under one cache key${gated ? ", asking once" : ""}`, async () => {
+      let executions = 0;
+      const act: HostTool = {
+        name: "act",
+        description: "A side effect",
+        params: [{ name: "text", type: "str", description: "Text" }],
+        returns: "str",
+        requiresApproval: gated,
+        execute: () => `r${++executions}`,
+      };
+      const asked: string[] = [];
+      const onApproval = (request: ApprovalRequest) => {
+        asked.push(request.description);
+        return true;
+      };
+      const session = new Session({ registry: new ToolRegistry([act]) });
+
+      const first = await session.run(code, { onApproval });
+      ok(first);
+      assert.equal(first.output, "r1");
+      for (let i = 0; i < 2; i++) {
+        const again = await session.run("z", { onApproval });
+        ok(again);
+        assert.equal(again.output, "r1", "a replay was not served from the cache");
+      }
+      assert.equal(executions, 1, "the replay re-executed the call");
+      const dump = JSON.parse(session.dump());
+      assert.deepEqual(
+        dump.callCache.map((entry: { key: string }) => entry.key),
+        ['act::{"text":"P(x=1)"}'],
+      );
+      assert.deepEqual(asked, gated ? ['act(text="P(x=1)")'] : []);
+    });
+  }
+});
+
 // ── Persistence hardening (#63) ───────────────────────────────────
 //
 // `Session.dump()` / `load()` are a public export. Measured before this
