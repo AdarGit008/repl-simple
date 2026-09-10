@@ -3255,6 +3255,14 @@ describe("RunOk.output is always a string, rendered as Python (#65 test 4, #69 f
     ["[(1, 2.0), {'k': {1}}, b'\\x00', 1e400, None]", "[[1, 2], {'k': {1}}, b'\\x00', inf, None]"],
     ["ValueError('bad')", "ValueError('bad')"],
     ["type(1)", "<class 'int'>"],
+    // Instances: 0.0.21 sent Monty's repr string, 0.0.23 sends a
+    // MontyClassProxy (the address is not carried; see the policy's losses).
+    ["class C:\n    def __init__(self):\n        self.x = 1\nC()", "<C object>"],
+    ["class C:\n    pass\n[C(), C()]", "[<C object>, <C object>]"],
+    [
+      "from dataclasses import dataclass\n@dataclass\nclass P:\n    x: int\n    y: str\nP(1, 'a')",
+      "P(x=1, y='a')",
+    ],
     ["print('x')", "None"],
     ["echo('hi')", "hi"],
     ["SUBMIT('done')", "done"],

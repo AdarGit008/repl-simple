@@ -574,7 +574,7 @@ by construction. `test/truncate.test.ts` and `test/sandbox.test.ts` assert again
 
 Python's, for what crossed the boundary:
 
-| Python | arrives as (Monty 0.0.21, measured) | `output` |
+| Python | arrives as (Monty 0.0.23, measured; unchanged from 0.0.21 unless noted) | `output` |
 |---|---|---|
 | `None`, `True`, `False` | `null`, `true`, `false` | `None`, `True`, `False` |
 | `42`, `10**20` | `42`, `100000000000000000000n` | `42`, `100000000000000000000` |
@@ -585,7 +585,8 @@ Python's, for what crossed the boundary:
 | `b'ab\x00'` | `Buffer` | `b'ab\x00'` |
 | `[1, 2]`, `{'a': 1}`, `{1, 2}`, `set()`, `{}` | `Array`, `Map`, `Set`, `Set`, `Map` | `[1, 2]`, `{'a': 1}`, `{1, 2}`, `set()`, `{}` |
 | `ValueError('bad')`, `type(1)` | `{__monty_type__: "Exception", …}`, `{__monty_type__: "Type", …}` | `ValueError('bad')`, `<class 'int'>` |
-| `range(3)`, a lambda, an instance | Monty's own repr string | `range(0, 3)`, `<function '<lambda>' at 0xc>`, … (verbatim) |
+| `range(3)`, a lambda | Monty's own repr string | `range(0, 3)`, `<function '<lambda>' at 0xc>` (verbatim) |
+| an instance, a dataclass instance | `MontyClassProxy` — class name, uuid, attributes (0.0.21: Monty's repr string, `<C object at 0x2>`, `P(x=1)`) | `<C object>`, `P(x=1)` |
 | `a = []; a.append(a); a` | `["[...]"]` — Monty breaks the cycle itself | `['[...]']` |
 
 ### Documented losses
@@ -600,6 +601,10 @@ What the boundary does not carry, and so what `output` cannot show. Recorded rat
   do not). Chosen deliberately: inspecting text is what a REPL is for, and a 10 KiB document as one
   escaped line is not an improvement.
 - **exponent spelling**: `1.5e-7` where Python writes `1.5e-07`.
+- **an instance's address**: `C()` renders `<C object>` where `print(C())` shows
+  `<C object at 0x50>`. Since 0.0.23 an instance crosses as a proxy carrying its class name and
+  attributes, not a repr; the proxy's uuid is an identity for passing it back, not an address, and
+  is never rendered.
 
 ### Elision
 
