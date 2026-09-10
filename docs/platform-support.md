@@ -45,8 +45,9 @@ It is not one. On Node the wasm entry selects an **in-process** factory — ther
 subprocess at all. Measured on `0.0.23` (Node 24.19.0): `session.workerPid` is `undefined`;
 `while True: pass` under a 1 s budget fires **0** host timer ticks at a 50 ms interval, against 19
 on the native path; and with no `maxDurationSecs` set, the same loop wedges the host until it is
-SIGKILLed (the probe killed it at 8 s). `0.0.21` measured the same way: 0 ticks, and a wedge that
-needed a SIGKILL. That is precisely the `0.0.18` failure mode this project migrated away from, so
+SIGKILLed (the probe killed it at 8 s). This section recorded the same on `0.0.21` — 0 ticks against
+9 on the native path, and a wedge that needed a SIGKILL — though it did not record the tick interval
+it used. That is precisely the `0.0.18` failure mode this project migrated away from, so
 the wasm entry would forfeit crash isolation, event-loop survival and the host backstop in one step,
 while appearing to work.
 
