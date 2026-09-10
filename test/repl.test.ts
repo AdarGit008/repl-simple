@@ -2704,6 +2704,104 @@ describe("ReplRunner — the accepted set is a hash, not a stat (#198)", () => {
   });
 });
 
+describe("ReplRunner — a store inside the project is reported to the host", () => {
+  // Found live: pi run with cwd = $HOME puts the default store inside the
+  // project. The refusal is right and stays; but its only witness was the
+  // model, reading `[preamble unverified] … inside the project`, and the one
+  // person who can move the store is the user. `onPreambleStoreInsideProject`
+  // is how a host learns it — as a kind, never parsed out of a notice — at
+  // each point the refusal costs something.
+
+  type Where = { store: string; project: string };
+  const SAVE_LATE = 'save_tool("late", "def late():\\n    return 9\\n", "nine")';
+
+  /** A runner whose store is `store`, recording every report. */
+  function reporting(cwd: string, store: string, trusted = true) {
+    const reports: Where[] = [];
+    // A variable, not a literal: the option is new, and this file must still
+    // typecheck against a runner that lacks it.
+    const options = {
+      isProjectTrusted: () => trusted,
+      preambleStoreDir: store,
+      onPreambleStoreInsideProject: (where: Where) => reports.push(where),
+    };
+    return { runner: new ReplRunner(cwd, options), reports };
+  }
+
+  it("a withholding build, save_tool, delete_tool and acceptPreamble each report it", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "adder", ADDER);
+    const store = join(cwd, "state");
+    try {
+      const { runner, reports } = reporting(cwd, store);
+      const where = { store, project: cwd };
+
+      const built = await runner.run("1", "s1");
+      assert.match(built, /inside the project/, "the model's notice is unchanged");
+      assert.deepEqual(reports, [where], "the build that withheld adder");
+
+      await runner.run(SAVE_LATE, "s1", async () => true);
+      assert.deepEqual(reports, [where, where], "save_tool");
+
+      await runner.run('delete_tool("late")', "s1", async () => true);
+      assert.deepEqual(reports, [where, where, where], "delete_tool");
+
+      assert.equal((await runner.acceptPreamble()).status, "store-unavailable");
+      assert.deepEqual(reports, [where, where, where, where], "acceptPreamble");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a build with nothing to withhold reports nothing", async () => {
+    const cwd = makeTempDir();
+    try {
+      const { runner, reports } = reporting(cwd, join(cwd, "state"));
+      await runner.run("1", "s1");
+      assert.deepEqual(reports, []);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a store outside the project reports nothing — healthy, or unusable for another reason", async () => {
+    const healthy = makeTempDir();
+    const unusable = makeTempDir();
+    saveToolFile(healthy, "adder", ADDER);
+    saveToolFile(unusable, "adder", ADDER);
+    const parent = makeStore();
+    const notADir = join(parent, "not-a-dir");
+    writeFileSync(notADir, "");
+    try {
+      for (const [cwd, store] of [
+        [healthy, parent],
+        [unusable, notADir],
+      ]) {
+        const { runner, reports } = reporting(cwd, store);
+        await runner.run(SAVE_LATE, "s1", async () => true);
+        await runner.acceptPreamble();
+        assert.deepEqual(reports, [], store);
+      }
+    } finally {
+      cleanup();
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("an untrusted project reports nothing — it never touches the store", async () => {
+    const cwd = makeTempDir();
+    saveToolFile(cwd, "adder", ADDER);
+    try {
+      const { runner, reports } = reporting(cwd, join(cwd, "state"), false);
+      await runner.run(SAVE_LATE, "s1", async () => true);
+      assert.equal((await runner.acceptPreamble()).status, "untrusted");
+      assert.deepEqual(reports, []);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe("ReplRunner — the store fails closed (#198)", () => {
   it("withholds everything and says so when the store cannot be written — never throws", async () => {
     const cwd = makeTempDir();
