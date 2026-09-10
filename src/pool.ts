@@ -2,11 +2,17 @@ import { Monty, type CheckoutOptions, type MontySession } from "@pydantic/monty/
 
 // ── Worker pool ──────────────────────────────────────────────────
 //
-// Monty 0.0.21 runs Python in crash-isolated worker subprocesses checked out
-// of a pool, where 0.0.18 ran it in-process. One pool serves the whole
-// process: workers are the expensive thing (~8.5 MB each), sessions are not,
-// and a pool per call would forfeit the warm-worker reuse that makes a
-// checkout cost ~0.5 ms instead of ~30 ms.
+// Monty runs Python in crash-isolated worker subprocesses checked out of a
+// pool (since 0.0.21; 0.0.18 ran it in-process). One pool serves the whole
+// process: workers are the expensive thing, sessions are not, and a pool per
+// call would forfeit the warm-worker reuse that makes a checkout cost ~0.5 ms
+// instead of ~30 ms.
+//
+// What a worker costs, as VmRSS of the `monty` subprocess, measured on 0.0.23
+// over 12 workers in three pools: ~9 MB idle (8.7–9.1 MB; 0.0.21 measured
+// 8.2–8.5 MB the same way, the "~8.5 MB" this comment used to give), ~10.4 MB
+// after an untyped feed, and ~16 MB (15.5–16.1) after a type-checked one. The
+// sandbox always type-checks, so ~16 MB is what a pool in use approaches.
 //
 // Both knobs below are set explicitly and never left to upstream's defaults,
 // because both defaults fail open in the same direction — silently, and only
@@ -20,7 +26,7 @@ import { Monty, type CheckoutOptions, type MontySession } from "@pydantic/monty/
 //     in the #40 spike. A caller that has wedged is strictly worse than one
 //     that has failed.
 
-/** Worker cap. Sized by memory (~8.5 MB each), not by core count. */
+/** Worker cap. Sized by memory (~16 MB each once used; see above), not by core count. */
 const DEFAULT_MAX_PROCESSES = 4;
 /** Seconds a checkout waits for a free worker before failing. Never `undefined`. */
 const DEFAULT_CHECKOUT_TIMEOUT_SECS = 30;

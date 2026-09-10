@@ -8,18 +8,18 @@ Code runs in [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly),
 Python, so the standard library is a fixed, closed set: **there are no third-party packages** and
 no way to install one, and most of the stdlib is absent.
 
-**Importable modules** — exactly these, verified against the pinned Monty 0.0.21. The code probes
+**Importable modules** — exactly these, verified against the pinned Monty 0.0.23. The code probes
 this at runtime (`probeImportableModules()` over `CANDIDATE_MODULES` in `src/registry.ts`), so the
 live answer follows the installed interpreter:
 
 `os`, `sys`, `json`, `re`, `datetime`, `math`, `typing`, `pathlib`, `asyncio`, `collections`,
-`itertools`, `dataclasses`
+`itertools`, `functools`, `base64`, `dataclasses`
 
-Anything else — `time`, `random`, `subprocess`, `socket`, `functools`, `hashlib`, `requests`,
-`numpy` and the rest — is refused by Monty's type checker as an unresolved import, before any code
-runs. There is no `subprocess` or `socket`: sandboxed Python cannot spawn processes or open
-sockets, and filesystem access goes through the host tools (and, for embedded use, an explicit
-mount) — never through `open()` on arbitrary host paths.
+Anything else — `time`, `random`, `subprocess`, `socket`, `hashlib`, `requests`, `numpy` and the
+rest — is refused by Monty's type checker as an unresolved import, before any code runs. There is
+no `subprocess` or `socket`: sandboxed Python cannot spawn processes or open sockets, and
+filesystem access goes through the host tools (and, for embedded use, an explicit mount) — never
+through `open()` on arbitrary host paths.
 
 **Language limits.** A few Python features raise `NotImplementedError` instead of running:
 
@@ -258,9 +258,10 @@ copy alongside the one pi already owns. It stays in `devDependencies` so local d
 and factories match the host's, exactly as upstream pi-code-tool does.
 
 Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
-`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. 0.0.21
-also ships a wasm runtime at `@pydantic/monty/wasm` that looks like a way around this and is not:
-it runs Python in-process, so a runaway blocks the event loop and there is no crash isolation. See
+`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. The
+pinned 0.0.23 also ships a wasm runtime at `@pydantic/monty/wasm`, which now loads with no extra
+install and looks like a way around this. It is not: it runs Python in-process, so a runaway
+blocks the event loop and there is no crash isolation. See
 [docs/platform-support.md](docs/platform-support.md).
 
 ## Dev
@@ -345,7 +346,7 @@ exhausted pool hangs with no error and no log rather than failing.
 
 | variable | default | effect |
 |---|---|---|
-| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~8.5 MB each), not by core count. |
+| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~9 MB each idle, ~16 MB once it has type-checked a run), not by core count. |
 | `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
 
 ### The worker pool

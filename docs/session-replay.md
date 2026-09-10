@@ -44,18 +44,18 @@ the interval lapses. It always flushes before a host call and by the end of the 
 large print still arrives in 8 KiB chunks. So whether a replayed prefix's last bytes share a
 callback with this call's first print is timing: a callback count would swallow or re-emit lines
 depending on it, while a byte count cuts at the same byte however the stream is chunked. (0.0.21
-called back once per `print` and held a partial until the next newline; the mark was made bytes then,
-for the partial-line case, and batching is why it still has to be.) The sandbox keeps upstream's
-batching rather than pinning `printFlushInterval: 0`; the reasoning is at `makePrintCallback`. The
-tripwire pins the shape; if an upstream bump changes it, that test fails before a session quietly
-swallows or re-emits a line.
+called back once per `print` and held a partial until the next newline; the mark was made bytes
+then, for the partial-line case, and batching is why it still has to be.) The sandbox keeps
+upstream's batching rather than pinning `printFlushInterval: 0`; the reasoning is at
+`makePrintCallback`. The tripwire pins the shape; if an upstream bump changes it, that test fails
+before a session quietly swallows or re-emits a line.
 
 **Determinism.** The mark taken from the original run describes the replay only if the replay prints
 the same bytes. It does, because the replay runs the same code with the same cached tool results and
-crosses the same host boundaries (a cached call still crosses the host, so buffered output is flushed
-there in both — measured across a gate in the original call and in the replay). Code that prints
-non-deterministically without a tool call is the exception, and it would break a callback count
-just the same.
+crosses the same host boundaries (a cached call still crosses the host, so buffered output is
+flushed there in both — measured across a gate in the original call and in the replay). Code that
+prints non-deterministically without a tool call is the exception, and it would break a callback
+count just the same.
 
 `calls` is likewise this call's on **every** outcome — success, error, and suspension (and so the
 resumed call's) — not the replayed prior calls (A16 below).
