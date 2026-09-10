@@ -1559,18 +1559,29 @@ describe("resource-limit breach on the resume after a host tool call", () => {
   // has to keep working *after* the call returns — a tool that overruns with no
   // Python following it completes `ok`.
   //
-  // The loop is 5,000,000 iterations rather than 200,000 because the duration
-  // clock inverted with the move to a worker. On 0.0.18 `maxDurationSecs` was
-  // wall clock and the 250 ms sleep alone consumed a 200 ms budget, so a short
-  // loop only had to run long enough to *notice*. 0.0.21's clock advances only
-  // while the interpreter executes and stops while the sandbox is suspended on
-  // a host call, so the sleep now contributes nothing and the loop has to
-  // spend the whole budget by itself (measured: 200,000 iterations cost ~67 ms
-  // of interpreter time, 5,000,000 cost ~555 ms).
+  // The loop has to spend the whole 0.2 s budget by itself. Since 0.0.21 the
+  // duration clock advances only while the interpreter executes and stops while
+  // the sandbox is suspended on a host call, so the 250 ms sleep contributes
+  // nothing (on 0.0.18 it was wall clock, and the sleep alone breached).
+  //
+  // So the loop's size is a bet on interpreter speed, and 5,000,000 lost it.
+  // Measured: that loop took a median 752 ms on 0.0.21 and 463 ms on 0.0.23
+  // on a Linux x64 dev box (~92 ns an iteration); on the macOS arm64 CI runner
+  // the whole test took ~457 ms on 0.0.21 (250 ms sleep, loop cut off at
+  // 0.2 s) but ~408 ms on 0.0.23 — the loop finished in ~158 ms, under the
+  // budget, and the run came back `ok` (PR #218, run 34462982174).
+  //
+  // 200,000,000 is sized for hardware nobody here has: ~18.8 s of interpreter
+  // time on that dev box, ~6.3 s at the arm64 runner's 0.0.23 rate (32x the
+  // budget), and still ~0.94 s on a machine 20x faster than the dev box (4.7x).
+  // It is bounded rather than `while True` on purpose: a broken duration limit
+  // must fail as an assertion (the loop completes, the run is `ok`, `err()`
+  // fails) in seconds, not hold a worker until the 300 s host wall clock.
+  // Working limits cut it at 0.2 s whatever its size.
   const OVERRUN_THEN_LOOP = [
     "slow()",
     "total = 0",
-    "for i in range(5000000):",
+    "for i in range(200000000):",
     "    total += i",
     "total",
   ].join("\n");
@@ -2428,7 +2439,15 @@ describe("a crashed sandbox worker", () => {
   // kills the worker `durationLimitGrace` later. That is the one path to
   // `MontyCrashedError`, and it has no 0.0.18 analogue — there the same code
   // froze the event loop until something SIGKILLed the whole process.
-  const UNCHECKPOINTED_RUNAWAY = "x = 10 ** 100000000\n1";
+  //
+  // The primitive has to outlast the kill point (the 0.5 s budget plus the
+  // watchdog's grace: `crashed` after ~1.55 s, measured) on any runner.
+  // `10 ** 100000000` finished in ~43 s unenforced on a Linux x64 dev box, which
+  // left ~10x on the macOS arm64 CI runner and ~1.4x on a machine 20x faster
+  // than that box. `10 ** 200000000` was still computing when a 60 s budget
+  // killed it (measured), so at least 40x here, and it still ends in a crash
+  // at ~1.5 s whatever its size.
+  const UNCHECKPOINTED_RUNAWAY = "x = 10 ** 200000000\n1";
 
   it("returns errorKind 'crashed', not 'runtime'", async () => {
     const result = await runInSandbox(
@@ -3015,7 +3034,13 @@ describe("print callback shape — the tripwire under the stdout mark (#61 D122)
     const lapsed: string[] = [];
     ok(
       await runInSandbox(
-        'print("a", end="")\nn = 0\nfor i in range(1000000):\n    n += i\nprint("b")',
+        // 10,000,000 iterations, because the busy loop has to outlast the 5 ms
+        // flush interval on any runner: ~900 ms on a Linux x64 dev box, ~45 ms
+        // (9x the interval) on a machine 20x faster. Measured with the interval
+        // stretched to stand in for faster hardware: 1,000,000 (~95 ms) merges
+        // into ['ab\n'] from a 0.1 s interval up; 10,000,000 still separates at
+        // 0.5 s and merges only at 1 s.
+        'print("a", end="")\nn = 0\nfor i in range(10000000):\n    n += i\nprint("b")',
         { registry },
         { onPrint: (text) => lapsed.push(text) },
       ),
