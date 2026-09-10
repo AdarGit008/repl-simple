@@ -60,7 +60,12 @@ export type ApprovalDecision = boolean | "suspend";
  * `maxWallClockSecs` is enforced on the *host* and covers the whole run, tool
  * time included. It is the only thing that bounds a host tool that never
  * returns — Monty's clock cannot fire while the worker is idle awaiting our
- * answer — and the only thing that returns that run's pooled worker.
+ * answer — and the only thing that returns that run's pooled worker. Time
+ * spent awaiting `onApproval` is *not* charged to it: the budget bounds host
+ * tools, not the person deciding whether one may run, so a dialog answered
+ * after the budget would have run out still decides its call. An `onApproval`
+ * that never settles is therefore bounded by `signal` alone, and holds the
+ * worker until then; bounding the wait is the callback's job.
  *
  * **Across a suspension the two clocks behave differently.** `maxDurationSecs`
  * is a budget over the whole run: the snapshot a suspended run leaves behind
@@ -96,7 +101,7 @@ export interface RunLimits {
   maxDurationSecs?: number;
   /** Sandbox heap ceiling in bytes. Breach → `MemoryError`. */
   maxMemory?: number;
-  /** Host wall-clock seconds for the whole run, host-tool time included. */
+  /** Host wall-clock seconds for the whole run, host-tool time included, `onApproval` time not. */
   maxWallClockSecs?: number;
   /** Instructions between sandbox GC cycles. Monty's default when omitted. */
   gcInterval?: number;

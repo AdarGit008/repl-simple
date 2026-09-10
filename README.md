@@ -198,8 +198,11 @@ See [#35](https://github.com/AdarGit008/repl-simple/issues/35).
 Every approval dialog is also **answerable and bounded**. The four `repl` tools declare
 `executionMode: "sequential"`, so two of them never run at once — two dialogs open together leaves
 the first one orphaned and pi with no way back. Escape dismisses a dialog and aborts the run rather
-than being swallowed, and a dialog nobody answers denies itself after five minutes.
-`REPL_APPROVAL_TIMEOUT_MS` changes that bound, and `0` removes it.
+than being swallowed, and a dialog nobody answers denies itself after five minutes: the call raises
+`PermissionError` and the trace lists it as denied. The wait is not charged to
+`REPL_MAX_WALL_CLOCK_SECS`, however long it takes, so that budget cannot end a dialog first.
+`REPL_APPROVAL_TIMEOUT_MS` changes the bound, and `0` removes it — an unanswered dialog then holds
+the run, and its worker, until it is answered, dismissed or aborted.
 See [#49](https://github.com/AdarGit008/repl-simple/issues/49).
 
 All four tools also **answer in every state**, with a sentence rather than an exception or a message
@@ -318,7 +321,7 @@ lasts.
 | `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
 | `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
 | `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
-| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included. The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
+| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included; time waiting for an approval answer is not (see [Approvals](#approvals)). The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
 
 The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
 worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would

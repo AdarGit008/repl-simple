@@ -95,6 +95,13 @@ export const MAX_DIALOGS_PER_CALL = 8;
  * Five minutes is long enough to read a `bash` command and decide, and the
  * expiry denies, so the fail-closed posture is unchanged. Set
  * `REPL_APPROVAL_TIMEOUT_MS` to change it, or to `0` to remove the bound.
+ *
+ * This bound, and not the run's host wall clock, is what ends a dialog nobody
+ * answers: the wait is not charged to `REPL_MAX_WALL_CLOCK_SECS` (see
+ * `RunLimits` in src/types.ts), so the expiry arrives as the denial above
+ * rather than as a run timeout. It follows that `0` leaves an unanswered
+ * dialog — and the run's pooled worker — waiting until it is answered,
+ * dismissed or aborted.
  */
 const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
 const APPROVAL_TIMEOUT_VAR = "REPL_APPROVAL_TIMEOUT_MS";
