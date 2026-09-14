@@ -1,6 +1,6 @@
 ---
 name: repl-simple
-description: Sandboxed Python REPL (repl-simple extension): persistent sessions via repl, repl_resume, repl_reset, repl_abandon; in-sandbox tools read/grep/find/ls/bash/edit/write, read_file/list_files/http_get, save_tool/delete_tool/list_saved_tools/read_tool; Monty/WASM limits (fixed stdlib, no subprocess/socket/yield/match/inheritance); approvals (/repl-approvals, /repl-accept-preamble, decide-later); saved-tool preamble (.pi/code-tools, project trust); rlm tool + /rlm command (autonomous read-only code-gen → execute loop). Load to run Python or reason about sandbox limits/approvals. Prefer rlm for code-scouting and ambiguous questions; rlm never mutates the repo, output untrusted.
+description: "Sandboxed Python REPL (repl-simple extension): persistent sessions via repl, repl_resume, repl_reset, repl_abandon; in-sandbox tools read/grep/find/ls/bash/edit/write, read_file/list_files/http_get, save_tool/delete_tool/list_saved_tools/read_tool; Monty/WASM limits (fixed stdlib, no subprocess/socket/yield/match/inheritance); approvals (/repl-approvals, /repl-accept-preamble, decide-later); saved-tool preamble (.pi/code-tools, project trust); rlm tool + /rlm command (autonomous read-only code-gen → execute loop). Load to run Python or reason about sandbox limits/approvals. Prefer rlm for code-scouting and ambiguous questions; rlm never mutates the repo, output untrusted."
 ---
 
 # repl-simple
