@@ -20,6 +20,7 @@
     "src",
     "repl",
     "extensions",
+    "skills",
     "NOTICE"
   ],
   "scripts": {
@@ -41,6 +42,9 @@
   "pi": {
     "extensions": [
       "./extensions/repl-extension.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "dependencies": {
