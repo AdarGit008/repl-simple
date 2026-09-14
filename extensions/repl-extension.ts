@@ -1658,14 +1658,19 @@ export default function (pi: ReplExtensionApi) {
 
   // ── /rlm ──────────────────────────────────────────────────────
   //
-  // The `rlm` tool above is the agent's handle on the loop; this command is
-  // the user's. It builds the loop's inputs, then runs `runRlm` detached so
-  // the prompt returns immediately instead of blocking on a multi-LLM-call
-  // loop; the formatted result is posted as a displayed custom message when it
-  // lands, so the answer appears in the transcript rather than a transient
-  // toast. No options are parsed from args: the spend bound is the same
-  // `REPL_RLM_BUDGET`-overrideable default the tool uses, and fine-grained
-  // control remains the tool's job.
+  // The `rlm` tool above is the agent's handle on the loop; these commands
+  // are the user's. `/rlm` builds the loop's inputs, then runs `runRlm`
+  // detached so the prompt returns immediately instead of blocking on a
+  // multi-LLM-call loop; the formatted result is posted as a displayed custom
+  // message when it lands, so the answer appears in the transcript rather than
+  // a transient toast. `/rlm-abort` stops the in-flight run. One run at a
+  // time: a second `/rlm` while one is running is refused rather than stacked,
+  // so a runaway loop cannot hide behind a queue of newer ones. No options are
+  // parsed from args: the spend bound is the same `REPL_RLM_BUDGET`-overrideable
+  // default the tool uses, and fine-grained control remains the tool's job.
+
+  // The abort handle for the in-flight run, or null when none is running.
+  let rlmAbortController: AbortController | null = null;
 
   pi.registerCommand("rlm", {
     description: "Run the RLM code-gen → execute loop on a question (read-only sandbox).",
@@ -1676,31 +1681,49 @@ export default function (pi: ReplExtensionApi) {
         return;
       }
 
-      ctx.ui.notify("RLM investigating…", "info");
+      if (rlmAbortController !== null) {
+        ctx.ui.notify("rlm is already running — /rlm-abort to stop it first", "error");
+        return;
+      }
 
-      // Build the loop's inputs now, then run it detached: the command
-      // resolves immediately and the result is posted when it lands, rather
-      // than blocking the prompt on a multi-LLM-call loop.
+      ctx.ui.notify("RLM investigating… (/rlm-abort to stop)", "info");
+
       const registry = buildRlmRegistry(ctx.cwd);
       const llmClient = createLlmClient(ctx, {});
 
-      void runRlm(question, { llmClient, registry, budget: defaultRlmBudget() })
-        .then((result) => {
-          pi.sendMessage({
-            customType: "rlm-result",
-            content: formatRlmResult(result),
-            display: true,
-            details: {
-              status: result.status,
-              answerSource: result.answerSource,
-              iterations: result.iterations.length,
-            },
-          });
-        })
-        .catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          ctx.ui.notify(`rlm failed: ${message}`, "error");
+      const controller = new AbortController();
+      rlmAbortController = controller;
+
+      void runRlm(question, {
+        llmClient,
+        registry,
+        budget: defaultRlmBudget(),
+        signal: controller.signal,
+      }).then((result) => {
+        rlmAbortController = null;
+        pi.sendMessage({
+          customType: "rlm-result",
+          content: formatRlmResult(result),
+          display: true,
+          details: {
+            status: result.status,
+            answerSource: result.answerSource,
+            iterations: result.iterations.length,
+          },
         });
+      });
+    },
+  });
+
+  pi.registerCommand("rlm-abort", {
+    description: "Abort the in-flight /rlm run.",
+    handler: async (_args, ctx) => {
+      if (rlmAbortController === null) {
+        ctx.ui.notify("no /rlm run is active", "error");
+        return;
+      }
+      rlmAbortController.abort();
+      ctx.ui.notify("rlm: aborting…", "info");
     },
   });
 }
