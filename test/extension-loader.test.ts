@@ -29,7 +29,7 @@ import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const EXTENSION_PATH = join(REPO_ROOT, "extensions", "repl-extension.ts");
-const EXPECTED_TOOLS = ["repl", "repl_resume", "repl_reset", "repl_abandon"];
+const EXPECTED_TOOLS = ["repl", "repl_resume", "repl_reset", "repl_abandon", "rlm"];
 
 let agentDir: string;
 let projectDir: string;
@@ -70,7 +70,7 @@ describe("pi extension loading (real loader)", () => {
     );
   });
 
-  it("registers exactly the four repl tools", async () => {
+  it("registers exactly the five repl tools", async () => {
     const result = await discoverAndLoadExtensions([REPO_ROOT], REPO_ROOT, agentDir);
     const ext = result.extensions.find((e) => e.resolvedPath === EXTENSION_PATH);
     assert.ok(ext, "repl-extension.ts did not load");

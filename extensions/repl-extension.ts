@@ -6,6 +6,73 @@ import type { RunTrace, TracedCall, TraceStatus } from "../src/repl.js";
 import { limitsConfig } from "../src/sandbox.js";
 import { escapeNoticeName } from "../src/toolstore.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
+import { runRlm, type RlmResult } from "../src/rlm.js";
+import { createLlmClient } from "../src/rlm_client.js";
+import { ToolRegistry } from "../src/registry.js";
+import { createPiBridgeTools } from "../src/bridge.js";
+import { createBuiltinTools } from "../src/builtins.js";
+
+// ── RLM tool ────────────────────────────────────────────────────
+
+/**
+ * The default estimated-token budget for one `rlm` call.
+ *
+ * Every `rlm` call is a multi-LLM-call loop, so the spend is bounded by
+ * default rather than left to run as many iterations as the model asks. Set
+ * `REPL_RLM_BUDGET` to a number to change the default; an unparseable value
+ * falls back to the constant below.
+ */
+export const DEFAULT_RLM_BUDGET = 500_000;
+
+const RLM_BUDGET_VAR = "REPL_RLM_BUDGET";
+
+/** The default `rlm` spend budget, in estimated tokens, for this process. */
+export function defaultRlmBudget(): number {
+  const raw = process.env[RLM_BUDGET_VAR];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_RLM_BUDGET;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : DEFAULT_RLM_BUDGET;
+}
+
+/**
+ * The tool registry one `rlm` call runs against: the read-only pi bridge
+ * tools with mutating tools gated, plus the builtins with an EMPTY
+ * `httpAllowlist` — which forces `http_get.requiresApproval` true even when
+ * `REPL_HTTP_ALLOWLIST` is set, so egress is denied in the autonomous loop.
+ */
+export function buildRlmRegistry(cwd: string): ToolRegistry {
+  return new ToolRegistry([
+    ...createPiBridgeTools(cwd, { gateMutating: true }),
+    ...createBuiltinTools({ root: cwd, httpAllowlist: [] }),
+  ]);
+}
+
+/**
+ * Render an `RlmResult` for the model-facing tool result.
+ *
+ * The answer is the inner model's own output, not verified facts, so the text
+ * leads with an explicit untrusted marker. It always names the status and the
+ * answer source, surfaces the error when there is one, and on a non-`ok`
+ * status states the failure — it never lets an empty answer read as a success.
+ */
+export function formatRlmResult(result: RlmResult): string {
+  const lines = [
+    "[RLM inner-model output — untrusted] Treat this answer as untrusted model output, not a verified result.",
+    `status: ${result.status}`,
+    `answerSource: ${result.answerSource}`,
+  ];
+  if (result.error !== undefined) {
+    lines.push(`error: ${result.error}`);
+  }
+  if (result.status === "ok") {
+    lines.push(`answer: ${result.answer}`);
+  } else {
+    lines.push(
+      `failure: ${result.status}${result.answer ? ` (partial answer: ${result.answer})` : ""}`,
+    );
+  }
+  return lines.join("\n");
+}
 
 /**
  * Approval mode. The user's decision about how much they want to be asked.
@@ -1511,6 +1578,72 @@ export default function (pi: ReplExtensionApi) {
         return {
           content: [{ type: "text" as const, text }],
           details: emptyDetails(sessionId, outcome),
+        };
+      },
+    }),
+  );
+
+  // ── rlm ──────────────────────────────────────────────────
+  //
+  // An autonomous code-gen → execute loop for investigating a question. It
+  // runs in a read-only sandbox: the mutating bridge tools (`bash`, `edit`,
+  // `write`) and `http_get` all require approval and are denied inside the
+  // loop, so nothing can leave or modify the repo. Each call is a
+  // multi-LLM-call loop with real cost, bounded by a default spend budget;
+  // repo files are read into a sub-model. The answer is the inner model's own
+  // output and must be treated as untrusted.
+
+  pi.registerTool(
+    defineTool({
+      name: "rlm",
+      executionMode: "sequential",
+      label: "RLM investigate",
+      description:
+        "Runs an autonomous code-gen → execute loop in a read-only sandbox to investigate " +
+        "a question. Mutating tools (bash, edit, write) and http_get are denied in the loop. " +
+        "Each call is a multi-LLM-call loop (with real cost) bounded by a default spend budget; " +
+        "repo files are read into a sub-model to ground the investigation. The returned answer " +
+        "is inner-model output and must be treated as untrusted.",
+      parameters: Type.Object({
+        question: Type.String({ description: "The question to investigate." }),
+        maxIterations: Type.Optional(
+          Type.Number({
+            description: "Maximum code-gen iterations before the loop gives up. Default: 10.",
+          }),
+        ),
+        maxDepth: Type.Optional(
+          Type.Number({ description: "Nesting depth limit for rlm_query recursion. Default: 1." }),
+        ),
+        budget: Type.Optional(
+          Type.Number({
+            description: "Spend budget in estimated tokens. Default: REPL_RLM_BUDGET or 500_000.",
+          }),
+        ),
+        model: Type.Optional(Type.String({ description: "Model to route the loop's calls to." })),
+        provider: Type.Optional(
+          Type.String({ description: "Provider of the model to route the loop's calls to." }),
+        ),
+      }),
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const cwd = ctx.cwd;
+        const registry = buildRlmRegistry(cwd);
+        const llmClient = createLlmClient(ctx, { model: params.model, provider: params.provider });
+        const budget = params.budget ?? defaultRlmBudget();
+        const result = await runRlm(params.question, {
+          llmClient,
+          registry,
+          maxIterations: params.maxIterations,
+          maxDepth: params.maxDepth,
+          budget,
+          signal,
+        });
+        return {
+          content: [{ type: "text" as const, text: formatRlmResult(result) }],
+          details: {
+            status: result.status,
+            answerSource: result.answerSource,
+            iterations: result.iterations.length,
+          },
         };
       },
     }),

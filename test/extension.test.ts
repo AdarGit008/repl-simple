@@ -16,7 +16,10 @@ import {
   APPROVE_CHOICE,
   DENY_CHOICE,
   LATER_CHOICE,
+  buildRlmRegistry,
   clampModelLimits,
+  defaultRlmBudget,
+  formatRlmResult,
 } from "../extensions/repl-extension.js";
 // The #35 constants are read off the namespace rather than named-imported so
 // that this file still *loads* against an extension that predates them: the
@@ -74,7 +77,7 @@ after(() => {
  * See issue #22.
  */
 
-const EXPECTED_TOOLS = ["repl", "repl_resume", "repl_reset", "repl_abandon"];
+const EXPECTED_TOOLS = ["repl", "repl_resume", "repl_reset", "repl_abandon", "rlm"];
 
 /** The subset of a registered tool this file needs, kept loose on purpose. */
 type RegisteredTool = {
@@ -191,7 +194,7 @@ function notifyCtx() {
 // ── Registration ─────────────────────────────────────────────────
 
 describe("repl extension — registration", () => {
-  it("registers exactly the four repl tools", async () => {
+  it("registers exactly the five repl tools", async () => {
     const tools = await loadTools();
 
     // Assert the set, so a deleted registration and an unexpected extra one
@@ -204,6 +207,145 @@ describe("repl extension — registration", () => {
       assert.ok(tool.label, `${tool.name} has no label`);
       assert.ok(tool.description, `${tool.name} has no description`);
       assert.equal(typeof tool.execute, "function", `${tool.name} has no execute`);
+    }
+  });
+});
+
+// ── RLM tool registration ────────────────────────────────────────
+//
+// `runRlm` (src/rlm.ts) is the library loop; the `rlm` tool is what exposes
+// it to the agent. These tests pin the tool contract — registration, the
+// parameter schema, the sandbox registry, the default budget, and the
+// untrusted-output formatting.
+
+describe("repl extension — rlm tool", () => {
+  it("registers an rlm tool the agent can invoke for auto-investigation", async () => {
+    const rlm = (await loadTools()).find((t) => t.name === "rlm");
+    assert.ok(rlm, "rlm did not register");
+
+    assert.ok(rlm.label, "rlm has no label");
+    assert.ok(rlm.description, "rlm has no description");
+    assert.equal(typeof rlm.execute, "function", "rlm has no execute");
+  });
+
+  it("rlm takes question (required) and optional maxIterations, maxDepth and budget", async () => {
+    const rlm = (await loadTools()).find((t) => t.name === "rlm");
+    assert.ok(rlm, "rlm did not register");
+
+    assert.equal(rlm.parameters.properties.question?.type, "string");
+    assert.deepEqual(rlm.parameters.required, ["question"]);
+
+    assert.equal(rlm.parameters.properties.maxIterations?.type, "number");
+    assert.equal(rlm.parameters.properties.maxDepth?.type, "number");
+    assert.equal(rlm.parameters.properties.budget?.type, "number");
+  });
+
+  it("buildRlmRegistry gates mutating tools and http_get, and leaves read tools ungated", () => {
+    const priorAllowlist = process.env.REPL_HTTP_ALLOWLIST;
+    process.env.REPL_HTTP_ALLOWLIST = "example.com";
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-reg-"));
+    try {
+      const registry = buildRlmRegistry(cwd);
+
+      const httpGet = registry.get("http_get");
+      assert.ok(httpGet, "http_get is missing from the rlm registry");
+      assert.equal(
+        httpGet.requiresApproval,
+        true,
+        "http_get must require approval even when REPL_HTTP_ALLOWLIST is set",
+      );
+
+      for (const name of ["bash", "edit", "write"]) {
+        const tool = registry.get(name);
+        assert.ok(tool, `${name} is missing from the rlm registry`);
+        assert.equal(tool.requiresApproval, true, `${name} must require approval in the loop`);
+      }
+
+      for (const name of ["read", "list_files"]) {
+        const tool = registry.get(name);
+        assert.ok(tool, `${name} is missing from the rlm registry`);
+        assert.ok(!tool.requiresApproval, `${name} must not require approval`);
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      if (priorAllowlist === undefined) delete process.env.REPL_HTTP_ALLOWLIST;
+      else process.env.REPL_HTTP_ALLOWLIST = priorAllowlist;
+    }
+  });
+
+  it("defaultRlmBudget defaults to 500_000 and honours REPL_RLM_BUDGET", () => {
+    const prior = process.env.REPL_RLM_BUDGET;
+    delete process.env.REPL_RLM_BUDGET;
+    try {
+      assert.equal(defaultRlmBudget(), 500_000);
+    } finally {
+      if (prior === undefined) delete process.env.REPL_RLM_BUDGET;
+      else process.env.REPL_RLM_BUDGET = prior;
+    }
+
+    process.env.REPL_RLM_BUDGET = "12345";
+    try {
+      assert.equal(defaultRlmBudget(), 12345);
+    } finally {
+      if (prior === undefined) delete process.env.REPL_RLM_BUDGET;
+      else process.env.REPL_RLM_BUDGET = prior;
+    }
+  });
+
+  it("formatRlmResult marks the answer untrusted and includes it on ok", () => {
+    const text = formatRlmResult({
+      status: "ok",
+      answerSource: "submitted",
+      answer: "42",
+      iterations: [],
+    });
+    assert.match(text, /untrusted/i);
+    assert.match(text, /42/);
+    assert.match(text, /status: ok/);
+    assert.match(text, /answerSource: submitted/);
+  });
+
+  it("formatRlmResult names the failure and error on a non-ok result", () => {
+    const text = formatRlmResult({
+      status: "budget_exhausted",
+      answerSource: "salvaged",
+      answer: "",
+      error: "budget gone",
+      iterations: [],
+    });
+    assert.match(text, /untrusted/i);
+    assert.match(text, /budget_exhausted/);
+    assert.match(text, /budget gone/);
+    assert.doesNotMatch(text, /status: ok/);
+    assert.match(text, /failure/);
+  });
+
+  it("wires execute through runRlm and reports the answer and status", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-run-"));
+    try {
+      const rlm = (await loadTools()).find((t) => t.name === "rlm");
+      assert.ok(rlm, "rlm did not register");
+
+      const result = await rlm.execute(
+        "rlm-run-1",
+        { question: "what is the answer?", maxIterations: 2 },
+        undefined,
+        undefined,
+        {
+          cwd,
+          model: { id: "fake-model" },
+          modelRegistry: {
+            complete: async () => ({
+              content: [{ type: "text", text: 'SUBMIT("rlm-answer")' }],
+            }),
+          },
+        },
+      );
+
+      assert.match(result.content[0].text, /rlm-answer/);
+      assert.equal((result.details as { status: string }).status, "ok");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 });
@@ -795,7 +937,7 @@ describe("repl extension — a dialog always settles (#49)", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("declares executionMode sequential on all four tools", async () => {
+  it("declares executionMode sequential on all five tools", async () => {
     // Cheap guard against someone removing it later without understanding
     // why it is there. The three tests below are the reason.
     for (const tool of await loadTools()) {
