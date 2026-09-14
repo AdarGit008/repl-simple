@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-fixture.js";
 
@@ -135,9 +135,9 @@ describe("build output", () => {
 });
 
 describe("tarball contents (#81)", () => {
-  it("ships dist/, src/, repl/, extensions/, and LICENSE", () => {
+  it("ships dist/, src/, repl/, extensions/, skills/, and LICENSE", () => {
     const files = packFileList();
-    for (const required of ["dist/", "src/", "repl/", "extensions/"]) {
+    for (const required of ["dist/", "src/", "repl/", "extensions/", "skills/"]) {
       assert.ok(
         files.some((f) => f.startsWith(required)),
         `tarball must ship ${required} (got ${files.length} entries)`,
@@ -148,6 +148,11 @@ describe("tarball contents (#81)", () => {
     assert.ok(
       files.includes("repl/repl_server.py"),
       "tarball must include repl/repl_server.py (the preamble asset)",
+    );
+    // The packaged skill manifest must ship so pi can load the skill from the package.
+    assert.ok(
+      files.includes("skills/repl-simple/SKILL.md"),
+      "tarball must include skills/repl-simple/SKILL.md (the skill manifest)",
     );
   });
 
@@ -225,6 +230,7 @@ interface Manifest {
   engines?: { node?: string };
   peerDependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  pi?: { extensions?: string[]; skills?: string[] };
 }
 
 function readManifest(): Manifest {
@@ -253,12 +259,20 @@ describe("manifest", () => {
     assert.equal(pkg.scripts?.prepublishOnly, "npm run build");
   });
 
-  it("files ships dist, src, repl, extensions, and NOTICE (D3)", () => {
+  it("files ships dist, src, repl, extensions, skills, and NOTICE (D3)", () => {
     const pkg = readManifest();
     assert.ok(Array.isArray(pkg.files), "package.json must declare a `files` allowlist");
-    for (const required of ["dist", "src", "repl", "extensions", "NOTICE"]) {
+    for (const required of ["dist", "src", "repl", "extensions", "skills", "NOTICE"]) {
       assert.ok(pkg.files?.includes(required), `files must include "${required}"`);
     }
+  });
+
+  it("declares the repl-simple skill under pi.skills", () => {
+    const pkg = readManifest();
+    assert.ok(
+      Array.isArray(pkg.pi?.skills) && pkg.pi.skills.includes("./skills"),
+      'pi.skills must include "./skills"',
+    );
   });
 
   it("declares @earendil-works/pi-coding-agent as a peer dependency (host-provided)", () => {
@@ -284,5 +298,62 @@ describe("manifest", () => {
       pkg.devDependencies?.["@earendil-works/pi-coding-agent"],
       "peerDependencies range must match devDependencies",
     );
+  });
+});
+
+describe("skill manifest", () => {
+  const SKILL_PATH = join(REPO_ROOT, "skills", "repl-simple", "SKILL.md");
+
+  /** Parse the two required frontmatter keys (`name`, `description`) from SKILL.md. */
+  function skillFrontmatter(): { name?: string; description?: string } {
+    const src = readFileSync(SKILL_PATH, "utf8");
+    const m = /^---\n([\s\S]*?)\n---/.exec(src);
+    assert.ok(m, "SKILL.md must open with YAML frontmatter");
+    const out: { name?: string; description?: string } = {};
+    for (const line of m[1].split("\n")) {
+      const kv = /^([a-z-]+):\s*(.*)$/.exec(line);
+      if (kv) out[kv[1] as "name" | "description"] = kv[2];
+    }
+    return out;
+  }
+
+  /** Relative file references (`.md`/`.ts`/`.py`) written inline in SKILL.md. */
+  function relativeRefs(): string[] {
+    const src = readFileSync(SKILL_PATH, "utf8");
+    const refs: string[] = [];
+    for (const m of src.matchAll(/`(\.[./][^`]*\.(?:md|ts|py))`/g)) {
+      refs.push(m[1]);
+    }
+    return refs;
+  }
+
+  it("ships a SKILL.md with a valid name and a <=1024-char description", () => {
+    assert.ok(existsSync(SKILL_PATH), "skills/repl-simple/SKILL.md must exist");
+    const fm = skillFrontmatter();
+    assert.match(
+      fm.name ?? "",
+      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+      "skill name must be lowercase kebab-case",
+    );
+    assert.ok(
+      typeof fm.description === "string" && fm.description.length > 0,
+      "skill description must be a non-empty string",
+    );
+    assert.ok(
+      (fm.description ?? "").length <= 1024,
+      `skill description must be <= 1024 chars (got ${fm.description?.length ?? 0})`,
+    );
+  });
+
+  it("every relative doc reference resolves from the skill directory", () => {
+    const skillDir = join(REPO_ROOT, "skills", "repl-simple");
+    const refs = relativeRefs();
+    assert.ok(refs.length > 0, "SKILL.md must reference files relative to the skill directory");
+    for (const rel of refs) {
+      assert.ok(
+        existsSync(resolve(skillDir, rel)),
+        `skill reference must resolve from skills/repl-simple/: ${rel}`,
+      );
+    }
   });
 });

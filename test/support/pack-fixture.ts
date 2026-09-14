@@ -73,12 +73,12 @@ export function createPackFixture(tag: string): PackFixture {
   mkdirSync(pkgDir, { recursive: true });
 
   // Stage the manifest and everything the `files` allowlist ships. `dist/` is
-  // built into the staging dir below; src/repl/extensions are copied verbatim
-  // so the packed package is complete and self-contained.
+  // built into the staging dir below; src/repl/extensions/skills are copied
+  // verbatim so the packed package is complete and self-contained.
   for (const file of ["package.json", "README.md", "LICENSE", "NOTICE"]) {
     cpSync(join(REPO_ROOT, file), join(pkgDir, file));
   }
-  for (const dir of ["src", "repl", "extensions"]) {
+  for (const dir of ["src", "repl", "extensions", "skills"]) {
     cpSync(join(REPO_ROOT, dir), join(pkgDir, dir), { recursive: true });
   }
 
