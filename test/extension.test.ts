@@ -115,6 +115,14 @@ type RegisteredCommand = {
   ) => Promise<void>;
 };
 
+/** A message the extension posted to the transcript via `pi.sendMessage`. */
+type SentMessage = {
+  customType: string;
+  content: string;
+  display: boolean;
+  details?: unknown;
+};
+
 /**
  * A lifecycle handler as the extension hands it to `pi.on` — the shape of
  * pi's `ExtensionHandler<SessionStartEvent | SessionShutdownEvent>`
@@ -142,22 +150,25 @@ async function load(): Promise<{
   tools: RegisteredTool[];
   commands: RegisteredCommand[];
   handlers: Map<string, LifecycleHandler[]>;
+  sentMessages: SentMessage[];
 }> {
   const tools: RegisteredTool[] = [];
   const commands: RegisteredCommand[] = [];
   const handlers = new Map<string, LifecycleHandler[]>();
+  const sentMessages: SentMessage[] = [];
   const mod = await import("../extensions/repl-extension.js");
   mod.default({
     registerTool: (t: unknown) => tools.push(t as RegisteredTool),
     registerCommand: (name: string, options: unknown) =>
       commands.push({ name, ...(options as Omit<RegisteredCommand, "name">) }),
+    sendMessage: (message: SentMessage) => sentMessages.push(message),
     on: (event: string, handler: LifecycleHandler) => {
       const list = handlers.get(event) ?? [];
       list.push(handler);
       handlers.set(event, list);
     },
   } as never);
-  return { tools, commands, handlers };
+  return { tools, commands, handlers, sentMessages };
 }
 
 /**
@@ -344,6 +355,171 @@ describe("repl extension — rlm tool", () => {
 
       assert.match(result.content[0].text, /rlm-answer/);
       assert.equal((result.details as { status: string }).status, "ok");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── /rlm command ──────────────────────────────────────────────
+//
+// The `rlm` tool above is the agent's handle on the loop; `/rlm` is the
+// user's. Both drive the same `runRlm` entry point, but the command parses
+// only the question from args (no budget/model flags) and posts the formatted
+// result as a displayed custom message instead of returning a tool result.
+
+describe("repl extension — /rlm command", () => {
+  it("registers /rlm with a description", async () => {
+    const { commands } = await load();
+    const rlm = commands.find((c) => c.name === "rlm");
+    assert.ok(rlm, "/rlm did not register");
+    assert.ok(rlm.description, "/rlm has no description");
+  });
+
+  it("refuses an empty question", async () => {
+    const { commands } = await load();
+    const rlm = commands.find((c) => c.name === "rlm");
+    assert.ok(rlm, "/rlm did not register");
+
+    const { ctx, notes } = notifyCtx();
+    await rlm.handler("   ", ctx);
+
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].type, "error");
+    assert.match(notes[0].message, /usage/i);
+  });
+
+  it("runs the loop in the background and posts the formatted result", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-cmd-"));
+    try {
+      const { commands, sentMessages } = await load();
+      const rlm = commands.find((c) => c.name === "rlm");
+      assert.ok(rlm, "/rlm did not register");
+
+      const notes: Array<{ message: string; type?: string }> = [];
+      const ctx = {
+        cwd,
+        model: { id: "fake-model" },
+        modelRegistry: {
+          complete: async () => ({
+            content: [{ type: "text", text: 'SUBMIT("rlm-answer")' }],
+          }),
+        },
+        ui: { notify: (message: string, type?: string) => notes.push({ message, type }) },
+      };
+
+      await rlm.handler("what is the answer?", ctx);
+
+      // The command returns before the loop finishes; wait for the detached
+      // result to be posted rather than asserting synchronously.
+      const deadline = Date.now() + 2000;
+      while (sentMessages.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      assert.equal(sentMessages.length, 1);
+      const posted = sentMessages[0];
+      assert.equal(posted.customType, "rlm-result");
+      assert.equal(posted.display, true);
+      assert.match(posted.content, /rlm-answer/);
+      assert.match(posted.content, /untrusted/i);
+      assert.equal((posted.details as { status: string }).status, "ok");
+      assert.match(notes[0].message, /investigating/i);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a second /rlm while one is running", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-busy-"));
+    try {
+      const { commands } = await load();
+      const rlm = commands.find((c) => c.name === "rlm");
+      assert.ok(rlm, "/rlm did not register");
+
+      const notes: Array<{ message: string; type?: string }> = [];
+      const ctx = {
+        cwd,
+        model: { id: "fake-model" },
+        modelRegistry: {
+          // Never settles: the first run stays in flight for the whole test.
+          complete: () => new Promise<{ content: Array<{ type: string; text: string }> }>(() => {}),
+        },
+        ui: { notify: (message: string, type?: string) => notes.push({ message, type }) },
+      };
+
+      await rlm.handler("first", ctx);
+      await rlm.handler("second", ctx);
+
+      const refusal = notes.find((n) => n.type === "error");
+      assert.ok(refusal, "the second /rlm must be refused");
+      assert.match(refusal.message, /already running/i);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("/rlm-abort reports when no run is active", async () => {
+    const { commands } = await load();
+    const abort = commands.find((c) => c.name === "rlm-abort");
+    assert.ok(abort, "/rlm-abort did not register");
+
+    const { ctx, notes } = notifyCtx();
+    await abort.handler("", ctx);
+
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].type, "error");
+    assert.match(notes[0].message, /no \/rlm run is active/i);
+  });
+
+  it("/rlm-abort fires the run's signal and posts an aborted result", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-abort-"));
+    try {
+      const { commands, sentMessages } = await load();
+      const rlm = commands.find((c) => c.name === "rlm");
+      const abort = commands.find((c) => c.name === "rlm-abort");
+      assert.ok(rlm, "/rlm did not register");
+      assert.ok(abort, "/rlm-abort did not register");
+
+      let capturedSignal: AbortSignal | undefined;
+      const notes: Array<{ message: string; type?: string }> = [];
+      const ctx = {
+        cwd,
+        model: { id: "fake-model" },
+        modelRegistry: {
+          complete: (_m: unknown, _c: unknown, opts?: { signal?: AbortSignal }) => {
+            capturedSignal = opts?.signal;
+            return new Promise<{ content: Array<{ type: string; text: string }> }>(() => {});
+          },
+        },
+        ui: { notify: (message: string, type?: string) => notes.push({ message, type }) },
+      };
+
+      await rlm.handler("what is the answer?", ctx);
+
+      // runRlm awaits buildSystemPrompt(registry) before its first model
+      // call, so wait for the detached loop to actually reach the model.
+      const deadline = Date.now() + 2000;
+      while (capturedSignal === undefined && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(capturedSignal, "the loop never asked the model");
+      assert.equal(capturedSignal.aborted, false);
+
+      await abort.handler("", ctx);
+      assert.equal(capturedSignal.aborted, true, "abort must fire the run's signal");
+
+      const postDeadline = Date.now() + 2000;
+      while (sentMessages.length === 0 && Date.now() < postDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      assert.equal(sentMessages.length, 1);
+      const posted = sentMessages[0];
+      assert.equal(posted.customType, "rlm-result");
+      assert.equal((posted.details as { status: string }).status, "aborted");
+      assert.match(posted.content, /aborted/);
+      assert.match(notes[1].message, /aborting/i);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -748,11 +924,11 @@ describe("repl extension — approval mode", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("registers /repl-approvals, and /repl-accept-preamble beside it (#198)", async () => {
+  it("registers /repl-approvals, /repl-accept-preamble, /rlm, and /rlm-abort (#198)", async () => {
     const { commands } = await load();
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["repl-approvals", "repl-accept-preamble"],
+      ["repl-approvals", "repl-accept-preamble", "rlm", "rlm-abort"],
     );
     for (const command of commands) {
       assert.ok(command.description, `${command.name} needs a description to be discoverable`);

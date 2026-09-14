@@ -7,7 +7,7 @@ import { limitsConfig } from "../src/sandbox.js";
 import { escapeNoticeName } from "../src/toolstore.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
 import { runRlm, type RlmResult } from "../src/rlm.js";
-import { createLlmClient } from "../src/rlm_client.js";
+import { createLlmClient, type RlmClientContext } from "../src/rlm_client.js";
 import { ToolRegistry } from "../src/registry.js";
 import { createPiBridgeTools } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
@@ -837,7 +837,7 @@ type SessionLifecycleHandler = (
  * directory and the trust decision, so `/repl-accept-preamble` reaches the
  * same runner a `repl` call would, and a way to answer.
  */
-interface CommandCtx {
+interface CommandCtx extends RlmClientContext {
   cwd: string;
   hasUI: boolean;
   isProjectTrusted(): boolean;
@@ -854,6 +854,13 @@ interface ReplExtensionApi {
       handler: (args: string, ctx: CommandCtx) => Promise<void>;
     },
   ) => void;
+  /** Post a displayed custom message into the transcript (pi.sendMessage). */
+  sendMessage: (message: {
+    customType: string;
+    content: string;
+    display: boolean;
+    details?: unknown;
+  }) => void;
   /**
    * Lifecycle events (`ExtensionAPI.on`, `types.d.ts:869` / `:875`).
    * `session_start` fires when a conversation begins — startup, reload,
@@ -1648,4 +1655,75 @@ export default function (pi: ReplExtensionApi) {
       },
     }),
   );
+
+  // ── /rlm ──────────────────────────────────────────────────────
+  //
+  // The `rlm` tool above is the agent's handle on the loop; these commands
+  // are the user's. `/rlm` builds the loop's inputs, then runs `runRlm`
+  // detached so the prompt returns immediately instead of blocking on a
+  // multi-LLM-call loop; the formatted result is posted as a displayed custom
+  // message when it lands, so the answer appears in the transcript rather than
+  // a transient toast. `/rlm-abort` stops the in-flight run. One run at a
+  // time: a second `/rlm` while one is running is refused rather than stacked,
+  // so a runaway loop cannot hide behind a queue of newer ones. No options are
+  // parsed from args: the spend bound is the same `REPL_RLM_BUDGET`-overrideable
+  // default the tool uses, and fine-grained control remains the tool's job.
+
+  // The abort handle for the in-flight run, or null when none is running.
+  let rlmAbortController: AbortController | null = null;
+
+  pi.registerCommand("rlm", {
+    description: "Run the RLM code-gen → execute loop on a question (read-only sandbox).",
+    handler: async (args, ctx) => {
+      const question = args.trim();
+      if (!question) {
+        ctx.ui.notify("Usage: /rlm <question>", "error");
+        return;
+      }
+
+      if (rlmAbortController !== null) {
+        ctx.ui.notify("rlm is already running — /rlm-abort to stop it first", "error");
+        return;
+      }
+
+      ctx.ui.notify("RLM investigating… (/rlm-abort to stop)", "info");
+
+      const registry = buildRlmRegistry(ctx.cwd);
+      const llmClient = createLlmClient(ctx, {});
+
+      const controller = new AbortController();
+      rlmAbortController = controller;
+
+      void runRlm(question, {
+        llmClient,
+        registry,
+        budget: defaultRlmBudget(),
+        signal: controller.signal,
+      }).then((result) => {
+        rlmAbortController = null;
+        pi.sendMessage({
+          customType: "rlm-result",
+          content: formatRlmResult(result),
+          display: true,
+          details: {
+            status: result.status,
+            answerSource: result.answerSource,
+            iterations: result.iterations.length,
+          },
+        });
+      });
+    },
+  });
+
+  pi.registerCommand("rlm-abort", {
+    description: "Abort the in-flight /rlm run.",
+    handler: async (_args, ctx) => {
+      if (rlmAbortController === null) {
+        ctx.ui.notify("no /rlm run is active", "error");
+        return;
+      }
+      rlmAbortController.abort();
+      ctx.ui.notify("rlm: aborting…", "info");
+    },
+  });
 }
