@@ -87,4 +87,4 @@ Anything else (`time`, `random`, `subprocess`, `socket`, `hashlib`, `requests`, 
 
 ## Maintainers
 
-The extension lives in the `repl-simple` package (`extensions/repl-extension.ts`). Full reference: `README.md`, `docs/project-trust.md`, `docs/approval-grants.md`, `docs/path-jail.md`, `docs/bash-env.md`, `docs/http-egress.md`, `docs/truncation-policy.md`.
+The extension lives in the `repl-simple` package (`../../extensions/repl-extension.ts`). Full reference: `../../README.md`, `../../docs/project-trust.md`, `../../docs/approval-grants.md`, `../../docs/path-jail.md`, `../../docs/bash-env.md`, `../../docs/http-egress.md`, `../../docs/truncation-policy.md`.

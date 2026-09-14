@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-fixture.js";
 
@@ -317,6 +317,16 @@ describe("skill manifest", () => {
     return out;
   }
 
+  /** Relative file references (`.md`/`.ts`/`.py`) written inline in SKILL.md. */
+  function relativeRefs(): string[] {
+    const src = readFileSync(SKILL_PATH, "utf8");
+    const refs: string[] = [];
+    for (const m of src.matchAll(/`(\.[./][^`]*\.(?:md|ts|py))`/g)) {
+      refs.push(m[1]);
+    }
+    return refs;
+  }
+
   it("ships a SKILL.md with a valid name and a <=1024-char description", () => {
     assert.ok(existsSync(SKILL_PATH), "skills/repl-simple/SKILL.md must exist");
     const fm = skillFrontmatter();
@@ -333,5 +343,17 @@ describe("skill manifest", () => {
       (fm.description ?? "").length <= 1024,
       `skill description must be <= 1024 chars (got ${fm.description?.length ?? 0})`,
     );
+  });
+
+  it("every relative doc reference resolves from the skill directory", () => {
+    const skillDir = join(REPO_ROOT, "skills", "repl-simple");
+    const refs = relativeRefs();
+    assert.ok(refs.length > 0, "SKILL.md must reference files relative to the skill directory");
+    for (const rel of refs) {
+      assert.ok(
+        existsSync(resolve(skillDir, rel)),
+        `skill reference must resolve from skills/repl-simple/: ${rel}`,
+      );
+    }
   });
 });
