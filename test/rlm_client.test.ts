@@ -175,4 +175,227 @@ describe("createLlmClient", () => {
     assert.equal(calls[0].model.id, "scoped-model");
     assert.equal(fetchCalled, false);
   });
+
+  it("injected tier rejects when the configured model does not resolve", async () => {
+    const { calls, registry } = makeRegistry("unused");
+    const client = createLlmClient(
+      {
+        model: { id: "fallback" },
+        modelRegistry: registry,
+        scopedModels: [{ model: { id: "other" } }],
+      },
+      { model: "missing-model" },
+    );
+
+    await assert.rejects(
+      client.query("sys", [{ role: "user", content: "hi" }]),
+      /RLM model not found/,
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("injected tier routes through modelRegistry.find when provider is set", async () => {
+    const calls: RecordedCall[] = [];
+    const findArgs: Array<[string, string]> = [];
+    const registry: RlmModelRegistry = {
+      find(provider, modelId) {
+        findArgs.push([provider, modelId]);
+        return { id: "via-find" };
+      },
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        return Promise.resolve({
+          content: [{ type: "text", text: "found reply" }],
+        });
+      },
+    };
+
+    const client = createLlmClient(
+      { model: { id: "fallback" }, modelRegistry: registry },
+      { provider: "acme", model: "m1" },
+    );
+
+    const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+
+    assert.equal(text, "found reply");
+    assert.deepEqual(findArgs, [["acme", "m1"]]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model.id, "via-find");
+  });
+
+  it("injected tier skips scoped models whose provider does not match config.provider", async () => {
+    const calls: RecordedCall[] = [];
+    const registry: RlmModelRegistry = {
+      find() {
+        return undefined;
+      },
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        return Promise.resolve({
+          content: [{ type: "text", text: "narrowed reply" }],
+        });
+      },
+    };
+
+    const client = createLlmClient(
+      {
+        model: { id: "fallback" },
+        modelRegistry: registry,
+        scopedModels: [
+          { model: { id: "shared-model", provider: "other" } },
+          { model: { id: "shared-model", provider: "acme" } },
+        ],
+      },
+      { provider: "acme", model: "shared-model" },
+    );
+
+    const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+
+    assert.equal(text, "narrowed reply");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model.id, "shared-model");
+    assert.equal(calls[0].model.provider, "acme");
+  });
+
+  it("env tier rejects a non-ok response with the status", async () => {
+    const { registry } = makeRegistry("unused");
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      return new Response("boom", { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      await withEnv({ REPL_RLM_BASE_URL: "https://api.example.com" }, async () => {
+        await assert.rejects(
+          client.query("sys", [{ role: "user", content: "hi" }]),
+          /RLM endpoint returned 500/,
+        );
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("env tier rejects when choices[0].message.content is not a string", async () => {
+    const { registry } = makeRegistry("unused");
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      return new Response(JSON.stringify({ choices: [{ message: { content: 42 } }] }), {
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    try {
+      await withEnv({ REPL_RLM_BASE_URL: "https://api.example.com" }, async () => {
+        await assert.rejects(client.query("sys", [{ role: "user", content: "hi" }]), /no text/);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("env tier normalizes a trailing slash out of the base URL", async () => {
+    const { registry } = makeRegistry("unused");
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    let fetchUrl = "";
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      fetchUrl = String(input);
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    try {
+      await withEnv({ REPL_RLM_BASE_URL: "https://api.example.com/" }, async () => {
+        const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+        assert.equal(text, "ok");
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(fetchUrl, "https://api.example.com/chat/completions");
+  });
+
+  it("injected tier passes an empty model id to find and names the provider in the not-found error", async () => {
+    const calls: RecordedCall[] = [];
+    const findArgs: Array<[string, string]> = [];
+    const registry: RlmModelRegistry = {
+      find(provider, modelId) {
+        findArgs.push([provider, modelId]);
+        return undefined;
+      },
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        return Promise.resolve({ content: [{ type: "text", text: "unused" }] });
+      },
+    };
+
+    const client = createLlmClient(
+      { model: { id: "fallback" }, modelRegistry: registry },
+      { provider: "acme" },
+    );
+
+    await assert.rejects(
+      client.query("sys", [{ role: "user", content: "hi" }]),
+      /RLM model not found for provider "acme"/,
+    );
+    assert.deepEqual(findArgs, [["acme", ""]]);
+    assert.equal(calls.length, 0);
+  });
+
+  it("injected tier skips scoped entries that carry no model", async () => {
+    const { calls, registry } = makeRegistry("picked reply");
+    const client = createLlmClient(
+      {
+        model: { id: "fallback" },
+        modelRegistry: registry,
+        scopedModels: [{ model: undefined }, { model: { id: "real-model" } }],
+      },
+      { model: "real-model" },
+    );
+
+    const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+
+    assert.equal(text, "picked reply");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model.id, "real-model");
+  });
+
+  it("injected tier treats omitted scopedModels as empty", async () => {
+    const { calls, registry } = makeRegistry("unused");
+    const client = createLlmClient(
+      { model: { id: "fallback" }, modelRegistry: registry },
+      { model: "missing-model" },
+    );
+
+    await assert.rejects(
+      client.query("sys", [{ role: "user", content: "hi" }]),
+      /RLM model not found/,
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("extracts an empty string when a text part has no text", async () => {
+    const calls: RecordedCall[] = [];
+    const registry: RlmModelRegistry = {
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        return Promise.resolve({ content: [{ type: "text" }] });
+      },
+    };
+
+    const client = createLlmClient({ model: { id: "default-model" }, modelRegistry: registry });
+
+    const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+
+    assert.equal(text, "");
+    assert.equal(calls.length, 1);
+  });
 });
