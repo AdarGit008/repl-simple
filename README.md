@@ -98,9 +98,11 @@ See [docs/tool-trace.md](docs/tool-trace.md) and
 the sandbox runs it, and the results are fed back until `SUBMIT(answer)`.
 
 From pi the same loop is reachable two ways: the `rlm` tool, which the agent calls for
-auto-investigation, and the `/rlm <question>` command, which runs the loop directly and posts the
-formatted result into the transcript. Both use the same `REPL_RLM_BUDGET`-overrideable spend
-default.
+auto-investigation, and the `/rlm <question>` command, which runs the loop detached — the prompt
+returns immediately and the formatted result is posted into the transcript when it lands.
+`/rlm-abort` stops the in-flight run. One run at a time: a second `/rlm` while one is running is
+refused, so a runaway loop cannot hide behind a queue. Both use the same
+`REPL_RLM_BUDGET`-overrideable spend default.
 
 Each iteration runs in a fresh sandbox — no variables, imports, or state carry over between
 iterations, so each snippet must be self-contained. Diagnostics fed back to the model are
