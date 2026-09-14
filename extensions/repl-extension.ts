@@ -7,7 +7,7 @@ import { limitsConfig } from "../src/sandbox.js";
 import { escapeNoticeName } from "../src/toolstore.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
 import { runRlm, type RlmResult } from "../src/rlm.js";
-import { createLlmClient } from "../src/rlm_client.js";
+import { createLlmClient, type RlmClientContext } from "../src/rlm_client.js";
 import { ToolRegistry } from "../src/registry.js";
 import { createPiBridgeTools } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
@@ -837,10 +837,11 @@ type SessionLifecycleHandler = (
  * directory and the trust decision, so `/repl-accept-preamble` reaches the
  * same runner a `repl` call would, and a way to answer.
  */
-interface CommandCtx {
+interface CommandCtx extends RlmClientContext {
   cwd: string;
   hasUI: boolean;
   isProjectTrusted(): boolean;
+  signal?: AbortSignal;
   ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
 }
 
@@ -854,6 +855,13 @@ interface ReplExtensionApi {
       handler: (args: string, ctx: CommandCtx) => Promise<void>;
     },
   ) => void;
+  /** Post a displayed custom message into the transcript (pi.sendMessage). */
+  sendMessage: (message: {
+    customType: string;
+    content: string;
+    display: boolean;
+    details?: unknown;
+  }) => void;
   /**
    * Lifecycle events (`ExtensionAPI.on`, `types.d.ts:869` / `:875`).
    * `session_start` fires when a conversation begins — startup, reload,
@@ -1648,4 +1656,47 @@ export default function (pi: ReplExtensionApi) {
       },
     }),
   );
+
+  // ── /rlm ──────────────────────────────────────────────────────
+  //
+  // The `rlm` tool above is the agent's handle on the loop; this command is
+  // the user's. It runs the same `runRlm` entry point synchronously in the
+  // handler — the loop's LLM calls go through the model registry — and posts
+  // the formatted result as a displayed custom message, so the answer lands in
+  // the transcript rather than a transient toast. No options are parsed from
+  // args: the spend bound is the same `REPL_RLM_BUDGET`-overrideable default
+  // the tool uses, and fine-grained control remains the tool's job.
+
+  pi.registerCommand("rlm", {
+    description: "Run the RLM code-gen → execute loop on a question (read-only sandbox).",
+    handler: async (args, ctx) => {
+      const question = args.trim();
+      if (!question) {
+        ctx.ui.notify("Usage: /rlm <question>", "error");
+        return;
+      }
+
+      ctx.ui.notify("RLM investigating…", "info");
+
+      const registry = buildRlmRegistry(ctx.cwd);
+      const llmClient = createLlmClient(ctx, {});
+      const result = await runRlm(question, {
+        llmClient,
+        registry,
+        budget: defaultRlmBudget(),
+        signal: ctx.signal,
+      });
+
+      pi.sendMessage({
+        customType: "rlm-result",
+        content: formatRlmResult(result),
+        display: true,
+        details: {
+          status: result.status,
+          answerSource: result.answerSource,
+          iterations: result.iterations.length,
+        },
+      });
+    },
+  });
 }

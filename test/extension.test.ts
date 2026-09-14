@@ -115,6 +115,14 @@ type RegisteredCommand = {
   ) => Promise<void>;
 };
 
+/** A message the extension posted to the transcript via `pi.sendMessage`. */
+type SentMessage = {
+  customType: string;
+  content: string;
+  display: boolean;
+  details?: unknown;
+};
+
 /**
  * A lifecycle handler as the extension hands it to `pi.on` — the shape of
  * pi's `ExtensionHandler<SessionStartEvent | SessionShutdownEvent>`
@@ -142,22 +150,25 @@ async function load(): Promise<{
   tools: RegisteredTool[];
   commands: RegisteredCommand[];
   handlers: Map<string, LifecycleHandler[]>;
+  sentMessages: SentMessage[];
 }> {
   const tools: RegisteredTool[] = [];
   const commands: RegisteredCommand[] = [];
   const handlers = new Map<string, LifecycleHandler[]>();
+  const sentMessages: SentMessage[] = [];
   const mod = await import("../extensions/repl-extension.js");
   mod.default({
     registerTool: (t: unknown) => tools.push(t as RegisteredTool),
     registerCommand: (name: string, options: unknown) =>
       commands.push({ name, ...(options as Omit<RegisteredCommand, "name">) }),
+    sendMessage: (message: SentMessage) => sentMessages.push(message),
     on: (event: string, handler: LifecycleHandler) => {
       const list = handlers.get(event) ?? [];
       list.push(handler);
       handlers.set(event, list);
     },
   } as never);
-  return { tools, commands, handlers };
+  return { tools, commands, handlers, sentMessages };
 }
 
 /**
@@ -344,6 +355,69 @@ describe("repl extension — rlm tool", () => {
 
       assert.match(result.content[0].text, /rlm-answer/);
       assert.equal((result.details as { status: string }).status, "ok");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── /rlm command ──────────────────────────────────────────────
+//
+// The `rlm` tool above is the agent's handle on the loop; `/rlm` is the
+// user's. Both drive the same `runRlm` entry point, but the command parses
+// only the question from args (no budget/model flags) and posts the formatted
+// result as a displayed custom message instead of returning a tool result.
+
+describe("repl extension — /rlm command", () => {
+  it("registers /rlm with a description", async () => {
+    const { commands } = await load();
+    const rlm = commands.find((c) => c.name === "rlm");
+    assert.ok(rlm, "/rlm did not register");
+    assert.ok(rlm.description, "/rlm has no description");
+  });
+
+  it("refuses an empty question", async () => {
+    const { commands } = await load();
+    const rlm = commands.find((c) => c.name === "rlm");
+    assert.ok(rlm, "/rlm did not register");
+
+    const { ctx, notes } = notifyCtx();
+    await rlm.handler("   ", ctx);
+
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].type, "error");
+    assert.match(notes[0].message, /usage/i);
+  });
+
+  it("runs the loop and posts the formatted result to the transcript", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-cmd-"));
+    try {
+      const { commands, sentMessages } = await load();
+      const rlm = commands.find((c) => c.name === "rlm");
+      assert.ok(rlm, "/rlm did not register");
+
+      const notes: Array<{ message: string; type?: string }> = [];
+      const ctx = {
+        cwd,
+        model: { id: "fake-model" },
+        modelRegistry: {
+          complete: async () => ({
+            content: [{ type: "text", text: 'SUBMIT("rlm-answer")' }],
+          }),
+        },
+        ui: { notify: (message: string, type?: string) => notes.push({ message, type }) },
+      };
+
+      await rlm.handler("what is the answer?", ctx);
+
+      assert.equal(sentMessages.length, 1);
+      const posted = sentMessages[0];
+      assert.equal(posted.customType, "rlm-result");
+      assert.equal(posted.display, true);
+      assert.match(posted.content, /rlm-answer/);
+      assert.match(posted.content, /untrusted/i);
+      assert.equal((posted.details as { status: string }).status, "ok");
+      assert.match(notes[0].message, /investigating/i);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -748,11 +822,11 @@ describe("repl extension — approval mode", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("registers /repl-approvals, and /repl-accept-preamble beside it (#198)", async () => {
+  it("registers /repl-approvals, /repl-accept-preamble, and /rlm (#198)", async () => {
     const { commands } = await load();
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["repl-approvals", "repl-accept-preamble"],
+      ["repl-approvals", "repl-accept-preamble", "rlm"],
     );
     for (const command of commands) {
       assert.ok(command.description, `${command.name} needs a description to be discoverable`);
