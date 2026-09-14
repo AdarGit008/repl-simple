@@ -841,7 +841,6 @@ interface CommandCtx extends RlmClientContext {
   cwd: string;
   hasUI: boolean;
   isProjectTrusted(): boolean;
-  signal?: AbortSignal;
   ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
 }
 
@@ -1660,12 +1659,13 @@ export default function (pi: ReplExtensionApi) {
   // ── /rlm ──────────────────────────────────────────────────────
   //
   // The `rlm` tool above is the agent's handle on the loop; this command is
-  // the user's. It runs the same `runRlm` entry point synchronously in the
-  // handler — the loop's LLM calls go through the model registry — and posts
-  // the formatted result as a displayed custom message, so the answer lands in
-  // the transcript rather than a transient toast. No options are parsed from
-  // args: the spend bound is the same `REPL_RLM_BUDGET`-overrideable default
-  // the tool uses, and fine-grained control remains the tool's job.
+  // the user's. It builds the loop's inputs, then runs `runRlm` detached so
+  // the prompt returns immediately instead of blocking on a multi-LLM-call
+  // loop; the formatted result is posted as a displayed custom message when it
+  // lands, so the answer appears in the transcript rather than a transient
+  // toast. No options are parsed from args: the spend bound is the same
+  // `REPL_RLM_BUDGET`-overrideable default the tool uses, and fine-grained
+  // control remains the tool's job.
 
   pi.registerCommand("rlm", {
     description: "Run the RLM code-gen → execute loop on a question (read-only sandbox).",
@@ -1678,25 +1678,29 @@ export default function (pi: ReplExtensionApi) {
 
       ctx.ui.notify("RLM investigating…", "info");
 
+      // Build the loop's inputs now, then run it detached: the command
+      // resolves immediately and the result is posted when it lands, rather
+      // than blocking the prompt on a multi-LLM-call loop.
       const registry = buildRlmRegistry(ctx.cwd);
       const llmClient = createLlmClient(ctx, {});
-      const result = await runRlm(question, {
-        llmClient,
-        registry,
-        budget: defaultRlmBudget(),
-        signal: ctx.signal,
-      });
 
-      pi.sendMessage({
-        customType: "rlm-result",
-        content: formatRlmResult(result),
-        display: true,
-        details: {
-          status: result.status,
-          answerSource: result.answerSource,
-          iterations: result.iterations.length,
-        },
-      });
+      void runRlm(question, { llmClient, registry, budget: defaultRlmBudget() })
+        .then((result) => {
+          pi.sendMessage({
+            customType: "rlm-result",
+            content: formatRlmResult(result),
+            display: true,
+            details: {
+              status: result.status,
+              answerSource: result.answerSource,
+              iterations: result.iterations.length,
+            },
+          });
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`rlm failed: ${message}`, "error");
+        });
     },
   });
 }

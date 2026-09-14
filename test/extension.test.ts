@@ -389,7 +389,7 @@ describe("repl extension — /rlm command", () => {
     assert.match(notes[0].message, /usage/i);
   });
 
-  it("runs the loop and posts the formatted result to the transcript", async () => {
+  it("runs the loop in the background and posts the formatted result", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-cmd-"));
     try {
       const { commands, sentMessages } = await load();
@@ -409,6 +409,13 @@ describe("repl extension — /rlm command", () => {
       };
 
       await rlm.handler("what is the answer?", ctx);
+
+      // The command returns before the loop finishes; wait for the detached
+      // result to be posted rather than asserting synchronously.
+      const deadline = Date.now() + 2000;
+      while (sentMessages.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
 
       assert.equal(sentMessages.length, 1);
       const posted = sentMessages[0];
