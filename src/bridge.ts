@@ -120,10 +120,10 @@ const DEFAULT_BASH_TIMEOUT_SECS = 120;
  * `fstat`ed: a final-component symlink swap is refused and a FIFO cannot
  * block the threadpool, because the fd — not the name — is what gets read.
  *
- * - `read` supplies `access` and `readFile` but not `detectImageMimeType`,
- *   which pi does not export. An image read this way is therefore decoded as
- *   UTF-8 text rather than attached; that is the price of closing the
- *   open-by-name window on the tool that reads file contents.
+ * - `read` supplies `access`, `readFile` and `detectImageMimeType`. pi does
+ *   not export its magic-byte sniffer, so the bytes are read through
+ *   {@link openJailedFile} and sniffed here — images stay attached without
+ *   reopening the path by name.
  * - `find` still gets none: it only consults its operations when they supply
  *   `glob`, which replaces the `fd` subprocess — losing .gitignore handling
  *   and the result caps with it. `fd`, like `rg`, does not follow symlinks
@@ -160,6 +160,108 @@ async function openJailedFile(path: string): Promise<FileHandle> {
   }
 }
 
+/** Bytes read for image sniffing — pi sniffs 4100 to see the PNG chunks. */
+const IMAGE_SNIFF_BYTES = 4100;
+
+/**
+ * Magic-byte detection for the image types the read tool attaches. pi does
+ * not export its sniffer (`detectSupportedImageMimeTypeFromFile` is internal
+ * and opens by name), so it is replicated here and fed from the jailed fd.
+ * Exported for the magic-byte tests.
+ */
+export function detectImageMimeType(buffer: Buffer): string | null {
+  if (startsWithBytes(buffer, [0xff, 0xd8, 0xff])) {
+    return buffer[3] === 0xf7 ? null : "image/jpeg";
+  }
+  if (startsWithBytes(buffer, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return isPng(buffer) && !isAnimatedPng(buffer) ? "image/png" : null;
+  }
+  if (startsWithAscii(buffer, 0, "GIF")) return "image/gif";
+  if (startsWithAscii(buffer, 0, "RIFF") && startsWithAscii(buffer, 8, "WEBP")) {
+    return "image/webp";
+  }
+  if (startsWithAscii(buffer, 0, "BM") && isBmp(buffer)) return "image/bmp";
+  return null;
+}
+
+function startsWithBytes(buffer: Buffer, bytes: number[]): boolean {
+  if (buffer.length < bytes.length) return false;
+  return bytes.every((byte, index) => buffer[index] === byte);
+}
+
+function startsWithAscii(buffer: Buffer, offset: number, text: string): boolean {
+  if (buffer.length < offset + text.length) return false;
+  for (let i = 0; i < text.length; i++) {
+    if (buffer[offset + i] !== text.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+function readUint32BE(buffer: Buffer, offset: number): number {
+  return (
+    (buffer[offset] ?? 0) * 0x1000000 +
+    ((buffer[offset + 1] ?? 0) << 16) +
+    ((buffer[offset + 2] ?? 0) << 8) +
+    (buffer[offset + 3] ?? 0)
+  );
+}
+
+function readUint32LE(buffer: Buffer, offset: number): number {
+  return (
+    (buffer[offset] ?? 0) +
+    ((buffer[offset + 1] ?? 0) << 8) +
+    ((buffer[offset + 2] ?? 0) << 16) +
+    (buffer[offset + 3] ?? 0) * 0x1000000
+  );
+}
+
+function readUint16LE(buffer: Buffer, offset: number): number {
+  return (buffer[offset] ?? 0) + ((buffer[offset + 1] ?? 0) << 8);
+}
+
+function isPng(buffer: Buffer): boolean {
+  return (
+    buffer.length >= 16 && readUint32BE(buffer, 8) === 13 && startsWithAscii(buffer, 12, "IHDR")
+  );
+}
+
+function isAnimatedPng(buffer: Buffer): boolean {
+  let offset = 8;
+  while (offset + 8 <= buffer.length) {
+    const chunkLength = readUint32BE(buffer, offset);
+    const chunkTypeOffset = offset + 4;
+    if (startsWithAscii(buffer, chunkTypeOffset, "acTL")) return true;
+    if (startsWithAscii(buffer, chunkTypeOffset, "IDAT")) return false;
+    const nextOffset = offset + 8 + chunkLength + 4;
+    if (nextOffset <= offset || nextOffset > buffer.length) return false;
+    offset = nextOffset;
+  }
+  return false;
+}
+
+function isBmp(buffer: Buffer): boolean {
+  if (buffer.length < 26) return false;
+  const declaredFileSize = readUint32LE(buffer, 2);
+  const pixelDataOffset = readUint32LE(buffer, 10);
+  const dibHeaderSize = readUint32LE(buffer, 14);
+  if (declaredFileSize !== 0 && declaredFileSize < 26) return false;
+  if (pixelDataOffset < 14 + dibHeaderSize) return false;
+  if (declaredFileSize !== 0 && pixelDataOffset >= declaredFileSize) return false;
+  let colorPlanes: number;
+  let bitsPerPixel: number;
+  if (dibHeaderSize === 12) {
+    colorPlanes = readUint16LE(buffer, 22);
+    bitsPerPixel = readUint16LE(buffer, 24);
+  } else if (dibHeaderSize >= 40 && dibHeaderSize <= 124) {
+    if (buffer.length < 30) return false;
+    colorPlanes = readUint16LE(buffer, 26);
+    bitsPerPixel = readUint16LE(buffer, 28);
+  } else {
+    return false;
+  }
+  return colorPlanes === 1 && [1, 4, 8, 16, 24, 32].includes(bitsPerPixel);
+}
+
 function jailedReadOperations(jail: PathJail, inherited?: ReadOperations): ReadOperations {
   return {
     access: async (p) => {
@@ -174,6 +276,18 @@ function jailedReadOperations(jail: PathJail, inherited?: ReadOperations): ReadO
       const handle = await openJailedFile(real);
       try {
         return await handle.readFile();
+      } finally {
+        await handle.close();
+      }
+    },
+    detectImageMimeType: async (p) => {
+      const real = await jail.resolve(p);
+      if (inherited?.detectImageMimeType) return inherited.detectImageMimeType(real);
+      const handle = await openJailedFile(real);
+      try {
+        const buffer = Buffer.alloc(IMAGE_SNIFF_BYTES);
+        const { bytesRead } = await handle.read(buffer, 0, IMAGE_SNIFF_BYTES, 0);
+        return detectImageMimeType(buffer.subarray(0, bytesRead));
       } finally {
         await handle.close();
       }

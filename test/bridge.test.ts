@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, symlinkSyn
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
-import { createPiBridgeTools } from "../src/bridge.js";
+import { createPiBridgeTools, detectImageMimeType } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
 import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 import type { BridgeOptions } from "../src/bridge.js";
@@ -152,6 +152,68 @@ describe("createPiBridgeTools — tool creation", () => {
   });
 });
 
+// ── Image sniffing ──────────────────────────────────────────────
+
+describe("detectImageMimeType", () => {
+  const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  /** A buffer the sniffer reads as a non-animated PNG (signature + IHDR). */
+  function fakePng(): Buffer {
+    return Buffer.concat([
+      PNG_SIGNATURE,
+      Buffer.from([0x00, 0x00, 0x00, 0x0d]), // IHDR chunk length
+      Buffer.from("IHDR", "ascii"),
+      Buffer.alloc(17),
+    ]);
+  }
+
+  function bmp(): Buffer {
+    const b = Buffer.alloc(30);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(54, 10); // pixel data offset ≥ 14 + DIB header size
+    b.writeUInt32LE(40, 14); // BITMAPINFOHEADER
+    b.writeUInt16LE(1, 26); // color planes
+    b.writeUInt16LE(24, 28); // bits per pixel
+    return b;
+  }
+
+  it("detects each image type the read tool attaches", () => {
+    assert.equal(detectImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00])), "image/jpeg");
+    assert.equal(detectImageMimeType(fakePng()), "image/png");
+    assert.equal(detectImageMimeType(Buffer.from("GIF89a", "ascii")), "image/gif");
+    assert.equal(
+      detectImageMimeType(
+        Buffer.concat([
+          Buffer.from("RIFF", "ascii"),
+          Buffer.alloc(4),
+          Buffer.from("WEBP", "ascii"),
+        ]),
+      ),
+      "image/webp",
+    );
+    assert.equal(detectImageMimeType(bmp()), "image/bmp");
+  });
+
+  it("returns null for text and for images pi will not attach", () => {
+    assert.equal(detectImageMimeType(Buffer.from("hello world", "ascii")), null);
+    // 0xf7 at byte 3 is the JPEG "not a JPEG" marker pi refuses.
+    assert.equal(detectImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xf7])), null);
+    // Animated PNG: an acTL chunk after IHDR is refused, mirroring pi.
+    const apng = Buffer.concat([
+      PNG_SIGNATURE,
+      Buffer.from([0x00, 0x00, 0x00, 0x0d]),
+      Buffer.from("IHDR", "ascii"),
+      Buffer.alloc(13),
+      Buffer.alloc(4),
+      Buffer.from([0x00, 0x00, 0x00, 0x08]),
+      Buffer.from("acTL", "ascii"),
+      Buffer.alloc(8),
+      Buffer.alloc(4),
+    ]);
+    assert.equal(detectImageMimeType(apng), null);
+  });
+});
+
 // ── Tool execution — read ───────────────────────────────────────
 
 describe("createPiBridgeTools — read execution", () => {
@@ -193,6 +255,18 @@ describe("createPiBridgeTools — read execution", () => {
     assert.notEqual(outcome, "timeout", "read must not hang on a FIFO");
     assert.ok(outcome instanceof Error, `expected an error, got ${String(outcome)}`);
     assert.match(outcome.message, /not a regular file/);
+  });
+
+  it("attaches an image instead of decoding it as UTF-8 text", async () => {
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+      "base64",
+    );
+    writeFileSync(join(tmpDir, "pixel.png"), png);
+    const tools = createPiBridgeTools(tmpDir);
+    const read = findTool(tools, "read");
+    const result = await read.execute({ path: "pixel.png" });
+    assert.match(result, /Read image file \[image\/png\]/);
   });
 });
 

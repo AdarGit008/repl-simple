@@ -488,6 +488,33 @@ describe("http_get — HTTPS DNS pinning", () => {
     });
     assert.deepEqual(resolved, [{ address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 }]);
   });
+
+  it("defaults to the pinned undici fetch, not globalThis.fetch", async () => {
+    // A revert to `?? fetch` would call the patched global and fail fast.
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      throw new Error("GLOBAL_FETCH_USED");
+    }) as typeof fetch;
+    try {
+      const tools = makeTools({ httpTimeoutSecs: 1 });
+      const httpGet = findTool(tools, "http_get");
+      // The pinned undici fetch connects to the validated public address;
+      // without a route to it the request fails (timeout/refused) — never by
+      // calling the patched global.
+      let err: unknown = null;
+      try {
+        await httpGet.execute({ url: "http://example.com/" });
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(
+        !(err instanceof Error && /GLOBAL_FETCH_USED/.test(err.message)),
+        `http_get used globalThis.fetch instead of the pinned undici fetch: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });
 
 // ── Truncation ──────────────────────────────────────────────────

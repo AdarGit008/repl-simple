@@ -3,7 +3,7 @@ import { open, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
-import { Agent } from "undici";
+import { Agent, fetch as undiciFetch } from "undici";
 import { createPathJail } from "./pathjail.js";
 import { requireString } from "./registry.js";
 import {
@@ -46,7 +46,7 @@ export interface BuiltinToolsOptions {
    * included. Default 30, or `REPL_HTTP_TIMEOUT_SECS`.
    */
   httpTimeoutSecs?: number;
-  /** Injectable fetch (tests). Default: global fetch. */
+  /** Injectable fetch (tests). Default: the pinned undici fetch. */
   fetchImpl?: typeof fetch;
   /**
    * Injectable hostname resolver (tests). Default: `dns.lookup(…, {all: true})`.
@@ -410,7 +410,16 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
   const root = resolve(options.root);
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_BYTES;
   const maxHttpBytes = options.maxHttpBytes ?? DEFAULT_MAX_BYTES;
-  const fetchImpl = options.fetchImpl ?? fetch;
+  // Default to the fetch from the same undici the dispatcher `Agent` comes
+  // from, not `globalThis.fetch`: Node's built-in fetch (undici 7.x) rejects
+  // an 8.x `Agent` as `dispatcher` with `UND_ERR_INVALID_ARG`, and pi's
+  // `undici.install()` only rewrites the global inside its own process. The
+  // dispatcher and the fetch must be the same undici for egress to work.
+  // `undici.fetch` shares the DOM `fetch` signature at runtime (URL/Request
+  // input, `RequestInit`, a `Response` with `.ok`/`.headers`/`.body`/`.text()`),
+  // so the cast to `typeof fetch` is honest; it only differs in undici's own
+  // richer typings (e.g. its `RequestInit` carries `dispatcher`).
+  const fetchImpl = options.fetchImpl ?? (undiciFetch as unknown as typeof fetch);
   const allowlist = (options.httpAllowlist ?? parseAllowlist(process.env.REPL_HTTP_ALLOWLIST)).map(
     (entry) => entry.trim().toLowerCase(),
   );
@@ -690,6 +699,10 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
       }
       const response = await fetchGuarded(url);
       if (!response.ok) {
+        // The body is never read on the non-ok path; cancel it so the
+        // dispatcher's already-fired close() does not wait on a stream that
+        // will never be consumed (which would hold the socket open).
+        await response.body?.cancel().catch(() => {});
         throw new HostToolError("OSError", `HTTP ${response.status} for ${url}`);
       }
       try {
