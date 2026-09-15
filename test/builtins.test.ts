@@ -1,12 +1,15 @@
 import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostToolError, type HostTool } from "../src/types.js";
+import { fetch as undiciFetch } from "undici";
 import {
   createBuiltinTools,
   isBlockedAddress,
+  resolveFetchImpl,
   __resetEverPrivateForTests,
   __everPrivateSizeForTests,
   EVER_PRIVATE_MAX_ENTRIES,
@@ -32,6 +35,37 @@ function findTool(tools: HostTool[], name: string): HostTool {
  * about.
  */
 const PUBLIC_LOOKUP = async () => ["93.184.216.34"];
+
+/** The shape `fetchGuarded` installs as `Agent.connect.lookup`. */
+type PinnedLookup = (
+  hostname: string,
+  options: unknown,
+  callback: (err: unknown, addresses: { address: string; family: number }[]) => void,
+) => void;
+
+/**
+ * undici keeps an `Agent`'s constructor options under a private symbol, so the
+ * `connect.lookup` override is not reachable through the public surface. Reach
+ * for it here so a test can assert the lookup resolves to the validated
+ * addresses without opening a real socket.
+ */
+function dispatcherLookup(dispatcher: unknown): PinnedLookup | undefined {
+  if (typeof dispatcher !== "object" || dispatcher === null) return undefined;
+  const optionsSymbol = Object.getOwnPropertySymbols(dispatcher).find(
+    (symbol) => symbol.description === "options",
+  );
+  if (!optionsSymbol) return undefined;
+  const stored = (dispatcher as Record<PropertyKey, unknown>)[optionsSymbol] as
+    | { connect?: { lookup?: unknown } }
+    | undefined;
+  return stored?.connect?.lookup as PinnedLookup | undefined;
+}
+
+/** Create a FIFO for the not-a-regular-file tests. Returns false on Windows. */
+function makeFifo(path: string): boolean {
+  if (process.platform === "win32") return false;
+  return spawnSync("mkfifo", [path], { stdio: "ignore" }).status === 0;
+}
 
 // ── createBuiltinTools — structure ──────────────────────────────
 
@@ -210,6 +244,24 @@ describe("read_file — integration", () => {
       assert.equal((e as HostToolError).pythonType, "PermissionError");
     }
   });
+
+  it("refuses a FIFO instead of hanging", { skip: process.platform === "win32" }, async () => {
+    const fifo = join(root, "read-file-fifo");
+    if (!makeFifo(fifo)) return;
+    const tools = createBuiltinTools({ root });
+    const readFile = findTool(tools, "read_file");
+    const outcome = await Promise.race([
+      Promise.resolve(readFile.execute({ path: "read-file-fifo" })).then(
+        () => "resolved" as const,
+        (e: unknown) => e,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("timeout" as const), 2000)),
+    ]);
+    assert.notEqual(outcome, "timeout", "read_file must not hang on a FIFO");
+    assert.ok(outcome instanceof HostToolError, `expected HostToolError, got ${String(outcome)}`);
+    assert.equal((outcome as HostToolError).pythonType, "OSError");
+    assert.match((outcome as Error).message, /not a regular file/);
+  });
 });
 
 // ── list_files — integration ────────────────────────────────────
@@ -354,6 +406,99 @@ describe("http_get — unit", () => {
       assert.ok(e instanceof HostToolError);
       assert.equal((e as HostToolError).pythonType, "TypeError");
     }
+  });
+});
+
+// ── http_get — HTTPS DNS pinning via dispatcher ─────────────────
+
+describe("http_get — HTTPS DNS pinning", () => {
+  function makeTools(opts?: Partial<BuiltinToolsOptions>) {
+    return createBuiltinTools({ root: "/tmp", lookupImpl: PUBLIC_LOOKUP, ...opts });
+  }
+
+  it("hands fetchImpl the original hostname URL for HTTPS, not an IP", async () => {
+    const handed: string[] = [];
+    const mockFetch: typeof fetch = async (input) => {
+      handed.push(String(input));
+      return new Response("ok", { status: 200 });
+    };
+    const tools = makeTools({ fetchImpl: mockFetch });
+    const httpGet = findTool(tools, "http_get");
+
+    assert.equal(await httpGet.execute({ url: "https://example.com/path?q=1" }), "ok");
+    assert.equal(handed.length, 1);
+
+    const target = new URL(handed[0]);
+    assert.equal(target.protocol, "https:");
+    assert.equal(target.hostname, "example.com", `fetchImpl was handed '${handed[0]}'`);
+    assert.equal(target.pathname, "/path");
+    assert.equal(target.search, "?q=1");
+  });
+
+  it("passes a dispatcher whose lookup resolves to the validated public address", async () => {
+    const handed: { init?: RequestInit }[] = [];
+    const mockFetch: typeof fetch = async (_input, init) => {
+      handed.push({ init });
+      return new Response("ok", { status: 200 });
+    };
+    const tools = makeTools({ fetchImpl: mockFetch });
+    const httpGet = findTool(tools, "http_get");
+
+    assert.equal(await httpGet.execute({ url: "https://example.com/" }), "ok");
+    assert.equal(handed.length, 1);
+
+    const dispatcher = (handed[0].init as (RequestInit & { dispatcher?: unknown }) | undefined)
+      ?.dispatcher;
+    assert.ok(dispatcher, "fetchImpl must receive a dispatcher");
+
+    const lookup = dispatcherLookup(dispatcher);
+    assert.ok(lookup, "the dispatcher must carry a connect.lookup override");
+
+    let resolved: { address: string; family: number }[] | null = null;
+    lookup("example.com", {}, (err, addresses) => {
+      assert.equal(err, null);
+      resolved = addresses;
+    });
+    assert.deepEqual(resolved, [{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  it("maps an IPv6 validated address to family 6", async () => {
+    const handed: { init?: RequestInit }[] = [];
+    const mockFetch: typeof fetch = async (_input, init) => {
+      handed.push({ init });
+      return new Response("ok", { status: 200 });
+    };
+    const tools = makeTools({
+      fetchImpl: mockFetch,
+      lookupImpl: async () => ["2606:2800:220:1:248:1893:25c8:1946"],
+    });
+    const httpGet = findTool(tools, "http_get");
+
+    assert.equal(await httpGet.execute({ url: "https://example.com/" }), "ok");
+
+    const dispatcher = (handed[0].init as (RequestInit & { dispatcher?: unknown }) | undefined)
+      ?.dispatcher;
+    assert.ok(dispatcher, "fetchImpl must receive a dispatcher");
+
+    const lookup = dispatcherLookup(dispatcher);
+    assert.ok(lookup, "the dispatcher must carry a connect.lookup override");
+
+    let resolved: { address: string; family: number }[] | null = null;
+    lookup("example.com", {}, (err, addresses) => {
+      assert.equal(err, null);
+      resolved = addresses;
+    });
+    assert.deepEqual(resolved, [{ address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 }]);
+  });
+
+  it("defaults to the pinned undici fetch, not globalThis.fetch", () => {
+    // A revert to `?? fetch` would hand back Node's built-in fetch (undici
+    // 7.x), which rejects the 8.x dispatcher Agent. The default must be the
+    // fetch from the same package as the Agent.
+    assert.equal(resolveFetchImpl(undefined), undiciFetch);
+    assert.notEqual(resolveFetchImpl(undefined), globalThis.fetch);
+    const injected: typeof fetch = async () => new Response("injected");
+    assert.equal(resolveFetchImpl(injected), injected);
   });
 });
 
@@ -542,7 +687,13 @@ describe("isBlockedAddress", () => {
     "::ffff:169.254.169.254",
     "::7f00:1",
     "64:ff9b::127.0.0.1",
+    // RFC 6052 /48 embedding: g3 = IPv4 octets 1-2, g4 = u.octet3 (u in the
+    // high byte), g5 = octet4.suffix. The local-use prefix is 64:ff9b:1::/48.
+    "64:ff9b:1:7f00:0:100::", // 127.0.0.1
+    "64:ff9b:1:c0a8:1:100::", // 192.168.1.1 (octet3 nonzero)
+    "64:ff9b:1:a00:0:100::", // 10.0.0.1
     "2002:7f00:1::",
+    "2001:0:0:0:0:0:80ff:fffe",
   ];
 
   const allowed = [
@@ -559,6 +710,8 @@ describe("isBlockedAddress", () => {
     "::ffff:93.184.216.34",
     "2002:5db8:d822::",
     "64:ff9b::93.184.216.34",
+    "64:ff9b:1:5db8:d8:2200::", // 93.184.216.34 (RFC 6052 /48 embedding)
+    "2001:0:0:0:0:0:a247:27dd",
   ];
 
   for (const address of blocked) {
@@ -700,6 +853,39 @@ describe("http_get — allowlist", () => {
       findTool(tools, "http_get").execute({ url: "https://api.example.com/" }),
       /private or reserved/,
     );
+  });
+});
+
+describe("http_get — allowlist '*'", () => {
+  it("a literal '*' entry is a loud error, not a silent deny-all", () => {
+    assert.throws(
+      () => createBuiltinTools({ root: "/tmp", httpAllowlist: ["*"] }),
+      (e: unknown) => {
+        assert.ok(e instanceof HostToolError, `expected HostToolError, got ${e}`);
+        assert.equal((e as HostToolError).pythonType, "ValueError");
+        assert.match((e as Error).message, /deny-all/);
+        return true;
+      },
+    );
+  });
+
+  it("REPL_HTTP_ALLOWLIST='*' is a loud error", () => {
+    const previous = process.env.REPL_HTTP_ALLOWLIST;
+    process.env.REPL_HTTP_ALLOWLIST = "*";
+    try {
+      assert.throws(
+        () => createBuiltinTools({ root: "/tmp" }),
+        (e: unknown) => {
+          assert.ok(e instanceof HostToolError, `expected HostToolError, got ${e}`);
+          assert.equal((e as HostToolError).pythonType, "ValueError");
+          assert.match((e as Error).message, /deny-all/);
+          return true;
+        },
+      );
+    } finally {
+      if (previous === undefined) delete process.env.REPL_HTTP_ALLOWLIST;
+      else process.env.REPL_HTTP_ALLOWLIST = previous;
+    }
   });
 });
 
@@ -1142,7 +1328,13 @@ describe("http_get — two-lookups-agree", () => {
 });
 
 describe("http_get — redirects", () => {
-  /** A fetch that answers from a table and records every URL it was handed. */
+  /**
+   * A fetch that answers from a table and records every URL it was handed.
+   *
+   * `http_get` keeps the original hostname in the URL and pins only DNS
+   * resolution via a dispatcher, so the URL this mock sees is the URL the
+   * caller asked for.
+   */
   function routed(routes: Record<string, Response | (() => Response)>) {
     const seen: string[] = [];
     const impl: typeof fetch = async (input, init) => {
@@ -1314,7 +1506,9 @@ describe("http_get — timeout", () => {
     const impl: typeof fetch = async (input, init) => {
       await new Promise((r) => setTimeout(r, 15));
       if (init?.signal?.aborted) throw init.signal.reason;
-      const n = Number(/h(\d+)/.exec(String(input))?.[1] ?? 0);
+      // The URL carries the original hostname; the hop number rides in it.
+      const hostname = new URL(String(input)).hostname;
+      const n = Number(/^h(\d+)\./.exec(hostname)?.[1] ?? 0);
       return new Response("", {
         status: 302,
         headers: { location: `http://h${n + 1}.example.com/` },

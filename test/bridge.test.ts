@@ -1,10 +1,11 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
-import { createPiBridgeTools } from "../src/bridge.js";
+import { createPiBridgeTools, detectImageMimeType } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
 import { BRIDGE_TOOLS_SKIP } from "./support/bridge-tools.js";
 import type { BridgeOptions } from "../src/bridge.js";
@@ -55,6 +56,12 @@ function findTool(tools: HostTool[], name: string): HostTool {
   const tool = tools.find((t) => t.name === name);
   assert.ok(tool, `Tool "${name}" not found`);
   return tool;
+}
+
+/** Create a FIFO for the not-a-regular-file tests. Returns false on Windows. */
+function makeFifo(path: string): boolean {
+  if (process.platform === "win32") return false;
+  return spawnSync("mkfifo", [path], { stdio: "ignore" }).status === 0;
 }
 
 // ── Jail helpers ────────────────────────────────────────────────
@@ -145,6 +152,91 @@ describe("createPiBridgeTools — tool creation", () => {
   });
 });
 
+// ── Image sniffing ──────────────────────────────────────────────
+
+describe("detectImageMimeType", () => {
+  const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  /** A buffer the sniffer reads as a non-animated PNG (signature + IHDR). */
+  function fakePng(): Buffer {
+    return Buffer.concat([
+      PNG_SIGNATURE,
+      Buffer.from([0x00, 0x00, 0x00, 0x0d]), // IHDR chunk length
+      Buffer.from("IHDR", "ascii"),
+      Buffer.alloc(17),
+    ]);
+  }
+
+  function bmp(): Buffer {
+    const b = Buffer.alloc(30);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(54, 10); // pixel data offset ≥ 14 + DIB header size
+    b.writeUInt32LE(40, 14); // BITMAPINFOHEADER
+    b.writeUInt16LE(1, 26); // color planes
+    b.writeUInt16LE(24, 28); // bits per pixel
+    return b;
+  }
+
+  /** BITMAPCOREHEADER (12-byte DIB) — the other BMP header the sniffer accepts. */
+  function bmpCore(): Buffer {
+    const b = Buffer.alloc(26);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(26, 10); // pixel data offset ≥ 14 + 12
+    b.writeUInt32LE(12, 14); // BITMAPCOREHEADER
+    b.writeUInt16LE(1, 22); // color planes
+    b.writeUInt16LE(24, 24); // bits per pixel
+    return b;
+  }
+
+  /** A BMP whose DIB header size is neither 12 nor 40-124. */
+  function bmpBadDib(): Buffer {
+    const b = Buffer.alloc(30);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(54, 10);
+    b.writeUInt32LE(20, 14); // invalid DIB header size
+    return b;
+  }
+
+  it("detects each image type the read tool attaches", () => {
+    assert.equal(detectImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00])), "image/jpeg");
+    assert.equal(detectImageMimeType(fakePng()), "image/png");
+    assert.equal(detectImageMimeType(Buffer.from("GIF89a", "ascii")), "image/gif");
+    assert.equal(
+      detectImageMimeType(
+        Buffer.concat([
+          Buffer.from("RIFF", "ascii"),
+          Buffer.alloc(4),
+          Buffer.from("WEBP", "ascii"),
+        ]),
+      ),
+      "image/webp",
+    );
+    assert.equal(detectImageMimeType(bmp()), "image/bmp");
+    assert.equal(detectImageMimeType(bmpCore()), "image/bmp");
+  });
+
+  it("returns null for text and for images pi will not attach", () => {
+    assert.equal(detectImageMimeType(Buffer.from("hello world", "ascii")), null);
+    // "BM" with an unrecognised DIB header size is not a BMP.
+    assert.equal(detectImageMimeType(bmpBadDib()), null);
+    // 0xf7 at byte 3 is the JPEG "not a JPEG" marker pi refuses.
+    assert.equal(detectImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xf7])), null);
+    // Animated PNG: an acTL chunk after IHDR is refused, mirroring pi.
+    const apng = Buffer.concat([
+      PNG_SIGNATURE,
+      Buffer.from([0x00, 0x00, 0x00, 0x0d]),
+      Buffer.from("IHDR", "ascii"),
+      Buffer.alloc(13),
+      Buffer.alloc(4),
+      Buffer.from([0x00, 0x00, 0x00, 0x08]),
+      Buffer.from("acTL", "ascii"),
+      Buffer.alloc(8),
+      Buffer.alloc(4),
+    ]);
+    assert.equal(detectImageMimeType(apng), null);
+  });
+});
+
 // ── Tool execution — read ───────────────────────────────────────
 
 describe("createPiBridgeTools — read execution", () => {
@@ -168,6 +260,37 @@ describe("createPiBridgeTools — read execution", () => {
     assert.ok(!result.includes("hello world"));
     assert.ok(!result.includes("line three"));
   });
+
+  it("refuses a FIFO instead of hanging", { skip: process.platform === "win32" }, async () => {
+    const dir = join(tmpDir, "read-fifo");
+    mkdirSync(dir);
+    const fifo = join(dir, "pipe");
+    if (!makeFifo(fifo)) return;
+    const tools = createPiBridgeTools(tmpDir);
+    const read = findTool(tools, "read");
+    const outcome = await Promise.race([
+      Promise.resolve(read.execute({ path: "read-fifo/pipe" })).then(
+        () => "resolved" as const,
+        (e: unknown) => e,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("timeout" as const), 2000)),
+    ]);
+    assert.notEqual(outcome, "timeout", "read must not hang on a FIFO");
+    assert.ok(outcome instanceof Error, `expected an error, got ${String(outcome)}`);
+    assert.match(outcome.message, /not a regular file/);
+  });
+
+  it("attaches an image instead of decoding it as UTF-8 text", async () => {
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+      "base64",
+    );
+    writeFileSync(join(tmpDir, "pixel.png"), png);
+    const tools = createPiBridgeTools(tmpDir);
+    const read = findTool(tools, "read");
+    const result = await read.execute({ path: "pixel.png" });
+    assert.match(result, /Read image file \[image\/png\]/);
+  });
 });
 
 // ── Tool execution — ls ─────────────────────────────────────────
@@ -186,6 +309,20 @@ describe("createPiBridgeTools — ls execution", () => {
     const ls = findTool(tools, "ls");
     const result = await ls.execute({});
     assert.ok(result.includes("test.txt"));
+  });
+
+  it("lists a directory containing a FIFO without hanging or suffixing it", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const dir = join(tmpDir, "ls-fifo");
+    mkdirSync(dir);
+    const fifo = join(dir, "pipe");
+    if (!makeFifo(fifo)) return;
+    const tools = createPiBridgeTools(tmpDir);
+    const ls = findTool(tools, "ls");
+    const listing = await ls.execute({ path: "ls-fifo" });
+    assert.ok(listing.includes("pipe"), "the FIFO entry is still listed");
+    assert.ok(!listing.includes("pipe/"), "a FIFO is not a directory");
   });
 });
 

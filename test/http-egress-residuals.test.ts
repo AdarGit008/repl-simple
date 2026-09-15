@@ -44,27 +44,29 @@ describe("http_get — #199 residuals", () => {
     __resetEverPrivateForTests();
   });
 
-  it("connects to the validated address, not the hostname (connect-time rebinding window)", {
-    todo:
-      "`fetchGuarded` hands `fetch` `url.href` — the name — so the connection resolves a third " +
-      "time, outside both validation lookups (src/builtins.ts, `fetchImpl(url.href, …)`; the " +
-      "window is documented on `defaultLookup`). Intended approach: a custom undici dispatcher " +
-      "whose `lookup` answers from the validated address set, passed as `init.dispatcher`, once " +
-      "undici is a dependency for another reason (docs/http-egress.md revisit trigger).",
-  }, async () => {
+  it("connects to the validated address, not the hostname (connect-time rebinding window)", async () => {
     // A rebinding resolver that answers public to BOTH validation lookups and
     // private only to the connection is invisible to the address check. The
     // property that closes the window is that the connection never resolves
-    // the name itself: `fetch` is handed either a validated literal address
-    // or a dispatcher that answers the name from the validated set.
+    // the name itself: `fetch` is handed the original hostname URL with a
+    // dispatcher whose `connect.lookup` pins DNS to the validated addresses,
+    // so a connect-time resolution cannot differ from what was validated.
     const validated = ["93.184.216.34"];
+    let lookups = 0;
     const handed: { url: string; init: RequestInit | undefined }[] = [];
     const fetchImpl: typeof fetch = async (input, init) => {
       handed.push({ url: String(input), init });
       return new Response("body", { status: 200 });
     };
     const httpGet = findTool(
-      createBuiltinTools({ root: "/tmp", fetchImpl, lookupImpl: async () => validated }),
+      createBuiltinTools({
+        root: "/tmp",
+        fetchImpl,
+        lookupImpl: async () => {
+          lookups++;
+          return validated;
+        },
+      }),
       "http_get",
     );
 
@@ -72,12 +74,16 @@ describe("http_get — #199 residuals", () => {
     assert.equal(handed.length, 1);
 
     const target = new URL(handed[0].url);
-    const dispatcher = (handed[0].init as { dispatcher?: unknown } | undefined)?.dispatcher;
-    assert.ok(
-      validated.includes(target.hostname) || dispatcher !== undefined,
-      `fetch was handed '${target.hostname}' with no address-pinning dispatcher — the ` +
-        "connection resolves the name again, outside validation",
+    assert.equal(
+      target.hostname,
+      "rebind.example.com",
+      "fetch must keep the original hostname, not a validated IP",
     );
+    assert.equal(lookups, 2, "two validation lookups, no connect-time resolution");
+
+    const dispatcher = (handed[0].init as (RequestInit & { dispatcher?: unknown }) | undefined)
+      ?.dispatcher;
+    assert.ok(dispatcher, "fetch must receive a dispatcher pinning DNS to the validated address");
   });
 
   it("remembers a hostname first refused at saturation (R1: refuse AND record)", {
