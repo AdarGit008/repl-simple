@@ -692,6 +692,31 @@ describe("maskSecrets — KEY / TOKEN / SECRET / PASSWORD assignments (family 4)
       exact: `export API_KEY='${REDACTED}'`,
     },
     {
+      // The value class used to stop at whitespace, so the tail of a quoted
+      // secret with spaces survived: API_KEY='secret value here' became
+      // API_KEY='[REDACTED] value here'. A value that opens with a quote runs
+      // to its closing quote instead, spaces included.
+      name: "a single-quoted secret containing spaces masks through the closing quote",
+      input: "API_KEY='secret value here'",
+      gone: ["secret value here", "value here"],
+      kept: ["API_KEY='", "'"],
+      exact: `API_KEY='${REDACTED}'`,
+    },
+    {
+      name: "a double-quoted secret containing spaces masks through the closing quote",
+      input: 'export API_KEY="secret value here"',
+      gone: ["secret value here", "value here"],
+      kept: ['export API_KEY="'],
+      exact: `export API_KEY="${REDACTED}"`,
+    },
+    {
+      name: "an unclosed quoted secret masks to the end of the line",
+      input: "API_KEY='secret value here\nnext: 1",
+      gone: ["secret value here", "value here"],
+      kept: ["API_KEY='", "next: 1"],
+      exact: `API_KEY='${REDACTED}\nnext: 1`,
+    },
+    {
       name: "dotted config name",
       input: "server.key=/etc/ssl/private/server.key",
       gone: ["/etc/ssl/private/server.key"],

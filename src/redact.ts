@@ -203,9 +203,12 @@ const PEM_PRIVATE_KEY_OPEN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/g;
  * `passwords=` and `tokenizer=` as data. Bare `key` takes `=` only: `key:`
  * is a JSON/YAML field name far more often than a credential, and the
  * decision's literal is `KEY=value` (Python's `key=` kwarg therefore masks —
- * the recorded cost). The value stops at whitespace, a quote, `;`, `,` or
- * `&`, so the terminator and whatever follows survive, and it never *ends*
- * in a closing bracket, brace or paren — `f(KEY=abc)` keeps its `)`,
+ * the recorded cost). A bare value stops at whitespace, a quote, `;`, `,`
+ * or `&`, so the terminator and whatever follows survive; a value that
+ * opens with a quote runs through spaces to its closing quote instead —
+ * `API_KEY='secret value here'` masks whole and keeps both quotes, and a
+ * quote never closed runs to the end of the line. It never *ends* in a
+ * closing bracket, brace or paren — `f(KEY=abc)` keeps its `)`,
  * `sorted(rows, key=str.lower)` keeps its shape — while a bracket inside a
  * value is part of it and goes with it. The one closing bracket a value may
  * end in is the `]` of a `[REDACTED]` the prefix rule left there
@@ -222,7 +225,7 @@ const SECRET_ASSIGNMENT = new RegExp(
   String.raw`\b((?:` +
     String.raw`(?:${SECRET_NAME}{0,63}?[_.-]KEY|APIKEY|${SECRET_NAME}{0,64}?(?:TOKEN|SECRET|PASSWORD|PASSWD))\b["']?[ \t]*[=:]` +
     String.raw`|KEY\b["']?[ \t]*=` +
-    String.raw`)[ \t]*["']?)(?!${REDACTED_LITERAL})([^\s"';,&]*${REDACTED_LITERAL}|[^\s"';,&]*[^\s"';,&)\]}])`,
+    String.raw`)[ \t]*["']?)(?!${REDACTED_LITERAL})((?<=["'])[^"'\n]*${REDACTED_LITERAL}|[^\s"';,&]*${REDACTED_LITERAL}|(?<=["'])[^"'\n]+|[^\s"';,&]*[^\s"';,&)\]}])`,
   "gi",
 );
 
