@@ -1,12 +1,116 @@
 # repl-simple
 
-Pi extension — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
+[![CI](https://github.com/AdarGit008/repl-simple/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AdarGit008/repl-simple/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A sandboxed Python REPL and `rlm`, a read-only code-investigation loop, for the
+[pi coding agent](https://github.com/earendil-works/pi).
+
+- **What it is.** A pi package. Its extension gives the agent five tools: a persistent Python REPL
+  (`repl`, `repl_resume`, `repl_reset`, `repl_abandon`) and `rlm`, an autonomous
+  code-gen → execute loop that investigates a question about the repo without changing it. It also
+  adds four slash commands (`/repl-approvals`, `/repl-accept-preamble`, `/rlm`, `/rlm-abort`) and a
+  skill that tells the agent when to use them.
+- **Why it matters.** pi has no built-in sandbox: its own tools run with the permissions of the pi
+  process. Here, Python runs in [Monty](https://github.com/pydantic/monty), Pydantic's Python
+  interpreter, inside a crash-isolated native worker subprocess. It cannot spawn processes or open
+  sockets. It reaches files and the network only through host tools that are jailed to the project
+  or ask you first.
+- **Who it is for.** pi users who want the agent to compute, parse and scout a codebase in Python
+  without handing it an unrestricted shell.
+
+## Install
+
+### Prerequisites
+
+- **[pi](https://github.com/earendil-works/pi)** (`@earendil-works/pi-coding-agent`). The declared
+  peer range is `^0.84.1`.
+- **Node >= 22.19.0** (`engines` in `package.json`, `.nvmrc`).
+- **A glibc platform with a `@pydantic/monty` binary:** Linux x64/arm64 (glibc) or macOS
+  x64/arm64, which CI tests on `ubuntu-latest` and `macos-latest`. Windows x64 has a published binary
+  but is **not exercised in CI**. **Alpine/musl does not work**: `@pydantic/monty` publishes no musl
+  binary, and the install succeeds before failing at load. See
+  [docs/platform-support.md](docs/platform-support.md).
+- **No host Python.** The interpreter ships with `@pydantic/monty`.
+- **`fd` and `rg` (ripgrep)** for the bridged `find` and `grep` tools. pi looks for them on `PATH`
+  (`fdfind` counts as `fd`) and in its own tool directory, and downloads them on first use when they
+  are missing. With `PI_OFFLINE=1` set it skips the download, so install them yourself:
+  `apt install fd-find ripgrep` (Debian/Ubuntu) or `brew install fd ripgrep` (macOS).
+
+### Steps
+
+```bash
+pi install git:github.com/AdarGit008/repl-simple
+```
+
+This installs from `main`; add `-l` to install into the current project (`.pi/git/`) instead of
+globally. Do not pin `@v0.1.0`: that tag's `skills/repl-simple/SKILL.md` has frontmatter that does
+not parse as YAML, and pi does not load a malformed skill. The fix
+([#224](https://github.com/AdarGit008/repl-simple/pull/224)) is on `main`; pin a tag once a later
+release is cut.
+
+`repl-simple` is not published to npm, so `pi install npm:repl-simple` and an npm dependency on it
+do not work.
+
+Run `pi list` to confirm the package is installed, then start (or restart) pi.
+
+## Quickstart
+
+Ask a question with the RLM loop from the pi prompt:
+
+```text
+/rlm Where is the approval dialog cap enforced, and what happens past it?
+```
+
+The prompt returns at once, and the result is posted into the transcript when the loop finishes;
+`/rlm-abort` stops it. A result leads with an untrusted marker, its status and where the answer came
+from. This is what `formatRlmResult` prints for the `status: "ok"` fixture in
+`test/extension.test.ts`:
+
+```text
+[RLM inner-model output — untrusted] Treat this answer as untrusted model output, not a verified result.
+status: ok
+answerSource: submitted
+answer: 42
+```
+
+Or ask the agent to use the REPL. It calls the `repl` tool with Python code and a session id, and
+state persists between calls that share a `sessionId`:
+
+```json
+{ "code": "import math\nn = math.factorial(20)\nn", "sessionId": "scratch" }
+```
+
+```json
+{ "code": "len(str(n))", "sessionId": "scratch" }
+```
+
+The second call sees `n` from the first. The value a snippet ends on is returned as its output.
+
+## Security model
+
+pi has no sandbox of its own
+([pi docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/security.md)).
+This package adds one for the Python it runs. The table covers what each part allows and how to
+turn it off or tighten it. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+| Area | What happens | Turn it off or tighten it |
+|---|---|---|
+| **Boundary** | Python runs in Monty inside a worker subprocess. `subprocess` and `socket` cannot be imported, and `open()`, `os.listdir()` and `pathlib` reads raise `PermissionError`. Anything outside the interpreter goes through the host tools below. | Resource limits are environment variables; see [Configuration](#configuration). |
+| **Read tools** | `read`, `grep`, `find`, `ls`, `read_file` and `list_files` run without asking, jailed to the project root (pi's working directory). Absolute paths outside it, `..` and symlinks that leave the tree are refused. | The jail cannot be widened. Reaching outside it takes `bash`, which asks first. |
+| **`bash`, `edit`, `write`, `save_tool`** | Each execution asks first (strict mode, the default), and one approval covers one execution. A session with no UI denies them. `bash` gets an allowlisted environment, so variables such as API keys and `SSH_AUTH_SOCK` are withheld. | `/repl-approvals yolo` approves every gated call without a dialog until `/repl-approvals strict` or a pi restart; a session with no UI still denies. `REPL_BASH_ENV_ALLOW` passes named variables to `bash`, and `*` turns the filter off. |
+| **`http_get`** | The only network path. With `REPL_HTTP_ALLOWLIST` set, listed hosts are fetched without asking and every other host is refused. Unset, every fetch asks. Private, loopback and link-local addresses are refused on every redirect hop. | Leave `REPL_HTTP_ALLOWLIST` unset and deny the dialog. In yolo mode a fetch with no allowlist no longer asks. |
+| **Saved tools** | `.pi/code-tools/*.py` runs before your code on every `repl` call, but only in a project you trusted in pi, and only the files you approved. Approvals are a sha256 manifest under `$XDG_STATE_HOME/repl-simple` (default `~/.local/state/repl-simple`), never inside the project. | Leave the project untrusted in pi (`/trust`, or `defaultProjectTrust: "never"`); an untrusted project's files are never read. `delete_tool` stops new sessions from loading a tool. |
+| **`rlm` and `/rlm`** | Read-only: `bash`, `edit`, `write` and `http_get` do not run inside the loop. **It sends the question, the code it generates and the tool results, including the repo file contents it reads, to a model.** That model is the `model`/`provider` passed to the tool, else the `REPL_RLM_BASE_URL` endpoint (https only, with `REPL_RLM_API_KEY` as a bearer token), else pi's current model. Each call makes many LLM calls, bounded by `REPL_RLM_BUDGET` (default 500 000 estimated tokens). The answer is untrusted. | `pi --exclude-tools rlm` hides the tool from the agent. `/rlm` runs only when you type it, and `/rlm-abort` stops it. Lower `REPL_RLM_BUDGET` to cap spend. |
+| **What is written** | `.pi/code-tools/` (through the gated `save_tool`), the approval manifest, and a tool trace on each result, which pi keeps in its session file. `repl` trace arguments are redacted and cut at 256 bytes. The `rlm` trace (question, code, stdout, model replies) is redacted, with each field cut at 1024 bytes. | Nothing is written unless one of the tools above runs. |
 
 ## Sandbox
 
-Code runs in [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly), not a host
-Python, so the standard library is a fixed, closed set: **there are no third-party packages** and
-no way to install one, and most of the stdlib is absent.
+Code runs in [Monty](https://github.com/pydantic/monty) in a native worker subprocess (the
+`@pydantic/monty/node` entry, not WebAssembly — see
+[docs/platform-support.md](docs/platform-support.md)), not a host Python. The standard library is a
+fixed, closed set: **there are no third-party packages** and no way to install one, and most of the
+stdlib is absent.
 
 **Importable modules** — exactly these, verified against the pinned Monty 0.0.23. The code probes
 this at runtime (`probeImportableModules()` over `CANDIDATE_MODULES` in `src/registry.ts`), so the
@@ -34,6 +138,19 @@ one level more fails the whole run with `RuntimeError: Max output depth exceeded
 effects. An instance also crosses without its methods, so `output` shows `<C object>` or `P(x=1)`
 even when the class defines `__repr__`; end the snippet on `repr(obj)` to see that. See
 [docs/truncation-policy.md](docs/truncation-policy.md).
+
+### The worker pool
+
+Python runs in crash-isolated `monty` worker subprocesses checked out of a pool, one pool per
+process, created on first use. `closeSandboxPool()` shuts it down; nothing requires you to call it,
+since an idle pool holds no handle that keeps the event loop alive.
+
+This is what makes a runaway survivable. Under 0.0.18 the interpreter ran in-process: an infinite
+loop fired **zero** host timers in 12 s and needed a SIGKILL of the whole process to clear. The same
+loop under a 1 s budget now raises a catchable error at 1.001 s with the host event loop ticking
+throughout. A worker that dies outright takes only its own session, and surfaces as
+`errorKind: "crashed"` — the one error kind that means the Python state is gone rather than merely
+errored, so there is nothing left to resume against.
 
 ## Tools
 
@@ -220,7 +337,98 @@ to have reset a session that never existed. A suspension names the session it be
 more than one live the model knows which to resume.
 See [#48](https://github.com/AdarGit008/repl-simple/issues/48).
 
+## Configuration
+
+Eighteen environment variables tune the package. Set them in the environment pi runs in. The list
+below is every `REPL_*` name read in `src/` and `extensions/`. `REPL_BASH_ENV_FILTERED` is not a
+setting: the package sets it to `1` inside a `bash` command's environment when the filter applied.
+
+### Resource limits
+
+Four are the default resource limits every run gets. A caller who passes no `limits` gets these,
+not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
+anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
+which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
+lasts.
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
+| `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
+| `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
+| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included; time waiting for an approval answer is not (see [Approvals](#approvals)). The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
+
+The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
+worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
+otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
+`createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails
+as one tool call — leaving the script alive to handle it — rather than as the death of the run.
+
+The `repl` tool's `maxDurationSecs` and `maxMemory` arguments can only lower the first two, never
+raise them past these values (or past 300 s and 1024 MiB).
+
+### Host memory guards
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MEMORY_CEILING_MB` | `5120` | Per-process RSS ceiling; `runInSandbox` throws `SandboxMemoryError` at or above it. Clamped down automatically inside a cgroup, since `/proc/meminfo` cannot see a container limit. `0` disables. |
+| `REPL_MEMORY_FLOOR_MB` | `0` (off) | Refuse to start when the host has less than this much memory available. Opt-in: whether the machine as a whole is short of memory is not this library's business to police. |
+
+**Both measure the host process, which is not where sandboxed Python allocates.** Python runs in a
+worker subprocess, so a script allocating gigabytes grows the worker and is stopped by
+`RunLimits.maxMemory` inside it, not by these. What they still catch is growth on *our* side of the
+line — accumulated messages, buffers, a caller looping over runs — which is what a host ceiling can
+honestly speak to.
+
+### `http_get`
+
+These are egress policy, not resource limits; the reasoning is in
+[docs/http-egress.md](docs/http-egress.md).
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_HTTP_ALLOWLIST` | empty | Comma-separated hosts `http_get` may reach, as a hostname or a `*.`-prefixed suffix. Set → those hosts need no approval and every other host is refused. Unset → every fetch requires approval. The `rlm` loop ignores it: `http_get` never runs there. |
+| `REPL_HTTP_TIMEOUT_SECS` | `30` | Deadline for one `http_get`, redirect chain and body read included. Breach → `TimeoutError` in Python. |
+
+### Worker pool
+
+Neither is left to `@pydantic/monty`'s own default, because both of those fail open: `maxProcesses`
+follows the CPU count, and `checkoutTimeout` waits **forever**, so an exhausted pool hangs with no
+error and no log rather than failing. The pool is sized when it is created, on first use.
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~9 MB each idle, ~16 MB once it has type-checked a run), not by core count. |
+| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
+
+### Sessions, approvals and `bash`
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MAX_SESSIONS` | `32` | Live REPL sessions per project directory before the least recently used one is evicted. A positive integer; an embedder's `ReplRunnerOptions.maxSessions` takes precedence. See [The session pool](#the-session-pool). |
+| `REPL_APPROVAL_TIMEOUT_MS` | `300000` (5 min) | How long an approval dialog stays open before it denies itself. `0` removes the bound, so an unanswered dialog holds the run until it is answered, dismissed or aborted. An unparseable value keeps the default. |
+| `REPL_BASH_ENV_ALLOW` | empty | Comma-separated variable names to pass through to `bash` on top of the allowlist. `*` turns the filter off. See [docs/bash-env.md](docs/bash-env.md). |
+
+### Saved tools
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_PREAMBLE_STORE_DIR` | `$XDG_STATE_HOME/repl-simple`, else `~/.local/state/repl-simple` | Where the saved-tool approval manifests live. It must be outside the project: a store inside it loads no saved tools, and pi says so. See [docs/project-trust.md](docs/project-trust.md). |
+
+### RLM
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_RLM_BUDGET` | `500000` | Default spend budget, in estimated tokens, for one `rlm` call or `/rlm` run. The `rlm` tool's `budget` argument overrides it; an unparseable value keeps the default. |
+| `REPL_RLM_BASE_URL` | unset | An `https://` OpenAI-compatible endpoint the loop's model calls are POSTed to (`<url>/chat/completions`). Used when the `rlm` tool gets no `model`/`provider` (always, for `/rlm`); unset → pi's current model. A non-`https://` value fails the call. |
+| `REPL_RLM_API_KEY` | unset | Sent to `REPL_RLM_BASE_URL` as an `Authorization: Bearer` header, never in the URL. |
+| `REPL_RLM_MODEL` | `rlm` | The `model` field sent to `REPL_RLM_BASE_URL`. |
+
 ## API
+
+The same code is a Node library. Its entry point, `dist/`, is built by `npm run build`, which also
+runs before `npm publish`. The package is not on npm yet, and a `pi install git:` checkout does not
+build `dist/`, so import it from a checkout you have built.
 
 ```typescript
 import {
@@ -253,329 +461,10 @@ import {
 } from "repl-simple";
 ```
 
-## Install
+## Contributing
 
-```json
-{
-  "dependencies": {
-    "repl-simple": "*"
-  }
-}
-```
-
-The `pi.extensions` field in `package.json` points at `extensions/repl-extension.ts`, which pi
-auto-loads to register the `repl` tools. It must name the **file**, not the `extensions/` directory —
-pi's discovery path (`<cwd>/.pi/extensions/`, `<agentDir>/extensions/`) passes the manifest entry
-straight to its module loader without expanding directories, so a directory entry registers zero
-tools. See [#37](https://github.com/AdarGit008/repl-simple/issues/37).
-
-In addition to `@pydantic/monty`, `repl-simple` requires the host pi environment to provide
-`@earendil-works/pi-coding-agent` — a **peer dependency** satisfied by pi itself, which supplies it at
-runtime. It is deliberately *not* a regular dependency: that would let the registry install a second
-copy alongside the one pi already owns. It stays in `devDependencies` so local development's types
-and factories match the host's, exactly as upstream pi-code-tool does.
-
-Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
-`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. The
-pinned 0.0.23 also ships a wasm runtime at `@pydantic/monty/wasm`, which now loads with no extra
-install and looks like a way around this. It is not: it runs Python in-process, so a runaway
-blocks the event loop and there is no crash isolation. See
-[docs/platform-support.md](docs/platform-support.md).
-
-## Dev
-
-```bash
-npm test        # tsx --test test/*.test.ts
-npm run check   # tsc --noEmit            (tsconfig.json)
-npm run build   # tsc -p tsconfig.build.json
-npm run lint    # biome check --error-on-warnings && knip
-npm run format  # biome format --write
-npm run coverage # per-file line-coverage floors
-npm run mutation # stryker, contained in a memory-capped systemd scope
-npm run test:contained # the suite, likewise contained
-```
-
-### Module map
-
-The two names that read as a transposition are not one
-([#174](https://github.com/AdarGit008/repl-simple/issues/174), session decision 16: documented,
-not renamed):
-
-| Path | What it is |
-|---|---|
-| `src/repl.ts` | `ReplRunner` — the **runner** behind the `repl` / `repl_resume` / `repl_reset` / `repl_abandon` tools: the session pool, project trust and the accepted set, the trace. Nothing RLM. |
-| `src/rlm.ts` | `runRlm` — the RLM **loop**: code-gen → execute → feedback until `SUBMIT`, with its prompt budgets, spend budget and salvage. |
-| `src/rlm_tools.ts` | The loop's sandbox-side tools — `llm_query`, `rlm_query`, `SUBMIT` — registered by `runRlm` for the sandbox, not by the extension. |
-| `repl/repl_server.py` | The bundled Python **preamble** the loop prepends (`getReplPreamble()`; the path is hard-coded in `src/preamble.ts`, and `repl/` is in `package.json` `files` so it ships). Named after pi-reepl's server, which it descends from. |
-| `src/session.ts` | `Session` — transcript replay, the call cache, dumps ([docs/session-replay.md](docs/session-replay.md)). |
-| `src/sandbox.ts`, `src/pool.ts` | One Monty run — dispatch loop, approval gate, limits — and the worker pool it checks out of. |
-| `src/registry.ts`, `src/builtins.ts`, `src/bridge.ts`, `src/toolstore.ts` | Host tools: the registry and stubs, the builtins, the jailed pi bridge, the saved-tool store. |
-| `extensions/repl-extension.ts` | The pi extension: registers the four tools and the `/repl-*` commands, renders results and the trace. |
-
-A rename would orphan the `coverage-baseline.json` keys, reopen the package `files` list (#81) and
-touch the pinned `scriptName` default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) that the
-diagnostic line-number regex reads; the map is what makes the names harmless.
-
-Ten environment variables tune the sandbox, all read at call time.
-
-Four are the default resource limits every run gets. A caller who passes no `limits` gets these,
-not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
-anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
-which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
-lasts.
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
-| `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
-| `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
-| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included; time waiting for an approval answer is not (see [Approvals](#approvals)). The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
-
-The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
-worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
-otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
-`createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails
-as one tool call — leaving the script alive to handle it — rather than as the death of the run.
-
-Two guard against a runaway exhausting the host:
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_MEMORY_CEILING_MB` | `5120` | Per-process RSS ceiling; `runInSandbox` throws `SandboxMemoryError` at or above it. Clamped down automatically inside a cgroup, since `/proc/meminfo` cannot see a container limit. `0` disables. |
-| `REPL_MEMORY_FLOOR_MB` | `0` (off) | Refuse to start when the host has less than this much memory available. Opt-in: whether the machine as a whole is short of memory is not this library's business to police. |
-
-**Both now measure the host process, which is no longer where sandboxed Python allocates.** Python
-runs in a worker subprocess, so a script allocating gigabytes grows the worker and is stopped by
-`RunLimits.maxMemory` inside it, not by these. What they still catch is growth on *our* side of the
-line — accumulated messages, buffers, a caller looping over runs — which is what a host ceiling can
-honestly speak to.
-
-Two bound `http_get`. They are egress policy, not resource limits; the reasoning is in
-[docs/http-egress.md](docs/http-egress.md).
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_HTTP_ALLOWLIST` | empty | Comma-separated hosts `http_get` may reach, as a hostname or a `*.`-prefixed suffix. Set → those hosts need no approval and every other host is refused. Unset → every fetch requires approval. |
-| `REPL_HTTP_TIMEOUT_SECS` | `30` | Deadline for one `http_get`, redirect chain and body read included. Breach → `TimeoutError` in Python. |
-
-Two size the worker pool. Neither is left to `@pydantic/monty`'s own default, because both of those
-fail open: `maxProcesses` follows the CPU count, and `checkoutTimeout` waits **forever**, so an
-exhausted pool hangs with no error and no log rather than failing.
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~9 MB each idle, ~16 MB once it has type-checked a run), not by core count. |
-| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
-
-### The worker pool
-
-Python runs in crash-isolated `monty` worker subprocesses checked out of a pool, one pool per
-process, created on first use. `closeSandboxPool()` shuts it down; nothing requires you to call it,
-since an idle pool holds no handle that keeps the event loop alive.
-
-This is what makes a runaway survivable. Under 0.0.18 the interpreter ran in-process: an infinite
-loop fired **zero** host timers in 12 s and needed a SIGKILL of the whole process to clear. The same
-loop under a 1 s budget now raises a catchable error at 1.001 s with the host event loop ticking
-throughout. A worker that dies outright takes only its own session, and surfaces as
-`errorKind: "crashed"` — the one error kind that means the Python state is gone rather than merely
-errored, so there is nothing left to resume against.
-
-Two TypeScript configs, deliberately:
-
-- **`tsconfig.json`** — what the compiler *checks*: `src/`, `test/` **and** `extensions/`. It is the
-  default config, so editors and a bare `tsc` see the same program CI does.
-- **`tsconfig.build.json`** — what the compiler *emits*: `src/` only, flat into `dist/` (its
-  `rootDir` is `src`, so `dist/` mirrors `src/`). `extensions/` is checked but not built, because pi
-  loads the `.ts` source directly through jiti and resolves `typebox` and
-  `@earendil-works/pi-coding-agent` from its own install.
-
-`typebox` is a devDependency pinned to the exact version pi pins (`1.3.7`). It is a compile-time
-need only — pi supplies it at runtime via a loader alias — and a range rather than a pin could drift
-the types the compiler checks away from the ones that actually run.
-
-### Formatting and lint
-
-[Biome](https://biomejs.dev) is the single formatter and linter — `npm run lint` runs `biome check`,
-covering the formatter, the linter and import sorting in one pass, and then
-[knip](https://knip.dev), the unused-export check that keeps the public barrel honest
-([#85](https://github.com/AdarGit008/repl-simple/issues/85)). `.editorconfig` carries the settings
-an editor can apply without Biome installed; `biome.json` reads it (`useEditorconfig`) and adds a
-100-column line width.
-
-`.claude/` is ignored by git, by Biome (`"!!.claude"` in `files.includes` — the double negation
-keeps the scanner out, not only the checker) and by knip. Claude Code keeps per-checkout state
-there, and its orchestrator puts agent worktrees under `.claude/worktrees/`, each a full copy of
-this tree with its own `biome.json`; Biome's scanner then reports *Found a nested root
-configuration* and `npm run lint` fails in the main checkout with nothing wrong in it. (knip prints
-a hint that the entry is unused — its `project` globs never reach `.claude/` — which is the point:
-they must never start to.)
-
-`--error-on-warnings` is what makes it a gate. Biome exits 0 on warning-severity diagnostics by
-default, so a rule like `noExplicitAny` would print and still pass. CI runs lint as its own job,
-once — formatting does not vary by platform or Node version, so it does not belong on the matrix.
-
-`@biomejs/biome` is pinned exactly, for the same reason `typebox` is: a linter on a caret range can
-turn a green `main` red on a new minor that adds a rule, with no change to this repo.
-
-**Import sorting is off.** Biome 2's `organizeImports` assist sorts every import and re-export in a
-file as one alphabetical block, ignoring the blank lines between them. `src/index.ts` is a barrel
-organised into commented sections (`// ── Registry ──`, `// ── Sandbox ──`, …); sorting it globally
-detached every section comment from the exports it labels. Deterministic import order is not worth
-losing authored structure in a change whose whole premise is that it alters no behaviour.
-
-Two lint rules are configured away from their defaults, both deliberately:
-
-- **`useTemplate: "error"`** — promoted from Biome's default `info`, which never fails a build. A rule
-  that cannot go red is decoration.
-- **`noNonNullAssertion: "off"`** — `strictNullChecks` already covers the safety case; the rule is a
-  style preference about how an already-established invariant is spelled. The three `src/` sites it
-  was switched off for were rewritten away by
-  [#84](https://github.com/AdarGit008/repl-simple/issues/84),
-  [#50](https://github.com/AdarGit008/repl-simple/issues/50) and
-  [#78](https://github.com/AdarGit008/repl-simple/issues/78): `biome lint
-  --only=style/noNonNullAssertion src` reports none today (2026-09-08), so the switch is now a
-  preference rather than an exemption, and turning the rule back on is a one-line change.
-
-The bulk-format commit is listed in `.git-blame-ignore-revs`. To skip it in blame locally:
-
-```bash
-git config blame.ignoreRevsFile .git-blame-ignore-revs
-```
-
-### Coverage floors
-
-`npm run coverage` runs the suite under Node's `--experimental-test-coverage` and enforces a
-**per-file** line-coverage floor from `coverage-baseline.json`. `npm run coverage:update` rewrites the
-baseline; lowering a floor is a decision to explain in the commit message, not a formality.
-
-Floors are per file because a global number does not bite. Deleting `test/sandbox.test.ts` — 1811
-lines when this was measured, and the only file that kills any `sandbox.ts` mutation — moved the
-global figure from 96.92% to **93.64%**, a drop a round global floor of 90% survives without noticing. The same deletion drops
-`src/sandbox.ts` from 97.06% to 83.63%, which the per-file floor catches. (Re-measured on 0.0.21;
-the same experiment on 0.0.18 moved the global figure by 0.55 pp.)
-
-**This is not a quality gate.** Coverage says lines executed, not that anything was asserted, and this
-suite has a documented history of tests that execute plenty and assert nothing (see
-[#23](https://github.com/AdarGit008/repl-simple/issues/23)). The mutation score from
-[#24](https://github.com/AdarGit008/repl-simple/issues/24) is the quality gate. This is a cheap
-regression detector that runs in seconds — do not let a coverage number justify skipping a test.
-
-**Adding a file under `src/` or `extensions/` means re-running `coverage:update` in the same change.**
-A source file with no floor has no gate, so the run fails until it gets one. If a file genuinely
-belongs outside the instrument, add it to `UNMEASURED_SOURCE_FILES` in `scripts/coverage.mjs` with its
-reason — `src/index.ts` is there today, a pure re-export barrel that `npm run check` already gates.
-Opting out has to be an edit somebody makes.
-
-Four things worth knowing before relying on it:
-
-- **`test/extension-loader.test.ts` is excluded from the coverage run** (not from `npm test`). It
-  drives pi's real `discoverAndLoadExtensions`, which loads `src/` a second time through pi's jiti
-  loader; Node merges V8 coverage by file path, so those barely-executed duplicates land on top of the
-  real entries. With it in the run, `src/sandbox.ts` reports **41.44%** against a true **97.06%**, and
-  the global figure reads 59.25% instead of 96.92%. Coverage cannot fall as tests are added — the low
-  number is the instrument misreporting, not a gap.
-- **Node's report cannot see a module that stopped being loaded.** It lists only files that were
-  loaded, so a module dropping out of the suite leaves the denominator and every percentage *rises*.
-  `coverage-baseline.json` doubles as a manifest for exactly this: a file with a floor that is absent
-  from the report is a hard error.
-- **A floor proves the lines run, not that the file's own tests do.** `src/truncate.ts` measures 100%
-  with `test/truncate.test.ts` deleted — the sandbox tests route enough output through the truncator to
-  execute every line of it. The floor still catches a *regression* in `truncate.ts`, which is its job;
-  it will not notice its test file leaving. Nothing here substitutes for
-  [#24](https://github.com/AdarGit008/repl-simple/issues/24).
-- **Three files' coverage varies between identical runs**, so `coverage:update` alone can write a
-  floor that flakes red. Measured over six back-to-back runs of the same tree: `src/truncate.ts`
-  reports 99.74% or 100.00%, `src/registry.ts` 99.50% or 100.00%. The varying line in
-  `truncate.ts` is `truncateText`'s declaration, and the lcov record shows it is the *instrument*
-  that varies, not the suite — in the low run the function's body carries a hit count of 380 while
-  its declaration line reads 0:
-
-  ```
-  DA:384,0      export function truncateText(     ← the declaration
-  DA:385,380      text: string,
-  DA:388,380      const t = new Truncator(opts);  ← the body, 380 executions
-  ```
-
-  The third file is `src/preamble.ts`, and it is the same artefact: in the low run
-  `getReplPreamble`'s declaration reads 0 while the function is recorded as called twice
-  (`FNDA:2`) and its body line twice. `truncate.ts` shows it on `formatValue`'s declaration too
-  (0 against `FNDA:1299`). Measured 2026-09-10 with the gate's own invocation on this tree and on
-  `origin/main` at Monty 0.0.21 alike, so neither is a regression; one gate run that day read both
-  files at 100.00%, three read 97.05% and 99.88%.
-
-  A function cannot run its body 380 times without being called. Nothing about test execution
-  differed between the runs; V8's per-function range count is lost when coverage from several test
-  processes is merged, while the block counts inside it survive. **This is why `coverage:update`
-  measures three times and writes the per-file minimum**, prints every file that varied with its
-  range, and **refuses to write** (naming the file) when a spread is wider than one line's worth —
-  a whole process's data going missing is a thing to look at, not to average away. The plain gate
-  carries the matching tolerance: a file fails only when it is **more than one line** below its
-  floor, because the instrument cannot resolve sub-line differences. Which end a run lands on is
-  machine-dependent: `registry.ts` reported its high in five of six local runs and its low on both
-  CI runs of the same commit. This is *not*
-  [#109](https://github.com/AdarGit008/repl-simple/issues/109) — that is real ordering-dependent
-  behaviour in the rlm tests, whereas nothing here executes differently.
-
-CI runs coverage as its own job on Node 24 / ubuntu only. The floors are exact measured numbers, and
-V8 line attribution differs enough between Node majors that a baseline shared across the matrix would
-have to be slackened until it stopped biting.
-
-(The reported `global` figure includes `scripts/` rows while the floors exclude them — the floor
-universe is tracked `src/` and `extensions/` sources; the global is reported, not a gate.)
-
-### Mutation score
-
-`npm run mutation` mutates `src/` and `extensions/` and fails below a **79%** floor
-(`thresholds.break`), just under the **79.28%** baseline — 5756 detected of 7263 valid mutants,
-re-measured against Monty 0.0.21 on 2026-09-10
-([#175](https://github.com/AdarGit008/repl-simple/issues/175)). Full write-up, per-file scores and
-the reasoning behind every config value: [docs/mutation-testing.md](docs/mutation-testing.md).
-
-**The floor moved up 58 → 79 because the tree's score did, not because the instrument got kinder.**
-Stryker's `coverageAnalysis: "perTest"` only skips tests that could not have killed the mutant, so
-it is score-neutral by construction; the rise belongs to waves 1–3 and the 0.0.21 migration. A floor
-going *down* is what would need explaining.
-
-This is the quality gate the coverage floors above are explicitly *not*. It used to be
-unaffordable: under the old `command` test runner every mutant re-ran the whole suite, and a full
-sweep of the current tree measured a **107-hour** ETA. Switching to
-[`@stryker-mutator/tap-runner`](https://stryker-mutator.io/docs/stryker-js/tap-runner/) with real
-per-test-file coverage brought the same sweep to **3h12m** (1.70 test files per mutant instead of
-27). Two consequences:
-
-- **Run it with `npm run mutation`**, which contains it in a systemd scope with a memory ceiling so
-  a breach cannot take your terminal session down with it, and sets `REQUIRE_BRIDGE_TOOLS=1` so a
-  host without `fd`/`rg` fails loudly instead of skipping those tests and scoring their mutants as
-  survivors. **Size `concurrency` by cores now, not RAM**: a test worker measured ~226 MB, and the
-  committed `concurrency: 6` peaked at 4 GB of 23 on an 8-core box. The containment stays — a
-  scope's cgroup accounts for a process tree while the `REPL_MEMORY_CEILING_MB` guard only sees the
-  host process — but memory has stopped being the binding constraint it was.
-- **Use `--incremental` or `--mutate` to scope a pull-request run**, and run the full sweep on a
-  schedule or on demand. StrykerJS has no `--since` flag; that is Stryker.NET's.
-
-The floor sits 0.28 under the baseline, which is rounding room rather than slack. A run coming in
-under it is a regression to explain, not a threshold to lower — though note this baseline is one
-run, where 58.09 had a reproducibility band established across sixteen.
-
-### Optional: `fd` and `ripgrep`
-
-The bridged `find` and `grep` tools shell out to `fd` and `rg`. Install them to run the tests that
-exercise those two tools:
-
-```bash
-apt install fd-find ripgrep     # Debian/Ubuntu
-brew install fd ripgrep         # macOS
-```
-
-Without them, those tests **skip** with a message naming what is missing; the rest of the suite runs
-normally. The suite never downloads them: `test/support/bridge-tools.ts` sets `PI_OFFLINE=1`, which
-stops `pi-coding-agent` fetching an unpinned "latest" binary from GitHub releases mid-run. Set
-`REQUIRE_BRIDGE_TOOLS=1` to turn the skip into a failure instead — CI does, so a broken install step
-goes red rather than quietly dropping coverage.
-
-CI (`.github/workflows/ci.yml`) runs `npm ci && npm run check && npm test` on Node 22 and 24 across
-ubuntu-latest and macos-latest, plus one `npm run lint` job and one `npm run coverage` job (Node 24,
-ubuntu), for every push and pull request.
+Development setup, the module map, the checks CI runs, coverage floors and mutation testing are
+in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Attribution
 

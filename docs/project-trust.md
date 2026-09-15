@@ -16,7 +16,8 @@ and project skills.
 
 ## Why trust and not a per-file hash
 
-`docs/actionable-items.md` A37 proposed prompting once per file **content hash**, the way direnv
+[`archive/actionable-items.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/archive/actionable-items.md)
+(now in the private repl-simple-lab repo) A37 proposed prompting once per file **content hash**, the way direnv
 prompts for a changed `.envrc`. That was rejected for a reason specific to this design: these files
 are written **by the agent, during a session**, whenever it decides a helper is worth keeping. The
 hashes churn. A hash-keyed prompt would produce a stream of approvals for code the user never wrote

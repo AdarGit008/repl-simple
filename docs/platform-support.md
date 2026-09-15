@@ -9,6 +9,9 @@ CI runs Node 22 and 24 on `ubuntu-latest` and `macos-latest`. The matrix is not 
 `@pydantic/monty` ships a separate prebuilt native binary per platform, so a green run on one leg is
 no evidence about the others.
 
+**Windows is not exercised in CI.** `@pydantic/monty` publishes a `win32-x64-msvc` binary (table
+below), but no CI leg runs on Windows, so nothing here shows the package working there.
+
 ## `@pydantic/monty` does not work on Alpine / musl
 
 **There is no musl build of `@pydantic/monty` at any published version** (checked through `0.0.23`).

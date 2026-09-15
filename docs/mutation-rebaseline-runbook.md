@@ -82,7 +82,7 @@ unchanged. With `coverageAnalysis: "off"` and `incremental: true`, the
 incremental differ's `mutantCanBeReused` answers *true* for every mutant whose source and tests did
 not change textually, because the runner reported no coverage to compare — so a sweep against an
 existing `.stryker-incremental.json` **re-executes nothing** and reproduces the previous run's
-statuses under a fresh timestamp. Observed on the #150 flight (`docs/ship-150.md`): 0 of 287 mutants
+statuses under a fresh timestamp. Observed on the #150 flight ([`docs/ship-150.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/docs/ship-150.md) in the private repl-simple-lab repo): 0 of 287 mutants
 re-ran, and every `statusReason` still cited the previous run's sandbox token. A re-baseline against
 a stale cache would "measure" the pre-0.0.21 numbers again and call them new.
 
@@ -187,7 +187,7 @@ Everything below is what the next person will look for, in the order they will l
 2. `stryker.config.json` — `thresholds.break`, set just under the new score the way 58 sits under
    58.09: rounding room, not slack. A lower floor than before is a regression to explain in the
    commit message, not a threshold to move.
-3. `README.md`, "Mutation score" — the floor, the baseline, the CPU-hours and the mutant count; delete
+3. `CONTRIBUTING.md`, "Mutation score" — the floor, the baseline, the CPU-hours and the mutant count; delete
    the paragraph saying the baseline is unverified, and the pointer to this runbook with it.
 4. This file — a "last run" line at the top: commit, date, host, hours, score.
 5. Commit the new `.stryker-incremental.json`? **No.** It stays ignored; attach it to the PR or the

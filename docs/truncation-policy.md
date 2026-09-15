@@ -418,7 +418,9 @@ tool result, which is what it was about.
 
 **Exception 2 — `output` is capped where the `RunResult` is built, not in `repl.ts`'s
 `formatResult`.** #34 names `repl.ts:112`, but capping there would leave the RLM loop uncapped, which
-is the same defect under a different consumer — `docs/REVIEW.md` A23 records a snippet ending in a
+is the same defect under a different consumer —
+[`docs/REVIEW.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/docs/REVIEW.md) A23 (now in
+the private repl-simple-lab repo) records a snippet ending in a
 bare `context` appending a full copy of the context to every subsequent prompt. Capping in
 `sandbox.ts` covers both, and is the stronger reading of "one policy, not two". `formatResult` then
 interpolates an already-bounded value, and says so.
@@ -689,6 +691,8 @@ payload of a REPL session's prints sits. If the evaluation ever runs, test that 
 
 ## Source
 
-Raised while scoping bucket 3. Findings: `docs/REVIEW.md` H32, H12 · `docs/actionable-items.md` A7,
-A12. Measurements M1–M9 taken against `src/` at `db957ee`; prior art read from
+Raised while scoping bucket 3. Findings:
+[`docs/REVIEW.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/docs/REVIEW.md) H32, H12 ·
+[`archive/actionable-items.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/archive/actionable-items.md)
+A7, A12 (both now in the private repl-simple-lab repo). Measurements M1–M9 taken against `src/` at `db957ee`; prior art read from
 `@earendil-works/pi-coding-agent@0.84.1` as installed.

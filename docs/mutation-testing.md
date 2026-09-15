@@ -447,7 +447,9 @@ Severity is lower than M22's: `src/session.ts:257` resolves a missing callback t
 **Closed 2026-08-17 (PR #147):** a targeted `--mutate src/repl.ts` sweep proved the mutant Killed
 on the current tree — the `ObjectLiteral` is now at `src/repl.ts:235` and the `!session` guard at
 `:210` (the `:62` cite above is stale since the #48/#59 rewrite); the killing test is
-`test/repl.test.ts:517`. Evidence in `docs/verify-110.md`. That sweep also surfaced two **new**
+`test/repl.test.ts:517`. Evidence in
+[`docs/verify-110.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/docs/verify-110.md)
+(now in the private repl-simple-lab repo). That sweep also surfaced two **new**
 resume-method survivors, tracked under #47:
 
 - `src/repl.ts:230` — `StringLiteral` (the "nothing waiting for approval" message) — Survived.
