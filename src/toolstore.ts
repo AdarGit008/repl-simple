@@ -402,6 +402,22 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
         continue;
       }
 
+      // `global read_file` declares the name module-level; an assignment made
+      // through it (usually inside a function) reaches the preamble's
+      // namespace, so a saved tool can shadow a host tool without a top-level
+      // `def` or `=`. Record every declared name — the declaration itself is
+      // the signal the tool wants that binding, and over-refusing here is the
+      // safe direction.
+      if (/^global\s/.test(s)) {
+        for (const m of s
+          .split("#")[0]
+          .slice("global".length)
+          .matchAll(/[A-Za-z_]\w*/g)) {
+          record(m[0]);
+        }
+        continue;
+      }
+
       // `for a, read_file in items` binds both — every identifier between
       // `for` and `in` is a target, so all of them are recorded (a nested
       // structure identifier that is merely read, not bound, over-refuses,
@@ -580,8 +596,12 @@ export function createToolStoreTools(options: ToolStoreOptions): HostTool[] {
 
       await ensureDir(dir);
 
-      // Wrap with docstring comment
+      // Wrap with docstring comment. A bare `\r` is a line terminator to
+      // Monty (as to CPython), so a `\r` in the description would break the
+      // `#` comment and let whatever follows execute at preamble time. Escape
+      // it into a literal backslash-r that stays inside the comment.
       const docComment = description
+        .replace(/\r/g, "\\r")
         .split("\n")
         .map((line) => `# ${line}`)
         .join("\n");

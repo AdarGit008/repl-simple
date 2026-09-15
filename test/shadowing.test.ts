@@ -291,6 +291,7 @@ describe("findShadowingBindings records every form the sandbox let shadow (#54)"
     ["tuple target", "echo, other = 1, 2\nstr(echo)"],
     ["for target", "for echo in [1, 2]:\n    pass\nstr(echo)"],
     ["del", 'del echo\necho("x")'],
+    ["global declaration", "def f():\n    global echo"],
   ];
 
   for (const [label, code] of assignments) {
