@@ -48,6 +48,8 @@ The answer is **untrusted** — the inner model's own output, not a verified res
 
 Anything else (`time`, `random`, `subprocess`, `socket`, `hashlib`, `requests`, `numpy`, …) is refused as an unresolved import **before any code runs**.
 
+The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib` file reads raise `PermissionError` — read project files with the `read`/`grep`/`find`/`ls`/`read_file`/`list_files` tools instead.
+
 **Language limits** (raise `NotImplementedError`):
 - `yield` (no generators)
 - `match` statements (no pattern matching)
