@@ -81,10 +81,17 @@ export const DEFAULT_GRANT_USES = 1;
 
 // ── Types ────────────────────────────────────────────────────────
 
+/**
+ * A host tool's cached result: a string, or the `string[]` a list-returning
+ * tool such as `list_files` produces. Replayed verbatim into the sandbox, so
+ * an array crosses back as the same Python list it was first returned as.
+ */
+type ToolResult = string | string[];
+
 /** A single cached tool call: the key + the result it produced. */
 interface CacheEntry {
   key: string;
-  result: string;
+  result: ToolResult;
   /**
    * Set on entries `load()` restored from a dump; never serialized.
    *
@@ -101,7 +108,7 @@ interface CacheEntry {
 /** A cache entry as it is written: the key and the result, nothing else. */
 interface PersistedCacheEntry {
   key: string;
-  result: string;
+  result: ToolResult;
 }
 
 /** Serialized form of the suspended state within a Session dump. */
@@ -256,7 +263,7 @@ function createCachingRegistry(
   const tools = parent.list().map((tool): HostTool => {
     const originalExecute = tool.execute;
 
-    const wrappedExecute = async (args: Record<string, unknown>): Promise<string> => {
+    const wrappedExecute = async (args: Record<string, unknown>): Promise<ToolResult> => {
       const key = cacheKey(tool.name, args);
 
       // 1. Serve from replay cache if there are remaining entries
@@ -445,6 +452,12 @@ function expectString(value: unknown, path: string): string {
   return value;
 }
 
+/** A cached tool result: a string, or an array of strings (a list return). */
+function expectToolResult(value: unknown, path: string): ToolResult {
+  if (typeof value === "string") return value;
+  return expectArray(value, path).map((item, i) => expectString(item, `${path}[${i}]`));
+}
+
 function expectBoolean(value: unknown, path: string): boolean {
   if (typeof value !== "boolean") fail(path, "must be a boolean");
   return value;
@@ -501,7 +514,7 @@ function cacheEntries(value: unknown, path: string, max: number): PersistedCache
     const entry = closedObject(item, entryPath, ["key", "result"]);
     return {
       key: expectString(entry.key, `${entryPath}.key`),
-      result: expectString(entry.result, `${entryPath}.result`),
+      result: expectToolResult(entry.result, `${entryPath}.result`),
     };
   });
 }
@@ -1224,7 +1237,12 @@ export class Session {
     const mask = (text: string) => maskSecrets(text).text;
     const cut = (text: string) =>
       redact(text, { maxBytes: REDACTED_VALUE_MAX_BYTES, recovery: REDACTED_RECOVERY }).text;
-    const entry = (e: CacheEntry) => ({ key: mask(e.key), result: cut(e.result) });
+    // A list result is redacted through its JSON spelling: the redacted dump
+    // is display/export only and is never reloaded, so the shape only has to
+    // be faithful, not replayable.
+    const redactResult = (result: ToolResult) =>
+      cut(typeof result === "string" ? result : JSON.stringify(result));
+    const entry = (e: CacheEntry) => ({ key: mask(e.key), result: redactResult(e.result) });
     const trace = (c: ToolCallTrace) => ({
       tool: c.tool,
       durationMs: c.durationMs,

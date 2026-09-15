@@ -435,17 +435,14 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
         optional: true,
       },
     ],
-    returns: "str",
+    returns: "list[str]",
     async execute(args) {
       const raw = args.path ?? ".";
       const path = requireString(raw, "path");
       const real = await resolveInRoot(path);
       try {
         const entries = await readdir(real, { withFileTypes: true });
-        return entries
-          .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-          .sort()
-          .join("\n");
+        return entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).sort();
       } catch (e) {
         const err = e as NodeJS.ErrnoException;
         if (err.code === "ENOTDIR") {

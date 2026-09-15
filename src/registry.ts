@@ -139,7 +139,7 @@ export interface StubDegradationReport {
 
 /**
  * Type names the checker resolves without a stub: the four names
- * `HostToolParam.type` can carry, the two `renderReturn` can emit, and the
+ * `HostToolParam.type` can carry, the three `renderReturn` can emit, and the
  * Python builtins a widened union would most plausibly add. A rendered name
  * outside this set is reported as `unknown-type` (#67 path 3) rather than
  * left for the checker to tolerate silently.
@@ -152,6 +152,7 @@ const KNOWN_TYPE_NAMES = new Set([
   "bytes",
   "None",
   "list",
+  "list[str]",
   "dict",
   "set",
   "tuple",

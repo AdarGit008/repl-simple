@@ -51,10 +51,15 @@ after(() => {
   rmSync(outsideDir, { recursive: true, force: true });
 });
 
-function findTool(tools: HostTool[], name: string): HostTool {
+/** A bridge tool: every one returns a string (`execute` returns `Promise<string>`). */
+type StringTool = Omit<HostTool, "execute"> & {
+  execute: (args: Record<string, unknown>) => string | Promise<string>;
+};
+
+function findTool(tools: HostTool[], name: string): StringTool {
   const tool = tools.find((t) => t.name === name);
   assert.ok(tool, `Tool "${name}" not found`);
-  return tool;
+  return tool as StringTool;
 }
 
 // ── Jail helpers ────────────────────────────────────────────────

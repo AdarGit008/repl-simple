@@ -143,6 +143,9 @@ withheld, and names the one it referenced. `REPL_BASH_ENV_ALLOW` passes named va
 
 **Builtins:** `read_file`, `list_files`, `http_get`
 
+`list_files(path?)` returns a Python `list[str]` of entry names, sorted, with directories ending
+in `/`; `read_file` returns the file contents as a `str`.
+
 `http_get` is the only way out of the sandbox to the network, so it is never both silent and
 unrestricted: with `REPL_HTTP_ALLOWLIST` set the listed hosts are fetched without a prompt and every
 other host is refused, and without it every fetch asks for approval. Either way, private, loopback and
