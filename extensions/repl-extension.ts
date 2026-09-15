@@ -6,7 +6,7 @@ import type { RunTrace, TracedCall, TraceStatus } from "../src/repl.js";
 import { limitsConfig } from "../src/sandbox.js";
 import { escapeNoticeName } from "../src/toolstore.js";
 import type { ApprovalRequest, ApprovalDecision, RunLimits } from "../src/types.js";
-import { runRlm, type RlmResult } from "../src/rlm.js";
+import { runRlm, type RlmIteration, type RlmResult } from "../src/rlm.js";
 import { createLlmClient, type RlmClientContext } from "../src/rlm_client.js";
 import { ToolRegistry } from "../src/registry.js";
 import { createPiBridgeTools } from "../src/bridge.js";
@@ -67,8 +67,9 @@ export function formatRlmResult(result: RlmResult): string {
   if (result.status === "ok") {
     lines.push(`answer: ${result.answer}`);
   } else {
+    const answer = result.answer.trim();
     lines.push(
-      `failure: ${result.status}${result.answer ? ` (partial answer: ${result.answer})` : ""}`,
+      `failure: ${result.status}${answer ? ` (partial answer: ${result.answer})` : " (no answer reached)"}`,
     );
   }
   return lines.join("\n");
@@ -573,6 +574,103 @@ export function buildDetails(trace: RunTrace): ReplDetails {
 /** The `details` for a tool that ran no code: the same shape, nothing to list. */
 function emptyDetails(sessionId: string, status: ReplDetails["status"]): ReplDetails {
   return { sessionId, status, calls: [], omittedCalls: 0 };
+}
+
+// ── The RLM trace on `details` ───────────────────────────────────
+//
+// The `rlm` tool and the `/rlm` command both run `runRlm` and then threw away
+// everything but the iteration count — `details` kept only `status`,
+// `answerSource` and `iterations: result.iterations.length`. pi persists
+// `details` to the session file, so a later "trace the last RLM run" could not
+// see the question, the generated code, or what each iteration produced. This
+// section turns the whole `RlmResult` into a display-safe, JSON-safe trace
+// with the same contract as the `repl` trace above: every string field is
+// secret-masked by the shared redaction helper and cut head-only at a per-field
+// byte ceiling, and the iteration list is capped defensively even though
+// `maxIterations` already bounds it upstream. The model-facing `content` is
+// untouched — only `details` changes.
+
+/** Byte ceiling on one RLM trace string field, marker included (1 KiB). */
+export const RLM_TRACE_MAX_BYTES = 1024;
+
+/** Most iterations one RLM `details` carries; the rest are counted, head-only. */
+export const RLM_TRACE_MAX_ITERATIONS = 1000;
+
+const RLM_TRACE_RECOVERY = "The trace keeps only the head of the field.";
+
+/** One RLM iteration as `details` carries it: display-safe, JSON-safe. */
+export interface RlmTraceIteration {
+  index: number;
+  code: string;
+  status: RlmIteration["result"]["status"];
+  stdout: string;
+  /** The `SUBMIT` answer / last-expression value on an ok run. */
+  output?: string;
+  /** The failure on an error run. */
+  error?: string;
+  llmResponse: string;
+}
+
+/** The `details` for an `rlm` run: the trace, display-safe. */
+export interface RlmTraceDetails {
+  question: string;
+  status: RlmResult["status"];
+  answerSource: RlmResult["answerSource"];
+  answer: string;
+  error?: string;
+  budget?: { limit: number; consumed: number; limited: boolean };
+  iterations: RlmTraceIteration[];
+  /** Iterations past `RLM_TRACE_MAX_ITERATIONS`, counted rather than listed. */
+  omittedIterations: number;
+}
+
+/** A free-text field of the RLM trace — masked, then head-cut at the trace cap. */
+function rlmTraceText(text: string): string {
+  return redact(text, { maxBytes: RLM_TRACE_MAX_BYTES, recovery: RLM_TRACE_RECOVERY }).text;
+}
+
+/**
+ * The `details` for an `rlm` / `/rlm` result: the whole run, display-safe.
+ *
+ * Pure — no I/O. Every string field is masked and cut head-only at
+ * `RLM_TRACE_MAX_BYTES`; `budget` is a plain record of three numbers and is
+ * carried whole; iterations past the defensive cap are counted, not listed.
+ */
+export function buildRlmTrace(question: string, result: RlmResult): RlmTraceDetails {
+  const kept = result.iterations.slice(0, RLM_TRACE_MAX_ITERATIONS);
+  const details: RlmTraceDetails = {
+    question: rlmTraceText(question),
+    status: result.status,
+    answerSource: result.answerSource,
+    answer: rlmTraceText(result.answer),
+    iterations: kept.map((iteration) => {
+      const entry: RlmTraceIteration = {
+        index: iteration.index,
+        code: rlmTraceText(iteration.code),
+        status: iteration.result.status,
+        stdout: rlmTraceText(iteration.result.stdout),
+        llmResponse: rlmTraceText(iteration.llmResponse),
+      };
+      if (iteration.result.status === "ok") {
+        entry.output = rlmTraceText(iteration.result.output);
+      } else if (iteration.result.status === "error") {
+        entry.error = rlmTraceText(iteration.result.error);
+      }
+      return entry;
+    }),
+    omittedIterations: result.iterations.length - kept.length,
+  };
+  if (result.error !== undefined) {
+    details.error = rlmTraceText(result.error);
+  }
+  if (result.budget !== undefined) {
+    details.budget = {
+      limit: result.budget.limit,
+      consumed: result.budget.consumed,
+      limited: result.budget.limited,
+    };
+  }
+  return details;
 }
 
 /** What a built-in tool's projected details add to a call's line. */
@@ -1632,6 +1730,14 @@ export default function (pi: ReplExtensionApi) {
         ),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        if (params.question.trim() === "") {
+          return {
+            content: [
+              { type: "text" as const, text: "Error: the rlm tool requires a non-empty question." },
+            ],
+            details: undefined,
+          };
+        }
         const cwd = ctx.cwd;
         const registry = buildRlmRegistry(cwd);
         const llmClient = createLlmClient(ctx, { model: params.model, provider: params.provider });
@@ -1646,11 +1752,7 @@ export default function (pi: ReplExtensionApi) {
         });
         return {
           content: [{ type: "text" as const, text: formatRlmResult(result) }],
-          details: {
-            status: result.status,
-            answerSource: result.answerSource,
-            iterations: result.iterations.length,
-          },
+          details: buildRlmTrace(params.question, result),
         };
       },
     }),
@@ -1705,11 +1807,7 @@ export default function (pi: ReplExtensionApi) {
           customType: "rlm-result",
           content: formatRlmResult(result),
           display: true,
-          details: {
-            status: result.status,
-            answerSource: result.answerSource,
-            iterations: result.iterations.length,
-          },
+          details: buildRlmTrace(question, result),
         });
       });
     },
