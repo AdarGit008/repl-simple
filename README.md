@@ -85,6 +85,23 @@ state persists between calls that share a `sessionId`:
 
 The second call sees `n` from the first. The value a snippet ends on is returned as its output.
 
+## Security model
+
+pi has no sandbox of its own
+([pi docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/security.md)).
+This package adds one for the Python it runs. The table covers what each part allows and how to
+turn it off or tighten it. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+| Area | What happens | Turn it off or tighten it |
+|---|---|---|
+| **Boundary** | Python runs in Monty inside a worker subprocess. `subprocess` and `socket` cannot be imported, and `open()`, `os.listdir()` and `pathlib` reads raise `PermissionError`. Anything outside the interpreter goes through the host tools below. | Resource limits are environment variables; see [Configuration](#configuration). |
+| **Read tools** | `read`, `grep`, `find`, `ls`, `read_file` and `list_files` run without asking, jailed to the project root (pi's working directory). Absolute paths outside it, `..` and symlinks that leave the tree are refused. | The jail cannot be widened. Reaching outside it takes `bash`, which asks first. |
+| **`bash`, `edit`, `write`, `save_tool`** | Each execution asks first (strict mode, the default), and one approval covers one execution. A session with no UI denies them. `bash` gets an allowlisted environment, so variables such as API keys and `SSH_AUTH_SOCK` are withheld. | `/repl-approvals yolo` approves every gated call without a dialog until `/repl-approvals strict` or a pi restart; a session with no UI still denies. `REPL_BASH_ENV_ALLOW` passes named variables to `bash`, and `*` turns the filter off. |
+| **`http_get`** | The only network path. With `REPL_HTTP_ALLOWLIST` set, listed hosts are fetched without asking and every other host is refused. Unset, every fetch asks. Private, loopback and link-local addresses are refused on every redirect hop. | Leave `REPL_HTTP_ALLOWLIST` unset and deny the dialog. In yolo mode a fetch with no allowlist no longer asks. |
+| **Saved tools** | `.pi/code-tools/*.py` runs before your code on every `repl` call, but only in a project you trusted in pi, and only the files you approved. Approvals are a sha256 manifest under `$XDG_STATE_HOME/repl-simple` (default `~/.local/state/repl-simple`), never inside the project. | Leave the project untrusted in pi (`/trust`, or `defaultProjectTrust: "never"`); an untrusted project's files are never read. `delete_tool` stops new sessions from loading a tool. |
+| **`rlm` and `/rlm`** | Read-only: `bash`, `edit`, `write` and `http_get` do not run inside the loop. **It sends the question, the code it generates and the tool results, including the repo file contents it reads, to a model.** That model is the `model`/`provider` passed to the tool, else the `REPL_RLM_BASE_URL` endpoint (https only, with `REPL_RLM_API_KEY` as a bearer token), else pi's current model. Each call makes many LLM calls, bounded by `REPL_RLM_BUDGET` (default 500 000 estimated tokens). The answer is untrusted. | `pi --exclude-tools rlm` hides the tool from the agent. `/rlm` runs only when you type it, and `/rlm-abort` stops it. Lower `REPL_RLM_BUDGET` to cap spend. |
+| **What is written** | `.pi/code-tools/` (through the gated `save_tool`), the approval manifest, and a tool trace on each result, which pi keeps in its session file. `repl` trace arguments are redacted and cut at 256 bytes. The `rlm` trace (question, code, stdout, model replies) is redacted, with each field cut at 1024 bytes. | Nothing is written unless one of the tools above runs. |
+
 ## Sandbox
 
 Code runs in [Monty](https://github.com/pydantic/monty) in a native worker subprocess (the
