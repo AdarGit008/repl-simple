@@ -322,6 +322,93 @@ to have reset a session that never existed. A suspension names the session it be
 more than one live the model knows which to resume.
 See [#48](https://github.com/AdarGit008/repl-simple/issues/48).
 
+## Configuration
+
+Eighteen environment variables tune the package. Set them in the environment pi runs in. The list
+below is every `REPL_*` name read in `src/` and `extensions/`. `REPL_BASH_ENV_FILTERED` is not a
+setting: the package sets it to `1` inside a `bash` command's environment when the filter applied.
+
+### Resource limits
+
+Four are the default resource limits every run gets. A caller who passes no `limits` gets these,
+not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
+anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
+which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
+lasts.
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
+| `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
+| `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
+| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included; time waiting for an approval answer is not (see [Approvals](#approvals)). The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
+
+The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
+worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
+otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
+`createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails
+as one tool call — leaving the script alive to handle it — rather than as the death of the run.
+
+The `repl` tool's `maxDurationSecs` and `maxMemory` arguments can only lower the first two, never
+raise them past these values (or past 300 s and 1024 MiB).
+
+### Host memory guards
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MEMORY_CEILING_MB` | `5120` | Per-process RSS ceiling; `runInSandbox` throws `SandboxMemoryError` at or above it. Clamped down automatically inside a cgroup, since `/proc/meminfo` cannot see a container limit. `0` disables. |
+| `REPL_MEMORY_FLOOR_MB` | `0` (off) | Refuse to start when the host has less than this much memory available. Opt-in: whether the machine as a whole is short of memory is not this library's business to police. |
+
+**Both measure the host process, which is not where sandboxed Python allocates.** Python runs in a
+worker subprocess, so a script allocating gigabytes grows the worker and is stopped by
+`RunLimits.maxMemory` inside it, not by these. What they still catch is growth on *our* side of the
+line — accumulated messages, buffers, a caller looping over runs — which is what a host ceiling can
+honestly speak to.
+
+### `http_get`
+
+These are egress policy, not resource limits; the reasoning is in
+[docs/http-egress.md](docs/http-egress.md).
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_HTTP_ALLOWLIST` | empty | Comma-separated hosts `http_get` may reach, as a hostname or a `*.`-prefixed suffix. Set → those hosts need no approval and every other host is refused. Unset → every fetch requires approval. The `rlm` loop ignores it: `http_get` never runs there. |
+| `REPL_HTTP_TIMEOUT_SECS` | `30` | Deadline for one `http_get`, redirect chain and body read included. Breach → `TimeoutError` in Python. |
+
+### Worker pool
+
+Neither is left to `@pydantic/monty`'s own default, because both of those fail open: `maxProcesses`
+follows the CPU count, and `checkoutTimeout` waits **forever**, so an exhausted pool hangs with no
+error and no log rather than failing. The pool is sized when it is created, on first use.
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~9 MB each idle, ~16 MB once it has type-checked a run), not by core count. |
+| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
+
+### Sessions, approvals and `bash`
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_MAX_SESSIONS` | `32` | Live REPL sessions per project directory before the least recently used one is evicted. A positive integer; an embedder's `ReplRunnerOptions.maxSessions` takes precedence. See [The session pool](#the-session-pool). |
+| `REPL_APPROVAL_TIMEOUT_MS` | `300000` (5 min) | How long an approval dialog stays open before it denies itself. `0` removes the bound, so an unanswered dialog holds the run until it is answered, dismissed or aborted. An unparseable value keeps the default. |
+| `REPL_BASH_ENV_ALLOW` | empty | Comma-separated variable names to pass through to `bash` on top of the allowlist. `*` turns the filter off. See [docs/bash-env.md](docs/bash-env.md). |
+
+### Saved tools
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_PREAMBLE_STORE_DIR` | `$XDG_STATE_HOME/repl-simple`, else `~/.local/state/repl-simple` | Where the saved-tool approval manifests live. It must be outside the project: a store inside it loads no saved tools, and pi says so. See [docs/project-trust.md](docs/project-trust.md). |
+
+### RLM
+
+| variable | default | effect |
+|---|---|---|
+| `REPL_RLM_BUDGET` | `500000` | Default spend budget, in estimated tokens, for one `rlm` call or `/rlm` run. The `rlm` tool's `budget` argument overrides it; an unparseable value keeps the default. |
+| `REPL_RLM_BASE_URL` | unset | An `https://` OpenAI-compatible endpoint the loop's model calls are POSTed to (`<url>/chat/completions`). Used when the `rlm` tool gets no `model`/`provider` (always, for `/rlm`); unset → pi's current model. A non-`https://` value fails the call. |
+| `REPL_RLM_API_KEY` | unset | Sent to `REPL_RLM_BASE_URL` as an `Authorization: Bearer` header, never in the URL. |
+| `REPL_RLM_MODEL` | `rlm` | The `model` field sent to `REPL_RLM_BASE_URL`. |
+
 ## API
 
 ```typescript
@@ -408,56 +495,7 @@ A rename would orphan the `coverage-baseline.json` keys, reopen the package `fil
 touch the pinned `scriptName` default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) that the
 diagnostic line-number regex reads; the map is what makes the names harmless.
 
-Ten environment variables tune the sandbox, all read at call time.
-
-Four are the default resource limits every run gets. A caller who passes no `limits` gets these,
-not "no limits" — omission cannot be a way to opt out, because before #32 it was the only way
-anything ran and nothing in this repository passed any. Opting out is spelled `limits: "unbounded"`,
-which is deliberate, greppable, and documented as holding a pooled worker for as long as the run
-lasts.
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_MAX_DURATION_SECS` | `30` | Interpreter compute budget. **Not wall clock:** the sandbox clock advances only while Python executes and stops while a host tool runs, so `bash("npm test")` costs it nothing. Breach → `errorKind: "timeout"`. |
-| `REPL_MAX_MEMORY_MB` | `512` | Sandbox heap ceiling, enforced inside the worker as a catchable `MemoryError` rather than an OOM kill. Breach → `errorKind: "memory"`. |
-| `REPL_MAX_SUSPENSIONS` | `10000` | Host crossings per run: every host-tool call (one a session replays from its cache included), name lookup and mounted-file read. Set because Monty's own default of 1000 refuses a session replaying its 1024-entry cache. Breach → a `RuntimeError` Python cannot catch, `errorKind: "runtime"`. |
-| `REPL_MAX_WALL_CLOCK_SECS` | `300` | Host wall clock for a whole run, host-tool time included; time waiting for an approval answer is not (see [Approvals](#approvals)). The only thing that bounds a host tool that never returns — and the only thing that hands that run's worker back. |
-
-The last of those is the fail-safe the other three cannot be. Monty's clock is polled inside the
-worker, so it cannot fire while the worker is idle waiting for us: `bash("sleep 99999")` would
-otherwise hang the run forever with every in-sandbox limit armed, holding its worker throughout.
-`createPiBridgeTools` also gives `bash` a 120 s default timeout of its own, so a hung command fails
-as one tool call — leaving the script alive to handle it — rather than as the death of the run.
-
-Two guard against a runaway exhausting the host:
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_MEMORY_CEILING_MB` | `5120` | Per-process RSS ceiling; `runInSandbox` throws `SandboxMemoryError` at or above it. Clamped down automatically inside a cgroup, since `/proc/meminfo` cannot see a container limit. `0` disables. |
-| `REPL_MEMORY_FLOOR_MB` | `0` (off) | Refuse to start when the host has less than this much memory available. Opt-in: whether the machine as a whole is short of memory is not this library's business to police. |
-
-**Both now measure the host process, which is no longer where sandboxed Python allocates.** Python
-runs in a worker subprocess, so a script allocating gigabytes grows the worker and is stopped by
-`RunLimits.maxMemory` inside it, not by these. What they still catch is growth on *our* side of the
-line — accumulated messages, buffers, a caller looping over runs — which is what a host ceiling can
-honestly speak to.
-
-Two bound `http_get`. They are egress policy, not resource limits; the reasoning is in
-[docs/http-egress.md](docs/http-egress.md).
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_HTTP_ALLOWLIST` | empty | Comma-separated hosts `http_get` may reach, as a hostname or a `*.`-prefixed suffix. Set → those hosts need no approval and every other host is refused. Unset → every fetch requires approval. |
-| `REPL_HTTP_TIMEOUT_SECS` | `30` | Deadline for one `http_get`, redirect chain and body read included. Breach → `TimeoutError` in Python. |
-
-Two size the worker pool. Neither is left to `@pydantic/monty`'s own default, because both of those
-fail open: `maxProcesses` follows the CPU count, and `checkoutTimeout` waits **forever**, so an
-exhausted pool hangs with no error and no log rather than failing.
-
-| variable | default | effect |
-|---|---|---|
-| `REPL_POOL_MAX_PROCESSES` | `4` | Worker cap. Sized by memory (~9 MB each idle, ~16 MB once it has type-checked a run), not by core count. |
-| `REPL_POOL_CHECKOUT_TIMEOUT_SECS` | `30` | How long a run waits for a free worker before failing with `errorKind: "unavailable"` — a `RunError` like any other, not a throw. |
+The environment variables are documented under [Configuration](#configuration).
 
 ### The worker pool
 
