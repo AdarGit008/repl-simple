@@ -994,7 +994,7 @@ export class ReplRunner {
             sink.pendingDetails = event.details;
           }
         : undefined,
-    });
+    }).filter((tool) => tool.name !== "read");
     const builtinTools = createBuiltinTools({ root: this.cwd });
     const tools = [...bridgeTools, ...builtinTools].map((tool) =>
       sink ? recordExecutions(tool, sink) : tool,

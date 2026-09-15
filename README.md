@@ -77,11 +77,12 @@ success. See [#59](https://github.com/AdarGit008/repl-simple/issues/59).
 
 ### The tool trace
 
-Every host-tool call a `repl` or `repl_resume` call makes — each jailed `read`, each `http_get`,
+Every host-tool call a `repl` or `repl_resume` call makes — each jailed `read_file`, each
+`http_get`,
 each gated `write` and whether it was approved — is reported on the tool result's `details`, which
 pi persists and hands to the renderer, and listed under the result in the TUI: collapsed, one
 summary line; expanded, one line per call with its arguments, duration, outcome and what the
-built-in tool reported (a truncated read, `bash`'s full-output path). Arguments are masked with the
+built-in tool reported (a truncated `read_file`, `bash`'s full-output path). Arguments are masked with the
 shared redaction helper and cut head-only at 256 bytes, so a `write` of a file or a pasted token
 never lands in the session file; results and `stdout` are not in the trace at all. Only calls that
 executed are listed — a call served from the replay cache is not. For embedders,
@@ -128,7 +129,9 @@ The three RLM tools below are self-registered by `runRlm` and available inside t
 
 **Pi bridge:** `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`
 
-The four read tools are confined to the project root, as `read_file` and `list_files` always were.
+In a `repl` session the bridged `read` is not registered — `read_file` (256 KiB, head+tail) is the
+reader. The three remaining read tools are confined to the project root, as `read_file` and
+`list_files` always were.
 An absolute path outside it, a `..` traversal, and a symlink whose target leaves the tree are all
 refused — so `~/.ssh`, `~/.aws`, `~/.config` and sibling checkouts are out of reach, which is a real
 cost when the thing you want to read genuinely lives there. The escape hatch is a `bash` call, which

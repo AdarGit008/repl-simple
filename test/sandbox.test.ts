@@ -154,6 +154,26 @@ describe("runInSandbox — error handling", () => {
   });
 });
 
+// ── Error truncation policy (#144) ──────────────────────────────
+
+describe("error truncation — the error field is bounded", () => {
+  const registry = new ToolRegistry();
+
+  it("caps a 2 MB runtime error at 16 KiB, head+tail with an in-band marker", async () => {
+    const result = await runInSandbox("raise ValueError('X' * 2000000)", { registry });
+    err(result);
+    assert.equal(result.errorKind, "runtime");
+    assert.ok(
+      byteSize(result.error) <= 16 * 1024,
+      `error is ${byteSize(result.error)} bytes for a 16 KiB budget`,
+    );
+    assert.match(result.error, /^ValueError: X/, "the error head was lost");
+    assert.match(result.error, /X+$/, "the error tail was lost");
+    assert.match(result.error, /\[… [\d.]+MB of [\d.]+MB elided\./);
+    assert.match(result.error, /Catch the exception and print the full traceback/);
+  });
+});
+
 // ── lineOffset: syntax-error correction ─────────────────────────
 //
 // The sandbox runs whatever script the caller assembles, prefix included, so

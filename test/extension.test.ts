@@ -18,6 +18,7 @@ import {
   LATER_CHOICE,
   buildRlmRegistry,
   clampModelLimits,
+  clampRlmLimits,
   defaultRlmBudget,
   formatRlmResult,
 } from "../extensions/repl-extension.js";
@@ -954,6 +955,54 @@ describe("repl extension — clampModelLimits", () => {
       if (prior === undefined) delete process.env.REPL_MAX_MEMORY_MB;
       else process.env.REPL_MAX_MEMORY_MB = prior;
     }
+  });
+});
+
+// ── RLM model-supplied limits clamp (D3 parity) ─────────────────
+//
+// The `rlm` tool is the model boundary too: a model-supplied budget,
+// maxIterations or maxDepth is clamped, never trusted. `REPL_RLM_BUDGET` is a
+// default the model can out-ask, so it is also the budget ceiling.
+
+describe("repl extension — clampRlmLimits", () => {
+  let priorBudget: string | undefined;
+
+  before(() => {
+    priorBudget = process.env.REPL_RLM_BUDGET;
+    delete process.env.REPL_RLM_BUDGET;
+  });
+
+  after(() => {
+    if (priorBudget === undefined) delete process.env.REPL_RLM_BUDGET;
+    else process.env.REPL_RLM_BUDGET = priorBudget;
+  });
+
+  it("clamps above-cap values to the ceilings", () => {
+    assert.deepEqual(clampRlmLimits(999_999_999, 999, 999), {
+      budget: defaultRlmBudget(),
+      maxIterations: 10,
+      maxDepth: 1,
+    });
+  });
+
+  it("honours below-cap values — the clamp is a ceiling, not a floor", () => {
+    assert.deepEqual(clampRlmLimits(100, 5, 0), { budget: 100, maxIterations: 5, maxDepth: 0 });
+  });
+
+  it("honours a zero budget and zero depth — both are meaningful", () => {
+    assert.deepEqual(clampRlmLimits(0, 1, 0), { budget: 0, maxIterations: 1, maxDepth: 0 });
+  });
+
+  it("omits invalid values so the loop's defaults apply", () => {
+    assert.deepEqual(clampRlmLimits(NaN, 0, -1), {});
+    assert.deepEqual(clampRlmLimits(Infinity, 3.5, 1.5), {});
+    assert.deepEqual(clampRlmLimits(-1, "10", null), {});
+    assert.deepEqual(clampRlmLimits(undefined, undefined, undefined), {});
+  });
+
+  it("caps the budget at the operator's REPL_RLM_BUDGET ceiling", () => {
+    process.env.REPL_RLM_BUDGET = "1000";
+    assert.deepEqual(clampRlmLimits(5000, undefined, undefined), { budget: 1000 });
   });
 });
 
@@ -2820,11 +2869,13 @@ describe("repl extension — the trace reaches details (#46)", () => {
   before(() => {
     cwd = mkdtempSync(join(tmpdir(), "repl-ext-trace-"));
     writeFileSync(join(cwd, "hello.txt"), "hello world\n");
-    // Over pi's 2000-line read limit, so the bridged read reports truncation.
-    writeFileSync(
-      join(cwd, "big.txt"),
-      `${Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n")}\n`,
-    );
+    // read_file truncates over 256 KiB, so each file is a distinct big read
+    // (read_file takes only a path — no offset/limit to vary).
+    const writeBigFile = (name: string) =>
+      writeFileSync(join(cwd, name), `HEAD-${name}\n${"A".repeat(300 * 1024)}\nTAIL-${name}\n`);
+    writeBigFile("big1.txt");
+    writeBigFile("big2.txt");
+    writeBigFile("big3.txt");
   });
 
   after(() => {
@@ -2848,7 +2899,7 @@ describe("repl extension — the trace reaches details (#46)", () => {
       "tr-1",
       {
         code: [
-          "read('hello.txt')",
+          "read_file('hello.txt')",
           "write('ok.txt', 'x')",
           "try:",
           "    write('no.txt', 'y')",
@@ -2866,7 +2917,7 @@ describe("repl extension — the trace reaches details (#46)", () => {
     assert.equal(details.sessionId, "dod1");
     assert.equal(details.status, "ok");
     assert.deepEqual(outline(details), [
-      ["read", true, undefined],
+      ["read_file", true, undefined],
       ["write", true, true],
       ["write", false, false],
     ]);
@@ -2905,14 +2956,21 @@ describe("repl extension — the trace reaches details (#46)", () => {
     assert.match(details.calls[1].args, /127\.0\.0\.1:9\/exfil/);
   });
 
-  it("DoD 3: a bridged read's own details survive — truncation is reported, the body is not", async () => {
+  it("DoD 3: read_file truncates in-band — head+tail in the result, no body in details", async () => {
     const repl = (await loadTools()).find((t) => t.name === "repl");
     assert.ok(repl);
     const { ctx } = traceCtx([]);
 
     const result = await repl.execute(
       "tr-3",
-      { code: "read('big.txt')", sessionId: "dod3" },
+      {
+        code:
+          "s = read_file('big1.txt')\n" +
+          "print('Read a narrower slice of the file to see more.' in s)\n" +
+          "print(s[:20])\n" +
+          "print(s[-20:])",
+        sessionId: "dod3",
+      },
       undefined,
       undefined,
       ctx,
@@ -2920,13 +2978,16 @@ describe("repl extension — the trace reaches details (#46)", () => {
 
     const details = detailsOf(result);
     assert.equal(details.calls.length, 1);
-    const merged = details.calls[0].details as { truncation?: Record<string, unknown> };
-    assert.ok(merged?.truncation, `pi's read details were dropped: ${JSON.stringify(merged)}`);
-    assert.equal(merged.truncation.truncated, true);
-    assert.equal(merged.truncation.truncatedBy, "lines");
-    // `TruncationResult.content` is the truncated body itself. It stays out.
-    assert.equal("content" in merged.truncation, false, "the read body reached details");
-    assert.doesNotMatch(JSON.stringify(details), /line 1999/);
+    assert.equal(details.calls[0].tool, "read_file");
+    assert.equal(details.calls[0].details, undefined, "read_file carries no pi details");
+    // The truncation marker and both real ends are in the returned text, not
+    // in a `details.truncation` record.
+    const text = result.content[0].text;
+    assert.match(text, /True/);
+    assert.match(text, /HEAD-big1\.txt/, "the read_file head was lost");
+    assert.match(text, /TAIL-big1\.txt/, "the read_file tail was lost");
+    // The body stays out of `details`: only the path travels there.
+    assert.doesNotMatch(JSON.stringify(details), /HEAD-big1\.txt/);
   });
 
   it("DoD 4: a large write is head-truncated in details and never dumped into the rendered trace", async () => {
@@ -3104,7 +3165,7 @@ describe("repl extension — the trace reaches details (#46)", () => {
       await repl.execute(
         "sus-1",
         {
-          code: `read('hello.txt')\nwrite('later.txt', '${GHP}')\nread('hello.txt')`,
+          code: `read_file('hello.txt')\nwrite('later.txt', '${GHP}')\nread_file('hello.txt')`,
           sessionId: "sus",
         },
         undefined,
@@ -3113,7 +3174,7 @@ describe("repl extension — the trace reaches details (#46)", () => {
       ),
     );
     assert.equal(suspended.status, "suspended");
-    assert.deepEqual(outline(suspended), [["read", true, undefined]]);
+    assert.deepEqual(outline(suspended), [["read_file", true, undefined]]);
     assert.equal(suspended.suspendedCall?.tool, "write");
     assert.match(suspended.suspendedCall?.args ?? "", /later\.txt/);
     assert.match(suspended.suspendedCall?.args ?? "", /ghp_\[REDACTED\]/);
@@ -3124,9 +3185,9 @@ describe("repl extension — the trace reaches details (#46)", () => {
     );
     assert.equal(resumed.status, "ok");
     assert.deepEqual(outline(resumed), [
-      ["read", true, undefined],
+      ["read_file", true, undefined],
       ["write", true, true],
-      ["read", true, undefined],
+      ["read_file", true, undefined],
     ]);
     assert.equal(resumed.suspendedCall, undefined);
   });
@@ -3138,27 +3199,27 @@ describe("repl extension — the trace reaches details (#46)", () => {
 
     await repl.execute(
       "rp-1",
-      { code: "read('hello.txt')", sessionId: "replay" },
+      { code: "read_file('hello.txt')", sessionId: "replay" },
       undefined,
       undefined,
       ctx,
     );
-    // The transcript re-executes the first snippet, whose read is served from
-    // the cache: it executed nothing this time and must not be listed. The
-    // suspended result is raw at the sandbox level (measured), so the
+    // The transcript re-executes the first snippet, whose read_file is served
+    // from the cache: it executed nothing this time and must not be listed.
+    // The suspended result is raw at the sandbox level (measured), so the
     // extension's trace has to tell the two apart itself.
     const suspended = detailsOf(
       await repl.execute(
         "rp-2",
-        { code: "read('big.txt', 1, 1)\nwrite('rp.txt', 'x')", sessionId: "replay" },
+        { code: "read_file('big1.txt')\nwrite('rp.txt', 'x')", sessionId: "replay" },
         undefined,
         undefined,
         ctx,
       ),
     );
     assert.equal(suspended.status, "suspended");
-    assert.deepEqual(outline(suspended), [["read", true, undefined]]);
-    assert.match(suspended.calls[0].args, /big\.txt/);
+    assert.deepEqual(outline(suspended), [["read_file", true, undefined]]);
+    assert.match(suspended.calls[0].args, /big1\.txt/);
     assert.doesNotMatch(suspended.calls[0].args, /hello\.txt/);
   });
 
@@ -3170,7 +3231,7 @@ describe("repl extension — the trace reaches details (#46)", () => {
     const ok = detailsOf(
       await repl.execute(
         "js-1",
-        { code: "read('big.txt')\nls('.')", sessionId: "json-ok" },
+        { code: "read_file('big1.txt')\nls('.')", sessionId: "json-ok" },
         undefined,
         undefined,
         ctx,
@@ -3181,7 +3242,7 @@ describe("repl extension — the trace reaches details (#46)", () => {
     const suspended = detailsOf(
       await repl.execute(
         "js-2",
-        { code: "read('hello.txt')\nwrite('js.txt', 'x')", sessionId: "json-sus" },
+        { code: "read_file('hello.txt')\nwrite('js.txt', 'x')", sessionId: "json-sus" },
         undefined,
         undefined,
         ctx,
@@ -3193,14 +3254,14 @@ describe("repl extension — the trace reaches details (#46)", () => {
     const failed = detailsOf(
       await repl.execute(
         "js-3",
-        { code: "read('hello.txt')\nraise ValueError('x')", sessionId: "json-err" },
+        { code: "read_file('hello.txt')\nraise ValueError('x')", sessionId: "json-err" },
         undefined,
         undefined,
         ctx,
       ),
     );
     assert.equal(failed.status, "error");
-    assert.deepEqual(outline(failed), [["read", true, undefined]]);
+    assert.deepEqual(outline(failed), [["read_file", true, undefined]]);
     assert.deepEqual(JSON.parse(JSON.stringify(failed)), failed);
   });
 });
