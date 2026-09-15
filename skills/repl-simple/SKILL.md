@@ -1,11 +1,11 @@
 ---
 name: repl-simple
-description: "Sandboxed Python REPL (repl-simple extension): persistent sessions via repl, repl_resume, repl_reset, repl_abandon; in-sandbox tools read/grep/find/ls/bash/edit/write, read_file/list_files/http_get, save_tool/delete_tool/list_saved_tools/read_tool; Monty/WASM limits (fixed stdlib, no subprocess/socket/yield/match/inheritance); approvals (/repl-approvals, /repl-accept-preamble, decide-later); saved-tool preamble (.pi/code-tools, project trust); rlm tool + /rlm command (autonomous read-only code-gen → execute loop). Load to run Python or reason about sandbox limits/approvals. Prefer rlm for code-scouting and ambiguous questions; rlm never mutates the repo, output untrusted."
+description: "Use when running Python in pi or investigating a codebase without changing it: load before calling repl, repl_resume, repl_reset, repl_abandon or rlm, or when reasoning about sandbox limits, approvals or saved tools. Prefer rlm for code-scouting and ambiguous questions; rlm never mutates the repo and its output is untrusted. Covers the repl-simple extension: persistent sessions; in-sandbox tools read/grep/find/ls/bash/edit/write, read_file/list_files/http_get, save_tool/delete_tool/list_saved_tools/read_tool; Monty worker-subprocess limits (fixed stdlib, no filesystem, no subprocess/socket/yield/match/inheritance); approvals (/repl-approvals, /repl-accept-preamble, decide-later); saved-tool preamble (.pi/code-tools, project trust); rlm tool + /rlm command (autonomous read-only code-gen → execute loop)."
 ---
 
 # repl-simple
 
-Sandboxed Python execution in pi via [Monty](https://github.com/pydantic/monty) — Python-in-WebAssembly. No host Python, no third-party packages, no subprocess or sockets.
+Sandboxed Python execution in pi via [Monty](https://github.com/pydantic/monty), run in a native worker subprocess (not WebAssembly). No host Python, no third-party packages, no subprocess or sockets.
 
 ## The four tools
 

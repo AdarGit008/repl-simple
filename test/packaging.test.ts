@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { loadSkillsFromDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-fixture.js";
 
 /**
@@ -342,6 +343,40 @@ describe("skill manifest", () => {
     assert.ok(
       (fm.description ?? "").length <= 1024,
       `skill description must be <= 1024 chars (got ${fm.description?.length ?? 0})`,
+    );
+  });
+
+  // The line-based check above cannot see YAML errors. At v0.1.0 the unquoted
+  // description ("…(repl-simple extension): persistent…") passed it, while the
+  // YAML parser pi uses rejected the file and pi skipped the skill (#224). This
+  // runs pi's own loader on the shipped skills/ directory, so a frontmatter that
+  // does not parse fails here instead of in a user's install.
+  it("pi's skill loader parses the frontmatter and loads the skill without warnings", () => {
+    const { skills, diagnostics } = loadSkillsFromDir({
+      dir: join(REPO_ROOT, "skills"),
+      source: "repl-simple",
+    });
+    assert.deepEqual(
+      diagnostics.map((d) => `${d.type}: ${d.message}`),
+      [],
+      "pi reported diagnostics loading skills/",
+    );
+    assert.deepEqual(
+      skills.map((s) => s.name),
+      ["repl-simple"],
+      "pi must load exactly the repl-simple skill",
+    );
+  });
+
+  it("the parsed description leads with when to use the skill", () => {
+    const { frontmatter } = parseFrontmatter<{ description?: unknown }>(
+      readFileSync(SKILL_PATH, "utf8"),
+    );
+    assert.equal(typeof frontmatter.description, "string", "description must parse to a string");
+    assert.match(
+      frontmatter.description as string,
+      /^Use when /,
+      "the description must open with its when-to-use trigger",
     );
   });
 
