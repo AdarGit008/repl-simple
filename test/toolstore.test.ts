@@ -346,10 +346,9 @@ describe("findShadowingBindings", () => {
   });
 
   it("records a global declaration of a reserved name", () => {
-    assert.deepEqual(
-      findShadowingBindings("def f():\n    global read_file", reserved),
-      ["read_file"],
-    );
+    assert.deepEqual(findShadowingBindings("def f():\n    global read_file", reserved), [
+      "read_file",
+    ]);
     assert.deepEqual(findShadowingBindings("global bash, read_file", reserved), [
       "bash",
       "read_file",

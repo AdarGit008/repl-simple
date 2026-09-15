@@ -409,7 +409,10 @@ export function findShadowingBindings(source: string, reserved: ReadonlySet<stri
       // the signal the tool wants that binding, and over-refusing here is the
       // safe direction.
       if (/^global\s/.test(s)) {
-        for (const m of s.split("#")[0].slice("global".length).matchAll(/[A-Za-z_]\w*/g)) {
+        for (const m of s
+          .split("#")[0]
+          .slice("global".length)
+          .matchAll(/[A-Za-z_]\w*/g)) {
           record(m[0]);
         }
         continue;
