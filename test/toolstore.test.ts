@@ -345,6 +345,17 @@ describe("findShadowingBindings", () => {
     assert.deepEqual(findShadowingBindings("*read_file, = items", reserved), ["read_file"]);
   });
 
+  it("records a global declaration of a reserved name", () => {
+    assert.deepEqual(
+      findShadowingBindings("def f():\n    global read_file", reserved),
+      ["read_file"],
+    );
+    assert.deepEqual(findShadowingBindings("global bash, read_file", reserved), [
+      "bash",
+      "read_file",
+    ]);
+  });
+
   it("returns [] for an empty reserved set", () => {
     assert.deepEqual(findShadowingBindings("def read_file(): ...", new Set()), []);
   });
@@ -371,6 +382,34 @@ describe("save_tool", () => {
       const content = readFileSync(join(root, ".pi", "code-tools", "my_func.py"), "utf-8");
       assert.ok(content.includes("def my_func(): return 42"));
       assert.ok(content.includes("Returns the answer"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("escapes a bare CR in the description so it cannot break out of the comment", async () => {
+    const root = makeTempDir();
+    try {
+      const { tools } = makeTools(root);
+      const save = findTool(tools, "save_tool");
+
+      await save.execute({
+        name: "cr_safe",
+        code: "def cr_safe(): return 1",
+        description: "harmless\rimport os\rx = 1",
+      });
+
+      const content = readFileSync(join(root, ".pi", "code-tools", "cr_safe.py"), "utf-8");
+      // A bare CR is a line terminator to Monty: left in the comment, the
+      // text after it would execute at preamble time. It must be escaped into
+      // a literal backslash-r inside the `#`-comment instead.
+      assert.ok(!content.includes("\r"), "a bare CR reached the saved file");
+      assert.ok(content.includes("\\r"), "the CR was not escaped into the comment");
+      // The escaped description stays on one comment line.
+      assert.ok(
+        content.includes("# harmless\\rimport os\\rx = 1"),
+        `escaped CR is missing from the comment: ${JSON.stringify(content)}`,
+      );
     } finally {
       cleanup();
     }
