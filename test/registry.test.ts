@@ -258,6 +258,20 @@ describe("renderPythonToolRules", () => {
     );
   });
 
+  it("warns that stdlib file access raises PermissionError and points at the tools", () => {
+    // The sandbox has no filesystem, so open()/os.listdir()/pathlib cannot see
+    // project files and raise PermissionError; the model must use the read/list/
+    // search tools instead. This is the rule that stops the loop wasting
+    // iterations on open("package.json") before discovering the read tool.
+    const rules = renderPythonToolRules(["json"]);
+    assert.match(rules, /open\(\)/);
+    assert.match(rules, /os\.listdir\(\)/);
+    assert.match(rules, /pathlib/);
+    assert.match(rules, /PermissionError/);
+    assert.match(rules, /read, grep, find, ls/);
+    assert.match(rules, /read_file, list_files/);
+  });
+
   it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", async () => {
     // Prompt text is behaviour (D156): the sentence describes the interpreter,
     // so the interpreter is measured in the same test. W2-3 recorded this as

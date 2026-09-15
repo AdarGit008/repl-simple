@@ -79,6 +79,25 @@ describe("createLlmClient", () => {
     assert.equal(typeof calls[0].context.messages[0].timestamp, "number");
   });
 
+  it("wraps assistant string content in a text block so it round-trips", async () => {
+    const { calls, registry } = makeRegistry("ok");
+    const client = createLlmClient({ model: { id: "m" }, modelRegistry: registry });
+
+    await client.query("sys", [
+      { role: "user", content: "question" },
+      { role: "assistant", content: "```python\nprint(1)\n```" },
+      { role: "user", content: "feedback" },
+    ]);
+
+    const messages = calls[0].context.messages;
+    // user content stays a string
+    assert.equal(messages[0].content, "question");
+    assert.equal(messages[2].content, "feedback");
+    // assistant content becomes a TextContent[] array (pi-ai AssistantMessage
+    // shape) — a plain string here makes every provider return an empty reply.
+    assert.deepEqual(messages[1].content, [{ type: "text", text: "```python\nprint(1)\n```" }]);
+  });
+
   it("throws a clear error when ctx.model is undefined", async () => {
     const { calls, registry } = makeRegistry("unused");
     const client = createLlmClient({ model: undefined, modelRegistry: registry });
