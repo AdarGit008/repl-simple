@@ -139,6 +139,14 @@ export interface RunOptions {
    */
   inputs?: Record<string, string>;
   /**
+   * Host Unix epoch in seconds that `datetime.date.today()` and
+   * `datetime.datetime.now()` derive from inside the sandbox. Defaults to
+   * `Date.now() / 1000` at run start; a caller pins it for a deterministic
+   * run. Not persisted and not carried across a suspension — the sandbox has
+   * no clock, so whoever starts a run (or resumes one) supplies it.
+   */
+  hostEpochSecs?: number;
+  /**
    * Host directories mounted into the sandbox, virtual path → host path.
    * Never stored in a snapshot; whoever resumes must hand it back, and
    * `Session` does (#38, #84).

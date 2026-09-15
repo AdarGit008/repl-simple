@@ -21,9 +21,14 @@ import {
   MontySyntaxError,
   MontyTypingError,
   MountDir,
+  NOT_HANDLED,
   type Frame,
+  type MontyDate,
+  type MontyDateTime,
   type MontySession,
+  type MontyTimeZone,
   NameLookupSnapshot,
+  type OsCallback,
   type PrintCallback,
   type ResourceLimits,
   type Snapshot,
@@ -61,6 +66,65 @@ import type {
 
 const DEFAULT_MAX_STDOUT = STDOUT_MAX_BYTES;
 const DEFAULT_MAX_OUTPUT = OUTPUT_MAX_BYTES;
+
+// ── Wall clock (datetime) ────────────────────────────────────────
+//
+// The WASM sandbox has no clock. `datetime.date.today()` and
+// `datetime.datetime.now()` surface as OS calls — `date.today` and
+// `datetime.now` — which the host answers from its own wall clock. The epoch
+// is pinned once per run start (`hostEpochSecs` when a caller supplied one for
+// a deterministic run, else `Date.now() / 1000`), so the two calls read one
+// consistent time and a caller can replay a run exactly.
+
+/** Unix epoch, in seconds, the sandbox's datetime calls derive from. */
+function runEpochSecs(runOpts: RunOptions | undefined): number {
+  return runOpts?.hostEpochSecs ?? Date.now() / 1000;
+}
+
+/** UTC components of an epoch, as the marker records Monty converts back. */
+function wallClockMarkers(epochSecs: number): { date: MontyDate; dateTime: MontyDateTime } {
+  // `Date.now()` is integer milliseconds, so `epochSecs * 1000` is exact on
+  // that path; `Math.round` keeps a caller-supplied fractional epoch honest to
+  // the nearest millisecond.
+  const ms = Math.round(epochSecs * 1000);
+  const d = new Date(ms);
+  const fields = {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    second: d.getUTCSeconds(),
+    microsecond: d.getUTCMilliseconds() * 1000,
+  };
+  return {
+    date: { __monty_type__: "Date", year: fields.year, month: fields.month, day: fields.day },
+    dateTime: { __monty_type__: "DateTime", ...fields },
+  };
+}
+
+/**
+ * The `os` callback handed to Monty: answers the sandbox's two datetime calls
+ * from the pinned epoch, and declines everything else (`NOT_HANDLED`) so the
+ * feed's mounts and Monty's own defaults keep their existing behaviour.
+ */
+function wallClockOs(epochSecs: number): OsCallback {
+  const markers = wallClockMarkers(epochSecs);
+  return (name, args) => {
+    if (name === "date.today") return markers.date;
+    if (name === "datetime.now") {
+      const tz = args?.[0] as MontyTimeZone | null | undefined;
+      if (tz !== null && tz !== undefined && tz.__monty_type__ === "TimeZone") {
+        // A tz-aware now(): shift the wall time by the zone's offset and say
+        // which zone it was.
+        const local = wallClockMarkers(epochSecs + tz.offsetSeconds).dateTime;
+        return { ...local, offsetSeconds: tz.offsetSeconds };
+      }
+      return markers.dateTime;
+    }
+    return NOT_HANDLED;
+  };
+}
 
 /**
  * Raise `pythonType` inside the sandbox with `message`.
@@ -1440,6 +1504,9 @@ export async function runInSandbox(
   }
 
   const printCallback = makePrintCallback(acc, runOpts);
+  // Pinned once per run: both datetime calls read one consistent time, and a
+  // caller that set `hostEpochSecs` gets that exact value.
+  const hostEpochSecs = runEpochSecs(runOpts);
 
   // Started here, not at the checkout: the budget is the caller's whole wait,
   // and the stub build below can queue for a worker of its own.
@@ -1479,6 +1546,7 @@ export async function runInSandbox(
                 inputs: runOpts?.inputs,
                 printCallback,
                 mount,
+                os: wallClockOs(hostEpochSecs),
               });
             } catch (err) {
               return classifyStartError(err, acc, runOpts?.lineOffset);
@@ -1550,6 +1618,9 @@ export async function resumeSuspended(
   }
 
   const printCallback = makePrintCallback(acc, runOpts);
+  // The resume's own pinned clock: `date.today()` / `datetime.now()` after the
+  // gate read this call's value, not a value from before the suspension.
+  const hostEpochSecs = runEpochSecs(runOpts);
 
   // The suspended run's worker was released when it suspended — the dump is
   // the whole of its state — so resuming takes a fresh one. The mounts have to
@@ -1566,9 +1637,9 @@ export async function resumeSuspended(
   //   - `externalLookup` — consulted only by `resumeAuto()` for host
   //     functions; this loop answers every `NameLookupSnapshot` itself with
   //     `resume(name)`, so there is nothing to carry.
-  //   - `os` — consulted only by `resumeAuto()` for OS calls the mounts do not
-  //     cover; never supplied on `feedStart` either, so deny-by-default holds
-  //     on both sides of the suspension.
+  //   - `os` — re-supplied below with this call's pinned wall clock, so
+  //     `date.today()` / `datetime.now()` keep working after the resume; it
+  //     declines every other OS call, so the mounts' deny-by-default is intact.
   // Not options of the load at all: `inputs` are globals in the snapshot; the
   // compute budget travels with it, limit and elapsed both (measured — the
   // checkout's `limits` below govern nothing the restored feed does except
@@ -1598,7 +1669,7 @@ export async function resumeSuspended(
                 options,
                 runOpts,
                 acc,
-                { printCallback, mount },
+                { printCallback, mount, os: wallClockOs(hostEpochSecs) },
                 offTheClock,
               ),
           ),
@@ -1618,7 +1689,7 @@ async function resumeInSession(
   options: SandboxOptions,
   runOpts: RunOptions | undefined,
   acc: DispatchAccumulators,
-  loadOpts: { printCallback: PrintCallback; mount: MountDir[] | undefined },
+  loadOpts: { printCallback: PrintCallback; mount: MountDir[] | undefined; os: OsCallback },
   offTheClock: OffTheClock,
 ): Promise<RunResult> {
   const registry = options.registry;

@@ -916,6 +916,48 @@ describe("runInSandbox — inputs", () => {
   });
 });
 
+// ── Wall clock ────────────────────────────────────────────────────
+//
+// Monty's WASM sandbox has no clock: `datetime.date.today()` and
+// `datetime.datetime.now()` surface as OS calls the host answers. The sandbox
+// injects the host epoch (or a caller-pinned one, for a deterministic run) and
+// answers those two calls from it.
+
+describe("runInSandbox — wall clock (datetime)", () => {
+  const registry = new ToolRegistry();
+
+  it("date.today() returns the UTC date for the injected epoch", async () => {
+    // 1700000000 seconds past the Unix epoch is 2023-11-14T22:13:20Z.
+    const result = await runInSandbox(
+      "import datetime\ndatetime.date.today().isoformat()",
+      { registry },
+      { hostEpochSecs: 1700000000 },
+    );
+    ok(result);
+    assert.equal(result.output, "2023-11-14");
+  });
+
+  it("datetime.now() returns the UTC datetime for the injected epoch", async () => {
+    const result = await runInSandbox(
+      "import datetime\ndatetime.datetime.now().isoformat()",
+      { registry },
+      { hostEpochSecs: 1700000000 },
+    );
+    ok(result);
+    assert.equal(result.output, "2023-11-14T22:13:20");
+  });
+
+  it("datetime.now() carries sub-second precision from a fractional epoch", async () => {
+    const result = await runInSandbox(
+      "import datetime\ndatetime.datetime.now().isoformat()",
+      { registry },
+      { hostEpochSecs: 1700000000.5 },
+    );
+    ok(result);
+    assert.equal(result.output, "2023-11-14T22:13:20.500000");
+  });
+});
+
 // ── Mount ─────────────────────────────────────────────────────────
 
 describe("runInSandbox — mount", () => {
