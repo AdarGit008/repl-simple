@@ -5,7 +5,8 @@
 `http_get` is the sandbox's only way to reach the network — Monty itself has none — so it is the leg
 of the read/execute/egress trifecta that decides whether a compromised script can *send* what it
 read. It shipped ungated: no approval, no destination policy, and `redirect: "follow"`, which
-[`docs/REVIEW.md` B3, H36] measured as a **zero-prompt exfiltration path** and a working SSRF
+[`docs/REVIEW.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/docs/REVIEW.md) B3, H36
+(now in the private repl-simple-lab repo) measured as a **zero-prompt exfiltration path** and a working SSRF
 primitive (a public-looking host answering `302 → http://127.0.0.1:<port>/` returned the internal
 body).
 

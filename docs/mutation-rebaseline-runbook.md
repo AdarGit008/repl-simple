@@ -82,7 +82,7 @@ unchanged. With `coverageAnalysis: "off"` and `incremental: true`, the
 incremental differ's `mutantCanBeReused` answers *true* for every mutant whose source and tests did
 not change textually, because the runner reported no coverage to compare — so a sweep against an
 existing `.stryker-incremental.json` **re-executes nothing** and reproduces the previous run's
-statuses under a fresh timestamp. Observed on the #150 flight (`docs/ship-150.md`): 0 of 287 mutants
+statuses under a fresh timestamp. Observed on the #150 flight ([`docs/ship-150.md`](https://github.com/AdarGit008/repl-simple-lab/blob/main/docs/ship-150.md) in the private repl-simple-lab repo): 0 of 287 mutants
 re-ran, and every `statusReason` still cited the previous run's sandbox token. A re-baseline against
 a stale cache would "measure" the pre-0.0.21 numbers again and call them new.
 
