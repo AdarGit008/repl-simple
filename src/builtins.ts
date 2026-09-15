@@ -3,6 +3,7 @@ import { open, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
+import { Agent } from "undici";
 import { createPathJail } from "./pathjail.js";
 import { requireString } from "./registry.js";
 import {
@@ -239,11 +240,11 @@ function isBlockedIpv6(groups: number[]): boolean {
  * `assertReachable` resolves twice, refuses unless the address set is
  * unchanged (order-insensitively), and any hostname that has ever resolved to
  * a private/reserved address is refused process-lifetime. The validated
- * address set is then handed back to `fetchGuarded`, which connects to one of
- * those literal addresses — the name is never handed to `fetch`, so a
- * connect-time resolution cannot differ from what was validated. The original
- * host rides along in the `Host` header so name-based virtual hosting still
- * routes.
+ * address set is then handed back to `fetchGuarded`, which overrides only DNS
+ * resolution via an undici `Agent` `connect.lookup` — the name is never handed
+ * to the OS resolver at connect time, so a connect-time resolution cannot
+ * differ from what was validated. The URL keeps the original hostname, so SNI,
+ * certificate verification and the `Host` header all stay on the real name.
  */
 async function defaultLookup(hostname: string): Promise<string[]> {
   const results = await lookup(hostname, { all: true, verbatim: true });
@@ -264,18 +265,6 @@ function sameAddressSet(first: string[], second: string[]): boolean {
     if (!b.has(address)) return false;
   }
   return true;
-}
-
-/**
- * Rewrite a URL so its host is a validated literal address, keeping the port,
- * path, query and fragment. The caller sets the original `Host` header
- * separately so the connection still identifies the name it was asked for.
- */
-function pinUrlToAddress(url: URL, addresses: string[]): URL {
-  const pinned = new URL(url.href);
-  const address = addresses[0];
-  pinned.hostname = isIP(address) === 6 ? `[${address}]` : address;
-  return pinned;
 }
 
 /** Split and clean a comma-separated allowlist; empty entries drop out. */
@@ -603,8 +592,9 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
    *
    * The validation lookups are `dns.lookup`, which takes no signal, so a
    * resolver that hangs is bounded by the OS resolver's own timeout and not by
-   * this one. The connection itself is pinned to a validated literal address,
-   * so it performs no further name resolution.
+   * this one. Each hop is fetched through an undici `Agent` whose
+   * `connect.lookup` resolves the validated addresses, so the connection
+   * performs no further name resolution of its own.
    */
   async function fetchGuarded(initial: string): Promise<Response> {
     const signal = AbortSignal.timeout(httpTimeoutMs);
@@ -617,15 +607,29 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
 
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
       const addresses = await assertReachable(url);
-      const pinned = pinUrlToAddress(url, addresses);
+      const dispatcher = new Agent({
+        connect: {
+          lookup: (_hostname, _options, callback) => {
+            callback(
+              null,
+              addresses.map((address) => ({
+                address,
+                family: isIP(address) === 6 ? 6 : 4,
+              })),
+            );
+          },
+        },
+      });
+
       let response: Response;
       try {
-        response = await fetchImpl(pinned.href, {
+        response = await fetchImpl(url.href, {
           redirect: "manual",
           signal,
-          headers: { Host: url.host },
-        });
+          dispatcher,
+        } as RequestInit & { dispatcher: Agent });
       } catch (e) {
+        void dispatcher.close().catch(() => {});
         const err = e as Error;
         if (err.name === "TimeoutError" || err.name === "AbortError" || signal.aborted) {
           throw new HostToolError("TimeoutError", `request to '${url.href}' timed out`);
@@ -638,11 +642,17 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
         : null;
       // A 3xx with no Location is not a redirect anyone can follow; hand it
       // back and let the `ok` check report it as the error status it is.
-      if (location === null) return response;
+      if (location === null) {
+        // The body is read by the caller after we return; `close()` is
+        // graceful and waits for that stream rather than tearing it down.
+        void dispatcher.close().catch(() => {});
+        return response;
+      }
 
       // Nothing here will read this body, and an unread stream holds the
       // connection open until GC.
       await response.body?.cancel().catch(() => {});
+      await dispatcher.close().catch(() => {});
       try {
         url = new URL(location, url);
       } catch {

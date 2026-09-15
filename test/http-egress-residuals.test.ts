@@ -48,8 +48,9 @@ describe("http_get — #199 residuals", () => {
     // A rebinding resolver that answers public to BOTH validation lookups and
     // private only to the connection is invisible to the address check. The
     // property that closes the window is that the connection never resolves
-    // the name itself: `fetch` is handed a validated literal address, with the
-    // original authority preserved in the Host header.
+    // the name itself: `fetch` is handed the original hostname URL with a
+    // dispatcher whose `connect.lookup` pins DNS to the validated addresses,
+    // so a connect-time resolution cannot differ from what was validated.
     const validated = ["93.184.216.34"];
     let lookups = 0;
     const handed: { url: string; init: RequestInit | undefined }[] = [];
@@ -73,18 +74,16 @@ describe("http_get — #199 residuals", () => {
     assert.equal(handed.length, 1);
 
     const target = new URL(handed[0].url);
-    assert.ok(
-      validated.includes(target.hostname),
-      `fetch was handed '${target.hostname}', not a validated address — the ` +
-        "connection resolves the name again, outside validation",
+    assert.equal(
+      target.hostname,
+      "rebind.example.com",
+      "fetch must keep the original hostname, not a validated IP",
     );
     assert.equal(lookups, 2, "two validation lookups, no connect-time resolution");
-    const hostHeader = new Headers(handed[0].init?.headers).get("host");
-    assert.equal(
-      hostHeader,
-      "rebind.example.com",
-      "the original authority must be preserved in the Host header",
-    );
+
+    const dispatcher = (handed[0].init as (RequestInit & { dispatcher?: unknown }) | undefined)
+      ?.dispatcher;
+    assert.ok(dispatcher, "fetch must receive a dispatcher pinning DNS to the validated address");
   });
 
   it("remembers a hostname first refused at saturation (R1: refuse AND record)", {
