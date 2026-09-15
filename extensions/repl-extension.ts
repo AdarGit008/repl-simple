@@ -34,6 +34,40 @@ export function defaultRlmBudget(): number {
   return Number.isFinite(parsed) ? parsed : DEFAULT_RLM_BUDGET;
 }
 
+/** Ceiling on a model-supplied `maxIterations` — the loop's default. */
+const RLM_MAX_ITERATIONS = 10;
+/** Ceiling on a model-supplied `maxDepth` — the loop's default. */
+const RLM_MAX_DEPTH = 1;
+
+/**
+ * Clamp the model-supplied `rlm` limits to their ceilings.
+ *
+ * The `rlm` tool is the same model boundary the `repl` tool clamps through
+ * `clampModelLimits`, so these knobs are clamped, never trusted:
+ * `budget` is capped at `defaultRlmBudget()` (the env override is a ceiling,
+ * not merely a default the model can out-ask), `maxIterations` at 10 and
+ * `maxDepth` at 1. A value that is not the right kind of number is omitted
+ * so the loop's own default applies — the model saying nothing and the model
+ * saying nonsense mean the same thing.
+ */
+export function clampRlmLimits(
+  budget?: unknown,
+  maxIterations?: unknown,
+  maxDepth?: unknown,
+): { budget?: number; maxIterations?: number; maxDepth?: number } {
+  const out: { budget?: number; maxIterations?: number; maxDepth?: number } = {};
+  if (typeof budget === "number" && Number.isFinite(budget) && budget >= 0) {
+    out.budget = Math.min(budget, defaultRlmBudget());
+  }
+  if (typeof maxIterations === "number" && Number.isInteger(maxIterations) && maxIterations >= 1) {
+    out.maxIterations = Math.min(maxIterations, RLM_MAX_ITERATIONS);
+  }
+  if (typeof maxDepth === "number" && Number.isInteger(maxDepth) && maxDepth >= 0) {
+    out.maxDepth = Math.min(maxDepth, RLM_MAX_DEPTH);
+  }
+  return out;
+}
+
 /**
  * The tool registry one `rlm` call runs against: the read-only pi bridge
  * tools with mutating tools gated, plus the builtins with an EMPTY
@@ -1741,12 +1775,13 @@ export default function (pi: ReplExtensionApi) {
         const cwd = ctx.cwd;
         const registry = buildRlmRegistry(cwd);
         const llmClient = createLlmClient(ctx, { model: params.model, provider: params.provider });
-        const budget = params.budget ?? defaultRlmBudget();
+        const limits = clampRlmLimits(params.budget, params.maxIterations, params.maxDepth);
+        const budget = limits.budget ?? defaultRlmBudget();
         const result = await runRlm(params.question, {
           llmClient,
           registry,
-          maxIterations: params.maxIterations,
-          maxDepth: params.maxDepth,
+          maxIterations: limits.maxIterations,
+          maxDepth: limits.maxDepth,
           budget,
           signal,
         });

@@ -41,6 +41,8 @@ import {
   STDOUT_RECOVERY,
   OUTPUT_MAX_BYTES,
   VALUE_RECOVERY,
+  VALUE_HEAD_RATIO,
+  truncateText,
 } from "./truncate.js";
 import { HostToolError } from "./types.js";
 import { SubmitSignal } from "./submit_signal.js";
@@ -179,11 +181,27 @@ class DispatchAccumulators {
   }
 }
 
+/**
+ * Recovery clause for a truncated error. The model owns the Python, so it
+ * can wrap the failing code in `try/except` and print the full traceback to
+ * see the whole exception the cap elided away (docs/truncation-policy.md
+ * #144).
+ */
+const ERROR_RECOVERY = "Catch the exception and print the full traceback to see more.";
+
 /** Assemble a `RunError` around whatever the accumulators hold. */
 function runError(kind: RunErrorKind, error: string, acc: DispatchAccumulators): RunError {
+  // The one place a `RunError.error` is made, whichever classifier builds it
+  // (#144): cap the diagnostic at the `output` budget (16 KiB, 50/50 head+tail)
+  // so both the `repl` tool and every RLM iteration read a bounded error.
+  const capped = truncateText(error, {
+    maxBytes: OUTPUT_MAX_BYTES,
+    headRatio: VALUE_HEAD_RATIO,
+    recovery: ERROR_RECOVERY,
+  }).text;
   return {
     status: "error",
-    error,
+    error: capped,
     errorKind: kind,
     stdout: acc.stdout,
     stdoutTruncated: acc.stdoutTruncated,

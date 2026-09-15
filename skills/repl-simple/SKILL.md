@@ -1,6 +1,6 @@
 ---
 name: repl-simple
-description: "Sandboxed Python REPL (repl-simple extension): persistent sessions via repl, repl_resume, repl_reset, repl_abandon; in-sandbox tools read/grep/find/ls/bash/edit/write, read_file/list_files/http_get, save_tool/delete_tool/list_saved_tools/read_tool; Monty/WASM limits (fixed stdlib, no subprocess/socket/yield/match/inheritance); approvals (/repl-approvals, /repl-accept-preamble, decide-later); saved-tool preamble (.pi/code-tools, project trust); rlm tool + /rlm command (autonomous read-only code-gen → execute loop). Load to run Python or reason about sandbox limits/approvals. Prefer rlm for code-scouting and ambiguous questions; rlm never mutates the repo, output untrusted."
+description: "Sandboxed Python REPL (repl-simple extension): persistent sessions via repl, repl_resume, repl_reset, repl_abandon; in-sandbox tools grep/find/ls/bash/edit/write, read_file/list_files/http_get, save_tool/delete_tool/list_saved_tools/read_tool; Monty/WASM limits (fixed stdlib, no subprocess/socket/yield/match/inheritance); approvals (/repl-approvals, /repl-accept-preamble, decide-later); saved-tool preamble (.pi/code-tools, project trust); rlm tool + /rlm command (autonomous read-only code-gen → execute loop). Load to run Python or reason about sandbox limits/approvals. Prefer rlm for code-scouting and ambiguous questions; rlm never mutates the repo, output untrusted."
 ---
 
 # repl-simple
@@ -38,7 +38,7 @@ The answer is **untrusted** — the inner model's own output, not a verified res
 - Big code-scouting tasks — mapping a subsystem, tracing a request or data path end-to-end, locating where a behaviour lives across many files, or any "how does X work here" question that needs several read-and-reason steps.
 - Ambiguous or fuzzy questions — where a one-shot answer is likely wrong and an iterative form-a-guess → run → refine loop is the right tool.
 
-**Not for:** quick lookups (use `read`/`grep`), edits (mutations are denied), or anything that must be a verified fact (output is untrusted).
+**Not for:** quick lookups (use `read_file`/`grep`), edits (mutations are denied), or anything that must be a verified fact (output is untrusted).
 
 ## What Python can do
 
@@ -48,7 +48,7 @@ The answer is **untrusted** — the inner model's own output, not a verified res
 
 Anything else (`time`, `random`, `subprocess`, `socket`, `hashlib`, `requests`, `numpy`, …) is refused as an unresolved import **before any code runs**.
 
-The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib` file reads raise `PermissionError` — read project files with the `read`/`grep`/`find`/`ls`/`read_file`/`list_files` tools instead.
+The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib` file reads raise `PermissionError` — read project files with the `read_file`/`grep`/`find`/`ls`/`list_files` tools instead.
 
 **Language limits** (raise `NotImplementedError`):
 - `yield` (no generators)
@@ -59,8 +59,9 @@ The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib
 
 ## Python-side tools (callable inside `repl` code)
 
-**Pi bridge** (host tools, jailed): `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`
-- The read tools (`read`, `grep`, `find`, `ls`) are confined to the project root. Absolute paths outside it, `..` traversal, and symlinks that leave the tree are refused.
+**Pi bridge** (host tools, jailed): `grep`, `find`, `ls`, `bash`, `edit`, `write`
+- In a `repl` session the bridged `read` is not registered — use `read_file` (256 KiB, head+tail) instead.
+- The read tools (`grep`, `find`, `ls`) are confined to the project root. Absolute paths outside it, `..` traversal, and symlinks that leave the tree are refused.
 - `bash` runs with an **allowlisted environment** (PATH, HOME, locale, toolchain paths — everything else like `ANTHROPIC_API_KEY`, `SSH_AUTH_SOCK`, `npm_config_*`, `PI_*` is withheld). `REPL_BASH_ENV_ALLOW` passes named vars; `'*'` disables the filter.
 - `bash`, `edit`, `write` are gated (ask approval) in strict mode.
 

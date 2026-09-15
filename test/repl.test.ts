@@ -170,9 +170,10 @@ describe("ReplRunner — bridge tools", () => {
     assert.ok(out.includes("hello.txt"));
   });
 
-  it("can read a file with read()", async () => {
+  it("does not expose the bridged read()", async () => {
     const out = await runner.run("read('hello.txt')");
-    assert.ok(out.includes("hello world"));
+    assert.match(out, /used when not defined/);
+    assert.ok(!out.includes("hello world"));
   });
 
   it("can find files with find()", { skip: BRIDGE_TOOLS_SKIP }, async () => {
@@ -195,6 +196,10 @@ describe("ReplRunner — builtin tools", () => {
   before(() => {
     cwd = makeTempDir();
     writeFileSync(join(cwd, "data.txt"), "builtin test\n");
+    writeFileSync(
+      join(cwd, "big1.txt"),
+      `HEAD-big1.txt\n${"A".repeat(300 * 1024)}\nTAIL-big1.txt\n`,
+    );
     runner = new ReplRunner(cwd);
   });
 
@@ -208,6 +213,18 @@ describe("ReplRunner — builtin tools", () => {
   it("can read a file with read_file()", async () => {
     const out = await runner.run("read_file('data.txt')");
     assert.ok(out.includes("builtin test"));
+  });
+
+  it("read_file truncates a >256 KiB file head+tail in-band", async () => {
+    const out = await runner.run(
+      "s = read_file('big1.txt')\n" +
+        "print('Read a narrower slice of the file to see more.' in s)\n" +
+        "print(s[:20])\n" +
+        "print(s[-20:])",
+    );
+    assert.match(out, /True/);
+    assert.match(out, /HEAD-big1\.txt/, "the read_file head was lost");
+    assert.match(out, /TAIL-big1\.txt/, "the read_file tail was lost");
   });
 });
 
@@ -262,11 +279,10 @@ describe("ReplRunner — http_get is not a silent egress", () => {
 /**
  * The read half of the same chain, through the shipped path.
  *
- * B3 measured the bridged `read` reaching anything the Pi process could —
- * with no prompt — while `read_file` next to it in the same registry refused.
- * Asserted here at the seam a user actually reaches, because the bridge unit
- * tests construct their own tools and so cannot catch `ReplRunner` handing
- * them the wrong root, or none.
+ * B3 measured a bridged reader reaching anything the Pi process could — with
+ * no prompt — while `read_file` next to it in the same registry refused. That
+ * bridged reader is no longer registered in a session; `read_file` is the only
+ * reader, so the jail test exercises it directly.
  */
 describe("ReplRunner — the read tools cannot leave cwd", () => {
   let runner: ReplRunner;
@@ -276,15 +292,15 @@ describe("ReplRunner — the read tools cannot leave cwd", () => {
     const cwd = makeTempDir();
     writeFileSync(join(cwd, "inside.txt"), "IN-ROOT-VALUE\n");
     // Outside the runner's root, and not somewhere the suite may write to.
-    secret = "/etc/hostname";
+    secret = "../outside.txt";
     runner = new ReplRunner(cwd);
   });
 
   after(cleanup);
 
-  it("refuses an absolute path outside the root, with no prompt", async () => {
+  it("refuses a path outside the root, with no prompt", async () => {
     const prompts: string[] = [];
-    const out = await runner.run(`read(path='${secret}')`, "jail", async (req) => {
+    const out = await runner.run(`read_file(path='${secret}')`, "jail", async (req) => {
       prompts.push(req.tool);
       return true;
     });
@@ -293,9 +309,9 @@ describe("ReplRunner — the read tools cannot leave cwd", () => {
     assert.match(out, /outside the project root/, "the refusal must say why");
   });
 
-  it("refuses '..' for read, ls, grep and find alike", async () => {
+  it("refuses '..' for read_file, ls, grep and find alike", async () => {
     for (const call of [
-      "read(path='../../etc/hostname')",
+      "read_file(path='../../etc/hostname')",
       "ls(path='../..')",
       "grep(pattern='root', path='../..')",
       "find(pattern='*', path='../..')",
@@ -306,7 +322,7 @@ describe("ReplRunner — the read tools cannot leave cwd", () => {
   });
 
   it("still reads inside the root", async () => {
-    const out = await runner.run("read(path='inside.txt')", "jail");
+    const out = await runner.run("read_file(path='inside.txt')", "jail");
     assert.match(out, /IN-ROOT-VALUE/);
   });
 });
@@ -3646,18 +3662,20 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
   before(() => {
     cwd = makeTempDir();
     writeFileSync(join(cwd, "hello.txt"), "hello world\n");
-    // Over pi's 2000-line read limit, so the bridged read reports truncation.
-    writeFileSync(
-      join(cwd, "big.txt"),
-      `${Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n")}\n`,
-    );
+    // read_file truncates over 256 KiB, so each file is a distinct big read
+    // (read_file takes only a path — no offset/limit to vary).
+    const writeBigFile = (name: string) =>
+      writeFileSync(join(cwd, name), `HEAD-${name}\n${"A".repeat(300 * 1024)}\nTAIL-${name}\n`);
+    writeBigFile("big1.txt");
+    writeBigFile("big2.txt");
+    writeBigFile("big3.txt");
     runner = new ReplRunner(cwd);
   });
 
   after(cleanup);
 
   const CODE = [
-    "read('hello.txt')",
+    "read_file('hello.txt')",
     "write('a.txt', 'x')",
     "try:",
     "    write('b.txt', 'y')",
@@ -3678,7 +3696,7 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
     assert.equal(traced.sessionId, "traced");
     assert.equal(traced.status, "ok");
     assert.deepEqual(outline(traced), [
-      ["read", true, undefined],
+      ["read_file", true, undefined],
       ["write", true, true],
       ["write", false, false],
     ]);
@@ -3688,13 +3706,13 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
   });
 
   it("an error result carries errorKind and the calls up to the failure", async () => {
-    const code = "read('hello.txt')\nraise ValueError('x')";
+    const code = "read_file('hello.txt')\nraise ValueError('x')";
     const plain = await runner.run(code, "err-plain");
     const traced = await runner.runWithTrace(code, "err-traced");
     assert.equal(traced.text, plain);
     assert.equal(traced.status, "error");
     assert.equal(traced.errorKind, "runtime");
-    assert.deepEqual(outline(traced), [["read", true, undefined]]);
+    assert.deepEqual(outline(traced), [["read_file", true, undefined]]);
   });
 
   it("the resume early returns are statuses with no calls", async () => {
@@ -3737,7 +3755,7 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
   });
 
   it("a suspended trace carries the calls so far and the waiting call; the resumed trace is the whole run and matches resume()", async () => {
-    const code = "read('hello.txt')\nwrite('s.txt', 'v')\nread('hello.txt')";
+    const code = "read_file('hello.txt')\nwrite('s.txt', 'v')\nread_file('hello.txt')";
     // Two runners over the same cwd, the same session id in each, one
     // through each API: the texts — which name the session — must agree at
     // both steps.
@@ -3746,7 +3764,7 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
     const tracedPaused = await runner.runWithTrace(code, "s", suspend);
     assert.equal(tracedPaused.text, plainPaused);
     assert.equal(tracedPaused.status, "suspended");
-    assert.deepEqual(outline(tracedPaused), [["read", true, undefined]]);
+    assert.deepEqual(outline(tracedPaused), [["read_file", true, undefined]]);
     assert.equal(tracedPaused.suspendedCall?.tool, "write");
     assert.deepEqual(tracedPaused.suspendedCall?.args, ["s.txt", "v"]);
 
@@ -3755,67 +3773,65 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
     assert.equal(tracedDone.text, plainDone);
     assert.equal(tracedDone.status, "ok");
     assert.deepEqual(outline(tracedDone), [
-      ["read", true, undefined],
+      ["read_file", true, undefined],
       ["write", true, true],
-      ["read", true, undefined],
+      ["read_file", true, undefined],
     ]);
     assert.equal(tracedDone.suspendedCall, undefined);
   });
 
-  it("bridged details are merged, and stay aligned across a suspension", async () => {
-    // pi's read reports details only when it truncated, so both reads are
-    // over the line limit — with different offsets, so they are two calls.
-    const code = "read('big.txt')\nwrite('d.txt', 'x')\nread('big.txt', 2)";
+  it("builtin read_file carries no bridged details, and stays aligned across a suspension", async () => {
+    // read_file truncates in-band (a head+tail marker in the returned text),
+    // not through pi's `details.truncation`; two distinct big files are two
+    // calls, since read_file takes a path and no offset/limit.
+    const code = "read_file('big1.txt')\nwrite('d.txt', 'x')\nread_file('big2.txt')";
     const paused = await runner.runWithTrace(code, "details", suspend);
-    const big = paused.calls[0].details as { truncation?: { truncated: boolean } } | undefined;
-    assert.equal(big?.truncation?.truncated, true, JSON.stringify(paused.calls[0]));
+    assert.equal(paused.calls[0].details, undefined, "read_file has no pi details");
 
     const done = await runner.resumeWithTrace("details", approve);
     assert.deepEqual(outline(done), [
-      ["read", true, undefined],
+      ["read_file", true, undefined],
       ["write", true, true],
-      ["read", true, undefined],
+      ["read_file", true, undefined],
     ]);
-    type Details = { truncation?: { truncated: boolean; totalLines: number } } | undefined;
-    const first = done.calls[0].details as Details;
-    const last = done.calls[2].details as Details;
-    assert.equal(first?.truncation?.truncated, true, "the pre-suspension read lost its details");
+    assert.equal(done.calls[0].details, undefined, "the pre-suspension read_file gained details");
     assert.equal(done.calls[1].details, undefined, "pi's write has no details to merge");
-    assert.equal(last?.truncation?.truncated, true, "the post-suspension read lost its details");
-    assert.deepEqual(done.calls[2].args, ["big.txt", 2]);
+    assert.equal(done.calls[2].details, undefined, "the post-suspension read_file gained details");
+    assert.deepEqual(done.calls[0].args, ["big1.txt"]);
+    assert.deepEqual(done.calls[2].args, ["big2.txt"]);
   });
 
   it("replay-served entries are excluded from error and suspended results", async () => {
-    await runner.run("read('hello.txt')", "raw");
+    await runner.run("read_file('hello.txt')", "raw");
 
-    // The transcript re-executes the first snippet, whose read is served from
-    // the cache. Session filters that out of an ok result only (measured):
+    // The transcript re-executes the first snippet, whose read_file is served
+    // from the cache. Session filters that out of an ok result only (measured):
     // the trace has to be what executed, whatever the outcome.
-    const failed = await runner.runWithTrace("read('big.txt', 1, 1)\nraise ValueError('e')", "raw");
+    const failed = await runner.runWithTrace("read_file('big1.txt')\nraise ValueError('e')", "raw");
     assert.equal(failed.status, "error");
     assert.deepEqual(
       failed.calls.map((c) => [c.tool, c.args[0]]),
-      [["read", "big.txt"]],
+      [["read_file", "big1.txt"]],
     );
 
     const paused = await runner.runWithTrace(
-      "read('big.txt', 2, 1)\nwrite('raw.txt', 'x')",
+      "read_file('big2.txt')\nwrite('raw.txt', 'x')",
       "raw",
       suspend,
     );
     assert.equal(paused.status, "suspended");
     assert.deepEqual(
       paused.calls.map((c) => c.args),
-      [["big.txt", 2, 1]],
+      [["big2.txt"]],
     );
 
     // And the ok path, which Session filters itself, agrees.
     runner.abandon("raw");
-    const ok = await runner.runWithTrace("read('big.txt', 3, 1)", "raw");
+    const ok = await runner.runWithTrace("read_file('big3.txt')", "raw");
     assert.equal(ok.status, "ok");
     assert.deepEqual(
       ok.calls.map((c) => c.args),
-      [["big.txt", 3, 1]],
+      [["big3.txt"]],
     );
   });
 
@@ -3823,11 +3839,11 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
     // Failures are not cached, so they cannot be replayed — and must not be
     // dropped as if they had been.
     const traced = await runner.runWithTrace(
-      "try:\n    read('../outside.txt')\nexcept PermissionError:\n    print('refused')",
+      "try:\n    read_file('../outside.txt')\nexcept PermissionError:\n    print('refused')",
       "fail",
     );
     assert.equal(traced.status, "ok");
-    assert.deepEqual(outline(traced), [["read", false, undefined]]);
+    assert.deepEqual(outline(traced), [["read_file", false, undefined]]);
     assert.match(traced.calls[0].error ?? "", /outside the project root/);
   });
 
@@ -3843,9 +3859,12 @@ describe("ReplRunner — runWithTrace and resumeWithTrace (#46, decision 11)", (
   }, async () => {
     await runner.run("1", "concurrent");
     const [a, b] = await Promise.all([
-      runner.runWithTrace("read('hello.txt')\nread('hello.txt')\nread('hello.txt')", "concurrent"),
       runner.runWithTrace(
-        "read('big.txt', 1, 1)\nread('big.txt', 2, 1)\nread('big.txt', 3, 1)",
+        "read_file('hello.txt')\nread_file('hello.txt')\nread_file('hello.txt')",
+        "concurrent",
+      ),
+      runner.runWithTrace(
+        "read_file('big1.txt')\nread_file('big2.txt')\nread_file('big3.txt')",
         "concurrent",
       ),
     ]);
