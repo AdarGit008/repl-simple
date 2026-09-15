@@ -21,5 +21,5 @@ reports/
 # biome.json; Biome's scanner then reports "Found a nested root configuration"
 # and `npm run lint` fails in the main checkout. Ignored here (Biome honours
 # .gitignore), in biome.json (`!!.claude`) and in knip.json. Nothing under it
-# is this project's source. See README, "Formatting and lint".
+# is this project's source. See CONTRIBUTING.md, "Formatting and lint".
 .claude/
