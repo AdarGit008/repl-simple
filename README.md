@@ -26,9 +26,11 @@ A sandboxed Python REPL and `rlm`, a read-only code-investigation loop, for the
 - **[pi](https://github.com/earendil-works/pi)** (`@earendil-works/pi-coding-agent`). The declared
   peer range is `^0.84.1`.
 - **Node >= 22.19.0** (`engines` in `package.json`, `.nvmrc`).
-- **A glibc platform with a `@pydantic/monty` binary:** Linux x64/arm64 (glibc), macOS x64/arm64,
-  or Windows x64. **Alpine/musl does not work**: `@pydantic/monty` publishes no musl binary, and the
-  install succeeds before failing at load. See [docs/platform-support.md](docs/platform-support.md).
+- **A glibc platform with a `@pydantic/monty` binary:** Linux x64/arm64 (glibc) or macOS
+  x64/arm64, which CI tests on `ubuntu-latest` and `macos-latest`. Windows x64 has a published binary
+  but is **not exercised in CI**. **Alpine/musl does not work**: `@pydantic/monty` publishes no musl
+  binary, and the install succeeds before failing at load. See
+  [docs/platform-support.md](docs/platform-support.md).
 - **No host Python.** The interpreter ships with `@pydantic/monty`.
 - **`fd` and `rg` (ripgrep)** for the bridged `find` and `grep` tools. pi looks for them on `PATH`
   (`fdfind` counts as `fd`) and in its own tool directory, and downloads them on first use when they
