@@ -272,6 +272,22 @@ describe("renderPythonToolRules", () => {
     assert.match(rules, /read_file, list_files/);
   });
 
+  it("gives concrete tool call examples and a PermissionError recovery hint", () => {
+    // The loop's model, pointed at project files, defaults to os.listdir()/
+    // open() and stalls on PermissionError before discovering the bridge read
+    // tools. Concrete call shapes plus an explicit "you used a filesystem API —
+    // switch to these tools" recovery rule are what stop that first-iteration
+    // stall (e2e finding: an un-hinted file-count question hit max_iterations;
+    // the same question with a find(pattern=…) hint returned the right count).
+    const rules = renderPythonToolRules(["json"]);
+    assert.ok(rules.includes('find(pattern="*.ts", path="src")'), rules);
+    assert.ok(rules.includes('ls("src")'), rules);
+    assert.ok(rules.includes('read("src/rlm.ts")'), rules);
+    assert.ok(rules.includes('grep(pattern="runRlm", path="src")'), rules);
+    assert.match(rules, /you used a filesystem API/);
+    assert.match(rules, /switch to these tools/);
+  });
+
   it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", async () => {
     // Prompt text is behaviour (D156): the sentence describes the interpreter,
     // so the interpreter is measured in the same test. W2-3 recorded this as

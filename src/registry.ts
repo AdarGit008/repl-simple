@@ -520,6 +520,9 @@ export function renderPythonToolRules(importableModules: string[]): string {
   read_file, list_files) — never open(), os.listdir(), or pathlib. The sandbox
   has no filesystem of its own, so those raise PermissionError and cannot see
   project files.
+- Example calls: find(pattern="*.ts", path="src"), ls("src"), read("src/rlm.ts"),
+  grep(pattern="runRlm", path="src"). If a run fails with PermissionError on
+  open()/os.listdir()/pathlib, you used a filesystem API — switch to these tools.
 - Class inheritance, metaclasses and match statements are not supported (NotImplementedError);
   a plain class with __init__ and methods works.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,
