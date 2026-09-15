@@ -53,10 +53,15 @@ function cleanup() {
   if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
 }
 
-function findTool(tools: HostTool[], name: string): HostTool {
+/** A toolstore tool: all four return a string (`execute` returns `Promise<string>`). */
+type StringTool = Omit<HostTool, "execute"> & {
+  execute: (args: Record<string, unknown>) => string | Promise<string>;
+};
+
+function findTool(tools: HostTool[], name: string): StringTool {
   const tool = tools.find((t) => t.name === name);
   if (!tool) throw new Error(`Tool '${name}' not found`);
-  return tool;
+  return tool as StringTool;
 }
 
 function makeTools(root: string): { tools: HostTool[]; opts: ToolStoreOptions } {

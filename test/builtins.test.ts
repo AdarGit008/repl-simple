@@ -82,7 +82,7 @@ describe("createBuiltinTools — structure", () => {
       assert.ok(tool.name.length > 0);
       assert.equal(typeof tool.description, "string");
       assert.ok(Array.isArray(tool.params));
-      assert.ok(tool.returns === "str" || tool.returns === "void");
+      assert.ok(tool.returns === "str" || tool.returns === "void" || tool.returns === "list[str]");
       assert.equal(typeof tool.execute, "function");
     }
   });
@@ -152,11 +152,11 @@ describe("createBuiltinTools — structure", () => {
     assert.equal(tool.params[0].optional, undefined);
   });
 
-  it("all tools declare returns: 'str'", () => {
+  it("read_file and http_get declare 'str'; list_files declares 'list[str]'", () => {
     const tools = createBuiltinTools({ root: "/tmp" });
-    for (const tool of tools) {
-      assert.equal(tool.returns, "str");
-    }
+    assert.equal(findTool(tools, "read_file").returns, "str");
+    assert.equal(findTool(tools, "list_files").returns, "list[str]");
+    assert.equal(findTool(tools, "http_get").returns, "str");
   });
 });
 
@@ -281,25 +281,24 @@ describe("list_files — integration", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it("lists entries with trailing '/' for directories, newline-separated", async () => {
+  it("lists entries as an array with trailing '/' for directories", async () => {
     const tools = createBuiltinTools({ root });
     const listFiles = findTool(tools, "list_files");
     const result = await listFiles.execute({ path: "." });
-    assert.equal(typeof result, "string");
-    const entries = result.split("\n");
-    assert.ok(entries.includes("a.txt"));
-    assert.ok(entries.includes("b.txt"));
-    assert.ok(entries.includes("subdir/"));
+    assert.ok(Array.isArray(result));
+    assert.ok(result.includes("a.txt"));
+    assert.ok(result.includes("b.txt"));
+    assert.ok(result.includes("subdir/"));
   });
 
   it("returns sorted entries", async () => {
     const tools = createBuiltinTools({ root });
     const listFiles = findTool(tools, "list_files");
     const result = await listFiles.execute({ path: "." });
-    const entries = result.split("\n");
+    assert.ok(Array.isArray(result));
     // Verify sorted
-    for (let i = 1; i < entries.length; i++) {
-      assert.ok(entries[i - 1] <= entries[i], `not sorted: ${entries[i - 1]} > ${entries[i]}`);
+    for (let i = 1; i < result.length; i++) {
+      assert.ok(result[i - 1] <= result[i], `not sorted: ${result[i - 1]} > ${result[i]}`);
     }
   });
 
@@ -307,7 +306,7 @@ describe("list_files — integration", () => {
     const tools = createBuiltinTools({ root });
     const listFiles = findTool(tools, "list_files");
     const result = await listFiles.execute({});
-    assert.equal(typeof result, "string");
+    assert.ok(Array.isArray(result));
     // Should contain entries from root
     assert.ok(result.length > 0);
   });
@@ -316,7 +315,7 @@ describe("list_files — integration", () => {
     const tools = createBuiltinTools({ root });
     const listFiles = findTool(tools, "list_files");
     const result = await listFiles.execute({ path: "subdir" });
-    assert.equal(result, "c.txt");
+    assert.deepEqual(result, ["c.txt"]);
   });
 
   it("throws NotADirectoryError for non-directory path", async () => {
@@ -520,9 +519,9 @@ describe("Truncation", () => {
     await withRoot(async (root) => {
       await writeFile(join(root, "big.txt"), "0123456789".repeat(5000));
       const tools = createBuiltinTools({ root, maxFileBytes: 2048 });
-      const result = await findTool(tools, "read_file").execute({
+      const result = (await findTool(tools, "read_file").execute({
         path: "big.txt",
-      });
+      })) as string;
       assert.ok(bytes(result) <= 2048, `got ${bytes(result)} bytes for a 2048 cap`);
       assert.ok(result.includes("elided"), "the marker must state what went");
     });
@@ -535,9 +534,9 @@ describe("Truncation", () => {
         `HEAD_MARKER\n${"filler\n".repeat(20000)}TAIL_MARKER\n`,
       );
       const tools = createBuiltinTools({ root, maxFileBytes: 4096 });
-      const result = await findTool(tools, "read_file").execute({
+      const result = (await findTool(tools, "read_file").execute({
         path: "big.txt",
-      });
+      })) as string;
       assert.ok(result.startsWith("HEAD_MARKER"), "head lost");
       assert.ok(result.trimEnd().endsWith("TAIL_MARKER"), "tail lost");
     });
@@ -550,9 +549,9 @@ describe("Truncation", () => {
       await writeFile(join(root, "accents.txt"), "é".repeat(50));
       for (const cap of [10, 11, 12, 64, 200, 1024]) {
         const tools = createBuiltinTools({ root, maxFileBytes: cap });
-        const result = await findTool(tools, "read_file").execute({
+        const result = (await findTool(tools, "read_file").execute({
           path: "accents.txt",
-        });
+        })) as string;
         assert.ok(!result.includes("\uFFFD"), `cap ${cap}: truncation introduced U+FFFD`);
         assert.ok(bytes(result) <= cap, `cap ${cap}: got ${bytes(result)} bytes`);
       }
@@ -587,9 +586,9 @@ describe("Truncation", () => {
       const content = "A".repeat(256 * 1024 + 1);
       await writeFile(join(root, "huge.txt"), content);
       const tools = createBuiltinTools({ root });
-      const result = await findTool(tools, "read_file").execute({
+      const result = (await findTool(tools, "read_file").execute({
         path: "huge.txt",
-      });
+      })) as string;
       assert.ok(result.includes("elided"));
       assert.ok(bytes(result) <= 256 * 1024);
       assert.ok(!result.includes(content));
@@ -604,9 +603,9 @@ describe("Truncation", () => {
       fetchImpl: mockFetch,
       lookupImpl: PUBLIC_LOOKUP,
     });
-    const result = await findTool(tools, "http_get").execute({
+    const result = (await findTool(tools, "http_get").execute({
       url: "https://example.com",
-    });
+    })) as string;
     assert.ok(bytes(result) <= 2048, `got ${bytes(result)} bytes for a 2048 cap`);
     // Head-only: the read stops at the budget, so there is no true total to
     // report and the marker says where it cut instead.
@@ -650,9 +649,9 @@ describe("Truncation", () => {
       fetchImpl: mockFetch,
       lookupImpl: PUBLIC_LOOKUP,
     });
-    const result = await findTool(tools, "http_get").execute({
+    const result = (await findTool(tools, "http_get").execute({
       url: "https://example.com",
-    });
+    })) as string;
     assert.ok(result.includes("truncated at"));
     assert.ok(bytes(result) <= 256 * 1024);
     assert.ok(!result.includes(content));

@@ -66,6 +66,7 @@ The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib
 - `bash`, `edit`, `write` are gated (ask approval) in strict mode.
 
 **Builtins**: `read_file`, `list_files`, `http_get`
+- `list_files(path?)` returns a Python `list[str]` of entry names (directories end with `/`); `read_file` returns a `str`.
 - `http_get` is the only network path out. With `REPL_HTTP_ALLOWLIST` set, listed hosts fetch without a prompt; otherwise every fetch asks. Private/loopback/link-local destinations are always refused.
 
 **Tool store**: `save_tool`, `delete_tool`, `list_saved_tools`, `read_tool`

@@ -1,5 +1,5 @@
 import { describe, it } from "node:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -14,6 +14,7 @@ import { closeSandboxPool } from "../src/pool.js";
 import { ToolRegistry } from "../src/registry.js";
 import { HostToolError } from "../src/types.js";
 import { createRLMTools } from "../src/rlm_tools.js";
+import { createBuiltinTools } from "../src/builtins.js";
 import { SubmitSignal } from "../src/submit_signal.js";
 import { STDOUT_MAX_LINES, OUTPUT_MAX_BYTES, VALUE_RECOVERY, formatSize } from "../src/truncate.js";
 import type {
@@ -582,6 +583,28 @@ describe("runInSandbox — host tool execution", () => {
     const result = await runInSandbox("get_null()", { registry });
     ok(result);
     assert.equal(result.output, "None");
+  });
+});
+
+// ── list_files returns a Python list ─────────────────────────────
+
+describe("runInSandbox — list_files returns a Python list", () => {
+  it("list_files('.') crosses as a list[str] with dirs ending in '/'", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repl-simple-list-files-"));
+    try {
+      writeFileSync(join(root, "a.txt"), "a");
+      mkdirSync(join(root, "subdir"));
+      const registry = new ToolRegistry(createBuiltinTools({ root }));
+      const result = await runInSandbox(
+        "x = list_files('.')\n" +
+          "type(x).__name__ + '|' + str(isinstance(x, list)) + '|' + str(x)",
+        { registry },
+      );
+      ok(result);
+      assert.equal(result.output, "list|True|['a.txt', 'subdir/']");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

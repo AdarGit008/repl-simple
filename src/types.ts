@@ -13,14 +13,18 @@ export interface HostTool {
   name: string;
   description: string;
   params: HostToolParam[];
-  returns: "str" | "void";
+  returns: "str" | "void" | "list[str]";
   /**
    * Runs the call. A class instance anywhere in an argument arrives as its
    * repr string (`<C object>`, `P(x=1)`), never as Monty's proxy object — the
    * sandbox normalises arguments before any tool, cache key, approval request
    * or trace sees them (`instancesAsRepr`, src/truncate.ts).
+   *
+   * A `string[]` return crosses into the sandbox as a Python `list[str]` —
+   * `@pydantic/monty`'s outbound `prepare` walk recurses into JS arrays
+   * (src/registry.ts renders the declared return type verbatim).
    */
-  execute(args: Record<string, unknown>): string | Promise<string>;
+  execute(args: Record<string, unknown>): string | string[] | Promise<string | string[]>;
   requiresApproval?: boolean;
   /**
    * Consequence text appended to the approval dialog description.
