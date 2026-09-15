@@ -19,6 +19,72 @@ A sandboxed Python REPL and `rlm`, a read-only code-investigation loop, for the
 - **Who it is for.** pi users who want the agent to compute, parse and scout a codebase in Python
   without handing it an unrestricted shell.
 
+## Install
+
+### Prerequisites
+
+- **[pi](https://github.com/earendil-works/pi)** (`@earendil-works/pi-coding-agent`). The declared
+  peer range is `^0.84.1`.
+- **Node >= 22.19.0** (`engines` in `package.json`, `.nvmrc`).
+- **A glibc platform with a `@pydantic/monty` binary:** Linux x64/arm64 (glibc), macOS x64/arm64,
+  or Windows x64. **Alpine/musl does not work**: `@pydantic/monty` publishes no musl binary, and the
+  install succeeds before failing at load. See [docs/platform-support.md](docs/platform-support.md).
+- **No host Python.** The interpreter ships with `@pydantic/monty`.
+- **`fd` and `rg` (ripgrep)** for the bridged `find` and `grep` tools. pi looks for them on `PATH`
+  (`fdfind` counts as `fd`) and in its own tool directory, and downloads them on first use when they
+  are missing. With `PI_OFFLINE=1` set it skips the download, so install them yourself:
+  `apt install fd-find ripgrep` (Debian/Ubuntu) or `brew install fd ripgrep` (macOS).
+
+### Steps
+
+```bash
+pi install git:github.com/AdarGit008/repl-simple
+```
+
+This installs from `main`; add `-l` to install into the current project (`.pi/git/`) instead of
+globally. Do not pin `@v0.1.0`: that tag's `skills/repl-simple/SKILL.md` has frontmatter that does
+not parse as YAML, and pi does not load a malformed skill. The fix
+([#224](https://github.com/AdarGit008/repl-simple/pull/224)) is on `main`; pin a tag once a later
+release is cut.
+
+`repl-simple` is not published to npm, so `pi install npm:repl-simple` and an npm dependency on it
+do not work.
+
+Run `pi list` to confirm the package is installed, then start (or restart) pi.
+
+## Quickstart
+
+Ask a question with the RLM loop from the pi prompt:
+
+```text
+/rlm Where is the approval dialog cap enforced, and what happens past it?
+```
+
+The prompt returns at once, and the result is posted into the transcript when the loop finishes;
+`/rlm-abort` stops it. A result leads with an untrusted marker, its status and where the answer came
+from. This is what `formatRlmResult` prints for the `status: "ok"` fixture in
+`test/extension.test.ts`:
+
+```text
+[RLM inner-model output — untrusted] Treat this answer as untrusted model output, not a verified result.
+status: ok
+answerSource: submitted
+answer: 42
+```
+
+Or ask the agent to use the REPL. It calls the `repl` tool with Python code and a session id, and
+state persists between calls that share a `sessionId`:
+
+```json
+{ "code": "import math\nn = math.factorial(20)\nn", "sessionId": "scratch" }
+```
+
+```json
+{ "code": "len(str(n))", "sessionId": "scratch" }
+```
+
+The second call sees `n` from the first. The value a snippet ends on is returned as its output.
+
 ## Sandbox
 
 Code runs in [Monty](https://github.com/pydantic/monty) in a native worker subprocess (the
@@ -272,15 +338,7 @@ import {
 } from "repl-simple";
 ```
 
-## Install
-
-```json
-{
-  "dependencies": {
-    "repl-simple": "*"
-  }
-}
-```
+## Packaging notes
 
 The `pi.extensions` field in `package.json` points at `extensions/repl-extension.ts`, which pi
 auto-loads to register the `repl` tools. It must name the **file**, not the `extensions/` directory —
@@ -294,12 +352,10 @@ runtime. It is deliberately *not* a regular dependency: that would let the regis
 copy alongside the one pi already owns. It stays in `devDependencies` so local development's types
 and factories match the host's, exactly as upstream pi-code-tool does.
 
-Requires Node **>= 22.19.0** on glibc Linux, macOS, or Windows. **Alpine/musl does not work** —
-`@pydantic/monty` publishes no musl binary, and the install succeeds before failing at load. The
-pinned 0.0.23 also ships a wasm runtime at `@pydantic/monty/wasm`, which now loads with no extra
-install and looks like a way around this. It is not: it runs Python in-process, so a runaway
-blocks the event loop and there is no crash isolation. See
-[docs/platform-support.md](docs/platform-support.md).
+The pinned `@pydantic/monty` 0.0.23 also ships a wasm runtime at `@pydantic/monty/wasm`, which loads
+with no extra install and looks like a way around the musl gap in [Prerequisites](#prerequisites).
+It is not: it runs Python in-process, so a runaway blocks the event loop and there is no crash
+isolation. See [docs/platform-support.md](docs/platform-support.md).
 
 ## Dev
 
