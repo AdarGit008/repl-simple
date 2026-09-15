@@ -20,7 +20,8 @@ package.
 
 Before opening a pull request, run what CI runs: `npm run lint`, `npm run check`, `npm test` and
 `npm run coverage` (see [CI](#ci) below). Commit messages and pull request titles use
-conventional prefixes such as `fix:`, `docs:` and `feat(rlm):`.
+conventional prefixes such as `fix:`, `docs:` and `feat(rlm):`. Add a line under `Unreleased` in
+[CHANGELOG.md](CHANGELOG.md) for any change a user of the package would notice.
 
 ## Commands
 
