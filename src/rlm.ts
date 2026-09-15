@@ -2,7 +2,7 @@ import type { RunOptions, RunResult } from "./types.js";
 import { ToolRegistry, probeImportableModules, renderPythonToolRules } from "./registry.js";
 import { createRLMTools, RLM_TOOL_CALL_CAP } from "./rlm_tools.js";
 import { estimateTokens, SpendBudget } from "./budget.js";
-import { runInSandbox } from "./sandbox.js";
+import { runInSandbox, SandboxMemoryError } from "./sandbox.js";
 import type { SandboxOptions } from "./sandbox.js";
 import { redact } from "./redact.js";
 import {
@@ -931,12 +931,30 @@ function buildInitialPrompt(question: string, inputs: Record<string, string>): s
   return parts.join("\n");
 }
 
+/**
+ * True when a run's output is the answer a successful `SUBMIT` carried.
+ *
+ * `RunOk.output` is always a string (`src/types.ts`, decision 15): the
+ * `SUBMIT` answer verbatim when the run ended in `SUBMIT`, else the last
+ * expression rendered by `formatValue`. A bare Python `str` renders verbatim
+ * (`docs/truncation-policy.md`), so the text `"None"` is ambiguous — it is
+ * both the `None` value and a submitted literal `"None"` string. The
+ * successful SUBMIT trace is the one in-repo signal that disambiguates them
+ * at these two consumption sites, where the original value is gone.
+ */
+function hasSubmittedAnswer(result: RunResult): boolean {
+  return result.calls.some((c) => c.tool === "SUBMIT" && c.ok);
+}
+
 /** Extract the best available answer when max iterations are exhausted. */
 function extractBestAnswer(iterations: RlmIteration[]): string {
-  // Last successful non-"None" output, else last non-empty stdout
+  // Last successful non-"None" output, else last non-empty stdout. A
+  // successful SUBMIT of the literal string "None" is still an answer.
   for (let i = iterations.length - 1; i >= 0; i--) {
     const r = iterations[i].result;
-    if (r.status === "ok" && r.output && r.output !== "None") return r.output;
+    if (r.status === "ok" && r.output && (r.output !== "None" || hasSubmittedAnswer(r))) {
+      return r.output;
+    }
   }
   // Fallback: last iteration's stdout
   for (let i = iterations.length - 1; i >= 0; i--) {
@@ -1027,15 +1045,18 @@ export function buildFeedback(result: RunResult): string {
   }
 
   // result.status === "ok"
-  if (result.output === "None" && !result.stdout) {
+  if (result.output === "None" && !result.stdout && !hasSubmittedAnswer(result)) {
     return "Your code ran without errors and produced no output. Write more code to investigate.";
   }
 
-  const output = truncateWithSentinels(result.output !== "None" ? result.output : "", {
-    maxBytes: FEEDBACK_OUTPUT_MAX_BYTES,
-    headRatio: VALUE_HEAD_RATIO,
-    recovery: VALUE_RECOVERY,
-  });
+  const output = truncateWithSentinels(
+    result.output !== "None" || hasSubmittedAnswer(result) ? result.output : "",
+    {
+      maxBytes: FEEDBACK_OUTPUT_MAX_BYTES,
+      headRatio: VALUE_HEAD_RATIO,
+      recovery: VALUE_RECOVERY,
+    },
+  );
   const stdout = truncateWithSentinels(result.stdout, {
     maxBytes: FEEDBACK_STDOUT_MAX_BYTES,
     headRatio: STDOUT_HEAD_RATIO,
@@ -1413,7 +1434,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
 
         return nested.status === "ok"
           ? nested.answer
-          : `[rlm_query error: ${nested.status}] ${nested.error ?? ""}`;
+          : `[rlm_query error: ${nested.status}] ${nested.answer || nested.error || ""}`;
       },
     }),
   ]);
@@ -1548,7 +1569,24 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
     // 4. Run in sandbox. The invocation cap is per iteration (#168): the
     // count starts from zero for every run.
     toolCallsThisIteration = 0;
-    const result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);
+    let result: RunResult;
+    try {
+      result = await runInSandbox(fullCode, sandboxOpts, sandboxRunOpts);
+    } catch (err) {
+      // The sandbox memory guard is a host condition, not the model's code:
+      // retrying is precisely wrong (sandbox.ts `assertMemoryHeadroom`), so
+      // `runRlm` salvages what completed and reports it as a result instead
+      // of throwing away accumulated iterations.
+      if (!(err instanceof SandboxMemoryError)) throw err;
+      return {
+        status: "error",
+        error: redactProviderError(err),
+        answer: extractBestAnswer(iterations),
+        answerSource: "salvaged",
+        iterations,
+        ...(budget ? { budget: budgetReport(budget, false) } : {}),
+      };
+    }
 
     // 5. Record iteration
     const iteration: RlmIteration = {
