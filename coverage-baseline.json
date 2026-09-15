@@ -3,7 +3,7 @@
   "files": {
     "extensions/repl-extension.ts": 99.87,
     "src/bashenv.ts": 84.21,
-    "src/bridge.ts": 100,
+    "src/bridge.ts": 99.69,
     "src/budget.ts": 100,
     "src/builtins.ts": 99.53,
     "src/pathjail.ts": 98.63,

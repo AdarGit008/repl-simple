@@ -177,6 +177,26 @@ describe("detectImageMimeType", () => {
     return b;
   }
 
+  /** BITMAPCOREHEADER (12-byte DIB) — the other BMP header the sniffer accepts. */
+  function bmpCore(): Buffer {
+    const b = Buffer.alloc(26);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(26, 10); // pixel data offset ≥ 14 + 12
+    b.writeUInt32LE(12, 14); // BITMAPCOREHEADER
+    b.writeUInt16LE(1, 22); // color planes
+    b.writeUInt16LE(24, 24); // bits per pixel
+    return b;
+  }
+
+  /** A BMP whose DIB header size is neither 12 nor 40-124. */
+  function bmpBadDib(): Buffer {
+    const b = Buffer.alloc(30);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(54, 10);
+    b.writeUInt32LE(20, 14); // invalid DIB header size
+    return b;
+  }
+
   it("detects each image type the read tool attaches", () => {
     assert.equal(detectImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00])), "image/jpeg");
     assert.equal(detectImageMimeType(fakePng()), "image/png");
@@ -192,10 +212,13 @@ describe("detectImageMimeType", () => {
       "image/webp",
     );
     assert.equal(detectImageMimeType(bmp()), "image/bmp");
+    assert.equal(detectImageMimeType(bmpCore()), "image/bmp");
   });
 
   it("returns null for text and for images pi will not attach", () => {
     assert.equal(detectImageMimeType(Buffer.from("hello world", "ascii")), null);
+    // "BM" with an unrecognised DIB header size is not a BMP.
+    assert.equal(detectImageMimeType(bmpBadDib()), null);
     // 0xf7 at byte 3 is the JPEG "not a JPEG" marker pi refuses.
     assert.equal(detectImageMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xf7])), null);
     // Animated PNG: an acTL chunk after IHDR is refused, mirroring pi.

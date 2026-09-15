@@ -403,6 +403,24 @@ async function readResponseTextLimited(response: Response, maxBytes: number): Pr
 // ── createBuiltinTools ───────────────────────────────────────────
 
 /**
+ * The fetch used when the caller does not inject one.
+ *
+ * Must be the same undici the dispatcher `Agent` comes from, not
+ * `globalThis.fetch`: Node's built-in fetch (undici 7.x) rejects an 8.x
+ * `Agent` as `dispatcher` with `UND_ERR_INVALID_ARG`, and pi's
+ * `undici.install()` only rewrites the global inside its own process. The
+ * dispatcher and the fetch must be the same undici for egress to work.
+ * `undici.fetch` shares the DOM `fetch` signature at runtime (URL/Request
+ * input, `RequestInit`, a `Response` with `.ok`/`.headers`/`.body`/`.text()`),
+ * so the cast to `typeof fetch` is honest; it only differs in undici's own
+ * richer typings (e.g. its `RequestInit` carries `dispatcher`). Exported so
+ * the default is asserted directly.
+ */
+export function resolveFetchImpl(option?: typeof fetch): typeof fetch {
+  return option ?? (undiciFetch as unknown as typeof fetch);
+}
+
+/**
  * Starter host tools: read_file / list_files (rooted, escape-proof) and
  * http_get (host-side fetch — the sandbox itself has no network access).
  */
@@ -410,16 +428,7 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
   const root = resolve(options.root);
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_BYTES;
   const maxHttpBytes = options.maxHttpBytes ?? DEFAULT_MAX_BYTES;
-  // Default to the fetch from the same undici the dispatcher `Agent` comes
-  // from, not `globalThis.fetch`: Node's built-in fetch (undici 7.x) rejects
-  // an 8.x `Agent` as `dispatcher` with `UND_ERR_INVALID_ARG`, and pi's
-  // `undici.install()` only rewrites the global inside its own process. The
-  // dispatcher and the fetch must be the same undici for egress to work.
-  // `undici.fetch` shares the DOM `fetch` signature at runtime (URL/Request
-  // input, `RequestInit`, a `Response` with `.ok`/`.headers`/`.body`/`.text()`),
-  // so the cast to `typeof fetch` is honest; it only differs in undici's own
-  // richer typings (e.g. its `RequestInit` carries `dispatcher`).
-  const fetchImpl = options.fetchImpl ?? (undiciFetch as unknown as typeof fetch);
+  const fetchImpl = resolveFetchImpl(options.fetchImpl);
   const allowlist = (options.httpAllowlist ?? parseAllowlist(process.env.REPL_HTTP_ALLOWLIST)).map(
     (entry) => entry.trim().toLowerCase(),
   );
