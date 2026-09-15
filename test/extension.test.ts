@@ -28,6 +28,7 @@ import {
 // about the cap. On such an extension they are `undefined`, and only the
 // assertions that use them fail. The #46 trace helpers are read the same way.
 import * as extension from "../extensions/repl-extension.js";
+import type { RlmIteration, RlmResult } from "../src/rlm.js";
 import { ReplRunner } from "../src/repl.js";
 import { resolvePreambleStoreDir } from "../src/toolstore.js";
 import { withPatchedPrototype } from "./support/prototype-patch.js";
@@ -331,6 +332,26 @@ describe("repl extension — rlm tool", () => {
     assert.match(text, /failure/);
   });
 
+  it("formatRlmResult annotates empty, whitespace and partial answers on failure", () => {
+    for (const answer of ["", "   "]) {
+      const text = formatRlmResult({
+        status: "max_iterations",
+        answerSource: "salvaged",
+        answer,
+        iterations: [],
+      });
+      assert.match(text, /failure: max_iterations \(no answer reached\)/);
+    }
+
+    const partial = formatRlmResult({
+      status: "budget_exhausted",
+      answerSource: "synthesised",
+      answer: "best effort",
+      iterations: [],
+    });
+    assert.match(partial, /failure: budget_exhausted \(partial answer: best effort\)/);
+  });
+
   it("wires execute through runRlm and reports the answer and status", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-run-"));
     try {
@@ -354,7 +375,43 @@ describe("repl extension — rlm tool", () => {
       );
 
       assert.match(result.content[0].text, /rlm-answer/);
-      assert.equal((result.details as { status: string }).status, "ok");
+      const details = result.details as extension.RlmTraceDetails;
+      assert.equal(details.status, "ok");
+      assert.equal(details.question, "what is the answer?");
+      assert.equal(details.iterations.length, 1);
+      assert.equal(details.iterations[0].index, 0);
+      assert.equal(details.iterations[0].status, "ok");
+      assert.match(details.iterations[0].code, /SUBMIT/);
+      assert.equal(details.iterations[0].output, "rlm-answer");
+      assert.match(details.iterations[0].llmResponse, /SUBMIT/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an empty or whitespace question without running the loop", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "repl-ext-rlm-empty-"));
+    try {
+      const rlm = (await loadTools()).find((t) => t.name === "rlm");
+      assert.ok(rlm, "rlm did not register");
+
+      let completions = 0;
+      const ctx = {
+        cwd,
+        model: { id: "fake-model" },
+        modelRegistry: {
+          complete: async () => {
+            completions++;
+            return { content: [{ type: "text", text: 'SUBMIT("never")' }] };
+          },
+        },
+      };
+
+      for (const question of ["", "   "]) {
+        const result = await rlm.execute("rlm-empty-1", { question }, undefined, undefined, ctx);
+        assert.match(result.content[0].text, /non-empty question/);
+      }
+      assert.equal(completions, 0, "the loop must not run for an empty question");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -423,7 +480,12 @@ describe("repl extension — /rlm command", () => {
       assert.equal(posted.display, true);
       assert.match(posted.content, /rlm-answer/);
       assert.match(posted.content, /untrusted/i);
-      assert.equal((posted.details as { status: string }).status, "ok");
+      const details = posted.details as extension.RlmTraceDetails;
+      assert.equal(details.status, "ok");
+      assert.equal(details.question, "what is the answer?");
+      assert.equal(details.iterations.length, 1);
+      assert.equal(details.iterations[0].index, 0);
+      assert.match(details.iterations[0].code, /SUBMIT/);
       assert.match(notes[0].message, /investigating/i);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -523,6 +585,169 @@ describe("repl extension — /rlm command", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+});
+
+// ── RLM trace details ────────────────────────────────────────────
+//
+// The `rlm` tool and `/rlm` command now persist the whole run — question,
+// answer and per-iteration code/results — on `details`, not just the
+// iteration count. `buildRlmTrace` is pure (no I/O), so its shape, secret
+// masking and byte caps are pinned here without a sandbox.
+
+describe("repl extension — rlm trace details", () => {
+  const GHP = `ghp_${"abcdefghijklmnopqrstuvwxyz0123456789"}`;
+
+  function okIteration(index: number, code: string): RlmIteration {
+    return {
+      index,
+      code,
+      result: {
+        status: "ok",
+        output: code,
+        outputTruncated: false,
+        stdout: "",
+        stdoutTruncated: false,
+        calls: [],
+      },
+      llmResponse: code,
+    };
+  }
+
+  function traceResult(iterations: RlmIteration[]): RlmResult {
+    return { status: "ok", answerSource: "submitted", answer: "42", iterations };
+  }
+
+  it("builds the suggested shape: question, status, answer and one entry per iteration", () => {
+    const details = extension.buildRlmTrace(
+      "what is the answer?",
+      traceResult([okIteration(0, 'SUBMIT("42")'), okIteration(1, "print(1)")]),
+    );
+
+    assert.equal(details.question, "what is the answer?");
+    assert.equal(details.status, "ok");
+    assert.equal(details.answerSource, "submitted");
+    assert.equal(details.answer, "42");
+    assert.equal(details.iterations.length, 2);
+    assert.deepEqual(
+      details.iterations.map((i) => i.index),
+      [0, 1],
+    );
+    assert.equal(details.iterations[0].status, "ok");
+    assert.equal(details.iterations[0].code, 'SUBMIT("42")');
+    assert.equal(details.iterations[0].output, 'SUBMIT("42")');
+    assert.equal(details.iterations[0].stdout, "");
+    assert.equal(details.iterations[0].llmResponse, 'SUBMIT("42")');
+    assert.equal("error" in details.iterations[0], false);
+    assert.equal(details.omittedIterations, 0);
+  });
+
+  it("carries error and budget fields when present", () => {
+    const errorIteration: RlmIteration = {
+      index: 0,
+      code: "1/0",
+      result: {
+        status: "error",
+        error: "ZeroDivisionError: division by zero",
+        errorKind: "runtime",
+        stdout: "traceback",
+        stdoutTruncated: false,
+        calls: [],
+      },
+      llmResponse: "1/0",
+    };
+    const details = extension.buildRlmTrace("boom", {
+      status: "error",
+      answerSource: "salvaged",
+      answer: "",
+      error: "provider rejected",
+      budget: { limit: 1000, consumed: 500, limited: false },
+      iterations: [errorIteration],
+    });
+
+    assert.equal(details.status, "error");
+    assert.equal(details.error, "provider rejected");
+    assert.deepEqual(details.budget, { limit: 1000, consumed: 500, limited: false });
+    assert.equal(details.iterations[0].status, "error");
+    assert.equal(details.iterations[0].error, "ZeroDivisionError: division by zero");
+    assert.equal("output" in details.iterations[0], false);
+  });
+
+  it("masks secrets in every string field", () => {
+    const secret = GHP;
+    const details = extension.buildRlmTrace(`question ${secret}`, {
+      status: "ok",
+      answerSource: "submitted",
+      answer: secret,
+      iterations: [
+        {
+          index: 0,
+          code: `print("${secret}")`,
+          result: {
+            status: "ok",
+            output: secret,
+            outputTruncated: false,
+            stdout: secret,
+            stdoutTruncated: false,
+            calls: [],
+          },
+          llmResponse: secret,
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(details);
+    assert.doesNotMatch(serialized, new RegExp(secret));
+    assert.match(serialized, /\[REDACTED\]/);
+  });
+
+  it("caps each string field head-only at RLM_TRACE_MAX_BYTES", () => {
+    const long = "L".repeat(64 * 1024);
+    const details = extension.buildRlmTrace(long, {
+      status: "ok",
+      answerSource: "submitted",
+      answer: long,
+      iterations: [
+        {
+          index: 0,
+          code: long,
+          result: {
+            status: "ok",
+            output: long,
+            outputTruncated: false,
+            stdout: long,
+            stdoutTruncated: false,
+            calls: [],
+          },
+          llmResponse: long,
+        },
+      ],
+    });
+
+    const fields = [
+      details.question,
+      details.answer,
+      details.iterations[0].code,
+      details.iterations[0].stdout,
+      details.iterations[0].output ?? "",
+      details.iterations[0].llmResponse,
+    ];
+    for (const field of fields) {
+      assert.ok(
+        Buffer.byteLength(field, "utf8") <= extension.RLM_TRACE_MAX_BYTES,
+        `field is ${Buffer.byteLength(field, "utf8")} bytes`,
+      );
+    }
+    assert.match(details.question, /truncated/);
+    assert.doesNotMatch(JSON.stringify(details), /L{1000}/);
+  });
+
+  it("caps the iteration list defensively and counts the omitted ones", () => {
+    const iterations = Array.from({ length: 1500 }, (_, i) => okIteration(i, "pass"));
+    const details = extension.buildRlmTrace("many", traceResult(iterations));
+
+    assert.equal(details.iterations.length, extension.RLM_TRACE_MAX_ITERATIONS);
+    assert.equal(details.omittedIterations, 500);
   });
 });
 
