@@ -55,6 +55,11 @@ The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib
 - `match` statements (no pattern matching)
 - class inheritance / metaclasses (`class B(A)` fails; a plain `class` with methods works)
 
+**Type-checker limits** (a static type check runs before execution and fails as `[error: typing]`, distinct from `[error: syntax]`/`[error: runtime]`):
+- Reflection builtins are absent: `dir`, `callable`, `hasattr`, `eval`, `exec`, `vars`, `globals`, `locals` — a missing name is a typing error, **not** a catchable `NameError`, so `try/except NameError` will not save you.
+- Stdlib stubs are partial: `sys.maxsize` and `asyncio.sleep` are missing, and modules have no `__dict__`.
+- Lambda parameters infer as `object`: `lambda a, b: a + b` is rejected (unsupported `+`) — use a `def` with annotated parameters instead.
+
 **Return values** cross to the host as data, with nesting caps: a list ~48 levels deep or a class instance ~24 deep is fine, one more fails the whole run with `RuntimeError: Max output depth exceeded` (after side effects). Instances cross **without their methods** — `__repr__` is not called, so end a snippet on `repr(obj)` to see a useful value.
 
 ## Python-side tools (callable inside `repl` code)
