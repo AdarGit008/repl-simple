@@ -90,8 +90,18 @@ function extractText(message: RlmAssistantMessage): string {
  * Translate runRlm messages into a pi-ai `Context`.
  *
  * The prompt field is `systemPrompt` (not `system`); every message carries a
- * `timestamp`; the role/content shape matches pi-ai's `UserMessage` (string
- * content) so the registry dispatches it unchanged.
+ * `timestamp`.
+ *
+ * User messages keep their string content — pi-ai's `UserMessage.content` is
+ * `string | (TextContent | ImageContent)[]`, so a string is valid. Assistant
+ * messages are different: `AssistantMessage.content` is a
+ * `(TextContent | ThinkingContent | ToolCall)[]` **array**, never a string. A
+ * string assistant message is not silently coerced — every provider measured
+ * (deepseek, openai, anthropic) returns an EMPTY response for it in ~1–100ms,
+ * which made any RLM task needing more than one iteration (the loop feeds the
+ * prior reply back as a string assistant message) spin to `max_iterations`
+ * with an empty synthesised answer. Wrap assistant string content in a text
+ * block so the conversation round-trips.
  */
 function toContext(
   systemPrompt: string,
@@ -102,7 +112,8 @@ function toContext(
     systemPrompt,
     messages: messages.map((message) => ({
       role: message.role,
-      content: message.content,
+      content:
+        message.role === "assistant" ? [{ type: "text", text: message.content }] : message.content,
       timestamp,
     })),
   };
