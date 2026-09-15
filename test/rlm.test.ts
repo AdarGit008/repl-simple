@@ -949,6 +949,125 @@ describe("runRlm() — nested rlm_query", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.answer, "outer: [rlm_query error: error] child llm failure");
   });
+
+  it("surfaces the child's synthesised answer when the nested loop does not return ok", async () => {
+    // A nested loop that exhausts its iterations and then synthesises an
+    // answer returns status:"max_iterations" with `answerSource:
+    // "synthesised"`. The parent's rlm_query error branch must carry that
+    // synthesised answer instead of replacing it with a bare error prefix.
+    const { llm } = mockLlmCodeGen([
+      '```python\nresult = rlm_query("sub")\nSUBMIT("outer: " + result)\n```',
+      "```python\nprint('child partial')\n```",
+      "child synthesised answer",
+    ]);
+
+    const result = await runRlm("task", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 1,
+    });
+
+    assert.equal(result.status, "ok");
+    assert.equal(
+      result.answer,
+      "outer: [rlm_query error: max_iterations] child synthesised answer",
+    );
+  });
+});
+
+// ── Sandbox memory guard (SandboxMemoryError) ──────────────────
+
+describe("runRlm() — sandbox memory guard", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  /** Restores whatever the env held, including "was not set at all". */
+  async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    const saved = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, vars);
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  it("catches SandboxMemoryError and returns a salvaged result with accumulated iterations", async () => {
+    // The first sandbox run succeeds with the guards disabled; onIteration
+    // then trips the ceiling so the SECOND sandbox run throws. The loop must
+    // catch it, salvage the first iteration's answer, and keep that iteration
+    // instead of throwing the accumulated work away.
+    await withEnv({ REPL_MEMORY_CEILING_MB: "0", REPL_MEMORY_FLOOR_MB: "0" }, async () => {
+      const { llm } = mockLlmCodeGen([
+        "```python\nx = 42\nx\n```",
+        "```python\nprint('second')\n```",
+      ]);
+
+      const result = await runRlm("q", {
+        llmClient: llm,
+        registry: rlmRegistry(),
+        maxIterations: 5,
+        onIteration: () => {
+          process.env.REPL_MEMORY_CEILING_MB = "1";
+        },
+      });
+
+      assert.equal(result.status, "error");
+      assert.equal(result.answer, "42");
+      assert.equal(result.answerSource, "salvaged");
+      assert.equal(result.iterations.length, 1);
+      assert.match(result.error ?? "", /ceiling/);
+    });
+  });
+});
+
+// ── Literal "None" answer vs Python None ────────────────────────
+
+describe("runRlm() — literal 'None' answer", () => {
+  /** Empty registry — runRlm self-registers its RLM tools (D51). */
+  function rlmRegistry(): ToolRegistry {
+    return new ToolRegistry([]);
+  }
+
+  it("salvages a submitted 'None' answer instead of dropping it", async () => {
+    // An abort that lands after the sandbox run but before the SUBMIT check
+    // leaves the successful SUBMIT('None') iteration in `iterations` and
+    // salvages from it. `extractBestAnswer` must not conflate the submitted
+    // string "None" with the Python None value.
+    const controller = new AbortController();
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("None")\n```']);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: rlmRegistry(),
+      maxIterations: 5,
+      signal: controller.signal,
+      onIteration: () => controller.abort(),
+    });
+
+    assert.equal(result.status, "aborted");
+    assert.equal(result.answer, "None");
+    assert.equal(result.answerSource, "salvaged");
+    assert.equal(result.iterations.length, 1);
+  });
+
+  it("buildFeedback renders a submitted 'None' as output, not the no-output branch", () => {
+    const feedback = buildFeedback({
+      status: "ok",
+      output: "None",
+      outputTruncated: false,
+      stdout: "",
+      stdoutTruncated: false,
+      calls: [{ tool: "SUBMIT", args: ["None"], kwargs: {}, durationMs: 0, ok: true }],
+    });
+
+    assert.equal(feedback, "Output: > None");
+  });
 });
 
 // ── RlmResult.error redaction (#167) ────────────────────────────
