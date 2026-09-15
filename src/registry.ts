@@ -515,6 +515,10 @@ export function renderPythonToolRules(importableModules: string[]): string {
 - Imports: ONLY these modules exist: ${importableModules.join(", ")}. Anything else
   (e.g. ${blocked.join(", ")}) raises ModuleNotFoundError — there are no third-party
   packages.
+- To read, list, or search PROJECT files, use the tools (read, grep, find, ls,
+  read_file, list_files) — never open(), os.listdir(), or pathlib. The sandbox
+  has no filesystem of its own, so those raise PermissionError and cannot see
+  project files.
 - Class inheritance, metaclasses and match statements are not supported (NotImplementedError);
   a plain class with __init__ and methods works.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,
