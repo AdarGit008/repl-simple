@@ -1,12 +1,31 @@
 # repl-simple
 
-Pi extension — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
+[![CI](https://github.com/AdarGit008/repl-simple/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AdarGit008/repl-simple/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A sandboxed Python REPL and `rlm`, a read-only code-investigation loop, for the
+[pi coding agent](https://github.com/earendil-works/pi).
+
+- **What it is.** A pi package. Its extension gives the agent five tools: a persistent Python REPL
+  (`repl`, `repl_resume`, `repl_reset`, `repl_abandon`) and `rlm`, an autonomous
+  code-gen → execute loop that investigates a question about the repo without changing it. It also
+  adds four slash commands (`/repl-approvals`, `/repl-accept-preamble`, `/rlm`, `/rlm-abort`) and a
+  skill that tells the agent when to use them.
+- **Why it matters.** pi has no built-in sandbox: its own tools run with the permissions of the pi
+  process. Here, Python runs in [Monty](https://github.com/pydantic/monty), Pydantic's Python
+  interpreter, inside a crash-isolated native worker subprocess. It cannot spawn processes or open
+  sockets. It reaches files and the network only through host tools that are jailed to the project
+  or ask you first.
+- **Who it is for.** pi users who want the agent to compute, parse and scout a codebase in Python
+  without handing it an unrestricted shell.
 
 ## Sandbox
 
-Code runs in [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly), not a host
-Python, so the standard library is a fixed, closed set: **there are no third-party packages** and
-no way to install one, and most of the stdlib is absent.
+Code runs in [Monty](https://github.com/pydantic/monty) in a native worker subprocess (the
+`@pydantic/monty/node` entry, not WebAssembly — see
+[docs/platform-support.md](docs/platform-support.md)), not a host Python. The standard library is a
+fixed, closed set: **there are no third-party packages** and no way to install one, and most of the
+stdlib is absent.
 
 **Importable modules** — exactly these, verified against the pinned Monty 0.0.23. The code probes
 this at runtime (`probeImportableModules()` over `CANDIDATE_MODULES` in `src/registry.ts`), so the
