@@ -1,5 +1,6 @@
 import { lookup } from "node:dns/promises";
-import { open, readdir, stat } from "node:fs/promises";
+import { open, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
 import { isIP } from "node:net";
 import { resolve } from "node:path";
 import { createPathJail } from "./pathjail.js";
@@ -131,8 +132,9 @@ export function __everPrivateSizeForTests(): number {
  * ranges, link-local — which is where `169.254.169.254` lives — plus the
  * unspecified, multicast and reserved blocks. IPv6 is checked in the same
  * terms, and the several ways IPv6 can carry an IPv4 address (`::ffff:`,
- * NAT64, 6to4) are unwrapped and checked as IPv4, since otherwise
- * `::ffff:127.0.0.1` is a spelling of loopback that walks past a v4-only list.
+ * NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4, Teredo) are unwrapped and
+ * checked as IPv4, since otherwise `::ffff:127.0.0.1` is a spelling of
+ * loopback that walks past a v4-only list.
  *
  * Exported because the ranges are data: a table this long is worth asserting
  * directly rather than only through the handful of them a fetch test reaches.
@@ -204,15 +206,27 @@ function isBlockedIpv6(groups: number[]): boolean {
   const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
   const embedded = (hi: number, lo: number) =>
     isBlockedIpv4([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join("."));
+  const embeddedOctets = (a: number, b: number, c: number, d: number) =>
+    isBlockedIpv4([a, b, c, d].join("."));
   const zeroThrough = (n: number) => groups.slice(0, n).every((g) => g === 0);
 
   if (zeroThrough(7) && g7 <= 1) return true; // :: and ::1
   if (zeroThrough(5) && g5 === 0xffff) return embedded(g6, g7); // ::ffff:0:0/96
   if (zeroThrough(6)) return embedded(g6, g7); // deprecated ::a.b.c.d
   if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
-    return embedded(g6, g7); // 64:ff9b::/96 NAT64
+    return embedded(g6, g7); // 64:ff9b::/96 NAT64 (well-known prefix)
+  }
+  if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0x0001 && g4 >> 8 === 0 && g6 === 0 && g7 === 0) {
+    // 64:ff9b:1::/48 NAT64 (local-use prefix): RFC 6052's 48-bit-prefix
+    // embedding is [prefix] octet1.octet2 u octet3.octet4 [suffix], so g3
+    // holds octets 1-2, g4 holds u (high byte, must be zero) + octet3 (low
+    // byte), and g5 holds octet4 (high byte) + the first suffix octet.
+    return embeddedOctets(g3 >> 8, g3 & 0xff, g4 & 0xff, g5 >> 8);
   }
   if (g0 === 0x2002) return embedded(g1, g2); // 2002::/16 6to4
+  if (g0 === 0x2001 && g1 === 0) {
+    return embedded(g6 ^ 0xffff, g7 ^ 0xffff); // 2001::/32 Teredo (client IPv4, XOR-obfuscated)
+  }
   if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
   if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast
@@ -222,15 +236,14 @@ function isBlockedIpv6(groups: number[]): boolean {
 /**
  * Resolve a hostname to every address it answers with.
  *
- * **The rebinding window is narrowed, not closed.** `assertReachable` resolves
- * twice and refuses unless the address set is unchanged (order-insensitively),
- * and any hostname that has ever resolved to a private/reserved address is
- * refused process-lifetime. But this still hands `fetch` the *name* — so a
- * resolver that answers public to both lookups and private only at connect-time
- * reaches a destination that was never validated. Closing that residual means
- * connecting to the address we pinned, which for `fetch` requires supplying a
- * custom `lookup` through an `undici` dispatcher. Revisit if `undici` ever
- * arrives for another reason.
+ * `assertReachable` resolves twice, refuses unless the address set is
+ * unchanged (order-insensitively), and any hostname that has ever resolved to
+ * a private/reserved address is refused process-lifetime. The validated
+ * address set is then handed back to `fetchGuarded`, which connects to one of
+ * those literal addresses — the name is never handed to `fetch`, so a
+ * connect-time resolution cannot differ from what was validated. The original
+ * host rides along in the `Host` header so name-based virtual hosting still
+ * routes.
  */
 async function defaultLookup(hostname: string): Promise<string[]> {
   const results = await lookup(hostname, { all: true, verbatim: true });
@@ -251,6 +264,18 @@ function sameAddressSet(first: string[], second: string[]): boolean {
     if (!b.has(address)) return false;
   }
   return true;
+}
+
+/**
+ * Rewrite a URL so its host is a validated literal address, keeping the port,
+ * path, query and fragment. The caller sets the original `Host` header
+ * separately so the connection still identifies the name it was asked for.
+ */
+function pinUrlToAddress(url: URL, addresses: string[]): URL {
+  const pinned = new URL(url.href);
+  const address = addresses[0];
+  pinned.hostname = isIP(address) === 6 ? `[${address}]` : address;
+  return pinned;
 }
 
 /** Split and clean a comma-separated allowlist; empty entries drop out. */
@@ -294,9 +319,22 @@ function envSeconds(name: string, fallback: number): number {
  * lands — cutting a character there is what produced U+FFFD before (M5).
  */
 async function readUtf8FileLimited(path: string, maxBytes: number): Promise<string> {
-  const size = (await stat(path)).size;
-  const handle = await open(path, "r");
+  // One open, no name reuse after it: O_NOFOLLOW refuses a final-component
+  // symlink and O_NONBLOCK turns a FIFO open into an immediate error instead
+  // of a threadpool hang. The size and the bytes both come from the fd, so a
+  // swap between a stat and a later read cannot race it (mirrors toolstore.ts).
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
+    const st = await handle.stat();
+    if (st.isDirectory()) {
+      const err = new Error("is a directory") as NodeJS.ErrnoException;
+      err.code = "EISDIR";
+      throw err;
+    }
+    if (!st.isFile()) {
+      throw new Error("not a regular file");
+    }
+    const size = st.size;
     if (size <= maxBytes) {
       const buffer = Buffer.alloc(size);
       const { bytesRead } = await handle.read(buffer, 0, size, 0);
@@ -387,6 +425,17 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
   const allowlist = (options.httpAllowlist ?? parseAllowlist(process.env.REPL_HTTP_ALLOWLIST)).map(
     (entry) => entry.trim().toLowerCase(),
   );
+  if (allowlist.includes("*")) {
+    // `*` is not a host and not a `*.`-suffix: it would match nothing while
+    // still disabling the approval prompt — a silent deny-all. Refuse it
+    // loudly rather than guessing whether the caller meant "any host".
+    throw new HostToolError(
+      "ValueError",
+      "http_get allowlist entry '*' would match no host while disabling the approval " +
+        "prompt (a silent deny-all). Unset the allowlist to prompt on every fetch, or " +
+        "list the hosts explicitly.",
+    );
+  }
   const httpTimeoutMs =
     (options.httpTimeoutSecs ?? envSeconds("REPL_HTTP_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT_SECS)) *
     1000;
@@ -476,8 +525,11 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
     return addresses;
   }
 
-  /** Scheme, allowlist and address checks. Run against every hop, not just the first. */
-  async function assertReachable(url: URL): Promise<void> {
+  /**
+   * Scheme, allowlist and address checks, run against every hop. Returns the
+   * validated address set the caller must connect to — never the hostname.
+   */
+  async function assertReachable(url: URL): Promise<string[]> {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new HostToolError("ValueError", `only http(s) URLs are allowed: '${url.href}'`);
     }
@@ -538,6 +590,7 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
         `'${url.hostname}' rebinding detected (address set changed between lookups)`,
       );
     }
+    return first;
   }
 
   /**
@@ -548,9 +601,10 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
    * chain of individually-quick redirects cannot outlast the budget, and it
    * covers the body read too — `fetch` ties the response stream to it.
    *
-   * It does not cover name resolution: `dns.lookup` takes no signal, so a
+   * The validation lookups are `dns.lookup`, which takes no signal, so a
    * resolver that hangs is bounded by the OS resolver's own timeout and not by
-   * this one. Every hop's DNS is therefore outside the budget it is charged to.
+   * this one. The connection itself is pinned to a validated literal address,
+   * so it performs no further name resolution.
    */
   async function fetchGuarded(initial: string): Promise<Response> {
     const signal = AbortSignal.timeout(httpTimeoutMs);
@@ -562,10 +616,15 @@ export function createBuiltinTools(options: BuiltinToolsOptions): HostTool[] {
     }
 
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
-      await assertReachable(url);
+      const addresses = await assertReachable(url);
+      const pinned = pinUrlToAddress(url, addresses);
       let response: Response;
       try {
-        response = await fetchImpl(url.href, { redirect: "manual", signal });
+        response = await fetchImpl(pinned.href, {
+          redirect: "manual",
+          signal,
+          headers: { Host: url.host },
+        });
       } catch (e) {
         const err = e as Error;
         if (err.name === "TimeoutError" || err.name === "AbortError" || signal.aborted) {

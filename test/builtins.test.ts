@@ -1,5 +1,6 @@
 import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile, mkdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +33,12 @@ function findTool(tools: HostTool[], name: string): HostTool {
  * about.
  */
 const PUBLIC_LOOKUP = async () => ["93.184.216.34"];
+
+/** Create a FIFO for the not-a-regular-file tests. Returns false on Windows. */
+function makeFifo(path: string): boolean {
+  if (process.platform === "win32") return false;
+  return spawnSync("mkfifo", [path], { stdio: "ignore" }).status === 0;
+}
 
 // ── createBuiltinTools — structure ──────────────────────────────
 
@@ -209,6 +216,24 @@ describe("read_file — integration", () => {
       assert.ok(e instanceof HostToolError);
       assert.equal((e as HostToolError).pythonType, "PermissionError");
     }
+  });
+
+  it("refuses a FIFO instead of hanging", { skip: process.platform === "win32" }, async () => {
+    const fifo = join(root, "read-file-fifo");
+    if (!makeFifo(fifo)) return;
+    const tools = createBuiltinTools({ root });
+    const readFile = findTool(tools, "read_file");
+    const outcome = await Promise.race([
+      Promise.resolve(readFile.execute({ path: "read-file-fifo" })).then(
+        () => "resolved" as const,
+        (e: unknown) => e,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("timeout" as const), 2000)),
+    ]);
+    assert.notEqual(outcome, "timeout", "read_file must not hang on a FIFO");
+    assert.ok(outcome instanceof HostToolError, `expected HostToolError, got ${String(outcome)}`);
+    assert.equal((outcome as HostToolError).pythonType, "OSError");
+    assert.match((outcome as Error).message, /not a regular file/);
   });
 });
 
@@ -542,7 +567,13 @@ describe("isBlockedAddress", () => {
     "::ffff:169.254.169.254",
     "::7f00:1",
     "64:ff9b::127.0.0.1",
+    // RFC 6052 /48 embedding: g3 = IPv4 octets 1-2, g4 = u.octet3 (u in the
+    // high byte), g5 = octet4.suffix. The local-use prefix is 64:ff9b:1::/48.
+    "64:ff9b:1:7f00:0:100::", // 127.0.0.1
+    "64:ff9b:1:c0a8:1:100::", // 192.168.1.1 (octet3 nonzero)
+    "64:ff9b:1:a00:0:100::", // 10.0.0.1
     "2002:7f00:1::",
+    "2001:0:0:0:0:0:80ff:fffe",
   ];
 
   const allowed = [
@@ -559,6 +590,8 @@ describe("isBlockedAddress", () => {
     "::ffff:93.184.216.34",
     "2002:5db8:d822::",
     "64:ff9b::93.184.216.34",
+    "64:ff9b:1:5db8:d8:2200::", // 93.184.216.34 (RFC 6052 /48 embedding)
+    "2001:0:0:0:0:0:a247:27dd",
   ];
 
   for (const address of blocked) {
@@ -700,6 +733,39 @@ describe("http_get — allowlist", () => {
       findTool(tools, "http_get").execute({ url: "https://api.example.com/" }),
       /private or reserved/,
     );
+  });
+});
+
+describe("http_get — allowlist '*'", () => {
+  it("a literal '*' entry is a loud error, not a silent deny-all", () => {
+    assert.throws(
+      () => createBuiltinTools({ root: "/tmp", httpAllowlist: ["*"] }),
+      (e: unknown) => {
+        assert.ok(e instanceof HostToolError, `expected HostToolError, got ${e}`);
+        assert.equal((e as HostToolError).pythonType, "ValueError");
+        assert.match((e as Error).message, /deny-all/);
+        return true;
+      },
+    );
+  });
+
+  it("REPL_HTTP_ALLOWLIST='*' is a loud error", () => {
+    const previous = process.env.REPL_HTTP_ALLOWLIST;
+    process.env.REPL_HTTP_ALLOWLIST = "*";
+    try {
+      assert.throws(
+        () => createBuiltinTools({ root: "/tmp" }),
+        (e: unknown) => {
+          assert.ok(e instanceof HostToolError, `expected HostToolError, got ${e}`);
+          assert.equal((e as HostToolError).pythonType, "ValueError");
+          assert.match((e as Error).message, /deny-all/);
+          return true;
+        },
+      );
+    } finally {
+      if (previous === undefined) delete process.env.REPL_HTTP_ALLOWLIST;
+      else process.env.REPL_HTTP_ALLOWLIST = previous;
+    }
   });
 });
 
@@ -1142,11 +1208,22 @@ describe("http_get — two-lookups-agree", () => {
 });
 
 describe("http_get — redirects", () => {
-  /** A fetch that answers from a table and records every URL it was handed. */
+  /**
+   * A fetch that answers from a table and records every URL it was handed.
+   *
+   * `http_get` pins the connection to a validated IP, so the URL this mock
+   * sees carries the IP, not the hostname. The original authority rides in the
+   * `Host` header; reconstruct it so the routes stay keyed by the URLs the
+   * caller asked for.
+   */
   function routed(routes: Record<string, Response | (() => Response)>) {
     const seen: string[] = [];
     const impl: typeof fetch = async (input, init) => {
-      const url = String(input);
+      const pinned = new URL(String(input));
+      const hostHeader = new Headers(init?.headers).get("host");
+      const url = hostHeader
+        ? `${pinned.protocol}//${hostHeader}${pinned.pathname}${pinned.search}`
+        : pinned.href;
       seen.push(url);
       assert.equal(init?.redirect, "manual", "redirects must not be followed by fetch");
       const route = routes[url];
@@ -1314,7 +1391,10 @@ describe("http_get — timeout", () => {
     const impl: typeof fetch = async (input, init) => {
       await new Promise((r) => setTimeout(r, 15));
       if (init?.signal?.aborted) throw init.signal.reason;
-      const n = Number(/h(\d+)/.exec(String(input))?.[1] ?? 0);
+      // The connection is pinned to an IP; the hop number rides in the Host
+      // header, which carries the original authority.
+      const host = new Headers(init?.headers).get("host") ?? String(input);
+      const n = Number(/^h(\d+)\./.exec(host)?.[1] ?? 0);
       return new Response("", {
         status: 302,
         headers: { location: `http://h${n + 1}.example.com/` },

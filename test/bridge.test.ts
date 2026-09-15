@@ -1,5 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
@@ -55,6 +56,12 @@ function findTool(tools: HostTool[], name: string): HostTool {
   const tool = tools.find((t) => t.name === name);
   assert.ok(tool, `Tool "${name}" not found`);
   return tool;
+}
+
+/** Create a FIFO for the not-a-regular-file tests. Returns false on Windows. */
+function makeFifo(path: string): boolean {
+  if (process.platform === "win32") return false;
+  return spawnSync("mkfifo", [path], { stdio: "ignore" }).status === 0;
 }
 
 // ── Jail helpers ────────────────────────────────────────────────
@@ -168,6 +175,25 @@ describe("createPiBridgeTools — read execution", () => {
     assert.ok(!result.includes("hello world"));
     assert.ok(!result.includes("line three"));
   });
+
+  it("refuses a FIFO instead of hanging", { skip: process.platform === "win32" }, async () => {
+    const dir = join(tmpDir, "read-fifo");
+    mkdirSync(dir);
+    const fifo = join(dir, "pipe");
+    if (!makeFifo(fifo)) return;
+    const tools = createPiBridgeTools(tmpDir);
+    const read = findTool(tools, "read");
+    const outcome = await Promise.race([
+      Promise.resolve(read.execute({ path: "read-fifo/pipe" })).then(
+        () => "resolved" as const,
+        (e: unknown) => e,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("timeout" as const), 2000)),
+    ]);
+    assert.notEqual(outcome, "timeout", "read must not hang on a FIFO");
+    assert.ok(outcome instanceof Error, `expected an error, got ${String(outcome)}`);
+    assert.match(outcome.message, /not a regular file/);
+  });
 });
 
 // ── Tool execution — ls ─────────────────────────────────────────
@@ -186,6 +212,20 @@ describe("createPiBridgeTools — ls execution", () => {
     const ls = findTool(tools, "ls");
     const result = await ls.execute({});
     assert.ok(result.includes("test.txt"));
+  });
+
+  it("lists a directory containing a FIFO without hanging or suffixing it", {
+    skip: process.platform === "win32",
+  }, async () => {
+    const dir = join(tmpDir, "ls-fifo");
+    mkdirSync(dir);
+    const fifo = join(dir, "pipe");
+    if (!makeFifo(fifo)) return;
+    const tools = createPiBridgeTools(tmpDir);
+    const ls = findTool(tools, "ls");
+    const listing = await ls.execute({ path: "ls-fifo" });
+    assert.ok(listing.includes("pipe"), "the FIFO entry is still listed");
+    assert.ok(!listing.includes("pipe/"), "a FIFO is not a directory");
   });
 });
 

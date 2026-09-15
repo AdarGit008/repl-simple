@@ -14,14 +14,16 @@ import {
   type GrepToolOptions,
   type LsOperations,
   type LsToolOptions,
+  type ReadOperations,
   type ReadToolOptions,
   type WriteToolOptions,
 } from "@earendil-works/pi-coding-agent";
+import { constants, type Stats } from "node:fs";
 import {
   access as fsAccess,
-  stat as fsStat,
-  readFile as fsReadFile,
+  open as fsOpen,
   readdir as fsReaddir,
+  type FileHandle,
 } from "node:fs/promises";
 import {
   createBashEnvHook,
@@ -112,29 +114,89 @@ const DEFAULT_BASH_TIMEOUT_SECS = 120;
  * makes this check the only one that decides.
  *
  * `operations` back it up for the paths pi derives itself rather than taking
- * from the model — grep's context reads, ls's per-entry stats. Neither
- * `read` nor `find` gets one, for reasons that are not symmetry:
+ * from the model — grep's context reads, ls's per-entry stats — and for
+ * `read`, whose open is the one the model points at. Every open below goes
+ * through one fd, obtained with `O_NOFOLLOW | O_NONBLOCK`, and is then
+ * `fstat`ed: a final-component symlink swap is refused and a FIFO cannot
+ * block the threadpool, because the fd — not the name — is what gets read.
  *
- * - `read` would have to supply `detectImageMimeType`, and pi does not export
- *   its sniffer. Omitting it means every image is decoded as UTF-8 text into
- *   the model's context. `read` opens exactly the one path it is given, which
- *   the argument jail has already canonicalised.
- * - `find` only consults its operations when they supply `glob`, which
- *   replaces the `fd` subprocess — losing .gitignore handling and the result
- *   caps with it. `fd`, like `rg`, does not follow symlinks out of the tree
- *   it is pointed at.
+ * - `read` supplies `access` and `readFile` but not `detectImageMimeType`,
+ *   which pi does not export. An image read this way is therefore decoded as
+ *   UTF-8 text rather than attached; that is the price of closing the
+ *   open-by-name window on the tool that reads file contents.
+ * - `find` still gets none: it only consults its operations when they supply
+ *   `glob`, which replaces the `fd` subprocess — losing .gitignore handling
+ *   and the result caps with it. `fd`, like `rg`, does not follow symlinks
+ *   out of the tree it is pointed at.
  */
+
+/** Open a jailed path once, refusing symlinks and never blocking on a FIFO. */
+async function openJailed(path: string): Promise<FileHandle> {
+  return fsOpen(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+}
+
+/** `fstat` the fd from {@link openJailed}, closing it on the way out. */
+async function statJailed(path: string): Promise<Stats> {
+  const handle = await openJailed(path);
+  try {
+    return await handle.stat();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Open a regular file by fd, refusing directories, FIFOs and symlinks. */
+async function openJailedFile(path: string): Promise<FileHandle> {
+  const handle = await openJailed(path);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) {
+      throw new HostToolError("OSError", `not a regular file: '${path}'`);
+    }
+    return handle;
+  } catch (e) {
+    await handle.close();
+    throw e;
+  }
+}
+
+function jailedReadOperations(jail: PathJail, inherited?: ReadOperations): ReadOperations {
+  return {
+    access: async (p) => {
+      const real = await jail.resolve(p);
+      if (inherited?.access) return inherited.access(real);
+      const handle = await openJailedFile(real);
+      await handle.close();
+    },
+    readFile: async (p) => {
+      const real = await jail.resolve(p);
+      if (inherited?.readFile) return inherited.readFile(real);
+      const handle = await openJailedFile(real);
+      try {
+        return await handle.readFile();
+      } finally {
+        await handle.close();
+      }
+    },
+  };
+}
+
 function jailedGrepOperations(jail: PathJail, inherited?: GrepOperations): GrepOperations {
   return {
     isDirectory: async (p) => {
       const real = await jail.resolve(p);
       if (inherited) return inherited.isDirectory(real);
-      return (await fsStat(real)).isDirectory();
+      return (await statJailed(real)).isDirectory();
     },
     readFile: async (p) => {
       const real = await jail.resolve(p);
       if (inherited) return inherited.readFile(real);
-      return fsReadFile(real, "utf-8");
+      const handle = await openJailedFile(real);
+      try {
+        return await handle.readFile("utf-8");
+      } finally {
+        await handle.close();
+      }
     },
   };
 }
@@ -154,11 +216,15 @@ function jailedLsOperations(jail: PathJail, inherited?: LsOperations): LsOperati
     },
     stat: async (p) => {
       const real = await jail.resolve(p);
-      return inherited ? inherited.stat(real) : fsStat(real);
+      return inherited ? inherited.stat(real) : statJailed(real);
     },
     readdir: async (p) => {
       const real = await jail.resolve(p);
       if (inherited) return inherited.readdir(real);
+      const st = await statJailed(real);
+      if (!st.isDirectory()) {
+        throw new HostToolError("NotADirectoryError", `not a directory: '${p}'`);
+      }
       return fsReaddir(real);
     },
   };
@@ -205,7 +271,11 @@ interface ToolSpec {
 const TOOL_SPECS: ToolSpec[] = [
   {
     name: "read",
-    factory: (cwd, opts) => createReadTool(cwd, opts.read),
+    factory: (cwd, opts, jail) =>
+      createReadTool(cwd, {
+        ...opts.read,
+        operations: jailedReadOperations(jail, opts.read?.operations),
+      }),
     params: [
       {
         name: "path",
