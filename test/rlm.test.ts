@@ -3060,11 +3060,7 @@ describe("runRlm() — approval-denial feedback", () => {
       .join("\n");
     assert.doesNotMatch(feedback, /Check your logic/, `got: ${feedback}`);
     assert.match(feedback, /requires approval/, `got: ${feedback}`);
-    assert.match(
-      feedback,
-      /Do not use tools that require approval/,
-      `got: ${feedback}`,
-    );
+    assert.match(feedback, /Do not use tools that require approval/, `got: ${feedback}`);
     assert.equal(result.answer, "recovered");
   });
 });
