@@ -31,8 +31,8 @@ function createLLMQueryTool(onLLMQuery: RLMToolOptions["onLLMQuery"]): HostTool 
   return {
     name: "llm_query",
     description:
-      "Ask the sub-LLM a question. Blocks until the LLM responds. " +
-      "Use for: semantic reasoning, summarization, open-ended analysis. " +
+      "Ask the sub-LLM a question and get a self-contained answer. " +
+      "Blocks until the LLM responds. " +
       "Avoid for: counting, filtering, regex — do those in Python directly. " +
       CAP_NOTE,
     params: [

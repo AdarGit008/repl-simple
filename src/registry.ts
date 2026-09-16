@@ -85,9 +85,9 @@ export class ToolRegistry {
       .map((tool) => {
         const params = renderParams(tool);
         const returns = renderReturn(tool);
-        const doc = tool.description.trim().replace(/\s+/g, " ");
+        const doc = renderToolDocstring(tool);
         const sig = `def ${tool.name}(${params}) -> ${returns}:`;
-        return doc.length > 0 ? `${sig}\n    """${doc}"""\n    ...` : `${sig}\n    ...`;
+        return doc.length > 0 ? `${sig}\n    ${doc}\n    ...` : `${sig}\n    ...`;
       })
       .join("\n\n");
   }
@@ -184,6 +184,23 @@ function renderParams(tool: HostTool): string {
   return tool.params
     .map((p) => `${p.name}: ${p.type}${p.optional ? " | None = None" : ""}`)
     .join(", ");
+}
+
+/**
+ * The docstring `renderToolDocs` shows for one tool: the tool-level
+ * description plus each parameter's own description, so non-obvious
+ * parameters (e.g. `edit`'s JSON-array `edits`) are documented rather than
+ * rendered as a bare `edits: str`.
+ */
+function renderToolDocstring(tool: HostTool): string {
+  const lines: string[] = [];
+  const summary = tool.description.trim().replace(/\s+/g, " ");
+  if (summary) lines.push(summary);
+  const described = tool.params
+    .filter((p) => p.description && p.description.trim().length > 0)
+    .map((p) => `- ${p.name}: ${p.description.trim().replace(/\s+/g, " ")}`);
+  if (described.length > 0) lines.push("Parameters:", ...described);
+  return lines.length > 0 ? `"""${lines.join("\n")}"""` : "";
 }
 
 /**
@@ -351,6 +368,7 @@ export const CANDIDATE_MODULES = [
   "string",
   "textwrap",
   "base64",
+  "binascii",
   "hashlib",
   "statistics",
   "io",
@@ -358,6 +376,7 @@ export const CANDIDATE_MODULES = [
   "enum",
   "dataclasses",
   "uuid",
+  "unicodedata",
   "csv",
   "urllib",
 ];
@@ -519,7 +538,7 @@ export async function probeTypeCheckerGaps(
 // ── Python tool rules ───────────────────────────────────────────
 
 /** Examples used in the import restriction rule, filtered against reality. */
-const BLOCKED_EXAMPLES = ["time", "random", "collections", "requests", "numpy"];
+const BLOCKED_EXAMPLES = ["time", "random", "requests", "numpy"];
 
 /**
  * Ground rules for the model writing sandboxed Python. Include alongside
@@ -532,20 +551,21 @@ export function renderPythonToolRules(importableModules: string[]): string {
   return `\
 - Call tools as plain functions, WITHOUT \`await\`.
 - Use print() to surface anything you need to see; printed output is returned to you.
+  stdout is capped (32 KiB / 1000 lines) and there is no stderr — summarise, don't dump.
 - The value of the last top-level expression is returned as the result (expressions
   inside if/try blocks are not).
-- Imports: ONLY these modules exist: ${importableModules.join(", ")}. Anything else
+- Imports: these modules are available: ${importableModules.join(", ")}. Anything else
   (e.g. ${blocked.join(", ")}) raises ModuleNotFoundError — there are no third-party
   packages.
 - To read, list, or search PROJECT files, use the tools (read, grep, find, ls,
-  read_file, list_files) — never open(), os.listdir(), or pathlib. The sandbox
-  has no filesystem of its own, so those raise PermissionError and cannot see
-  project files.
+  read_file, list_files) — never open(), os.listdir(), or pathlib. By default the
+  sandbox has no filesystem (open()/os.listdir()/pathlib raise PermissionError)
+  and cannot see project files.
 - Example calls: find(pattern="*.ts", path="src"), ls("src"), read("src/rlm.ts"),
   grep(pattern="runRlm", path="src"). If a run fails with PermissionError on
   open()/os.listdir()/pathlib, you used a filesystem API — switch to these tools.
-- Class inheritance, metaclasses and match statements are not supported (NotImplementedError);
-  a plain class with __init__ and methods works.
+- Class inheritance, metaclasses, match statements, and yield/generators are not
+  supported (NotImplementedError); a plain class with __init__ and methods works.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,
   FileNotFoundError, OSError).`;
 }

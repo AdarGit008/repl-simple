@@ -489,6 +489,14 @@ const TRUNCATED_VIEW_END = `${TRUNCATED_VIEW_PREFIX} END]`;
  */
 const TRUNCATED_VIEW_NEUTRALISED = "[TRUNCATED\u200BVIEW";
 
+/**
+ * Neutralised form of the history-drop notice phrase: a zero-width space
+ * (U+200B) replaces the ordinary space, so untrusted data can never carry the
+ * exact "turns were dropped" phrase the system emits as its own drop notice.
+ */
+const HISTORY_DROP_PHRASE = "earlier turns dropped";
+const HISTORY_DROP_NEUTRALISED = "earlier turns\u200Bdropped";
+
 /** Bytes the sentinel wrap adds: open + close + two newlines. */
 const SENTINEL_OVERHEAD_BYTES = contentBytes(`${TRUNCATED_VIEW_BEGIN}\n\n${TRUNCATED_VIEW_END}`);
 
@@ -510,7 +518,9 @@ function truncateWithSentinels(
   value: string,
   opts: { maxBytes: number; headRatio: number; recovery: string },
 ): string {
-  const neutralised = value.replaceAll(TRUNCATED_VIEW_PREFIX, TRUNCATED_VIEW_NEUTRALISED);
+  const neutralised = value
+    .replaceAll(TRUNCATED_VIEW_PREFIX, TRUNCATED_VIEW_NEUTRALISED)
+    .replaceAll(HISTORY_DROP_PHRASE, HISTORY_DROP_NEUTRALISED);
   const { text, truncated } = truncateText(neutralised, {
     maxBytes: opts.maxBytes - SENTINEL_OVERHEAD_BYTES,
     headRatio: opts.headRatio,
@@ -615,11 +625,13 @@ Your job: investigate the user's question by writing Python code, running it,
 interpreting the results, and submitting your final answer.
 
 Rules:
-- Write ONLY Python code between \`\`\`python fences.
+- Write Python code between \`\`\`python fences to investigate.
 - Use print() to inspect data. stdout is returned to you.
-- The last expression value is also returned.
-- Call llm_query(prompt) to ask for reasoning help.
-- Call SUBMIT(answer) exactly once when you have the final answer.
+- The value of the last top-level expression is also returned (expressions inside
+  if/try blocks are not).
+- Call llm_query(prompt) to ask for a self-contained answer to a sub-question.
+- When you are done, call SUBMIT(answer). A plain-text answer may also be
+  accepted as the final answer.
 - NEVER call SUBMIT without first investigating.
 - If code errors, read the error message, fix the code, and retry.
 ${SENTINEL_RULE}
@@ -998,7 +1010,16 @@ export function buildFeedback(result: RunResult): string {
       .split("\n")
       .map((line) => `> ${line}`)
       .join("\n");
-    let feedback = `Error: ${quotedError}\nstdout: ${stdout}`;
+    // Same line-quoting as the error value: a forged `\nstdout:` inside
+    // stdout renders at column 2, so only the real delimiter can sit at
+    // column 0.
+    const quotedStdout = stdout
+      ? stdout
+          .split("\n")
+          .map((line) => `> ${line}`)
+          .join("\n")
+      : "";
+    let feedback = `Error: ${quotedError}\nstdout:\n${quotedStdout}`;
     if (result.errorKind === "syntax") {
       feedback += "\n\nFix the syntax error in your Python code.";
     } else if (result.errorKind === "typing") {
@@ -1029,12 +1050,16 @@ export function buildFeedback(result: RunResult): string {
       // gone rather than merely unhappy, so every variable, import and
       // definition from earlier in the run went with it. Telling the model to
       // "fix the error" would invite it to build on state that no longer
-      // exists.
-      feedback +=
-        "\n\nThe sandbox was terminated and all its state was lost. " +
-        "Retry with self-contained code that does not rely on anything " +
-        "defined earlier, and make it cheaper — the usual cause is running " +
-        "too long.";
+      // exists. `src/sandbox.ts` names the one distinction that changes what
+      // to do: a watchdog kill is the model's cost problem, a bare worker
+      // death is not its doing — so do not blame "running too long" on it.
+      feedback += result.error.includes("exceeded its time budget")
+        ? "\n\nThe sandbox was terminated because execution exceeded its time budget " +
+          "and all its state was lost. Retry with self-contained code that does " +
+          "not rely on anything defined earlier, and do less work."
+        : "\n\nThe sandbox worker died unexpectedly and all its state was lost. " +
+          "Retry with self-contained code that does not rely on anything " +
+          "defined earlier.";
     }
     return feedback;
   }
@@ -1065,7 +1090,15 @@ export function buildFeedback(result: RunResult): string {
     headRatio: STDOUT_HEAD_RATIO,
     recovery: STDOUT_RECOVERY,
   });
-  const stdoutSection = stdout ? `\nstdout:\n${stdout}` : "";
+  // Quote stdout lines too (D19/D36): a forged `\nstdout:` inside stdout then
+  // renders at column 2, so only the real delimiter sits at column 0.
+  const quotedStdout = stdout
+    ? stdout
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n")
+    : "";
+  const stdoutSection = quotedStdout ? `\nstdout:\n${quotedStdout}` : "";
   // D36 (#156): quote every line of the output with a `> ` prefix — the same
   // close D19 gives the error branch (test 18). A forged `\nstdout:` inside
   // the value then renders as `> stdout:` and can no longer line up at
@@ -1603,9 +1636,12 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
 
     // An abort that landed during this iteration — mid-sandbox-run (partial
     // errorKind:"aborted" result) or racing a completed run — surfaces here
-    // with the iteration included (#75, D34). The SUBMIT check below only runs
-    // when the signal is not aborted.
-    if (options.signal?.aborted) {
+    // with the iteration included (#75, D34). A sandbox that reported
+    // `aborted` because a `runOptions`-carried signal fired (the loop's own
+    // `options.signal` may be unset) is the same terminal outcome: feeding
+    // "Execution was aborted." back and calling the LLM again would leave the
+    // model no next step. The SUBMIT check below only runs when not aborted.
+    if (options.signal?.aborted || (result.status === "error" && result.errorKind === "aborted")) {
       return aborted();
     }
 
