@@ -371,7 +371,7 @@ export const CANDIDATE_MODULES = [
 //
 // On 0.0.18 it was also a memory bug, which is what made it urgent: a Monty
 // whose type check *failed* leaked ~6.9 MB no GC reclaimed, and since every
-// `TY_GAP_CANDIDATES` entry is a gap by definition, all six threw and the gap
+// `TY_GAP_CANDIDATES` entry is a gap by definition, all five threw and the gap
 // probe leaked ~41 MB per sandbox run. That leak is gone with the constructor
 // it lived in — measured on 0.0.21, 60 failing type checks hold host RSS flat.
 // The memoisation stays for the reason it was filed under: the work is
@@ -446,7 +446,6 @@ export async function probeImportableModules(
  */
 export const TY_GAP_CANDIDATES = [
   "open",
-  "bytearray",
   "PermissionError",
   "FileNotFoundError",
   "IsADirectoryError",
@@ -455,14 +454,16 @@ export const TY_GAP_CANDIDATES = [
 
 /**
  * Why each `TY_GAP_CANDIDATES` entry is declared `Any` for the checker (#67
- * path 2). All six were measured unresolved (`unresolved-reference`) on
- * 0.0.21; the runtime provides every one of them. Declaring a name `Any`
- * widens the same hole path 1 opens — a call through it is unchecked — so
+ * path 2). All five were measured unresolved (`unresolved-reference`) on
+ * 0.0.21; the runtime provides every one of them. `bytearray` is deliberately
+ * absent from the list: on 0.0.23 it is not a runtime name (`NameError`), so
+ * letting the checker flag it as `unresolved-reference` is the earlier,
+ * correct diagnostic. Declaring a name `Any` widens the same hole path 1
+ * opens — a call through it is unchecked — so
  * the list is deliberate and closed: adding a name means adding its reason.
  */
 export const TY_GAP_REASONS: Readonly<Record<string, string>> = {
   open: "a runtime builtin (raises PermissionError without a mount) that the checker's builtins stub omits",
-  bytearray: "a runtime builtin type the checker's builtins stub omits",
   PermissionError:
     "raised at runtime by `open` without a mount and by jailed host tools; the checker does not know the class, so `except PermissionError` would be flagged",
   FileNotFoundError:
