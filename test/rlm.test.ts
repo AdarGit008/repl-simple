@@ -740,6 +740,34 @@ describe("runRlm() — registry-built prompt", () => {
     );
     assert.ok(systemPrompt.includes("SUBMIT"), `prompt does not name SUBMIT:\n${systemPrompt}`);
   });
+
+  it("renders the available-tools section from descriptions, without stub bodies (issue test 2)", async () => {
+    // The model-facing tool list must describe each tool and must NOT reuse the
+    // type-checker stubs, whose `raise NotImplementedError` bodies read to the
+    // inner model as "these tools are broken".
+    const tool: HostTool = {
+      name: "my_tool",
+      description: "a caller tool",
+      params: [],
+      returns: "str",
+      execute: async () => "hi",
+    };
+    const registry = new ToolRegistry([tool]);
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+
+    const result = await runRlm("q", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.ok(
+      systemPrompt.includes("a caller tool"),
+      `prompt must carry the tool description:\n${systemPrompt}`,
+    );
+    assert.ok(
+      !systemPrompt.includes("raise NotImplementedError"),
+      `prompt must not show type-checker stub bodies to the model:\n${systemPrompt}`,
+    );
+  });
 });
 
 // ── D67: the D17 sentinel rule is always present on every prompt ──

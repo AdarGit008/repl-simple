@@ -176,6 +176,48 @@ describe("ToolRegistry", () => {
       assert.ok(stubs.includes("add"), `stubs should mention 'add', got: ${stubs}`);
     });
   });
+
+  describe("renderToolDocs", () => {
+    it("renders a signature with ellipsis body and description, never NotImplementedError", () => {
+      const reg = new ToolRegistry();
+      reg.add(makeParamTool());
+      const docs = reg.renderToolDocs();
+      assert.ok(
+        docs.includes("def add(a: int, b: int | None = None) -> str:"),
+        `docs should render the add signature, got: ${docs}`,
+      );
+      assert.ok(
+        docs.includes("Add two numbers"),
+        `docs should carry the tool description, got: ${docs}`,
+      );
+      assert.ok(
+        !docs.includes("raise NotImplementedError"),
+        `docs must not reuse the type-checker stub body: ${docs}`,
+      );
+    });
+
+    it("renders a description-less tool as a bare signature with ellipsis", () => {
+      const reg = new ToolRegistry();
+      reg.add(makeTool({ description: "" }));
+      const docs = reg.renderToolDocs();
+      assert.ok(docs.includes("def read_file() -> str:"), `got: ${docs}`);
+      assert.ok(!docs.includes("raise NotImplementedError"), `got: ${docs}`);
+    });
+
+    it("keeps raise NotImplementedError in the type-checker stubs, not the docs", async () => {
+      const reg = new ToolRegistry();
+      reg.add(makeParamTool());
+      const stubs = await reg.renderTypeStubs();
+      assert.ok(
+        stubs.includes("raise NotImplementedError"),
+        `stubs keep the placeholder body, got: ${stubs}`,
+      );
+      assert.ok(
+        !reg.renderToolDocs().includes("raise NotImplementedError"),
+        `docs are stub-body-free: ${reg.renderToolDocs()}`,
+      );
+    });
+  });
 });
 
 // ── Dead public API (#85, decision 14, D133/D134) ───────────────

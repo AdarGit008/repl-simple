@@ -73,6 +73,26 @@ export class ToolRegistry {
   }
 
   /**
+   * Model-facing tool list for the RLM system prompt. Renders each tool's
+   * signature with an ellipsis body (`...`) and its description as a docstring.
+   *
+   * Deliberately NOT `renderTypeStubs()`: that output ends every stub with
+   * `raise NotImplementedError`, which is a type-checker placeholder — shown to
+   * the model as tool documentation it reads as "these tools are broken".
+   */
+  renderToolDocs(): string {
+    return this.list()
+      .map((tool) => {
+        const params = renderParams(tool);
+        const returns = renderReturn(tool);
+        const doc = tool.description.trim().replace(/\s+/g, " ");
+        const sig = `def ${tool.name}(${params}) -> ${returns}:`;
+        return doc.length > 0 ? `${sig}\n    """${doc}"""\n    ...` : `${sig}\n    ...`;
+      })
+      .join("\n\n");
+  }
+
+  /**
    * Which tools the type checker cannot check as declared (#67).
    *
    * `tools` carries the two degradation paths that are ours, per tool:
