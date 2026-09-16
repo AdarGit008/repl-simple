@@ -58,6 +58,7 @@ function createRLMQueryTool(onRLMQuery: RLMToolOptions["onRLMQuery"]): HostTool 
     description:
       "Spawn a nested RLM loop to investigate a sub-question. " +
       "The nested loop gets its own sandbox and fresh LLM sessions. " +
+      "At the depth limit it degrades to a single LLM answer instead of spawning. " +
       "Use for: deep multi-step sub-investigations that need code execution. " +
       CAP_NOTE,
     params: [
