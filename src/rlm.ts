@@ -632,10 +632,13 @@ ${SENTINEL_RULE}
  * fresh-sandbox wording and the D17 sentinel-authentication rule verbatim,
  * and names `llm_query`/`SUBMIT` — then adds the `rlm_query` tool rule, the
  * "do not define your own" rule, and registry-rendered "## Available Tools"
- * and "## Python Rules" sections so every registered tool is named.
+ * and "## Python Rules" sections so every registered tool is named. The
+ * available-tools section is `renderToolDocs()` (descriptions, ellipsis
+ * bodies), never the type-checker stubs whose `raise NotImplementedError`
+ * bodies would read to the model as broken tools.
  */
 async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
-  const stubs = await registry.renderTypeStubs();
+  const toolDocs = registry.renderToolDocs();
   const importableModules = await probeImportableModules();
   const rules = renderPythonToolRules(importableModules);
   // #67 (D105): a tool whose stub degraded has no checked signature, so the
@@ -660,7 +663,7 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
     "## Available Tools",
     "Call these as plain functions (no await, no import):",
     "",
-    stubs || "(standard Python only)",
+    toolDocs || "(standard Python only)",
     ...uncheckedSection,
     "",
     "## Python Rules",
