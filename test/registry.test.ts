@@ -317,14 +317,14 @@ describe("renderPythonToolRules", () => {
     assert.ok(rules.includes("datetime"));
   });
 
-  it("mentions blocked/absent modules", () => {
-    // Should warn about modules like 'time', 'random' etc. if not importable
+  it("warns that unavailable imports are refused before running", () => {
+    // Should warn about modules like 'time', 'random' etc. if not importable.
+    // The truth: with the type checker on, an unavailable import is a static
+    // `error[unresolved-import]` before any code runs — never a runtime
+    // ModuleNotFoundError the model could except.
     const rules = renderPythonToolRules(["json"]);
-    // The rules should mention that some modules are not available
-    assert.ok(
-      rules.includes("ModuleNotFoundError") || rules.includes("exist"),
-      `expected rules to warn about unavailable modules, got: ${rules}`,
-    );
+    assert.match(rules, /unresolved-import/);
+    assert.doesNotMatch(rules, /ModuleNotFoundError/);
   });
 
   it("warns that stdlib file access raises PermissionError and points at the tools", () => {
@@ -355,6 +355,8 @@ describe("renderPythonToolRules", () => {
     assert.ok(rules.includes('grep(pattern="runRlm", path="src")'), rules);
     assert.match(rules, /you used a filesystem API/);
     assert.match(rules, /switch to these tools/);
+    assert.match(rules, /requires approval/);
+    assert.match(rules, /do not call them/);
   });
 
   it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", async () => {

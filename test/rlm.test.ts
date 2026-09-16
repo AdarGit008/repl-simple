@@ -768,6 +768,43 @@ describe("runRlm() — registry-built prompt", () => {
       `prompt must not show type-checker stub bodies to the model:\n${systemPrompt}`,
     );
   });
+
+  it("caves the gated tools: bash/edit/write/http_get are always denied", async () => {
+    // The RLM registry gates the mutating bridge tools and forces
+    // http_get.requiresApproval; runRlm supplies no onApproval, so those four
+    // tools are always denied. The prompt must say so, or the model calls them
+    // and wastes iterations on a PermissionError it cannot fix.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const registry = new ToolRegistry([]);
+
+    const result = await runRlm("q", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.ok(
+      systemPrompt.includes(
+        "`bash`, `edit`, `write`, and `http_get` require approval and are always denied in this loop",
+      ),
+      `prompt must warn about the gated tools:\n${systemPrompt}`,
+    );
+  });
+
+  it("tells the model rlm_query degrades at the depth limit instead of always spawning", async () => {
+    // At depth >= maxDepth rlm_query does not spawn a nested loop — it
+    // downgrades to a single LLM ask. The prompt must state that, or the model
+    // expects a nested investigation that never happens.
+    const { llm } = mockLlmCodeGen(['```python\nSUBMIT("done")\n```']);
+    const registry = new ToolRegistry([]);
+
+    const result = await runRlm("q", { llmClient: llm, registry, maxIterations: 5 });
+
+    assert.equal(result.status, "ok");
+    const systemPrompt = llm.calls()[0].systemPrompt;
+    assert.ok(
+      systemPrompt.includes("at the depth limit it degrades to a single LLM answer"),
+      `prompt must state the rlm_query depth-limit downgrade:\n${systemPrompt}`,
+    );
+  });
 });
 
 // ── D67: the D17 sentinel rule is always present on every prompt ──
@@ -3086,6 +3123,46 @@ describe("runRlm() — a run that hit a limit", () => {
       });
       assert.match(feedback, advice, `${errorKind}: got ${feedback}`);
     }
+  });
+});
+
+// ── Feedback for an approval denial ─────────────────────────────
+
+describe("runRlm() — approval-denial feedback", () => {
+  it("does not say 'Check your logic' and points at approval", async () => {
+    // A gated tool with no onApproval is denied and surfaces as a Python
+    // PermissionError (errorKind "runtime"). The feedback must not blame the
+    // model's logic — the failure is the tool needing approval, which the RLM
+    // loop never grants.
+    const gated: HostTool = {
+      name: "bash",
+      description: "run a shell command",
+      params: [{ name: "command", type: "str", description: "shell command" }],
+      returns: "str",
+      requiresApproval: true,
+      execute: async () => "never runs",
+    };
+    const { llm } = mockLlmCodeGen([
+      '```python\nbash("ls")\n```',
+      '```python\nSUBMIT("recovered")\n```',
+    ]);
+
+    const result = await runRlm("q", {
+      llmClient: llm,
+      registry: new ToolRegistry([gated]),
+      maxIterations: 2,
+    });
+
+    assert.equal(result.iterations[0].result.status, "error");
+    assert.equal(result.iterations[0].result.errorKind, "runtime");
+    const feedback = llm
+      .calls()[1]
+      .messages.map((m) => m.content)
+      .join("\n");
+    assert.doesNotMatch(feedback, /Check your logic/, `got: ${feedback}`);
+    assert.match(feedback, /requires approval/, `got: ${feedback}`);
+    assert.match(feedback, /Do not use tools that require approval/, `got: ${feedback}`);
+    assert.equal(result.answer, "recovered");
   });
 });
 

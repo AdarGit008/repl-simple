@@ -669,13 +669,15 @@ async function buildSystemPrompt(registry: ToolRegistry): Promise<string> {
 
   return [
     DEFAULT_RLM_SYSTEM_PROMPT,
-    "- Call rlm_query(query, context?) to spawn a nested investigation.",
+    "- Call rlm_query(query, context?) to spawn a nested investigation; at the depth limit it degrades to a single LLM answer.",
     "- Do NOT define your own llm_query, rlm_query, or SUBMIT functions.",
     "",
     "## Available Tools",
     "Call these as plain functions (no await, no import):",
     "",
     toolDocs || "(standard Python only)",
+    "",
+    "`bash`, `edit`, `write`, and `http_get` require approval and are always denied in this loop — do not call them.",
     ...uncheckedSection,
     "",
     "## Python Rules",
@@ -1025,7 +1027,13 @@ export function buildFeedback(result: RunResult): string {
     } else if (result.errorKind === "typing") {
       feedback += "\n\nFix the type error in your Python code.";
     } else if (result.errorKind === "runtime") {
-      feedback += "\n\nFix the runtime error. Check your logic.";
+      if (result.error.includes("requires approval")) {
+        feedback +=
+          "\n\nDo not use tools that require approval. " +
+          "Use print() and basic Python operations instead.";
+      } else {
+        feedback += "\n\nFix the runtime error. Check your logic.";
+      }
     } else if (result.errorKind === "timeout") {
       // Not "check your logic": the code may be perfectly correct and simply
       // too expensive, and a model told to fix a bug it cannot find will

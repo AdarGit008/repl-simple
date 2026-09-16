@@ -555,15 +555,17 @@ export function renderPythonToolRules(importableModules: string[]): string {
 - The value of the last top-level expression is returned as the result (expressions
   inside if/try blocks are not).
 - Imports: these modules are available: ${importableModules.join(", ")}. Anything else
-  (e.g. ${blocked.join(", ")}) raises ModuleNotFoundError — there are no third-party
-  packages.
+  (e.g. ${blocked.join(", ")}) is refused before your code runs (a type-check error,
+  error[unresolved-import]) — you cannot except it; delete the import and retry.
 - To read, list, or search PROJECT files, use the tools (read, grep, find, ls,
   read_file, list_files) — never open(), os.listdir(), or pathlib. By default the
   sandbox has no filesystem (open()/os.listdir()/pathlib raise PermissionError)
   and cannot see project files.
 - Example calls: find(pattern="*.ts", path="src"), ls("src"), read("src/rlm.ts"),
-  grep(pattern="runRlm", path="src"). If a run fails with PermissionError on
-  open()/os.listdir()/pathlib, you used a filesystem API — switch to these tools.
+  grep(pattern="runRlm", path="src"). If a run fails with PermissionError, either
+  you used a filesystem API (open()/os.listdir()/pathlib) — switch to these tools —
+  or you called a tool that requires approval (bash/edit/write/http_get are always
+  denied in the RLM loop) — do not call them.
 - Class inheritance, metaclasses, match statements, and yield/generators are not
   supported (NotImplementedError); a plain class with __init__ and methods works.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,
