@@ -407,6 +407,17 @@ interface LiveSession {
  */
 const DEFAULT_MAX_SESSIONS = 32;
 
+/**
+ * How many evicted ids the pool remembers so the next `run`/`resume` on one
+ * can say why it is fresh.
+ *
+ * The pool itself is capped, so a long conversation evicts steadily; an
+ * unbounded tombstone map would trade one unbounded map for another. Past
+ * this bound the ordinary `no-session` sentence answers — what the model got
+ * before the notice existed — rather than pretending nothing was dropped.
+ */
+const EVICTION_TOMBSTONES = 64;
+
 /** Positive integer or fallback — the same rule `src/pool.ts` applies. */
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -447,6 +458,14 @@ export class ReplRunner {
   private cwd: string;
   private isProjectTrusted: () => boolean;
   private maxSessions: number;
+  /**
+   * Ids the cap dropped, newest last, bounded to `EVICTION_TOMBSTONES`.
+   *
+   * `reset` and a trust-change rebuild delete their entry directly rather
+   * than through `insert`, so only a cap eviction leaves a tombstone — which
+   * is exactly the case the model cannot otherwise explain (#F8).
+   */
+  private readonly evicted = new Set<string>();
   /** This project's accepted-set manifest (#198). Never touched while the project is untrusted. */
   private manifest: PreambleManifestStore;
   /** `onPreambleStoreInsideProject` with this runner's two paths bound; a no-op when unset. */
@@ -586,12 +605,20 @@ export class ReplRunner {
     signal?: AbortSignal,
     limits?: RunLimits | "unbounded",
   ): Promise<RunTrace> {
-    const noSession = (): RunTrace => ({
-      text: `No session '${sessionId}' exists. Run some code first.`,
-      sessionId,
-      status: "no-session",
-      calls: [],
-    });
+    const noSession = (): RunTrace => {
+      // An id the cap dropped gets the eviction answer: "no session" is true
+      // but useless when the pool is the reason. One-shot, like the run-path
+      // notice — consumed here so a later `run` does not repeat it.
+      const evicted = this.evicted.delete(sessionId);
+      return {
+        text: evicted
+          ? evictedMessage(sessionId, this.maxSessions, "resume")
+          : `No session '${sessionId}' exists. Run some code first.`,
+        sessionId,
+        status: "no-session",
+        calls: [],
+      };
+    };
     const live = this.sessions.get(sessionId);
     if (!live) return noSession();
     this.touch(sessionId, live);
@@ -849,6 +876,7 @@ export class ReplRunner {
             this.attachTrustChangeNotice(sessionId, existing);
             trustChanged = false;
           }
+          this.attachEvictionNotice(sessionId, existing);
           return existing;
         }
         // trustChangeDiscards deleted the entry. The replacement must say so
@@ -878,6 +906,21 @@ export class ReplRunner {
     if (live.trustChangeNoticed) return;
     live.trustChangeNoticed = true;
     const message = trustChangedMessage(sessionId, false);
+    live.notice = live.notice === undefined ? message : `${message}\n\n${live.notice}`;
+  }
+
+  /**
+   * Deliver the one-shot `[evicted]` notice when an id the cap dropped comes
+   * back.
+   *
+   * Eviction is silent by design — the pool must not exceed its cap — which
+   * left the model holding an id and believing its variables were there. The
+   * tombstone is what turns that next call into an explanation, and it is
+   * consumed here, once, like every other notice.
+   */
+  private attachEvictionNotice(sessionId: string, live: LiveSession): void {
+    if (!this.evicted.delete(sessionId)) return;
+    const message = evictedMessage(sessionId, this.maxSessions, "run");
     live.notice = live.notice === undefined ? message : `${message}\n\n${live.notice}`;
   }
 
@@ -939,7 +982,25 @@ export class ReplRunner {
       if (entry.session.isSuspended()) continue;
       if (entry.busy > 0) continue;
       this.sessions.delete(key);
+      this.rememberEviction(key);
       if (this.sessions.size <= this.maxSessions) return;
+    }
+  }
+
+  /**
+   * Remember that the cap — not a reset — dropped `sessionId`.
+   *
+   * Insertion-ordered and bounded: re-evicting an id moves it to the newest
+   * position, and the oldest tombstone is forgotten once the bound is
+   * reached, so the memory cost stays a constant.
+   */
+  private rememberEviction(sessionId: string): void {
+    this.evicted.delete(sessionId);
+    this.evicted.add(sessionId);
+    while (this.evicted.size > EVICTION_TOMBSTONES) {
+      const oldest = this.evicted.values().next().value;
+      if (oldest === undefined) break;
+      this.evicted.delete(oldest);
     }
   }
 
@@ -1427,6 +1488,22 @@ function trustChangedMessage(sessionId: string, lostSuspension: boolean): string
       ? ` The approval that was pending went with it — that call never executed. Run it again if you still want it.`
       : "")
   );
+}
+
+/**
+ * Why a session id is fresh after the pool dropped it.
+ *
+ * `purpose` keeps the resume sentence honest: a resume has nothing to
+ * continue, while a run starts over.
+ */
+function evictedMessage(sessionId: string, maxSessions: number, purpose: "run" | "resume"): string {
+  const head =
+    `[evicted] Session '${sessionId}' was the least-recently-used of more than ` +
+    `${maxSessions} live sessions, so the pool dropped it.`;
+  return purpose === "resume"
+    ? `${head} There is nothing to resume — run code with repl to start a fresh session.`
+    : `${head} It starts fresh: variables, imports and cached tool calls are gone. ` +
+        `Raise REPL_MAX_SESSIONS (or ReplRunnerOptions.maxSessions) to keep more sessions.`;
 }
 
 /** Prepend a session's one-shot notice to a result, and consume it. */
