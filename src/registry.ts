@@ -479,7 +479,8 @@ export const TY_GAP_REASONS: Readonly<Record<string, string>> = {
  * rejects as unresolved. These need `name: Any = None` declarations
  * in the type-check stubs.
  *
- * The gaps did **not** close on 0.0.21 — measured, all six still report
+ * The gaps did **not** close on 0.0.21 — measured, all six names in the list
+ * then (five today; see `TY_GAP_REASONS` for why `bytearray` left) reported
  * `unresolved-reference`. What changed is where the declaration goes: into
  * out-of-band `typeCheckStubs` rather than a prefix prepended to the user's
  * source, so it no longer shifts the line numbers in reported diagnostics
@@ -535,8 +536,11 @@ export function renderPythonToolRules(importableModules: string[]): string {
 - The value of the last top-level expression is returned as the result (expressions
   inside if/try blocks are not).
 - Imports: ONLY these modules exist: ${importableModules.join(", ")}. Anything else
-  (e.g. ${blocked.join(", ")}) raises ModuleNotFoundError — there are no third-party
+  (e.g. ${blocked.join(", ")}) is refused before it runs — a typing error named
+  \`unresolved-import\`, never a catchable ImportError — and there are no third-party
   packages.
+- I/O is print()-only: sys.stdout.write, sys.stderr.write, os.environ and os.getenv
+  raise at runtime even though the checker accepts them.
 - To read, list, or search PROJECT files, use the tools (read, grep, find, ls,
   read_file, list_files) — never open(), os.listdir(), or pathlib. The sandbox
   has no filesystem of its own, so those raise PermissionError and cannot see
@@ -544,8 +548,13 @@ export function renderPythonToolRules(importableModules: string[]): string {
 - Example calls: find(pattern="*.ts", path="src"), ls("src"), read("src/rlm.ts"),
   grep(pattern="runRlm", path="src"). If a run fails with PermissionError on
   open()/os.listdir()/pathlib, you used a filesystem API — switch to these tools.
-- Class inheritance, metaclasses and match statements are not supported (NotImplementedError);
-  a plain class with __init__ and methods works.
+- Class inheritance, metaclasses, match statements, yield and del are not supported
+  (NotImplementedError); a plain class with __init__ and methods works. A construct the
+  parser or checker refuses discards the whole snippet — nothing in it runs.
+- Lambda parameters infer as object: pass an annotated def to functools.reduce/max/min
+  instead of a lambda (sorted(..., key=lambda ...) works).
+- Only class objects carry \`__name__\` (and \`type(x).__name__\`); functions, builtins and
+  instances expose no dunder methods.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,
   FileNotFoundError, OSError).`;
 }

@@ -24,6 +24,7 @@ import { createPiBridgeTools } from "../src/bridge.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { createToolStoreTools } from "../src/toolstore.js";
 import { SandboxUnavailableError, closeSandboxPool, withSandboxSession } from "../src/pool.js";
+import { MontyComplete } from "@pydantic/monty/node";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -290,14 +291,33 @@ describe("renderPythonToolRules", () => {
     assert.ok(rules.includes("datetime"));
   });
 
-  it("mentions blocked/absent modules", () => {
-    // Should warn about modules like 'time', 'random' etc. if not importable
+  it("says a refused import is a static unresolved-import, not a catchable ModuleNotFoundError", async () => {
+    // The rules used to promise `ModuleNotFoundError`, which a model acts on
+    // by writing `try/except ModuleNotFoundError` — code that cannot work:
+    // the refusal is a typing error before execution, and the exception class
+    // is itself unresolved to the checker. Prompt text is behaviour (D156),
+    // so the sentence and the interpreter are measured in the same test.
     const rules = renderPythonToolRules(["json"]);
-    // The rules should mention that some modules are not available
-    assert.ok(
-      rules.includes("ModuleNotFoundError") || rules.includes("exist"),
-      `expected rules to warn about unavailable modules, got: ${rules}`,
-    );
+    assert.match(rules, /unresolved-import/);
+    assert.doesNotMatch(rules, /ModuleNotFoundError/);
+
+    const refused = await runInSandbox("import time", { registry: new ToolRegistry() });
+    assert.equal(refused.status, "error", JSON.stringify(refused));
+    assert.equal(refused.status === "error" ? refused.errorKind : "", "typing");
+    assert.match(refused.status === "error" ? refused.error : "", /unresolved-import/);
+  });
+
+  it("names every construct that discards the snippet, and the print()-only I/O rule", () => {
+    // These sentences are the model's only warning that one refused construct
+    // costs the whole run, and that sys.stdout.write/os.environ pass the
+    // checker but fail at runtime.
+    const rules = renderPythonToolRules(["json"]);
+    assert.match(rules, /yield/);
+    assert.match(rules, /\bdel\b/);
+    assert.match(rules, /sys\.stderr\.write/);
+    assert.match(rules, /os\.environ/);
+    assert.match(rules, /annotated/);
+    assert.match(rules, /__name__/);
   });
 
   it("warns that stdlib file access raises PermissionError and points at the tools", () => {
@@ -352,6 +372,36 @@ describe("renderPythonToolRules", () => {
     });
     assert.equal(inherit.status, "error", JSON.stringify(inherit));
     assert.match(inherit.status === "error" ? inherit.error : "", /NotImplementedError/);
+  });
+
+  it("measures which checker-rejected names exist at runtime (D156)", async () => {
+    // SKILL.md tells the model which rejected names are usable at runtime
+    // (map, getattr, ...) and which are simply absent; reviewer A flagged the
+    // runtime half as unmeasured. Measure it with the checker off, one fresh
+    // session per name: a resolved name completes (MontyComplete) while an
+    // absent one comes back as a NameLookupSnapshot, which leaves the session
+    // suspended — so this probe cannot share one session across names.
+    // `bytearray` is the control that fails if it ever classified everything
+    // as present (it is the one the runtime genuinely lacks).
+    const resolves: string[] = [];
+    const names = [
+      "map",
+      "filter",
+      "getattr",
+      "hasattr",
+      "setattr",
+      "dir",
+      "callable",
+      "bytearray",
+    ];
+    for (const name of names) {
+      const found = await withSandboxSession({ typeCheck: false }, async (session) => {
+        const snap = await session.feedStart(name);
+        return snap instanceof MontyComplete && snap.output !== undefined && snap.output !== null;
+      });
+      if (found) resolves.push(name);
+    }
+    assert.deepEqual(resolves, ["map", "filter", "getattr", "hasattr", "setattr"]);
   });
 });
 

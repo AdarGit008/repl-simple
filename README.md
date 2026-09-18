@@ -27,6 +27,18 @@ through `open()` on arbitrary host paths.
 - **`match` statements** — pattern matching is not implemented.
 - **class inheritance and metaclasses** — a plain `class` with methods and `__init__` works, but
   `class B(A)` raises `NotImplementedError`.
+- **`del`** — the `del` statement is not implemented.
+
+A refusal is all-or-nothing: the parser and the type checker both run before the first statement,
+so a rejected construct discards the whole snippet — nothing in it runs and no side effect happens.
+
+**Type checker.** A static type check runs before execution and fails as `[error: typing]`. Missing
+names are typing errors, not catchable `NameError`s (`ImportError` and `ModuleNotFoundError` are
+themselves rejected by the checker, and a refused import never runs). `map`, `filter`, `getattr`,
+`hasattr` and `setattr` exist at runtime but the checker rejects them; a longer list of names is
+absent from both — `skills/repl-simple/SKILL.md` carries the measured lists. I/O is `print()`-only
+(`sys.stdout.write`/`sys.stderr.write` and `os.environ`/`os.getenv` raise at runtime), and only
+class objects carry `__name__` — functions, builtins and instances expose no dunder methods.
 
 **Returned values.** The value a snippet ends on crosses to the host as data, with two limits on
 Monty 0.0.23. Nesting is capped: a list 48 levels deep and a class instance 24 deep are fine, and
@@ -52,7 +64,8 @@ Sessions are pooled per project directory, with a **cap of 32 live sessions** an
 when a new one would exceed it: the session used least recently is dropped first. The knobs, in
 precedence order: `ReplRunnerOptions.maxSessions` (embedders) > `REPL_MAX_SESSIONS` env (positive
 integer) > 32. A dropped session is gone — its variables, imports and cache are released, and the
-next `repl` call on that id starts fresh.
+next `repl` call on that id starts fresh. That first call carries a one-shot `[evicted]` notice
+naming the cap, so the model is not left guessing why its variables vanished.
 
 **A session with a pending approval is never evicted, and neither is one whose call is still
 running.** Evicting either would discard a call the user was asked to approve — or may be about to
