@@ -382,6 +382,13 @@ function notProjectRelative(pattern: string): boolean {
 
 interface ToolSpec {
   name: string;
+  /**
+   * Optional override of pi's own tool description. `read` needs one: pi's
+   * text claims "Images are sent as attachments", but this bridge keeps only
+   * text blocks (see the `c.type === "text"` filter below), so the model
+   * must be told the sandbox sees text only.
+   */
+  description?: string;
   // pi's tool factories each return a differently-shaped AgentTool and the
   // package exports no common supertype. Narrowing this would mean
   // re-declaring pi's types here, free to drift from the ones that actually
@@ -402,6 +409,9 @@ interface ToolSpec {
 const TOOL_SPECS: ToolSpec[] = [
   {
     name: "read",
+    description:
+      "Read the contents of a text file. Returns text only — image files are " +
+      "not supported through the sandbox. Use offset/limit for large files.",
     factory: (cwd, opts, jail) =>
       createReadTool(cwd, {
         ...opts.read,
@@ -656,7 +666,7 @@ export function createPiBridgeTools(cwd: string, options: BridgeOptions = {}): H
 
     return {
       name: spec.name,
-      description: agentTool.description ?? "",
+      description: spec.description ?? agentTool.description ?? "",
       params: spec.params,
       returns: "str" as const,
       requiresApproval: spec.mutating ? gateMutating : gateReads,

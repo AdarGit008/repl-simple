@@ -31,8 +31,8 @@ function createLLMQueryTool(onLLMQuery: RLMToolOptions["onLLMQuery"]): HostTool 
   return {
     name: "llm_query",
     description:
-      "Ask the sub-LLM a question. Blocks until the LLM responds. " +
-      "Use for: semantic reasoning, summarization, open-ended analysis. " +
+      "Ask the sub-LLM a question and get a self-contained answer. " +
+      "Blocks until the LLM responds. " +
       "Avoid for: counting, filtering, regex — do those in Python directly. " +
       CAP_NOTE,
     params: [
@@ -58,6 +58,7 @@ function createRLMQueryTool(onRLMQuery: RLMToolOptions["onRLMQuery"]): HostTool 
     description:
       "Spawn a nested RLM loop to investigate a sub-question. " +
       "The nested loop gets its own sandbox and fresh LLM sessions. " +
+      "At the depth limit it degrades to a single LLM answer instead of spawning. " +
       "Use for: deep multi-step sub-investigations that need code execution. " +
       CAP_NOTE,
     params: [

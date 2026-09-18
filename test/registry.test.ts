@@ -218,6 +218,33 @@ describe("ToolRegistry", () => {
         `docs are stub-body-free: ${reg.renderToolDocs()}`,
       );
     });
+
+    it("renders parameter descriptions for non-obvious parameters", () => {
+      const reg = new ToolRegistry([
+        {
+          name: "edit",
+          description: "Edit a file",
+          params: [
+            { name: "path", type: "str", description: "File to edit." },
+            {
+              name: "edits",
+              type: "str",
+              description: "JSON array of {oldText, newText} objects.",
+            },
+          ],
+          returns: "str",
+          execute: () => "",
+        },
+      ]);
+      const docs = reg.renderToolDocs();
+      assert.ok(docs.includes("def edit(path: str, edits: str) -> str:"), docs);
+      assert.ok(docs.includes("Parameters:"), docs);
+      assert.ok(docs.includes("- path: File to edit."), docs);
+      assert.ok(
+        docs.includes("- edits: JSON array of {oldText, newText} objects."),
+        `edits description missing:\n${docs}`,
+      );
+    });
   });
 });
 
@@ -313,7 +340,6 @@ describe("renderPythonToolRules", () => {
     // checker but fail at runtime.
     const rules = renderPythonToolRules(["json"]);
     assert.match(rules, /yield/);
-    assert.match(rules, /\bdel\b/);
     assert.match(rules, /sys\.stderr\.write/);
     assert.match(rules, /os\.environ/);
     assert.match(rules, /annotated/);
@@ -349,6 +375,8 @@ describe("renderPythonToolRules", () => {
     assert.ok(rules.includes('grep(pattern="runRlm", path="src")'), rules);
     assert.match(rules, /you used a filesystem API/);
     assert.match(rules, /switch to these tools/);
+    assert.match(rules, /requires approval/);
+    assert.match(rules, /do not call them/);
   });
 
   it("tells the truth about classes: a plain class runs on 0.0.21, only inheritance and match do not", async () => {
@@ -373,6 +401,23 @@ describe("renderPythonToolRules", () => {
     });
     assert.equal(inherit.status, "error", JSON.stringify(inherit));
     assert.match(inherit.status === "error" ? inherit.error : "", /NotImplementedError/);
+  });
+
+  it("softens the import claim and does not list importable modules as blocked", () => {
+    const rules = renderPythonToolRules(["json", "collections"]);
+    assert.doesNotMatch(rules, /ONLY these modules exist/);
+    assert.match(rules, /these modules are available/);
+    assert.doesNotMatch(rules, /e\.g\. [^\n]*collections/);
+    assert.match(rules, /e\.g\. time, random, requests, numpy/);
+  });
+
+  it("mentions yield/generators and the stdout cap, and qualifies the filesystem claim", () => {
+    const rules = renderPythonToolRules(["json"]);
+    assert.match(rules, /yield\/generators/);
+    assert.match(rules, /stdout is capped/);
+    assert.match(rules, /no stderr/);
+    assert.match(rules, /By default the\s+sandbox has no filesystem/);
+    assert.match(rules, /open\(\)\/os\.listdir\(\)\/pathlib raise PermissionError/);
   });
 
   it("keeps SKILL.md's absent-vs-present split measured, not asserted (D156)", async () => {
@@ -447,6 +492,24 @@ describe("probeImportableModules / probeTypeCheckerGaps", () => {
     const result = await probeImportableModules(["json", "this_does_not_exist_xyz"]);
     assert.ok(result.includes("json"), `expected json to be importable, got: ${result}`);
     assert.ok(!result.includes("this_does_not_exist_xyz"));
+  });
+
+  it("CANDIDATE_MODULES names the verified importable stdlib modules", () => {
+    for (const name of ["json", "collections", "binascii", "unicodedata"]) {
+      assert.ok(CANDIDATE_MODULES.includes(name), `CANDIDATE_MODULES must include ${name}`);
+    }
+  });
+
+  it("the default probe finds the verified importable stdlib modules", async () => {
+    resetProbeMemos();
+    const result = await probeImportableModules();
+    for (const name of ["json", "collections", "binascii", "unicodedata"]) {
+      assert.ok(result.includes(name), `expected ${name} importable, got: ${result}`);
+    }
+    // These are typeshed stubs, not runtime modules — probing them must say so.
+    for (const name of ["builtins", "types", "typing_extensions", "_collections_abc"]) {
+      assert.ok(!result.includes(name), `expected ${name} absent, got: ${result}`);
+    }
   });
 
   it("reports a name the type checker cannot resolve", async () => {

@@ -155,6 +155,15 @@ describe("createPiBridgeTools — tool creation", () => {
       assert.equal(tool.returns, "str", `${tool.name} should return 'str'`);
     }
   });
+
+  it("the read tool is documented as text-only, not as image attachments", () => {
+    // The bridge keeps only text blocks from pi's read result, so pi's own
+    // "Images are sent as attachments" claim must not reach the sandbox model.
+    const read = findTool(createPiBridgeTools(tmpDir), "read");
+    assert.doesNotMatch(read.description, /images are sent as attachments/i);
+    assert.doesNotMatch(read.description, /Supports text files and images/i);
+    assert.match(read.description, /text only/i);
+  });
 });
 
 // ── Image sniffing ──────────────────────────────────────────────

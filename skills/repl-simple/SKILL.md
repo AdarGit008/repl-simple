@@ -56,7 +56,6 @@ The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib
 - `yield` (no generators)
 - `match` statements (no pattern matching)
 - class inheritance / metaclasses (`class B(A)` fails; a plain `class` with methods works)
-- `del` (no `del` statement)
 
 A construct the parser or checker refuses discards the whole snippet — no statement in it runs, and no side effect happens.
 

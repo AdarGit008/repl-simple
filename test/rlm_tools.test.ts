@@ -72,6 +72,15 @@ describe("llm_query params", () => {
     const tool = findTool(createRLMTools(opts), "llm_query");
     assert.equal(tool.returns, "str");
   });
+
+  it("describes itself as a self-contained ask, not semantic reasoning", () => {
+    // The loop sends llm_query's prompt with the SAME code-generation system
+    // prompt, so the tool description must not promise reasoning/summarisation
+    // the sub-LLM is not being asked to do.
+    const tool = findTool(createRLMTools(opts), "llm_query");
+    assert.match(tool.description, /self-contained answer/);
+    assert.doesNotMatch(tool.description, /semantic reasoning|summarization|open-ended analysis/);
+  });
 });
 
 // ── rlm_query params ────────────────────────────────────────────
