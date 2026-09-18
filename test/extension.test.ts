@@ -785,6 +785,24 @@ describe("repl extension — parameter schemas", () => {
       repl.parameters.properties.maxMemory?.description ?? "",
       /capped at 1024, or lower/,
     );
+    // A model that asks for 0 must not believe it set a limit: a non-positive
+    // value is treated as omitted, and the description has to say so.
+    assert.match(
+      repl.parameters.properties.maxDurationSecs?.description ?? "",
+      /treated as omitted/,
+    );
+    assert.match(repl.parameters.properties.maxMemory?.description ?? "", /treated as omitted/);
+  });
+
+  it("documents the session-pool cap in the repl description", async () => {
+    const repl = (await loadTools()).find((t) => t.name === "repl");
+    assert.ok(repl, "repl did not register");
+
+    // The model is the only party holding an id across calls, so the
+    // description is where the cap and its one-shot notice must appear.
+    assert.match(repl.description, /32 live sessions/);
+    assert.match(repl.description, /oldest session/);
+    assert.match(repl.description, /\[evicted\] notice/);
   });
 
   it("documents the cancellation boundary in the repl description (D6)", async () => {

@@ -51,7 +51,8 @@ All four review findings were fixed in `59.5` and `59.6` (tests added first, RED
 - **Verified** `src/repl.ts:269-284`: the `for (;;)` loop's `existing !== undefined` correctly
   distinguishes trust-discard rebuilds (notice) from eviction-recreation (no notice); the
   revalidation `continue` cannot busy-spin (every iteration awaits a trust check, and each
-  `continue` requires another caller to have changed the map).
+  `continue` requires another caller to have changed the map). (Superseded in part:
+  eviction-recreation now carries a one-shot `[evicted]` notice.)
 - **Verified** `src/repl.ts:296-311`: `inflight.delete` and `insert` run in the same synchronous
   `.then`, so no caller can miss both maps; concurrent joiners of a failing creation all reject
   together, which is correct (the creation genuinely failed; only *later* callers retry).
