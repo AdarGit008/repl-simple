@@ -363,6 +363,19 @@ async function jailPathArg(
   return { ...args, path: await jail.resolve(raw) };
 }
 
+/**
+ * Whether a `find` glob is trying to leave the jailed root.
+ *
+ * The jail holds the `path` argument, and `pattern` is a glob — so an
+ * absolute pattern never reaches the resolver and fd answers "no files
+ * found" rather than a refusal: an empty result the model reads as fact. A
+ * `..` segment is refused for the same reason: it can only describe a search
+ * the jail would have rejected had it arrived as `path`.
+ */
+function escapesSearchRoot(pattern: string): boolean {
+  return pattern.startsWith("/") || pattern.split("/").includes("..");
+}
+
 interface ToolSpec {
   name: string;
   // pi's tool factories each return a differently-shaped AgentTool and the
@@ -477,6 +490,21 @@ const TOOL_SPECS: ToolSpec[] = [
       { name: "limit", type: "int", description: "Maximum number of results.", optional: true },
     ],
     mutating: false,
+    // `path` is jailed above; `pattern` is not a path and never reaches the
+    // jail, so a glob pointing outside the root would be answered with "No
+    // files found matching pattern" — a refusal-shaped fact the model would
+    // act on. Refuse it by name instead (F7).
+    prepareArgs: (args) => {
+      const pattern = args.pattern;
+      if (typeof pattern === "string" && escapesSearchRoot(pattern)) {
+        throw new HostToolError(
+          "PermissionError",
+          `the find pattern '${pattern}' is outside the search root '${String(args.path)}'; ` +
+            "find patterns cannot leave the project root — use a project-relative glob",
+        );
+      }
+      return args;
+    },
   },
   {
     name: "ls",

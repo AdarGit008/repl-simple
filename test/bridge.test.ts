@@ -444,6 +444,11 @@ describe("createPiBridgeTools — the cwd jail", () => {
       ["grep", { pattern: SECRET, path: "escape-dir" }],
       ["ls", { path: "escape-dir" }],
       ["find", { pattern: "secret.txt", path: "escape-dir" }],
+      // The pattern is a glob, not a `path`, so the jail never sees these:
+      // an absolute glob is refused by name rather than silently matching
+      // nothing and reading as "this directory has no files" (F7).
+      ["find", { pattern: "/etc/*" }],
+      ["find", { pattern: "../*.md" }],
       ["read_file", { path: "escape-link" }],
       ["list_files", { path: "escape-dir" }],
     ];
