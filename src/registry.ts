@@ -551,8 +551,9 @@ export function renderPythonToolRules(importableModules: string[]): string {
 - Class inheritance, metaclasses, match statements, yield and del are not supported
   (NotImplementedError); a plain class with __init__ and methods works. A construct the
   parser or checker refuses discards the whole snippet — nothing in it runs.
-- Lambda parameters infer as object: pass an annotated def to functools.reduce/max/min
-  instead of a lambda (sorted(..., key=lambda ...) works).
+- Lambda callbacks get object parameters: when the body uses them (a + b, p[0], len(w)),
+  pass an annotated def — reduce/max/min reject such callbacks in some positions, while
+  sorted(..., key=lambda ...) and list.sort(key=...) are accepted.
 - Only class objects carry \`__name__\` (and \`type(x).__name__\`); functions, builtins and
   instances expose no dunder methods.
 - Tool failures raise normal Python exceptions you can catch (e.g. ValueError,

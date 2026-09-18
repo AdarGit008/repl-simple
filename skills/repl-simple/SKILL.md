@@ -65,7 +65,7 @@ A construct the parser or checker refuses discards the whole snippet — no stat
 - Rejected by the checker but **present** at runtime (measured with the checker off), so a normal type-checked run still cannot use them: `map`, `filter`, `getattr`, `hasattr`, `setattr`.
 - `ImportError` and `ModuleNotFoundError` exist at runtime but are rejected by the checker — and a refused import never runs, so there is nothing to catch.
 - Stdlib stubs are partial: `os.getcwd`, `os.path`, `sys.argv`, `sys.exit`, `sys.path`, `sys.maxsize`, `collections.OrderedDict`, `asyncio.sleep`, `itertools.product`/`permutations`/`combinations`, `functools.wraps`/`lru_cache` and `pathlib.PurePath` are missing, and modules have no `__dict__`.
-- Lambda parameters infer as `object`: `lambda a, b: a + b` is rejected (unsupported `+`) — use a `def` with annotated parameters instead. Position matters: the same call passes as a bare expression and fails inside `print(...)`; `sorted(..., key=…)` and `list.sort(key=…)` are accepted.
+- Lambda parameters passed as callbacks infer as `object`: a body that uses them (`a + b`, `p[0]`, `len(w)`) is rejected in some positions — `functools.reduce(lambda …)` passes as a bare expression and fails inside `print(...)`, and `max`/`min(..., key=lambda …)` behave the same way. `sorted(..., key=…)` and `list.sort(key=…)` are accepted, and a lambda called directly is always fine. Use a `def` with annotated parameters when the callback uses its arguments.
 - I/O is `print()`-only: `sys.stdout.write`/`sys.stderr.write` and `os.environ`/`os.getenv` pass the checker but raise at runtime.
 - Only class objects carry `__name__` (and `type(x).__name__`); functions, builtins and instances expose no dunder methods.
 

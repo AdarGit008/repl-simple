@@ -2015,8 +2015,10 @@ describe("ReplRunner — the pool is capped and never drops a pending approval (
       const back = await runner.run("1 + 1", "doomed");
       assert.match(back, /\[evicted\]/, `no eviction notice: ${back}`);
       assert.match(back, /'doomed'/);
-      assert.match(back, /least-recently-used/);
-      assert.match(back, /2 live sessions/);
+      assert.match(back, /oldest session the pool could drop/);
+      assert.match(back, /2-session cap/);
+      assert.match(back, /starts fresh/);
+      assert.match(back, /Raise REPL_MAX_SESSIONS/);
       assert.match(back, /\[result\]\n2/, "the notice must ride with the run it explains");
 
       const again = await runner.run("2 + 2", "doomed");
@@ -2039,8 +2041,36 @@ describe("ReplRunner — the pool is capped and never drops a pending approval (
 
       const text = await runner.resume("old");
       assert.match(text, /\[evicted\]/, text);
+      assert.match(text, /nothing to resume/, text);
+      assert.doesNotMatch(text, /starts fresh/, "the resume sentence must not promise a fresh run");
       assert.doesNotMatch(text, /No session 'old' exists/);
-      assert.match(text, /nothing to resume/);
+
+      // One-shot: the resume consumed the tombstone, so the run that follows
+      // is not told about the same eviction again.
+      const after = await runner.run("1 + 1", "old");
+      assert.doesNotMatch(after, /\[evicted\]/, `the notice repeated: ${after}`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("forgets the oldest tombstone past the bound instead of growing without limit", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    try {
+      // 66 inserts is 65 evictions: one more than EVICTION_TOMBSTONES, so the
+      // first tombstone must have been forgotten while the newest is still
+      // there. This is the test that keeps "bounded" true — without it the
+      // bound branch is never executed.
+      for (let i = 0; i < 66; i++) await runner.run("1", `s${i}`);
+
+      const newest = await runner.run("1", "s64");
+      assert.match(newest, /\[evicted\]/, `the newest tombstone was forgotten: ${newest}`);
+
+      const oldest = await runner.run("1", "s0");
+      assert.doesNotMatch(oldest, /\[evicted\]/, "the tombstone map grew past its bound");
+      assert.match(oldest, /\[result\]\n1/, "the forgotten id runs as an ordinary fresh session");
     } finally {
       cleanup();
     }

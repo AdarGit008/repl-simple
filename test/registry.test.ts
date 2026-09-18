@@ -318,6 +318,7 @@ describe("renderPythonToolRules", () => {
     assert.match(rules, /os\.environ/);
     assert.match(rules, /annotated/);
     assert.match(rules, /__name__/);
+    assert.match(rules, /discards the whole snippet/);
   });
 
   it("warns that stdlib file access raises PermissionError and points at the tools", () => {
@@ -374,34 +375,62 @@ describe("renderPythonToolRules", () => {
     assert.match(inherit.status === "error" ? inherit.error : "", /NotImplementedError/);
   });
 
-  it("measures which checker-rejected names exist at runtime (D156)", async () => {
-    // SKILL.md tells the model which rejected names are usable at runtime
-    // (map, getattr, ...) and which are simply absent; reviewer A flagged the
-    // runtime half as unmeasured. Measure it with the checker off, one fresh
-    // session per name: a resolved name completes (MontyComplete) while an
-    // absent one comes back as a NameLookupSnapshot, which leaves the session
-    // suspended — so this probe cannot share one session across names.
-    // `bytearray` is the control that fails if it ever classified everything
-    // as present (it is the one the runtime genuinely lacks).
-    const resolves: string[] = [];
-    const names = [
-      "map",
-      "filter",
-      "getattr",
-      "hasattr",
-      "setattr",
-      "dir",
-      "callable",
-      "bytearray",
-    ];
-    for (const name of names) {
+  it("keeps SKILL.md's absent-vs-present split measured, not asserted (D156)", async () => {
+    // The runtime half of SKILL.md's claim shipped unmeasured; this reads the
+    // documented names out of the skill and measures every one of them, so
+    // the list cannot drift from the interpreter. With the checker off a
+    // resolved name completes (MontyComplete) and an absent one comes back as
+    // a NameLookupSnapshot, which leaves the session suspended — so each name
+    // gets a fresh session. A probe that classified everything as present
+    // fails on the first absent name; `bytearray` is the negative control.
+    const skill = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "repl-simple", "SKILL.md"),
+      "utf8",
+    );
+    const documented = (marker: string): string[] => {
+      const line = skill.split("\n").find((l) => l.includes(marker));
+      assert.ok(line, `SKILL.md lost its '${marker}' bullet`);
+      const list = line.slice(line.lastIndexOf(":") + 1);
+      return [...list.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    };
+    const absentDoc = documented("absent at runtime");
+    const presentDoc = documented("present** at runtime");
+    assert.ok(absentDoc.includes("bytearray"), "the negative control left the absent list");
+
+    const presentMeasured: string[] = [];
+    for (const name of [...absentDoc, ...presentDoc]) {
       const found = await withSandboxSession({ typeCheck: false }, async (session) => {
         const snap = await session.feedStart(name);
-        return snap instanceof MontyComplete && snap.output !== undefined && snap.output !== null;
+        return snap instanceof MontyComplete;
       });
-      if (found) resolves.push(name);
+      if (found) presentMeasured.push(name);
     }
-    assert.deepEqual(resolves, ["map", "filter", "getattr", "hasattr", "setattr"]);
+    assert.deepEqual(presentMeasured, presentDoc, "SKILL.md disagrees with the interpreter");
+  });
+
+  it("measures the lambda-callback claim it makes (D156)", async () => {
+    // The rule names which call sites reject a callback whose body uses its
+    // arguments. Measure both halves: a prompt that steers the model off
+    // working code, or warns about a failure that cannot happen, is a bug in
+    // this repo — the first version of this bullet did both.
+    const reducePrint = await runInSandbox(
+      "import functools\nprint(functools.reduce(lambda a, b: a + b, [1, 2]))",
+      { registry: new ToolRegistry() },
+    );
+    assert.equal(reducePrint.status, "error", JSON.stringify(reducePrint));
+    assert.match(reducePrint.status === "error" ? reducePrint.error : "", /unsupported-operator/);
+
+    const reduceBare = await runInSandbox(
+      "import functools\nfunctools.reduce(lambda a, b: a + b, [1, 2])",
+      { registry: new ToolRegistry() },
+    );
+    assert.equal(reduceBare.status, "ok", JSON.stringify(reduceBare));
+
+    const sortedKey = await runInSandbox(
+      'print(sorted([(2, "b"), (1, "a")], key=lambda p: p[0]))',
+      { registry: new ToolRegistry() },
+    );
+    assert.equal(sortedKey.status, "ok", JSON.stringify(sortedKey));
   });
 });
 

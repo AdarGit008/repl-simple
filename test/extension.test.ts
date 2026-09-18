@@ -801,7 +801,8 @@ describe("repl extension — parameter schemas", () => {
     // The model is the only party holding an id across calls, so the
     // description is where the cap and its one-shot notice must appear.
     assert.match(repl.description, /32 live sessions/);
-    assert.match(repl.description, /least-recently-used/);
+    assert.match(repl.description, /oldest session/);
+    assert.match(repl.description, /\[evicted\] notice/);
   });
 
   it("documents the cancellation boundary in the repl description (D6)", async () => {

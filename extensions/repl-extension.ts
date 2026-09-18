@@ -1536,9 +1536,9 @@ export default function (pi: ReplExtensionApi) {
         "with no pause points runs until the duration limit (maxDurationSecs). " +
         `One repl or repl_resume call opens at most ${MAX_DIALOGS_PER_CALL} approval ` +
         "dialogs; gated calls past that are denied and the result says why. " +
-        "At most 32 live sessions are pooled per project (REPL_MAX_SESSIONS); the " +
-        "least-recently-used is dropped, and the next call on that id starts fresh with " +
-        "an [evicted] notice. " +
+        "At most 32 live sessions are pooled per project by default (REPL_MAX_SESSIONS); " +
+        "past that cap the oldest session that is not awaiting approval is dropped, and the " +
+        "next call on that id starts fresh with an [evicted] notice. " +
         "The sessionId is scoped to this Pi session: when the conversation ends " +
         "(/new, /resume, /fork, quit) every REPL session is disposed, a pending approval " +
         "is dropped, and the same sessionId in the next conversation is a new, empty REPL.",

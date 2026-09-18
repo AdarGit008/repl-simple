@@ -463,7 +463,7 @@ export class ReplRunner {
    *
    * `reset` and a trust-change rebuild delete their entry directly rather
    * than through `insert`, so only a cap eviction leaves a tombstone — which
-   * is exactly the case the model cannot otherwise explain (#F8).
+   * is exactly the case the model cannot otherwise explain.
    */
   private readonly evicted = new Set<string>();
   /** This project's accepted-set manifest (#198). Never touched while the project is untrusted. */
@@ -1497,9 +1497,12 @@ function trustChangedMessage(sessionId: string, lostSuspension: boolean): string
  * continue, while a run starts over.
  */
 function evictedMessage(sessionId: string, maxSessions: number, purpose: "run" | "resume"): string {
+  // "the oldest session the pool could drop", not "the least recently used":
+  // `insert` skips suspended and busy entries, so a more recent session can
+  // outlive a less recent one — the statement must stay true in that state.
   const head =
-    `[evicted] Session '${sessionId}' was the least-recently-used of more than ` +
-    `${maxSessions} live sessions, so the pool dropped it.`;
+    `[evicted] Session '${sessionId}' was the oldest session the pool could drop, so it was ` +
+    `dropped to stay within the ${maxSessions}-session cap.`;
   return purpose === "resume"
     ? `${head} There is nothing to resume — run code with repl to start a fresh session.`
     : `${head} It starts fresh: variables, imports and cached tool calls are gone. ` +

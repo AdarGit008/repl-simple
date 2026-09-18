@@ -364,16 +364,20 @@ async function jailPathArg(
 }
 
 /**
- * Whether a `find` glob is trying to leave the jailed root.
+ * Whether a glob is absolute or climbs out of the project root.
  *
- * The jail holds the `path` argument, and `pattern` is a glob — so an
- * absolute pattern never reaches the resolver and fd answers "no files
- * found" rather than a refusal: an empty result the model reads as fact. A
- * `..` segment is refused for the same reason: it can only describe a search
- * the jail would have rejected had it arrived as `path`.
+ * An honesty guard, not an escape guard: both `fd` and `rg` walk only the
+ * jailed search path, so a pattern like `/etc/*` comes back as "no files
+ * found" / "no matches found" — an empty result the model reads as fact.
+ * Absolute patterns are refused even when they happen to name an in-root
+ * path, because accepting some would mean resolving them against the jail
+ * first; the rule is simply "project-relative globs". Both separators are
+ * checked so the guard does not stop at the platform boundary.
  */
-function escapesSearchRoot(pattern: string): boolean {
-  return pattern.startsWith("/") || pattern.split("/").includes("..");
+function notProjectRelative(pattern: string): boolean {
+  if (pattern.startsWith("/") || pattern.startsWith("\\")) return true;
+  if (/^[A-Za-z]:[\\/]/.test(pattern)) return true;
+  return pattern.split(/[\\/]/).includes("..");
 }
 
 interface ToolSpec {
@@ -475,6 +479,19 @@ const TOOL_SPECS: ToolSpec[] = [
       },
     ],
     mutating: false,
+    // The same honesty guard as `find`: a `glob` is not a `path`, so an
+    // absolute one never reaches the jail and rg answers "No matches found"
+    // — an empty result the model reads as fact.
+    prepareArgs: (args) => {
+      const glob = args.glob;
+      if (typeof glob === "string" && notProjectRelative(glob)) {
+        throw new HostToolError(
+          "PermissionError",
+          `the grep glob '${glob}' is not project-relative; use a glob inside the project root`,
+        );
+      }
+      return args;
+    },
   },
   {
     name: "find",
@@ -493,14 +510,14 @@ const TOOL_SPECS: ToolSpec[] = [
     // `path` is jailed above; `pattern` is not a path and never reaches the
     // jail, so a glob pointing outside the root would be answered with "No
     // files found matching pattern" — a refusal-shaped fact the model would
-    // act on. Refuse it by name instead (F7).
+    // act on. Refuse it by name instead.
     prepareArgs: (args) => {
       const pattern = args.pattern;
-      if (typeof pattern === "string" && escapesSearchRoot(pattern)) {
+      if (typeof pattern === "string" && notProjectRelative(pattern)) {
         throw new HostToolError(
           "PermissionError",
-          `the find pattern '${pattern}' is outside the search root '${String(args.path)}'; ` +
-            "find patterns cannot leave the project root — use a project-relative glob",
+          `the find pattern '${pattern}' is not project-relative; use a glob inside the ` +
+            "project root (e.g. '*.ts' with an optional jailed 'path')",
         );
       }
       return args;
