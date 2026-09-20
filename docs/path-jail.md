@@ -81,7 +81,10 @@ Two tools deliberately have none:
   exactly the path it is given, which the argument jail has already canonicalised.
 - **`find`** only consults its operations when they supply `glob`, which replaces the `fd`
   subprocess entirely — losing .gitignore handling and the result caps with it. `fd`, like `rg`,
-  does not follow symlinks out of the tree it is pointed at.
+  does not follow symlinks out of the tree it is pointed at. The bridge refuses an absolute
+  `pattern` (or one containing a `..` segment) before `fd` runs, so the model gets a refusal it
+  can act on instead of fd's "no files found": the pattern is not a `path` and never reaches the
+  jail described above.
 
 A caller's own `operations` still compose: the jail wraps them, and they see canonical, in-root
 paths or nothing at all.

@@ -52,7 +52,10 @@
    mutant changes no observable behavior (every access re-checks trust). None in the single-flight,
    LRU, or eviction-skip logic.
 3. **Silent eviction for idle sessions** (no model-facing notice when an evicted id comes back
-   fresh) — not requested by #59; observe in practice before adding a tombstone.
+   fresh) — not requested by #59; observe in practice before adding a tombstone. **Observed and
+   resolved**: the live e2e run showed sessions vanishing with no explanation, and the pool now
+   keeps a bounded tombstone that delivers a one-shot `[evicted]` notice on the next
+   `repl`/`repl_resume` call for a dropped id.
 4. **Concurrent same-id runs through the direct API** replay from the same starting snapshot —
    unreachable via the shipped extension (`executionMode: "sequential"`); inherent to replay-based
    sessions, belongs to #61 if it ever matters.

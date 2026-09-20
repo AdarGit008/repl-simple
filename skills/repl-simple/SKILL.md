@@ -18,6 +18,8 @@ Sandboxed Python execution in pi via [Monty](https://github.com/pydantic/monty) 
 
 - `maxDurationSecs`: interpreter compute seconds, default 30, cap 300.
 - `maxMemory`: sandbox heap MiB, default 512, cap 1024.
+- A non-positive or non-finite limit is treated as omitted (the fail-safe default applies) — `maxDurationSecs=0` is not a limit of zero.
+- Sessions are pooled per project: at most 32 live (`REPL_MAX_SESSIONS`); the least-recently-used is evicted — never one with a pending approval — and the next call on that id starts fresh with a one-shot `[evicted]` notice.
 - A `repl` or `repl_resume` call opens at most **8 approval dialogs**; gated calls past that are denied and the result says so.
 - Running new `repl` code while a call is suspended discards that call — `repl_resume` first if you still want it.
 - Sessions are scoped to one pi conversation: `/new`, `/resume`, `/fork`, or quit disposes every session and drops pending approvals. The same `sessionId` next conversation is a fresh, empty REPL.
@@ -55,10 +57,16 @@ The sandbox has no filesystem of its own: `open()`, `os.listdir()`, and `pathlib
 - `match` statements (no pattern matching)
 - class inheritance / metaclasses (`class B(A)` fails; a plain `class` with methods works)
 
+A construct the parser or checker refuses discards the whole snippet — no statement in it runs, and no side effect happens.
+
 **Type-checker limits** (a static type check runs before execution and fails as `[error: typing]`, distinct from `[error: syntax]`/`[error: runtime]`):
-- Some builtins are blocked by the checker: `dir`, `callable`, `eval`, `exec`, `vars`, `globals`, `locals`, `bytearray` do not exist at runtime, while `getattr`, `hasattr`, `setattr`, `map`, `filter` exist at runtime but the checker rejects them — either way a missing name is a typing error, **not** a catchable `NameError`, so `try/except NameError` will not save you.
-- Stdlib stubs are partial: `sys.maxsize`, `asyncio.sleep`, and `pathlib.PurePath` are missing, and modules have no `__dict__`.
-- Lambda parameters infer as `object`: `lambda a, b: a + b` is rejected (unsupported `+`) — use a `def` with annotated parameters instead.
+- Rejected by the checker **and** absent at runtime — a missing name is a typing error, **not** a catchable `NameError`, so `try/except NameError` will not save you: `dir`, `vars`, `callable`, `format`, `issubclass`, `super`, `classmethod`, `staticmethod`, `memoryview`, `complex`, `compile`, `eval`, `exec`, `globals`, `locals`, `input`, `breakpoint`, `__import__`, `bytearray`.
+- Rejected by the checker but **present** at runtime (measured with the checker off), so a normal type-checked run still cannot use them: `map`, `filter`, `getattr`, `hasattr`, `setattr`.
+- `ImportError` and `ModuleNotFoundError` exist at runtime but are rejected by the checker — and a refused import never runs, so there is nothing to catch.
+- Stdlib stubs are partial: `os.getcwd`, `os.path`, `sys.argv`, `sys.exit`, `sys.path`, `sys.maxsize`, `collections.OrderedDict`, `asyncio.sleep`, `itertools.product`/`permutations`/`combinations`, `functools.wraps`/`lru_cache` and `pathlib.PurePath` are missing, and modules have no `__dict__`.
+- Lambda parameters passed as callbacks infer as `object`: a body that uses them (`a + b`, `p[0]`, `len(w)`) is rejected in some positions — `functools.reduce(lambda …)` passes as a bare expression and fails inside `print(...)`, and `max`/`min(..., key=lambda …)` behave the same way. `sorted(..., key=…)` and `list.sort(key=…)` are accepted, and a lambda called directly is always fine. Use a `def` with annotated parameters when the callback uses its arguments.
+- I/O is `print()`-only: `sys.stdout.write`/`sys.stderr.write` and `os.environ`/`os.getenv` pass the checker but raise at runtime.
+- Only class objects carry `__name__` (and `type(x).__name__`); functions, builtins and instances expose no dunder methods.
 
 **Return values** cross to the host as data, with nesting caps: a list ~48 levels deep or a class instance ~24 deep is fine, one more fails the whole run with `RuntimeError: Max output depth exceeded` (after side effects). Instances cross **without their methods** — `__repr__` is not called, so end a snippet on `repr(obj)` to see a useful value.
 

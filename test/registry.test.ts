@@ -24,6 +24,7 @@ import { createPiBridgeTools } from "../src/bridge.js";
 import { createRLMTools } from "../src/rlm_tools.js";
 import { createToolStoreTools } from "../src/toolstore.js";
 import { SandboxUnavailableError, closeSandboxPool, withSandboxSession } from "../src/pool.js";
+import { MontyComplete } from "@pydantic/monty/node";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -317,14 +318,33 @@ describe("renderPythonToolRules", () => {
     assert.ok(rules.includes("datetime"));
   });
 
-  it("warns that unavailable imports are refused before running", () => {
-    // Should warn about modules like 'time', 'random' etc. if not importable.
-    // The truth: with the type checker on, an unavailable import is a static
-    // `error[unresolved-import]` before any code runs — never a runtime
-    // ModuleNotFoundError the model could except.
+  it("says a refused import is a static unresolved-import, not a catchable ModuleNotFoundError", async () => {
+    // The rules used to promise `ModuleNotFoundError`, which a model acts on
+    // by writing `try/except ModuleNotFoundError` — code that cannot work:
+    // the refusal is a typing error before execution, and the exception class
+    // is itself unresolved to the checker. Prompt text is behaviour (D156),
+    // so the sentence and the interpreter are measured in the same test.
     const rules = renderPythonToolRules(["json"]);
     assert.match(rules, /unresolved-import/);
     assert.doesNotMatch(rules, /ModuleNotFoundError/);
+
+    const refused = await runInSandbox("import time", { registry: new ToolRegistry() });
+    assert.equal(refused.status, "error", JSON.stringify(refused));
+    assert.equal(refused.status === "error" ? refused.errorKind : "", "typing");
+    assert.match(refused.status === "error" ? refused.error : "", /unresolved-import/);
+  });
+
+  it("names every construct that discards the snippet, and the print()-only I/O rule", () => {
+    // These sentences are the model's only warning that one refused construct
+    // costs the whole run, and that sys.stdout.write/os.environ pass the
+    // checker but fail at runtime.
+    const rules = renderPythonToolRules(["json"]);
+    assert.match(rules, /yield/);
+    assert.match(rules, /sys\.stderr\.write/);
+    assert.match(rules, /os\.environ/);
+    assert.match(rules, /annotated/);
+    assert.match(rules, /__name__/);
+    assert.match(rules, /discards the whole snippet/);
   });
 
   it("warns that stdlib file access raises PermissionError and points at the tools", () => {
@@ -398,6 +418,64 @@ describe("renderPythonToolRules", () => {
     assert.match(rules, /no stderr/);
     assert.match(rules, /By default the\s+sandbox has no filesystem/);
     assert.match(rules, /open\(\)\/os\.listdir\(\)\/pathlib raise PermissionError/);
+  });
+
+  it("keeps SKILL.md's absent-vs-present split measured, not asserted (D156)", async () => {
+    // The runtime half of SKILL.md's claim shipped unmeasured; this reads the
+    // documented names out of the skill and measures every one of them, so
+    // the list cannot drift from the interpreter. With the checker off a
+    // resolved name completes (MontyComplete) and an absent one comes back as
+    // a NameLookupSnapshot, which leaves the session suspended — so each name
+    // gets a fresh session. A probe that classified everything as present
+    // fails on the first absent name; `bytearray` is the negative control.
+    const skill = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "repl-simple", "SKILL.md"),
+      "utf8",
+    );
+    const documented = (marker: string): string[] => {
+      const line = skill.split("\n").find((l) => l.includes(marker));
+      assert.ok(line, `SKILL.md lost its '${marker}' bullet`);
+      const list = line.slice(line.lastIndexOf(":") + 1);
+      return [...list.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    };
+    const absentDoc = documented("absent at runtime");
+    const presentDoc = documented("present** at runtime");
+    assert.ok(absentDoc.includes("bytearray"), "the negative control left the absent list");
+
+    const presentMeasured: string[] = [];
+    for (const name of [...absentDoc, ...presentDoc]) {
+      const found = await withSandboxSession({ typeCheck: false }, async (session) => {
+        const snap = await session.feedStart(name);
+        return snap instanceof MontyComplete;
+      });
+      if (found) presentMeasured.push(name);
+    }
+    assert.deepEqual(presentMeasured, presentDoc, "SKILL.md disagrees with the interpreter");
+  });
+
+  it("measures the lambda-callback claim it makes (D156)", async () => {
+    // The rule names which call sites reject a callback whose body uses its
+    // arguments. Measure both halves: a prompt that steers the model off
+    // working code, or warns about a failure that cannot happen, is a bug in
+    // this repo — the first version of this bullet did both.
+    const reducePrint = await runInSandbox(
+      "import functools\nprint(functools.reduce(lambda a, b: a + b, [1, 2]))",
+      { registry: new ToolRegistry() },
+    );
+    assert.equal(reducePrint.status, "error", JSON.stringify(reducePrint));
+    assert.match(reducePrint.status === "error" ? reducePrint.error : "", /unsupported-operator/);
+
+    const reduceBare = await runInSandbox(
+      "import functools\nfunctools.reduce(lambda a, b: a + b, [1, 2])",
+      { registry: new ToolRegistry() },
+    );
+    assert.equal(reduceBare.status, "ok", JSON.stringify(reduceBare));
+
+    const sortedKey = await runInSandbox(
+      'print(sorted([(2, "b"), (1, "a")], key=lambda p: p[0]))',
+      { registry: new ToolRegistry() },
+    );
+    assert.equal(sortedKey.status, "ok", JSON.stringify(sortedKey));
   });
 });
 

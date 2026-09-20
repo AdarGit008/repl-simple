@@ -2000,6 +2000,81 @@ describe("ReplRunner — the pool is capped and never drops a pending approval (
       cleanup();
     }
   });
+
+  it("an evicted id is told why it is fresh — once, and only if it was evicted", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 2 });
+
+    try {
+      await runner.run("v = 1", "keep");
+      await runner.run("v = 2", "doomed");
+      await runner.run("v", "keep"); // touch: doomed is now the candidate
+      await runner.run("v = 3", "newcomer"); // over the cap: doomed is evicted
+      assert.equal(runner.liveSessionCount(), 2);
+
+      const back = await runner.run("1 + 1", "doomed");
+      assert.match(back, /\[evicted\]/, `no eviction notice: ${back}`);
+      assert.match(back, /'doomed'/);
+      assert.match(back, /oldest session the pool could drop/);
+      assert.match(back, /2-session cap/);
+      assert.match(back, /starts fresh/);
+      assert.match(back, /Raise REPL_MAX_SESSIONS/);
+      assert.match(back, /\[result\]\n2/, "the notice must ride with the run it explains");
+
+      const again = await runner.run("2 + 2", "doomed");
+      assert.doesNotMatch(again, /\[evicted\]/, "the notice is one-shot");
+
+      const never = await runner.run("3 + 3", "brand-new");
+      assert.doesNotMatch(never, /\[evicted\]/, "a never-created id must not claim eviction");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("resume on an evicted id says evicted, not 'no session'", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    try {
+      await runner.run("v = 1", "old");
+      await runner.run("v = 2", "new"); // over the cap: old is evicted
+
+      const text = await runner.resume("old");
+      assert.match(text, /\[evicted\]/, text);
+      assert.match(text, /nothing to resume/, text);
+      assert.doesNotMatch(text, /starts fresh/, "the resume sentence must not promise a fresh run");
+      assert.doesNotMatch(text, /No session 'old' exists/);
+
+      // One-shot: the resume consumed the tombstone, so the run that follows
+      // is not told about the same eviction again.
+      const after = await runner.run("1 + 1", "old");
+      assert.doesNotMatch(after, /\[evicted\]/, `the notice repeated: ${after}`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("forgets the oldest tombstone past the bound instead of growing without limit", async () => {
+    const cwd = makeTempDir();
+    const runner = new ReplRunner(cwd, { maxSessions: 1 });
+
+    try {
+      // 66 inserts is 65 evictions: one more than EVICTION_TOMBSTONES, so the
+      // first tombstone must have been forgotten while the newest is still
+      // there. This is the test that keeps "bounded" true — without it the
+      // bound branch is never executed.
+      for (let i = 0; i < 66; i++) await runner.run("1", `s${i}`);
+
+      const newest = await runner.run("1", "s64");
+      assert.match(newest, /\[evicted\]/, `the newest tombstone was forgotten: ${newest}`);
+
+      const oldest = await runner.run("1", "s0");
+      assert.doesNotMatch(oldest, /\[evicted\]/, "the tombstone map grew past its bound");
+      assert.match(oldest, /\[result\]\n1/, "the forgotten id runs as an ordinary fresh session");
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 // ── Reset evicts: no hollow entries (#59) ───────────────────────
@@ -2343,7 +2418,13 @@ describe("ReplRunner — resume revalidates after its trust check (#59)", () => 
       releaseCheck();
 
       const out = await resuming;
-      assert.match(out, /No session 'victim' exists/, `a result for an evicted session: ${out}`);
+      // The eviction message, not the generic one: the pool dropping the
+      // session is the reason there is nothing to resume, and a tombstone
+      // exists to say so (#F8). What this test exists for is unchanged — no
+      // result for a session the pool no longer holds.
+      assert.match(out, /\[evicted\]/, `a result for an evicted session: ${out}`);
+      assert.match(out, /nothing to resume/, out);
+      assert.doesNotMatch(out, /\[result\]/, `a result for an evicted session: ${out}`);
       assert.equal(runner.liveSessionCount(), 1, "the eviction did not stick");
     } finally {
       target.trustChangeDiscards = original.bind(runner);

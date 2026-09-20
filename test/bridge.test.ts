@@ -453,6 +453,16 @@ describe("createPiBridgeTools — the cwd jail", () => {
       ["grep", { pattern: SECRET, path: "escape-dir" }],
       ["ls", { path: "escape-dir" }],
       ["find", { pattern: "secret.txt", path: "escape-dir" }],
+      // The pattern is a glob, not a `path`, so the jail never sees these:
+      // they are refused by name rather than silently matching nothing and
+      // reading as "this directory has no files".
+      ["find", { pattern: "/etc/*" }],
+      ["find", { pattern: "../*.md" }],
+      ["find", { pattern: "..\\..\\secret" }],
+      ["find", { pattern: "C:\\etc\\*" }],
+      // Same class one tool over: an absolute `glob` filters rg's walk to
+      // nothing and the model reads "No matches found" as fact.
+      ["grep", { pattern: "hi", glob: "/etc/*" }],
       ["read_file", { path: "escape-link" }],
       ["list_files", { path: "escape-dir" }],
     ];
@@ -469,6 +479,33 @@ describe("createPiBridgeTools — the cwd jail", () => {
       }
       assert.fail(`${name} reached outside the root and returned: ${output}`);
     }
+  });
+
+  it("refuses a non-relative glob by name, but keeps '..' inside a name", async () => {
+    // The guard exists so the model gets a refusal instead of "no files
+    // found" — and it must not swallow legitimate names: a file called
+    // 'a..b.txt' is not a traversal, and neither is a directory called 'a..b'.
+    writeFileSync(join(tmpDir, "a..b.txt"), "dots\n");
+    mkdirSync(join(tmpDir, "a..b"), { recursive: true });
+    writeFileSync(join(tmpDir, "a..b", "inner.md"), "inner\n");
+    const tools = createPiBridgeTools(tmpDir);
+    const find = findTool(tools, "find");
+
+    assert.match(await find.execute({ pattern: "a..b.txt" }), /a\.\.b\.txt/);
+    assert.match(await find.execute({ pattern: "a..b/*.md" }), /inner\.md/);
+
+    await assert.rejects(
+      async () => find.execute({ pattern: "/etc/*" }),
+      (err: unknown) => {
+        assert.ok(err instanceof HostToolError, `got ${err}`);
+        assert.equal((err as HostToolError).pythonType, "PermissionError");
+        // The wording is the model's only actionable part, so it is pinned —
+        // and it must not claim an in-root absolute pattern was outside.
+        assert.match(String((err as Error).message), /not project-relative/);
+        assert.doesNotMatch(String((err as Error).message), /outside the search root/);
+        return true;
+      },
+    );
   });
 
   it("is one implementation, shared by both readers", async () => {
