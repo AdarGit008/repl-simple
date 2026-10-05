@@ -48,8 +48,11 @@
     ]
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.131.0",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "@pydantic/monty": "0.0.23",
-    "undici": "8.9.0"
+    "undici": "8.9.0",
+    "zod": "4.6.5"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1"
