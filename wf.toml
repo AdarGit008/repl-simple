@@ -1,0 +1,9 @@
+# wf.toml — how `wf` verifies this repo (okf-dev-workflow).
+# [gate] steps are command lines (split with shlex, no shell):
+# declared = always runs, "" = skipped, undeclared = default (skipped if the tool is absent).
+# `test` is also what `wf red` / `wf green` run, with the test paths appended.
+[gate]
+lint = "npm run lint"
+typecheck = "npm run check"
+test = "npx tsx --test"
+build = "npm run build"
