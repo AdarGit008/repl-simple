@@ -8,6 +8,7 @@ import { createPiBridgeTools } from "../src/bridge.js";
 import { createBuiltinTools } from "../src/builtins.js";
 import { createToolStoreTools } from "../src/toolstore.js";
 import { createRLMTools } from "../src/rlm_tools.js";
+import { MCP_TOOL_NAMES } from "../src/mcp_server.js";
 import { createPackFixture, REPO_ROOT, type PackFixture } from "./support/pack-fixture.js";
 
 /**
@@ -233,6 +234,17 @@ describe("README truth (#82)", () => {
       readmeTableToolNames(readme(), "### REPL (direct)"),
       REPL_TOP_LEVEL_TOOLS,
       "README 'REPL (direct)' table drifted from the extension's registered tools",
+    );
+  });
+
+  it("the README 'MCP tools' table matches the tools the MCP server registers", () => {
+    // `MCP_TOOL_NAMES` is what `createReplMcpServer` registers, pinned against
+    // the live server by test/mcp_server.test.ts; the table must list exactly
+    // those, in registration order.
+    assert.deepEqual(
+      readmeTableToolNames(readme(), "### MCP tools"),
+      [...MCP_TOOL_NAMES],
+      "README 'MCP tools' table drifted from the MCP server's registered tools",
     );
   });
 
