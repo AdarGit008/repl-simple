@@ -73,8 +73,18 @@ const EXCLUDED_TEST_FILES = ["test/extension-loader.test.ts"];
  * No test imports it, so it never reaches the report, and there is no
  * behaviour in it to cover if one did. `npm run check` already fails if a
  * re-exported name stops resolving, which is the only way a barrel breaks.
+ *
+ * `src/mcp_main.ts` is the `repl-simple-mcp` bin: configuration from the
+ * environment, the server on stdio, a shutdown hook. Its test
+ * (`test/mcp_stdio.test.ts`) spawns it as a child process and drives it over
+ * stdin/stdout — the only way to see what it does. Node's coverage follows
+ * into that child only some of the time (measured: absent from all three
+ * `--update` runs, present at 80.64% in the next plain run), and a floor on
+ * a file that is sometimes absent from the report is a hard error by design
+ * ("has a floor but is absent"). Everything it calls (`src/mcp_server.ts`)
+ * is floored.
  */
-const UNMEASURED_SOURCE_FILES = ["src/index.ts"];
+const UNMEASURED_SOURCE_FILES = ["src/index.ts", "src/mcp_main.ts"];
 
 /** Every tracked source file expected to carry a floor.
  *
