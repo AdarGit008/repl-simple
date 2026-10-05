@@ -1,6 +1,6 @@
 # repl-simple
 
-Pi extension — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
+Pi extension and MCP server (`repl-simple-mcp`) — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
 
 ## Sandbox
 

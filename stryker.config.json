@@ -6,7 +6,7 @@
     "testFiles": ["test/*.test.ts"],
     "nodeArgs": ["--import", "tsx", "--test-reporter=tap", "-r", "{{hookFile}}", "{{testFile}}"]
   },
-  "mutate": ["src/**/*.ts", "extensions/**/*.ts"],
+  "mutate": ["src/**/*.ts", "extensions/**/*.ts", "!src/mcp_main.ts"],
   "coverageAnalysis": "perTest",
   "concurrency": 6,
   "incremental": true,

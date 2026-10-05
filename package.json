@@ -2,7 +2,7 @@
   "name": "repl-simple",
   "version": "0.2.0",
   "type": "module",
-  "description": "Pi extension — sandboxed Python execution via Monty",
+  "description": "Pi extension and MCP server — sandboxed Python execution via Monty",
   "keywords": [
     "pi-package"
   ],
@@ -14,6 +14,9 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
+  },
+  "bin": {
+    "repl-simple-mcp": "dist/mcp_main.js"
   },
   "files": [
     "dist",
@@ -48,8 +51,11 @@
     ]
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.131.0",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "@pydantic/monty": "0.0.23",
-    "undici": "8.9.0"
+    "undici": "8.9.0",
+    "zod": "4.6.5"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1"

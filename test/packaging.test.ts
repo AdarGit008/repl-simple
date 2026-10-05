@@ -120,6 +120,15 @@ describe("build output", () => {
     );
   });
 
+  it("emits the MCP bin at dist/mcp_main.js with its shebang intact", () => {
+    const main = join(DIST, "mcp_main.js");
+    assert.ok(existsSync(main), "expected dist/mcp_main.js — the `bin` target — to exist");
+    assert.ok(
+      readFileSync(main, "utf8").startsWith("#!/usr/bin/env node\n"),
+      "tsc must keep the shebang on the first line, or `bin` cannot run the file",
+    );
+  });
+
   it("emits no test files into dist/", () => {
     const files = filesRelativeTo(DIST);
     const testFiles = files.filter((f) => f.split(sep)[0] === "test" || /\.test\./.test(f));
@@ -148,6 +157,11 @@ describe("tarball contents (#81)", () => {
     assert.ok(
       files.includes("repl/repl_server.py"),
       "tarball must include repl/repl_server.py (the preamble asset)",
+    );
+    // The MCP bin target must ship, or `repl-simple-mcp` resolves to nothing after install.
+    assert.ok(
+      files.includes("dist/mcp_main.js"),
+      "tarball must include dist/mcp_main.js (the bin)",
     );
     // The packaged skill manifest must ship so pi can load the skill from the package.
     assert.ok(
@@ -203,6 +217,42 @@ describe("scratch consumer (offline, SPEC AS6)", () => {
   });
 });
 
+describe("scratch consumer (offline): the bin", () => {
+  it("dist/mcp_main.js from the packed artifact starts and answers an MCP handshake", () => {
+    // One JSON-RPC `initialize` on stdin, one response on stdout, then stdin
+    // closes and the server exits. Pins the whole chain a Claude Code user
+    // relies on: the bin resolves its deps from the installed package, speaks
+    // the protocol on stdout, and writes nothing else there.
+    const initialize = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "packaging-test", version: "0" },
+      },
+    });
+    const run = spawnSync(process.execPath, [join(packedPkgDir, "dist", "mcp_main.js")], {
+      cwd: consumerDir,
+      encoding: "utf8",
+      input: `${initialize}\n`,
+      timeout: 30_000,
+      env: { ...process.env, PI_OFFLINE: "1" },
+    });
+    assert.equal(run.status, 0, `bin exited ${run.status}:\n${run.stdout}\n${run.stderr}`);
+    const lines = run.stdout.split("\n").filter((line) => line.trim() !== "");
+    assert.equal(lines.length, 1, `expected exactly one JSON-RPC frame on stdout:\n${run.stdout}`);
+    const reply = JSON.parse(lines[0]) as {
+      id: number;
+      result?: { serverInfo?: { name?: string; version?: string } };
+    };
+    assert.equal(reply.id, 1);
+    assert.equal(reply.result?.serverInfo?.name, "repl-simple");
+    assert.equal(reply.result?.serverInfo?.version, readManifest().version);
+  });
+});
+
 describe("export reachability", () => {
   it("every value export of src/index.ts is reachable from the packed artifact", async () => {
     const pkg = await import(pathToFileURL(join(packedPkgDir, "dist", "index.js")).href);
@@ -221,8 +271,10 @@ describe("export reachability", () => {
 
 interface Manifest {
   private?: boolean;
+  version?: string;
   main?: string;
   types?: string;
+  bin?: Record<string, string>;
   exports?: Record<string, { import?: string; types?: string }>;
   files?: string[];
   license?: string;
@@ -257,6 +309,14 @@ describe("manifest", () => {
     assert.equal(pkg.exports?.["."]?.types, "./dist/index.d.ts");
     assert.equal(pkg.license, "MIT");
     assert.equal(pkg.scripts?.prepublishOnly, "npm run build");
+  });
+
+  it("declares the repl-simple-mcp bin, pointing at the built entry under dist/", () => {
+    const pkg = readManifest();
+    assert.equal(pkg.bin?.["repl-simple-mcp"], "dist/mcp_main.js");
+    // The target must be inside `files`' dist/ (shipped) and emitted by the
+    // build config, which includes src/**/*.ts — src/mcp_main.ts is the source.
+    assert.ok(existsSync(join(REPO_ROOT, "src", "mcp_main.ts")), "src/mcp_main.ts must exist");
   });
 
   it("files ships dist, src, repl, extensions, skills, and NOTICE (D3)", () => {
