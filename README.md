@@ -1,6 +1,6 @@
 # repl-simple
 
-Pi extension — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
+Pi extension and MCP server (`repl-simple-mcp`) — sandboxed Python execution via [Monty](https://github.com/pydantic/monty) (Python-in-WebAssembly interpreter).
 
 ## Sandbox
 
@@ -301,99 +301,6 @@ install and looks like a way around this. It is not: it runs Python in-process, 
 blocks the event loop and there is no crash isolation. See
 [docs/platform-support.md](docs/platform-support.md).
 
-## Claude Code (MCP server)
-
-The same five tools, served over [MCP](https://modelcontextprotocol.io) stdio so Claude Code — or
-any MCP client — can call them without pi. The server is the package `bin`, `repl-simple-mcp`
-(`dist/mcp_main.js`, built by `npm run build`); it wraps the same `ReplRunner` and `runRlm` the pi
-extension uses, through the same model boundary (`src/model_boundary.ts`), and changes nothing about
-pi. The package is not on npm yet, so install from a clone:
-
-```bash
-git clone https://github.com/AdarGit008/repl-simple && cd repl-simple
-npm install && npm run build
-```
-
-Then register it with Claude Code. Run this **in the project you want the sandbox rooted at**:
-
-```bash
-claude mcp add --transport stdio repl-simple \
-  --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  -- node /absolute/path/to/repl-simple/dist/mcp_main.js
-```
-
-`--scope project` writes the entry to `.mcp.json` for the whole team instead of your local config;
-Claude Code asks before using a project-scoped server, and strips credential-named variables
-(`*KEY*`, `*TOKEN*`, …) from the environment it hands such servers, so the key has to be passed
-explicitly — `--env`, or `"env": {"ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"}` in `.mcp.json`.
-The key is only needed by `rlm`; `repl` works without one.
-
-The peer dependency `@earendil-works/pi-coding-agent` (the bridged `bash`/`grep`/… tools, see
-[Install](#install)) is in `devDependencies`, so a clone's `npm install` has it; npm 7+ also installs
-peers for a registry install. Without it the server fails at startup with `ERR_MODULE_NOT_FOUND` for
-that package (`src/bridge.ts` imports it statically); nothing runs half-configured.
-
-### MCP tools
-
-| Tool | Description |
-|------|-------------|
-| `repl(code, sessionId?, maxDurationSecs?, maxMemory?)` | Execute Python in a named session. Variables persist across calls. The description a model reads lists the Python-side host tools, read off the runner's own registry. |
-| `repl_resume(approvalId, sessionId?, decision?)` | Decide the pending gated call — `approve` (default) runs it, `deny` refuses it — and continue the run. `approvalId` must be the id the suspended result handed back. |
-| `repl_reset(sessionId?)` | Clear all state in a session, pending approval included. |
-| `repl_abandon(sessionId?)` | Drop a pending gated call without running it; the session keeps its state. |
-| `rlm(question, maxIterations?, maxDepth?, budget?)` | The autonomous read-only code-gen → execute loop, on the Anthropic API. The answer is inner-model output and must be treated as untrusted. |
-
-### Approvals over MCP
-
-MCP has no dialog for the server to open, and the server **never approves anything on its own**.
-Every gated call (`bash`, `edit`, `write`, `save_tool`, an unlisted `http_get`) suspends the run —
-the library's "decide later" answer — and the result says so: the call has **not** run, here is the
-call, here is its `approvalId`, and these are the three things that decide it:
-
-- `repl_resume(sessionId, approvalId)` runs it. **Claude Code's permission prompt in front of that
-  tool call is the human approval**: the user sees `repl_resume` with the id and the session, and
-  the preceding `repl` result in the transcript names the exact call. The id binds the decision to
-  the call that was shown — any other id (stale after new code ran, mistyped, guessed) resumes
-  nothing and the result repeats the pending call and its id. If the continuation reaches another
-  gated call it suspends again under a **new** id, so every gated call is its own prompt.
-- `repl_resume(sessionId, approvalId, decision='deny')` refuses it: Python sees `PermissionError`
-  and the code continues, exactly as a denied dialog does in pi.
-- `repl_abandon(sessionId)` drops the suspended run; the session lives on. Running new `repl` code on
-  the session does the same and says so (`[discarded]`).
-
-The gate therefore holds exactly as long as Claude Code asks. Allow-listing
-`mcp__repl-simple__repl_resume` (or the whole server, `mcp__repl-simple`), answering "don't ask
-again", or `--dangerously-skip-permissions` removes the human from the loop: every call the model
-chooses to resume then runs. The MCP server is strict mode with no `yolo`; that switch is the
-client's. Inside `rlm` nothing changes — gated tools are denied outright in the loop, as in pi.
-
-### Environment
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | — | Read by the Anthropic SDK **in the server process**, for `rlm` only. Never logged, never put in a result, and withheld from the sandboxed `bash` by the env allowlist ([docs/bash-env.md](docs/bash-env.md)). Unset → `repl` works, `rlm` returns `status: error`. The SDK's other credential sources (`ANTHROPIC_AUTH_TOKEN`, an `ant auth login` profile) work too. |
-| `REPL_RLM_ANTHROPIC_MODEL` | `claude-opus-5-5` | The model id the `rlm` loop queries. The operator's knob, not the model's: the MCP `rlm` tool has no `model`/`provider` parameters. |
-| `REPL_MCP_ROOT` | `CLAUDE_PROJECT_DIR`, else the cwd | The project root: path jail, `.pi/code-tools`, the bridged tools' cwd. Claude Code sets `CLAUDE_PROJECT_DIR` for the servers it spawns, so the default is right under Claude Code. |
-| `REPL_MCP_TRUST_PROJECT` | unset — **untrusted** | `1`/`true`/`yes` trusts the project, which lets an **accepted** saved-tool set load ([docs/project-trust.md](docs/project-trust.md)). Trust alone loads nothing: the server has no dialog to accept files on, so acceptance comes from pi's `/repl-accept-preamble` or an embedder calling `acceptPreamble()`. |
-
-Every `REPL_*` variable the sandbox reads applies unchanged — `REPL_RLM_BUDGET` (the `rlm` spend
-ceiling), `REPL_MAX_*`, `REPL_HTTP_ALLOWLIST`, `REPL_BASH_ENV_ALLOW`, `REPL_PREAMBLE_STORE_DIR`.
-
-### Limits
-
-- Everything in [Sandbox](#sandbox) holds: Monty's fixed stdlib, no `subprocess`/sockets, no third-party
-  packages, the language gaps, the type checker, the 32 KiB / 16 KiB output caps.
-- **glibc only.** `@pydantic/monty` has no musl build, so the server does not run on Alpine; see
-  [docs/platform-support.md](docs/platform-support.md). Node >= 22.19.0.
-- One server process serves one root, and tool calls are serialised — the pi extension's
-  `executionMode: "sequential"` — so two `repl` calls in one turn run one after the other.
-- Sessions live as long as the server process, which Claude Code starts and stops with its own
-  session; a pending approval dies with the process, unexecuted. `rlm` costs real API money per call; the default budget
-  bounds it (`REPL_RLM_BUDGET`).
-- No `/repl-approvals yolo`, no `/repl-accept-preamble`, no result rendering: those are pi commands.
-  The trace a pi result carries on `details` is not sent over MCP — the result text is what the
-  model gets.
-
 ## Dev
 
 ```bash
@@ -423,9 +330,6 @@ not renamed):
 | `src/sandbox.ts`, `src/pool.ts` | One Monty run — dispatch loop, approval gate, limits — and the worker pool it checks out of. |
 | `src/registry.ts`, `src/builtins.ts`, `src/bridge.ts`, `src/toolstore.ts` | Host tools: the registry and stubs, the builtins, the jailed pi bridge, the saved-tool store. |
 | `extensions/repl-extension.ts` | The pi extension: registers the four tools and the `/repl-*` commands, renders results and the trace. |
-| `src/model_boundary.ts` | The model boundary both hosts share: the limit clamps, the `rlm` knobs and their ceilings, the read-only `rlm` registry, the `rlm` result rendering. |
-| `src/mcp_server.ts`, `src/mcp_main.ts` | The MCP host: `createReplMcpServer()` registers the five tools over the same runner and loop (approvals as suspend → `repl_resume` with an `approvalId`); `mcp_main.ts` is the `repl-simple-mcp` bin on stdio. |
-| `src/anthropic_client.ts` | `createAnthropicLlmClient()` — the `LlmClient` for `rlm` outside pi, on the Anthropic SDK. |
 
 A rename would orphan the `coverage-baseline.json` keys, reopen the package `files` list (#81) and
 touch the pinned `scriptName` default `"rlm.py"` (`src/rlm.ts`, `test/rlm.test.ts` M21) that the
@@ -645,9 +549,6 @@ universe is tracked `src/` and `extensions/` sources; the global is reported, no
 re-measured against Monty 0.0.21 on 2026-09-10
 ([#175](https://github.com/AdarGit008/repl-simple/issues/175)). Full write-up, per-file scores and
 the reasoning behind every config value: [docs/mutation-testing.md](docs/mutation-testing.md).
-One file is outside the mutate set: `src/mcp_main.ts`, the stdio process shim, whose only test
-drives it as a child process — a mutant there is invisible to the in-process runner, so it would
-count as uncovered rather than measure anything.
 
 **The floor moved up 58 → 79 because the tree's score did, not because the instrument got kinder.**
 Stryker's `coverageAnalysis: "perTest"` only skips tests that could not have killed the mutant, so

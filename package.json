@@ -2,7 +2,7 @@
   "name": "repl-simple",
   "version": "0.2.0",
   "type": "module",
-  "description": "Pi extension — sandboxed Python execution via Monty",
+  "description": "Pi extension and MCP server — sandboxed Python execution via Monty",
   "keywords": [
     "pi-package"
   ],
