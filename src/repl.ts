@@ -658,6 +658,18 @@ export class ReplRunner {
   }
 
   /**
+   * The host tools a session of this runner binds for Python, as its registry
+   * holds them — name, parameters, whether a call asks for approval. For a
+   * host that has to describe the sandbox to its model before the first call
+   * (the MCP server's tool text); the list is the one `buildRegistry`
+   * composes, so it cannot drift from what a session binds. The toolstore
+   * tools are added at session creation and are not in it.
+   */
+  describeHostTools(): HostTool[] {
+    return this.buildRegistry().registry.list();
+  }
+
+  /**
    * Discard a pending suspension without approving or denying.
    *
    * @returns which of the three states the session was in — see
