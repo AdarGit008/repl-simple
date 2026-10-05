@@ -15,6 +15,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "repl-simple-mcp": "dist/mcp_main.js"
+  },
   "files": [
     "dist",
     "src",

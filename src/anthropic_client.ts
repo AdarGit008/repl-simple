@@ -93,7 +93,9 @@ export function createAnthropicLlmClient(options: AnthropicLlmClientOptions = {}
       );
       if (reply.stop_reason === "refusal") {
         const category = reply.stop_details?.category ?? "unspecified";
-        throw new Error(`Anthropic refused the request (stop_reason: refusal, category: ${category})`);
+        throw new Error(
+          `Anthropic refused the request (stop_reason: refusal, category: ${category})`,
+        );
       }
       if (reply.stop_reason === "max_tokens") {
         throw new Error(

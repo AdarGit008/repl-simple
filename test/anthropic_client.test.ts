@@ -220,7 +220,11 @@ describe("createAnthropicLlmClient", () => {
     // actually queries. We only assert the construction half here; the SDK's
     // own credential resolution is not under test.
     await withEnv(
-      { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined, ANTHROPIC_PROFILE: undefined },
+      {
+        ANTHROPIC_API_KEY: undefined,
+        ANTHROPIC_AUTH_TOKEN: undefined,
+        ANTHROPIC_PROFILE: undefined,
+      },
       () => {
         assert.doesNotThrow(() => createAnthropicLlmClient());
       },
