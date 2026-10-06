@@ -1,6 +1,6 @@
 import { limitsConfig } from "./sandbox.js";
 import type { RunLimits } from "./types.js";
-import type { RlmResult } from "./rlm.js";
+import { DEFAULT_RLM_MAX_ITERATIONS, type RlmResult } from "./rlm.js";
 import { ToolRegistry } from "./registry.js";
 import { createPiBridgeTools } from "./bridge.js";
 import { createBuiltinTools } from "./builtins.js";
@@ -42,8 +42,22 @@ export function defaultRlmBudget(): number {
   return Number.isFinite(parsed) ? parsed : DEFAULT_RLM_BUDGET;
 }
 
-/** Ceiling on a model-supplied `maxIterations` — the loop's default. */
-const RLM_MAX_ITERATIONS = 10;
+const RLM_MAX_ITERATIONS_VAR = "REPL_RLM_MAX_ITERATIONS";
+
+/**
+ * The default `rlm` iteration count for this process — and, like the budget,
+ * also the ceiling on a model-supplied `maxIterations`. The env override is a
+ * ceiling, not merely a default the model can out-ask: a value below the
+ * library default still clamps, and a non-integer or non-positive value falls
+ * back to `DEFAULT_RLM_MAX_ITERATIONS`.
+ */
+export function defaultRlmMaxIterations(): number {
+  const raw = process.env[RLM_MAX_ITERATIONS_VAR];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_RLM_MAX_ITERATIONS;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : DEFAULT_RLM_MAX_ITERATIONS;
+}
+
 /** Ceiling on a model-supplied `maxDepth` — the loop's default. */
 const RLM_MAX_DEPTH = 1;
 
@@ -53,8 +67,9 @@ const RLM_MAX_DEPTH = 1;
  * The `rlm` tool is the same model boundary the `repl` tool clamps through
  * `clampModelLimits`, so these knobs are clamped, never trusted:
  * `budget` is capped at `defaultRlmBudget()` (the env override is a ceiling,
- * not merely a default the model can out-ask), `maxIterations` at 10 and
- * `maxDepth` at 1. A value that is not the right kind of number is omitted
+ * not merely a default the model can out-ask), `maxIterations` at
+ * `defaultRlmMaxIterations()` and `maxDepth` at 1. A value that is not the
+ * right kind of number is omitted
  * so the loop's own default applies — the model saying nothing and the model
  * saying nonsense mean the same thing.
  */
@@ -68,7 +83,7 @@ export function clampRlmLimits(
     out.budget = Math.min(budget, defaultRlmBudget());
   }
   if (typeof maxIterations === "number" && Number.isInteger(maxIterations) && maxIterations >= 1) {
-    out.maxIterations = Math.min(maxIterations, RLM_MAX_ITERATIONS);
+    out.maxIterations = Math.min(maxIterations, defaultRlmMaxIterations());
   }
   if (typeof maxDepth === "number" && Number.isInteger(maxDepth) && maxDepth >= 0) {
     out.maxDepth = Math.min(maxDepth, RLM_MAX_DEPTH);

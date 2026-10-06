@@ -5800,19 +5800,19 @@ describe("runRlm() — defaults (D58)", () => {
     return new ToolRegistry([]);
   }
 
-  it("defaults maxIterations to 10 (kills M1)", async () => {
-    // More than 10 code replies, none of which SUBMITs: the loop must stop at
+  it("defaults maxIterations to 20 (kills M1)", async () => {
+    // More than 20 code replies, none of which SUBMITs: the loop must stop at
     // the default cap, not run forever or stop at any other count.
     const code = "```python\nprint('still working...')\n```";
-    const { llm } = mockLlmCodeGen(Array.from({ length: 15 }, () => code));
+    const { llm } = mockLlmCodeGen(Array.from({ length: 25 }, () => code));
 
     const result = await runRlm("q", { llmClient: llm, registry: rlmRegistry() });
 
     assert.equal(result.status, "max_iterations");
     assert.equal(
       result.iterations.length,
-      10,
-      "omitting maxIterations must run exactly 10 iterations",
+      20,
+      "omitting maxIterations must run exactly 20 iterations",
     );
   });
 

@@ -10,6 +10,7 @@ import {
   clampModelLimits,
   clampRlmLimits,
   defaultRlmBudget,
+  defaultRlmMaxIterations,
   formatRlmResult,
 } from "./model_boundary.js";
 import { closeSandboxPool } from "./pool.js";
@@ -448,7 +449,9 @@ export function createReplMcpServer(options: ReplMcpServerOptions): ReplMcpServe
         maxIterations: z
           .number()
           .optional()
-          .describe("Maximum code-gen iterations before the loop gives up. Default and cap: 10."),
+          .describe(
+            "Maximum code-gen iterations before the loop gives up. Default and cap: 20 (REPL_RLM_MAX_ITERATIONS).",
+          ),
         maxDepth: z
           .number()
           .optional()
@@ -471,7 +474,7 @@ export function createReplMcpServer(options: ReplMcpServerOptions): ReplMcpServe
         const result = await runRlm(args.question, {
           llmClient,
           registry: buildRlmRegistry(options.root),
-          maxIterations: limits.maxIterations,
+          maxIterations: limits.maxIterations ?? defaultRlmMaxIterations(),
           maxDepth: limits.maxDepth,
           budget: limits.budget ?? defaultRlmBudget(),
           signal: extra.signal,

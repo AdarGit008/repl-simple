@@ -16,6 +16,13 @@ import {
   VALUE_RECOVERY,
 } from "./truncate.js";
 
+// The default number of code-gen → execute iterations for a `rlm` run when the
+// caller omits `maxIterations`. The host model boundary
+// (`src/model_boundary.ts`) uses this same value as its ceiling and lets the
+// operator override it via `REPL_RLM_MAX_ITERATIONS`; keeping the value here
+// gives the library and the boundary one source of truth.
+export const DEFAULT_RLM_MAX_ITERATIONS = 20;
+
 // ── RLM types ────────────────────────────────────────────────────
 
 /**
@@ -78,7 +85,7 @@ export interface RlmOptions {
    * callers need NOT restate it (D67).
    */
   systemPrompt?: string;
-  /** Max RLM iterations before giving up. Default: 10. */
+  /** Max RLM iterations before giving up. Default: 20. */
   maxIterations?: number;
   /** Nesting depth limit for `rlm_query` recursion. Default: 1. */
   maxDepth?: number;
@@ -1261,7 +1268,7 @@ export async function runRlm(question: string, options: RlmOptions): Promise<Rlm
   }
 
   const llmClient = options.llmClient;
-  const maxIterations = options.maxIterations ?? 10;
+  const maxIterations = options.maxIterations ?? DEFAULT_RLM_MAX_ITERATIONS;
   const iterations: RlmIteration[] = [];
   // Assigned after the merged registry exists (D50): the default system
   // prompt is built from the live registry, so it cannot be a static const.
