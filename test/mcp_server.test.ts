@@ -595,15 +595,16 @@ describe("MCP server — rlm", () => {
   });
 
   it("clamps the model-supplied knobs: iterations stop at the ceiling, not at the request", async () => {
-    // Fourteen non-submitting replies; the ceiling is 10, so the loop must end
-    // at max_iterations having asked ten times for code plus once for the
-    // synthesised answer — eleven, never the fourteen it could have consumed.
-    const llm = cannedLlm(Array.from({ length: 14 }, () => "```python\n1\n```"));
+    // Twenty-four non-submitting replies; the ceiling is 20, so the loop must
+    // end at max_iterations having asked twenty times for code plus once for
+    // the synthesised answer — twenty-one, never the twenty-four it could have
+    // consumed.
+    const llm = cannedLlm(Array.from({ length: 24 }, () => "```python\n1\n```"));
     const h = await connect({ llmClient: llm });
     try {
       const result = await call(h, "rlm", { question: "q", maxIterations: 50 });
       assert.match(result.text, /status: max_iterations/);
-      assert.ok(llm.queries.length <= 11, `asked ${llm.queries.length} times`);
+      assert.ok(llm.queries.length <= 21, `asked ${llm.queries.length} times`);
     } finally {
       await h.close();
     }

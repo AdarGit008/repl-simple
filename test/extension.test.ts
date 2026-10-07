@@ -20,6 +20,7 @@ import {
   clampModelLimits,
   clampRlmLimits,
   defaultRlmBudget,
+  defaultRlmMaxIterations,
   formatRlmResult,
 } from "../extensions/repl-extension.js";
 // The #35 constants are read off the namespace rather than named-imported so
@@ -984,21 +985,26 @@ describe("repl extension — clampModelLimits", () => {
 
 describe("repl extension — clampRlmLimits", () => {
   let priorBudget: string | undefined;
+  let priorMaxIterations: string | undefined;
 
   before(() => {
     priorBudget = process.env.REPL_RLM_BUDGET;
+    priorMaxIterations = process.env.REPL_RLM_MAX_ITERATIONS;
     delete process.env.REPL_RLM_BUDGET;
+    delete process.env.REPL_RLM_MAX_ITERATIONS;
   });
 
   after(() => {
     if (priorBudget === undefined) delete process.env.REPL_RLM_BUDGET;
     else process.env.REPL_RLM_BUDGET = priorBudget;
+    if (priorMaxIterations === undefined) delete process.env.REPL_RLM_MAX_ITERATIONS;
+    else process.env.REPL_RLM_MAX_ITERATIONS = priorMaxIterations;
   });
 
   it("clamps above-cap values to the ceilings", () => {
     assert.deepEqual(clampRlmLimits(999_999_999, 999, 999), {
       budget: defaultRlmBudget(),
-      maxIterations: 10,
+      maxIterations: 20,
       maxDepth: 1,
     });
   });
@@ -1021,6 +1027,27 @@ describe("repl extension — clampRlmLimits", () => {
   it("caps the budget at the operator's REPL_RLM_BUDGET ceiling", () => {
     process.env.REPL_RLM_BUDGET = "1000";
     assert.deepEqual(clampRlmLimits(5000, undefined, undefined), { budget: 1000 });
+  });
+
+  it("defaultRlmMaxIterations defaults to 20 and honours REPL_RLM_MAX_ITERATIONS", () => {
+    assert.equal(defaultRlmMaxIterations(), 20);
+    process.env.REPL_RLM_MAX_ITERATIONS = "7";
+    try {
+      assert.equal(defaultRlmMaxIterations(), 7);
+    } finally {
+      delete process.env.REPL_RLM_MAX_ITERATIONS;
+    }
+    process.env.REPL_RLM_MAX_ITERATIONS = "0";
+    try {
+      assert.equal(defaultRlmMaxIterations(), 20);
+    } finally {
+      delete process.env.REPL_RLM_MAX_ITERATIONS;
+    }
+  });
+
+  it("caps maxIterations at the operator's REPL_RLM_MAX_ITERATIONS ceiling", () => {
+    process.env.REPL_RLM_MAX_ITERATIONS = "30";
+    assert.deepEqual(clampRlmLimits(undefined, 999, undefined), { maxIterations: 30 });
   });
 });
 

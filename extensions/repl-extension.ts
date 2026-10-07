@@ -21,6 +21,7 @@ export {
   clampModelLimits,
   clampRlmLimits,
   defaultRlmBudget,
+  defaultRlmMaxIterations,
   formatRlmResult,
 } from "../src/model_boundary.js";
 import {
@@ -28,6 +29,7 @@ import {
   clampModelLimits,
   clampRlmLimits,
   defaultRlmBudget,
+  defaultRlmMaxIterations,
   formatRlmResult,
 } from "../src/model_boundary.js";
 
@@ -1612,7 +1614,8 @@ export default function (pi: ReplExtensionApi) {
         question: Type.String({ description: "The question to investigate." }),
         maxIterations: Type.Optional(
           Type.Number({
-            description: "Maximum code-gen iterations before the loop gives up. Default: 10.",
+            description:
+              "Maximum code-gen iterations before the loop gives up. Default and cap: 20 (REPL_RLM_MAX_ITERATIONS).",
           }),
         ),
         maxDepth: Type.Optional(
@@ -1645,7 +1648,7 @@ export default function (pi: ReplExtensionApi) {
         const result = await runRlm(params.question, {
           llmClient,
           registry,
-          maxIterations: limits.maxIterations,
+          maxIterations: limits.maxIterations ?? defaultRlmMaxIterations(),
           maxDepth: limits.maxDepth,
           budget,
           signal,
@@ -1699,6 +1702,7 @@ export default function (pi: ReplExtensionApi) {
       void runRlm(question, {
         llmClient,
         registry,
+        maxIterations: defaultRlmMaxIterations(),
         budget: defaultRlmBudget(),
         signal: controller.signal,
       }).then((result) => {
