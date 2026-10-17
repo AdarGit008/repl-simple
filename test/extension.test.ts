@@ -590,6 +590,170 @@ describe("repl extension — /rlm command", () => {
   });
 });
 
+// ── /rlm-setup ───────────────────────────────────────────────────
+//
+// The one-shot install command: interactive (confirm/input), defaults to the
+// session model with no fallback, and writes an idempotent managed block to
+// the shell profile. Tests drive the dialogs with canned answers and point
+// HOME at a temp dir so the file write is observable.
+
+describe("repl extension — /rlm-setup command", () => {
+  const RLM_KEYS = [
+    "REPL_RLM_DEFAULT_MODEL",
+    "REPL_RLM_DEFAULT_PROVIDER",
+    "REPL_RLM_FALLBACK_MODELS",
+  ] as const;
+
+  interface Answers {
+    confirm: boolean[];
+    inputs: Array<string | undefined>;
+  }
+
+  function makeCtx(model: { id: string; provider?: string } | undefined, answers: Answers) {
+    const notes: Array<{ message: string; type?: string }> = [];
+    const ctx = {
+      model,
+      ui: {
+        notify: (message: string, type?: string) => notes.push({ message, type }),
+        confirm: async () => answers.confirm.shift() ?? false,
+        input: async () => answers.inputs.shift(),
+      },
+    };
+    return { ctx, notes };
+  }
+
+  function saveEnv(keys: readonly string[]): Map<string, string | undefined> {
+    return new Map(keys.map((k) => [k, process.env[k]]));
+  }
+
+  function restoreEnv(saved: Map<string, string | undefined>): void {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
+  async function runSetup(
+    model: { id: string; provider?: string } | undefined,
+    answers: Answers,
+  ): Promise<{ home: string; notes: Array<{ message: string; type?: string }> }> {
+    const home = mkdtempSync(join(tmpdir(), "repl-ext-rlm-setup-"));
+    const savedHome = process.env.HOME;
+    const savedShell = process.env.SHELL;
+    const savedRlm = saveEnv(RLM_KEYS);
+    process.env.HOME = home;
+    process.env.SHELL = "/bin/zsh";
+    try {
+      const { commands } = await load();
+      const setup = commands.find((c) => c.name === "rlm-setup");
+      assert.ok(setup, "/rlm-setup did not register");
+      const { ctx, notes } = makeCtx(model, answers);
+      await setup.handler("", ctx as never);
+      return { home, notes };
+    } finally {
+      restoreEnv(savedRlm);
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = savedShell;
+    }
+  }
+
+  it("defaults to the session model with no fallback", async () => {
+    const { home, notes } = await runSetup(
+      { id: "deepseek-v4-pro", provider: "deepseek" },
+      { confirm: [true, false], inputs: [] },
+    );
+    const profile = readFileSync(join(home, ".zshrc"), "utf8");
+    assert.match(profile, /export REPL_RLM_DEFAULT_MODEL="deepseek-v4-pro"/);
+    assert.match(profile, /export REPL_RLM_DEFAULT_PROVIDER="deepseek"/);
+    assert.doesNotMatch(profile, /REPL_RLM_FALLBACK_MODELS/);
+    assert.ok(notes.some((n) => /\.zshrc/.test(n.message)));
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("opts into a custom model and provider", async () => {
+    const { home } = await runSetup(
+      { id: "session-model", provider: "session-provider" },
+      { confirm: [false, false], inputs: ["custom-model", "custom-provider"] },
+    );
+    const profile = readFileSync(join(home, ".zshrc"), "utf8");
+    assert.match(profile, /export REPL_RLM_DEFAULT_MODEL="custom-model"/);
+    assert.match(profile, /export REPL_RLM_DEFAULT_PROVIDER="custom-provider"/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("renders the model label without a provider when the session has none", async () => {
+    const { home } = await runSetup({ id: "bare-model" }, { confirm: [true, false], inputs: [] });
+    const profile = readFileSync(join(home, ".zshrc"), "utf8");
+    assert.match(profile, /export REPL_RLM_DEFAULT_MODEL="bare-model"/);
+    assert.doesNotMatch(profile, /REPL_RLM_DEFAULT_PROVIDER/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("opts into a fallback chain", async () => {
+    const { home } = await runSetup(
+      { id: "m", provider: "p" },
+      { confirm: [true, true], inputs: ["groq/a,openrouter/b"] },
+    );
+    const profile = readFileSync(join(home, ".zshrc"), "utf8");
+    assert.match(profile, /export REPL_RLM_FALLBACK_MODELS="groq\/a,openrouter\/b"/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("cancels when the custom model is empty", async () => {
+    const { home, notes } = await runSetup(
+      { id: "session-model" },
+      { confirm: [false], inputs: [""] },
+    );
+    assert.equal(existsSync(join(home, ".zshrc")), false);
+    assert.ok(notes.some((n) => /cancelled/.test(n.message)));
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("asks for a model when there is no session model", async () => {
+    const { home } = await runSetup(undefined, { confirm: [false], inputs: ["m1", "p1"] });
+    const profile = readFileSync(join(home, ".zshrc"), "utf8");
+    assert.match(profile, /export REPL_RLM_DEFAULT_MODEL="m1"/);
+    assert.match(profile, /export REPL_RLM_DEFAULT_PROVIDER="p1"/);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("preserves existing profile content and replaces a prior managed block", async () => {
+    const home = mkdtempSync(join(tmpdir(), "repl-ext-rlm-setup-"));
+    const savedHome = process.env.HOME;
+    const savedShell = process.env.SHELL;
+    const savedRlm = saveEnv(RLM_KEYS);
+    process.env.HOME = home;
+    process.env.SHELL = "/bin/zsh";
+    try {
+      const profile = join(home, ".zshrc");
+      writeFileSync(
+        profile,
+        'export PATH=/usr/bin\n# >>> repl-simple rlm (managed) >>>\nexport REPL_RLM_DEFAULT_MODEL="old"\n# <<< repl-simple rlm (managed) <<<\ntail-line\n',
+      );
+      const { commands } = await load();
+      const setup = commands.find((c) => c.name === "rlm-setup");
+      assert.ok(setup);
+      const { ctx } = makeCtx({ id: "m", provider: "p" }, { confirm: [true, false], inputs: [] });
+      await setup.handler("", ctx as never);
+
+      const content = readFileSync(profile, "utf8");
+      assert.match(content, /export PATH=\/usr\/bin/);
+      assert.match(content, /export REPL_RLM_DEFAULT_MODEL="m"/);
+      assert.doesNotMatch(content, /"old"/);
+      assert.match(content, /tail-line/);
+    } finally {
+      restoreEnv(savedRlm);
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = savedShell;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── RLM trace details ────────────────────────────────────────────
 //
 // The `rlm` tool and `/rlm` command now persist the whole run — question,

@@ -1776,14 +1776,6 @@ export default function (pi: ReplExtensionApi) {
         provider = (prov ?? "").trim();
       }
 
-      if (model === "") {
-        ctx.ui.notify(
-          "rlm setup: no model resolved — set REPL_RLM_DEFAULT_MODEL manually.",
-          "error",
-        );
-        return;
-      }
-
       const fallbackOn = await ctx.ui.confirm(
         "repl-simple: rlm fallback",
         "Enable a fallback chain, tried in order on HTTP 429?",
