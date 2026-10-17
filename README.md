@@ -118,6 +118,12 @@ returns immediately and the formatted result is posted into the transcript when 
 refused, so a runaway loop cannot hide behind a queue. Both use the same
 `REPL_RLM_BUDGET`-overrideable spend default.
 
+Model routing: the `rlm` tool accepts `model`/`provider` to route the loop to a specific model. With
+neither, the client resolves a model in order: `REPL_RLM_BASE_URL` (an `https://` OpenAI-compatible
+endpoint with `REPL_RLM_API_KEY`/`REPL_RLM_MODEL`), then `REPL_RLM_DEFAULT_MODEL` (+
+`REPL_RLM_DEFAULT_PROVIDER`) with `REPL_RLM_FALLBACK_MODELS` (comma list of `provider/model-id`, tried
+on a 429), then the session's main model.
+
 Each iteration runs in a fresh sandbox — no variables, imports, or state carry over between
 iterations, so each snippet must be self-contained. Diagnostics fed back to the model are
 offset-corrected: line numbers refer to the model's own code, and no preamble source is shown

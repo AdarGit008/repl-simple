@@ -219,10 +219,83 @@ async function completeViaRegistry(
   return extractText(reply);
 }
 
+// ── Env-default tier ────────────────────────────────────────────
+
+const RLM_DEFAULT_MODEL_VAR = "REPL_RLM_DEFAULT_MODEL";
+const RLM_DEFAULT_PROVIDER_VAR = "REPL_RLM_DEFAULT_PROVIDER";
+const RLM_FALLBACK_MODELS_VAR = "REPL_RLM_FALLBACK_MODELS";
+
+/** A non-empty env value, or `undefined`. */
+function envValue(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  return raw.trim();
+}
+
+/**
+ * The env-default config from `REPL_RLM_DEFAULT_MODEL` / `REPL_RLM_DEFAULT_PROVIDER`,
+ * mirroring the injected `{ model, provider }` shape. Undefined when neither is
+ * set (the tier is off).
+ */
+function envDefaultConfig(): RlmClientConfig | undefined {
+  const model = envValue(RLM_DEFAULT_MODEL_VAR);
+  const provider = envValue(RLM_DEFAULT_PROVIDER_VAR);
+  if (!model && !provider) return undefined;
+  return { model, provider };
+}
+
+/**
+ * Parse `REPL_RLM_FALLBACK_MODELS`, a comma-separated list of
+ * `provider/model-id` entries (split on the first `/`), or bare `model-id`
+ * entries. Empty and whitespace entries are dropped.
+ */
+function parseFallbackConfigs(raw: string | undefined): RlmClientConfig[] {
+  if (!raw || raw.trim() === "") return [];
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "")
+    .map((entry) => {
+      const slash = entry.indexOf("/");
+      if (slash === -1) return { model: entry };
+      return { provider: entry.slice(0, slash), model: entry.slice(slash + 1) };
+    });
+}
+
+/** True when an error is a provider rate limit (HTTP 429) worth falling back from. */
+function isRateLimitError(err: unknown): boolean {
+  return err instanceof Error && /429/.test(err.message);
+}
+
+/**
+ * Call the registry with each model in order, skipping to the next only on a
+ * 429 rate-limit error. A non-429 error rethrows immediately (it is not a
+ * quota problem another model can fix), and an exhausted list rethrows the
+ * last error.
+ */
+async function completeViaRegistryWithFallback(
+  registry: RlmModelRegistry,
+  models: RlmModel[],
+  systemPrompt: string,
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  signal?: AbortSignal,
+): Promise<string> {
+  let lastError: unknown;
+  for (const model of models) {
+    try {
+      return await completeViaRegistry(registry, model, systemPrompt, messages, signal);
+    } catch (err) {
+      lastError = err;
+      if (!isRateLimitError(err)) throw err;
+    }
+  }
+  throw lastError;
+}
+
 // ── Factory ──────────────────────────────────────────────────────
 
 /**
- * Build an `LlmClient` that routes calls to one of three tiers, in priority
+ * Build an `LlmClient` that routes calls to one of four tiers, in priority
  * order:
  *
  * 1. **Injected** — `config.model` / `config.provider` resolve a model through
@@ -230,7 +303,10 @@ async function completeViaRegistry(
  *    `modelRegistry.complete` (which handles per-model auth, OAuth included).
  * 2. **Env** — `process.env.REPL_RLM_BASE_URL` (an `https://` OpenAI-compatible
  *    endpoint) with `REPL_RLM_API_KEY` and `REPL_RLM_MODEL` (default `"rlm"`).
- * 3. **Default** — `ctx.model` via `modelRegistry.complete`.
+ * 3. **Env-default** — `REPL_RLM_DEFAULT_MODEL` / `REPL_RLM_DEFAULT_PROVIDER`
+ *    resolve a model through the same registry, then `REPL_RLM_FALLBACK_MODELS`
+ *    (comma list of `provider/model-id`) are tried in order on a 429.
+ * 4. **Default** — `ctx.model` via `modelRegistry.complete`.
  */
 export function createLlmClient(ctx: RlmClientContext, config: RlmClientConfig = {}): LlmClient {
   return {
@@ -248,10 +324,31 @@ export function createLlmClient(ctx: RlmClientContext, config: RlmClientConfig =
         return completeViaEnvEndpoint(systemPrompt, messages, signal, baseUrl);
       }
 
+      const defaultConfig = envDefaultConfig();
+      if (defaultConfig) {
+        const primary = resolveInjectedModel(ctx, defaultConfig);
+        if (!primary) {
+          throw new Error(
+            `RLM model not found for ${describeConfig(defaultConfig)} ` +
+              `(${RLM_DEFAULT_MODEL_VAR}/${RLM_DEFAULT_PROVIDER_VAR})`,
+          );
+        }
+        const fallbacks = parseFallbackConfigs(process.env[RLM_FALLBACK_MODELS_VAR])
+          .map((fallback) => resolveInjectedModel(ctx, fallback))
+          .filter((model): model is RlmModel => model !== undefined);
+        return completeViaRegistryWithFallback(
+          ctx.modelRegistry,
+          [primary, ...fallbacks],
+          systemPrompt,
+          messages,
+          signal,
+        );
+      }
+
       if (!ctx.model) {
         throw new Error(
           "RLM client has no model: set config.model/config.provider, " +
-            "REPL_RLM_BASE_URL, or ctx.model",
+            "REPL_RLM_BASE_URL, REPL_RLM_DEFAULT_MODEL, or ctx.model",
         );
       }
       return completeViaRegistry(ctx.modelRegistry, ctx.model, systemPrompt, messages, signal);
