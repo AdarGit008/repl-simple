@@ -34,6 +34,15 @@ Sandboxed Python execution in pi via [Monty](https://github.com/pydantic/monty) 
 
 The loop's sandbox is **read-only**: the mutating bridge tools (`bash`, `edit`, `write`) and `http_get` are denied, so it reads and reasons over the repo but never changes it. Each call is a multi-LLM-call loop with real cost, bounded by `REPL_RLM_BUDGET` (default 500 000 estimated tokens).
 
+**Model routing** — when the `rlm` tool is called without `model`/`provider` and `REPL_RLM_BASE_URL`
+is unset, the client resolves `REPL_RLM_DEFAULT_MODEL` (+ optional `REPL_RLM_DEFAULT_PROVIDER`) through
+the host registry, then tries `REPL_RLM_FALLBACK_MODELS` (a comma-separated list of `provider/model-id`
+entries) in order on a 429, and finally falls back to the session's main model.
+
+Run **`/rlm-setup`** once after install to bake these exports into your shell profile. It defaults to
+your session model (no fallback) and asks whether to opt in to a custom model/provider and a 429
+fallback chain — X fallback models make the chain your default + X.
+
 The answer is **untrusted** — the inner model's own output, not a verified result. Treat it as a hypothesis to check. Every result carries a `status` (`ok` / `max_iterations` / `budget_exhausted` / `aborted` / `error`) and an `answerSource` (`submitted` / `salvaged` / `synthesised`).
 
 **Use `rlm` for:**

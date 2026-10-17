@@ -1,3 +1,5 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { maskSecrets, redact } from "../src/redact.js";
@@ -7,6 +9,13 @@ import { escapeNoticeName } from "../src/toolstore.js";
 import type { ApprovalRequest, ApprovalDecision } from "../src/types.js";
 import { runRlm, type RlmIteration, type RlmResult } from "../src/rlm.js";
 import { createLlmClient, type RlmClientContext } from "../src/rlm_client.js";
+import {
+  applyRlmExportBlock,
+  applyRlmSetupEnv,
+  detectShellProfile,
+  renderRlmExportBlock,
+  type RlmSetupConfig,
+} from "../src/rlm_setup.js";
 
 // ── The model boundary (src/model_boundary.ts) ───────────────────
 //
@@ -835,7 +844,11 @@ interface CommandCtx extends RlmClientContext {
   cwd: string;
   hasUI: boolean;
   isProjectTrusted(): boolean;
-  ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
+  ui: {
+    notify: (message: string, type?: "info" | "warning" | "error") => void;
+    confirm: (title: string, message: string) => Promise<boolean>;
+    input: (title: string, placeholder?: string) => Promise<string | undefined>;
+  };
 }
 
 /** Extension registration surface — the subset of pi's API this file uses. */
@@ -1726,6 +1739,77 @@ export default function (pi: ReplExtensionApi) {
       }
       rlmAbortController.abort();
       ctx.ui.notify("rlm: aborting…", "info");
+    },
+  });
+
+  pi.registerCommand("rlm-setup", {
+    description:
+      "Configure the rlm model: default model/provider (session model by default) and an optional 429 fallback chain, baked into your shell profile.",
+    handler: async (_args, ctx) => {
+      const session = ctx.model;
+      let model = session?.id ?? "";
+      let provider = session?.provider ?? "";
+
+      let useSession = true;
+      if (session) {
+        const label = provider ? `${model} (${provider})` : model;
+        useSession = await ctx.ui.confirm(
+          "repl-simple: rlm model",
+          `Use the session model ${label} as the rlm default?`,
+        );
+      }
+
+      if (!session || !useSession) {
+        const custom = await ctx.ui.input(
+          "repl-simple: rlm custom model",
+          "model id, e.g. openai/gpt-oss-120b",
+        );
+        if (custom === undefined || custom.trim() === "") {
+          ctx.ui.notify("rlm setup cancelled — no model chosen.", "info");
+          return;
+        }
+        model = custom.trim();
+        const prov = await ctx.ui.input(
+          "repl-simple: rlm provider",
+          "provider, e.g. groq (leave empty for none)",
+        );
+        provider = (prov ?? "").trim();
+      }
+
+      const fallbackOn = await ctx.ui.confirm(
+        "repl-simple: rlm fallback",
+        "Enable a fallback chain, tried in order on HTTP 429?",
+      );
+      let fallbackModels = "";
+      if (fallbackOn) {
+        const chain = await ctx.ui.input(
+          "repl-simple: rlm fallback chain",
+          "comma-separated provider/model-id, e.g. groq/qwen/qwen3.8-27b,openrouter/poolside/laguna-s-2.1:free",
+        );
+        fallbackModels = (chain ?? "").trim();
+      }
+
+      const config: RlmSetupConfig = {
+        model,
+        provider: provider || undefined,
+        fallbackModels: fallbackModels || undefined,
+      };
+
+      const profile = detectShellProfile(process.env.SHELL, homedir());
+      const block = renderRlmExportBlock(config, profile);
+      let current = "";
+      try {
+        current = await readFile(profile, "utf8");
+      } catch {
+        current = "";
+      }
+      await writeFile(profile, applyRlmExportBlock(current, block), "utf8");
+      applyRlmSetupEnv(config);
+
+      ctx.ui.notify(
+        `rlm setup: wrote ${profile}. Applied to this session; run \`source ${profile}\` (or open a new shell) to persist.`,
+        "info",
+      );
     },
   });
 }

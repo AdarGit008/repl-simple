@@ -417,4 +417,206 @@ describe("createLlmClient", () => {
     assert.equal(text, "");
     assert.equal(calls.length, 1);
   });
+
+  it("env-default tier routes through modelRegistry.complete when REPL_RLM_DEFAULT_MODEL is set", async () => {
+    const { calls, registry } = makeRegistry("env-default reply");
+    const client = createLlmClient({
+      model: undefined,
+      modelRegistry: registry,
+      scopedModels: [{ model: { id: "free-model" } }],
+    });
+
+    await withEnv({ REPL_RLM_DEFAULT_MODEL: "free-model" }, async () => {
+      const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+      assert.equal(text, "env-default reply");
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model.id, "free-model");
+  });
+
+  it("env-default tier rejects when the default model does not resolve", async () => {
+    const { calls, registry } = makeRegistry("unused");
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    await withEnv({ REPL_RLM_DEFAULT_MODEL: "missing" }, async () => {
+      await assert.rejects(
+        client.query("sys", [{ role: "user", content: "hi" }]),
+        /RLM model not found/,
+      );
+    });
+    assert.equal(calls.length, 0);
+  });
+
+  it("env-default tier falls back to REPL_RLM_FALLBACK_MODELS on a 429", async () => {
+    const calls: RecordedCall[] = [];
+    const registry: RlmModelRegistry = {
+      find(provider, modelId) {
+        return { id: `${provider}/${modelId}`, provider };
+      },
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        if (model.id === "groq/primary") {
+          return Promise.reject(new Error("429: rate limit"));
+        }
+        return Promise.resolve({ content: [{ type: "text", text: "fallback reply" }] });
+      },
+    };
+
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    await withEnv(
+      {
+        REPL_RLM_DEFAULT_MODEL: "primary",
+        REPL_RLM_DEFAULT_PROVIDER: "groq",
+        REPL_RLM_FALLBACK_MODELS: "openrouter/fallback-model",
+      },
+      async () => {
+        const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+        assert.equal(text, "fallback reply");
+      },
+    );
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].model.id, "groq/primary");
+    assert.equal(calls[1].model.id, "openrouter/fallback-model");
+  });
+
+  it("env-default tier does not fall back on a non-429 error", async () => {
+    const calls: RecordedCall[] = [];
+    const registry: RlmModelRegistry = {
+      find(provider, modelId) {
+        return { id: `${provider}/${modelId}`, provider };
+      },
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        return Promise.reject(new Error("500: server error"));
+      },
+    };
+
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    await withEnv(
+      {
+        REPL_RLM_DEFAULT_MODEL: "primary",
+        REPL_RLM_DEFAULT_PROVIDER: "groq",
+        REPL_RLM_FALLBACK_MODELS: "openrouter/fallback-model",
+      },
+      async () => {
+        await assert.rejects(
+          client.query("sys", [{ role: "user", content: "hi" }]),
+          /500: server error/,
+        );
+      },
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model.id, "groq/primary");
+  });
+
+  it("env-default tier rethrows the last 429 when every model is rate-limited", async () => {
+    const calls: RecordedCall[] = [];
+    const registry: RlmModelRegistry = {
+      find(provider, modelId) {
+        return { id: `${provider}/${modelId}`, provider };
+      },
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        return Promise.reject(new Error("429: rate limit"));
+      },
+    };
+
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    await withEnv(
+      {
+        REPL_RLM_DEFAULT_MODEL: "primary",
+        REPL_RLM_DEFAULT_PROVIDER: "groq",
+        REPL_RLM_FALLBACK_MODELS: "openrouter/fallback-model,nvidia/third",
+      },
+      async () => {
+        await assert.rejects(
+          client.query("sys", [{ role: "user", content: "hi" }]),
+          /429: rate limit/,
+        );
+      },
+    );
+
+    assert.equal(calls.length, 3);
+  });
+
+  it("injected tier wins over the env-default tier", async () => {
+    const { calls, registry } = makeRegistry("injected wins");
+    const client = createLlmClient(
+      {
+        model: undefined,
+        modelRegistry: registry,
+        scopedModels: [{ model: { id: "injected-model" } }, { model: { id: "env-model" } }],
+      },
+      { model: "injected-model" },
+    );
+
+    await withEnv({ REPL_RLM_DEFAULT_MODEL: "env-model" }, async () => {
+      const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+      assert.equal(text, "injected wins");
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model.id, "injected-model");
+  });
+
+  it("env endpoint tier wins over the env-default tier", async () => {
+    const { registry } = makeRegistry("unused");
+    const client = createLlmClient({ model: undefined, modelRegistry: registry });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "endpoint wins" } }] }),
+        {
+          status: 200,
+        },
+      );
+    }) as typeof fetch;
+
+    try {
+      await withEnv(
+        { REPL_RLM_BASE_URL: "https://api.example.com", REPL_RLM_DEFAULT_MODEL: "env-model" },
+        async () => {
+          const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+          assert.equal(text, "endpoint wins");
+        },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("env-default fallback accepts a bare model-id resolved through scopedModels", async () => {
+    const calls: RecordedCall[] = [];
+    const registry: RlmModelRegistry = {
+      complete(model, context, options) {
+        calls.push({ model, context, options });
+        if (model.id === "primary") return Promise.reject(new Error("429: rate limit"));
+        return Promise.resolve({ content: [{ type: "text", text: "bare fallback reply" }] });
+      },
+    };
+    const client = createLlmClient({
+      model: undefined,
+      modelRegistry: registry,
+      scopedModels: [{ model: { id: "primary" } }, { model: { id: "bare-fallback" } }],
+    });
+
+    await withEnv(
+      { REPL_RLM_DEFAULT_MODEL: "primary", REPL_RLM_FALLBACK_MODELS: "bare-fallback" },
+      async () => {
+        const text = await client.query("sys", [{ role: "user", content: "hi" }]);
+        assert.equal(text, "bare fallback reply");
+      },
+    );
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].model.id, "primary");
+    assert.equal(calls[1].model.id, "bare-fallback");
+  });
 });
