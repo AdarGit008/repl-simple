@@ -1243,11 +1243,11 @@ describe("repl extension — approval mode", () => {
     if (cwd) rmSync(cwd, { recursive: true, force: true });
   });
 
-  it("registers /repl-approvals, /repl-accept-preamble, /rlm, and /rlm-abort (#198)", async () => {
+  it("registers /repl-approvals, /repl-accept-preamble, /rlm, /rlm-abort, and /rlm-setup (#198)", async () => {
     const { commands } = await load();
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["repl-approvals", "repl-accept-preamble", "rlm", "rlm-abort"],
+      ["repl-approvals", "repl-accept-preamble", "rlm", "rlm-abort", "rlm-setup"],
     );
     for (const command of commands) {
       assert.ok(command.description, `${command.name} needs a description to be discoverable`);

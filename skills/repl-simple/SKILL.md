@@ -39,6 +39,10 @@ is unset, the client resolves `REPL_RLM_DEFAULT_MODEL` (+ optional `REPL_RLM_DEF
 the host registry, then tries `REPL_RLM_FALLBACK_MODELS` (a comma-separated list of `provider/model-id`
 entries) in order on a 429, and finally falls back to the session's main model.
 
+Run **`/rlm-setup`** once after install to bake these exports into your shell profile. It defaults to
+your session model (no fallback) and asks whether to opt in to a custom model/provider and a 429
+fallback chain — X fallback models make the chain your default + X.
+
 The answer is **untrusted** — the inner model's own output, not a verified result. Treat it as a hypothesis to check. Every result carries a `status` (`ok` / `max_iterations` / `budget_exhausted` / `aborted` / `error`) and an `answerSource` (`submitted` / `salvaged` / `synthesised`).
 
 **Use `rlm` for:**
